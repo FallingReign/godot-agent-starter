@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Import defaults, written into project.godot's [importer_defaults] block by",
+    "`python bootstrap.py --import-profile <name>`.",
+    "",
+    "WHY THIS IS A DAY-ONE DECISION, not a later one:",
+    "Godot writes every parameter individually into each .import sidecar rather",
+    "than recording 'uses default'. Changing these values later does NOT",
+    "propagate to anything already imported. Retrofitting means deleting every",
+    ".import file to force a project-wide reimport, which produces a very large",
+    "diff. Set the profile before the first asset lands.",
+    "",
+    "Pick by target, not by taste. Add your own profiles freely; the gate does",
+    "not care which one you use, only that assets have committed sidecars."
+  ],
+  "profiles": {
+    "desktop-3d": {
+      "description": "Forward+ desktop. Quality first, VRAM is cheap, mipmaps for 3D.",
+      "settings": {
+        "texture": {
+          "compress/mode": 2,
+          "compress/high_quality": true,
+          "mipmaps/generate": true,
+          "detect_3d/compress_to": 1
+        },
+        "oggvorbisstr": {
+          "loop": false
+        }
+      }
+    },
+    "desktop-2d": {
+      "description": "Forward+ desktop, 2D-first. No mipmaps, lossless textures.",
+      "settings": {
+        "texture": {
+          "compress/mode": 0,
+          "mipmaps/generate": false,
+          "detect_3d/compress_to": 0
+        },
+        "oggvorbisstr": {
+          "loop": false
+        }
+      }
+    },
+    "mobile": {
+      "description": "Mobile renderer. Aggressive compression, mipmaps mandatory, VRAM is the constraint.",
+      "settings": {
+        "texture": {
+          "compress/mode": 2,
+          "compress/high_quality": false,
+          "mipmaps/generate": true,
+          "process/size_limit": 2048,
+          "detect_3d/compress_to": 1
+        },
+        "oggvorbisstr": {
+          "loop": false
+        }
+      }
+    }
+  }
+}

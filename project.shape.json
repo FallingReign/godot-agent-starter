@@ -1,0 +1,41 @@
+{
+  "_schema": "Every key below is validated. Run: python tools/schema.py --describe shape",
+  "_example": "Each array shows one example. Delete the _ keys and the examples before real use.",
+  "name": "",
+  "pitch": "",
+  "involvement": "",
+  "decisions": [
+    {
+      "_": "delete. Append only: never edit or remove a settled entry.",
+      "id": "world-structure",
+      "question": "the question as it was actually asked",
+      "answer": "what was decided",
+      "because": "one line on what forced it now",
+      "date": "2026-01-01",
+      "decided_by": "human",
+      "revisit_if": "what would invalidate this, or the word permanent",
+      "docs_at": "",
+      "note": ""
+    }
+  ],
+  "questions": [
+    {
+      "_": "delete. Delete an entry when answered; never mark it answered.",
+      "id": "cell-pitch",
+      "question": "the open question",
+      "blocks": "what work this blocks",
+      "raised": "2026-01-01",
+      "options": []
+    }
+  ],
+  "direction": [
+    {
+      "_": "delete",
+      "id": "maps-grow",
+      "heading": "the known heading, one line",
+      "accommodate": "what today's work must leave room for",
+      "not_yet": "what must NOT be built yet, despite the above",
+      "added": "2026-01-01"
+    }
+  ]
+}

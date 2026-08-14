@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "deny": [
+      "Write(ARCHITECTURE.md)",
+      "Edit(ARCHITECTURE.md)",
+      "Edit(check.py)",
+      "Write(check.py)",
+      "Edit(arch.py)",
+      "Write(arch.py)",
+      "Edit(sanitise.py)",
+      "Write(sanitise.py)",
+      "Edit(.gate.sha256)",
+      "Write(.gate.sha256)",
+      "Edit(**/*.import)",
+      "Write(**/*.import)",
+      "Edit(**/*.uid)",
+      "Write(**/*.uid)",
+      "Edit(project.godot)",
+      "Write(project.godot)",
+      "Edit(export_presets.cfg)",
+      "Write(export_presets.cfg)",
+      "Edit(addons/**)",
+      "Write(addons/**)",
+      "Bash(python check.py --accept-gate-changes)",
+      "Bash(python3 check.py --accept-gate-changes)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(gdformat .)",
+      "Bash(uvx gdformat .)",
+      "Bash(uv tool run --from gdtoolkit==4.* gdformat .)",
+      "Bash(git checkout --:*)",
+      "Bash(git clean:*)",
+      "Bash(git reset:*)",
+      "Write(tools/gen_gdscript_doc.py)",
+      "Edit(gate.rules.json)",
+      "Write(gate.rules.json)",
+      "Edit(arch.rules.json)",
+      "Write(arch.rules.json)"
+    ],
+    "_comment": [
+      "Scenes: .tscn and .tres are deliberately NOT denied. The sanitise and resources gate stages verify them, so they meet the same bar as everything else the agent owns. Read docs/SCENES.md before writing one.",
+      "The gate: check.py, arch.py, sanitise.py, tools/validate_resources.gd and .gate.sha256 are denied because editing the gate is the one route to a false green. The integrity stage catches it even if this deny list is bypassed.",
+      "--accept-gate-changes is denied because re-baselining the manifest must be a human decision.",
+      "ARCHITECTURE.md is generated: run `python arch.py --write` instead of editing it.",
+      "arch.rules.json and gate.rules.json are intentionally NOT denied. The agent may propose rule changes; AGENTS.md requires it to ask before widening a boundary.",
+      "project.godot is denied so the [debug] warnings block and [importer_defaults] cannot be quietly altered. Use bootstrap.py --import-profile for import defaults."
+    ]
+  }
+}

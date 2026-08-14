@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Boundary rules, enforced by arch.py and by `python check.py --only arch`.",
+    "This file is the source of truth for ALLOWED dependencies; the mermaid",
+    "diagram in ARCHITECTURE.md is generated from this plus the actual code.",
+    "Paths are relative to src/ (the Godot project). Gate scripts and docs live",
+    "at the repo root and are not part of the game's dependency graph.",
+    "A module absent from `modules` is drawn but not constrained, so you can",
+    "add directories freely and tighten them later. At involvement 'module' or",
+    "above, an undeclared module means structure was built without approval.",
+    "module_depth 2 means scripts/logic is a module and scripts/logic/combat",
+    "is folded into it. Raise it if your tree gets deeper."
+  ],
+  "module_depth": 2,
+  "modules": {
+    "scripts/logic": {
+      "description": "pure rules, no engine deps",
+      "may_depend_on": [
+        "scripts/data"
+      ]
+    },
+    "scripts/data": {
+      "description": "typed config + level format",
+      "may_depend_on": []
+    },
+    "scripts": {
+      "description": "node layer, wiring",
+      "may_depend_on": [
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "tests/unit": {
+      "description": "logic tests",
+      "may_depend_on": [
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "tests": {
+      "description": "harnesses",
+      "may_depend_on": [
+        "scripts",
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "tools": {
+      "description": "headless validators run by the gate, not shipped in the game",
+      "may_depend_on": []
+    },
+    "scenes": {
+      "description": "scene files, presentation only",
+      "may_depend_on": [
+        "scripts",
+        "scripts/logic",
+        "scripts/data"
+      ]
+    }
+  },
+  "forbid_autoload_use_in": [
+    "scripts/logic/",
+    "scripts/data/"
+  ],
+  "type_boundary": {
+    "_note": "Which directories must stay fully typed (interior) and which are allowed loose containers because their job is converting external data (boundary). Rename or add freely to match your layout; the types check reads this, so reorganising into feature folders does not require editing a gate file.",
+    "interior": [
+      "scripts/logic/"
+    ],
+    "boundary": [
+      "scripts/data/"
+    ]
+  }
+}

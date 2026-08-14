@@ -1,0 +1,63 @@
+# Godot's import cache and editor state. Regenerated on open; never commit.
+.godot/
+src/.godot/
+
+# Gate artefacts.
+.checklogs/
+.godot_doc/
+
+# Vendored third-party bundle, fetched by bootstrap.py --fix. Not source, and
+# a few MB of minified JS in every diff is noise. plan.html degrades to
+# readable diagram source without it.
+tools/vendor/
+.gate.sha256.bak
+*.bak
+
+# Python.
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Exported builds.
+build/
+export/
+*.exe
+*.pck
+*.apk
+*.aab
+*.dmg
+*.zip
+
+# OS noise.
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor noise.
+.vscode/
+.idea/
+*.swp
+*~
+
+# Generated plan view. Rewritten by the gate on every run, so committing it
+# produces noise on every commit. plan/ SNAPSHOTS are deliberately NOT ignored:
+# they are the record of how the plan moved between slices.
+plan.html
+
+# DO NOT ADD:
+#   *.import   - Godot import metadata. Ignoring it forces a full reimport on
+#                every clone and can change asset UIDs.
+#   *.uid      - Script/resource identity. Ignoring it breaks every scene-to-
+#                script link on a fresh clone.
+#   project.godot, export_presets.cfg, .gutconfig.json - project configuration.
+#   plan/*.html - per-slice snapshots. The comparison between them is the
+#                 record of how the design changed; losing it loses the audit.
+
+# Retro working files. The evidence pack is regenerated on demand and the SDK
+# scratch dir holds a generated bridge script, so neither belongs in history.
+# docs/retro/*.md IS committed -- the findings are the durable record.
+docs/retro/evidence.json
+docs/retro/prompt.md
+docs/retro/.sdk/
+docs/retro/.ran

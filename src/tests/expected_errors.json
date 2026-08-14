@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Error lines a PASSING test is expected to emit.",
+    "",
+    "A test that asserts bad input is rejected will legitimately produce error",
+    "output: push_error is the correct way for a parser to report a bad file,",
+    "and the test proving it fires is a passing test. The gut stage fails on",
+    "error text by default, so declare the expected ones here.",
+    "",
+    "Anything NOT declared still fails the stage. Every entry needs a 'why':",
+    "an unexplained allowance is how a real error gets hidden. A declared",
+    "error that never occurs is reported as stale, so this list cannot rot.",
+    "",
+    "Do NOT use this to silence errors you have not understood. If an error is",
+    "a real defect, fix the defect."
+  ],
+  "expected": []
+}

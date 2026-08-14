@@ -1,0 +1,14 @@
+# gdtoolkit / gdlint configuration.
+# If gdlint rejects a key here, regenerate a full default with:
+#   gdlint -d > .gdlintrc
+# and then re-apply the overrides below.
+max-line-length: 120
+max-file-lines: 400
+function-arguments-number: 6
+max-public-methods: 20
+excluded_directories:
+  - .git
+  - .godot
+  - addons
+  - build
+  - export

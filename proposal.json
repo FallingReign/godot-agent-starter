@@ -1,0 +1,28 @@
+{
+  "_schema": "Every key below is validated. Run: python tools/schema.py --describe proposal",
+  "_example": "Arrays show one example each. Delete the _ keys and the examples when you write a real proposal.",
+  "slice": "",
+  "status": "",
+  "approved_by": "",
+  "approved_on": "",
+  "baseline_sha": "",
+  "experience": {
+    "player_does": "",
+    "feels_like": "",
+    "camera": "",
+    "controls": "",
+    "not_this": ""
+  },
+  "design_refs": [],
+  "mockup": {
+    "svg": "",
+    "caption": "",
+    "not_possible": ""
+  },
+  "considered_existing": [],
+  "modules": [],
+  "files": [],
+  "functions": [],
+  "revisions": [],
+  "acknowledged": []
+}

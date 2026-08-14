@@ -1,0 +1,126 @@
+{
+  "_comment": [
+    "Banned-idiom patterns for `python check.py --only grep`.",
+    "External so you can tailor the kit to your game without editing check.py.",
+    "Delete any rule that does not apply: the `net` tag is meaningless in a",
+    "single-player game, for instance.",
+    "Each rule: id, pattern (Python regex, matched per line), message, tag.",
+    "Tags are organisational only. Suppress one line with a trailing # gate:allow"
+  ],
+  "rules": [
+    {
+      "id": "connect-4arg",
+      "pattern": "(^|[^A-Za-z0-9_])connect\\(\\s*\"[^\"]*\"\\s*,",
+      "message": "four-argument connect() -- parses, never fires. Use signal.connect(callable)",
+      "tag": "godot3"
+    },
+    {
+      "id": "disconnect-string",
+      "pattern": "(^|[^A-Za-z0-9_])disconnect\\(\\s*\"[^\"]*\"\\s*,",
+      "message": "string-based disconnect() -- use signal.disconnect(callable)",
+      "tag": "godot3"
+    },
+    {
+      "id": "is-connected-string",
+      "pattern": "(^|[^A-Za-z0-9_])is_connected\\(\\s*\"",
+      "message": "string-based is_connected() -- use signal.is_connected(callable)",
+      "tag": "godot3"
+    },
+    {
+      "id": "emit-signal-string",
+      "pattern": "emit_signal\\(\\s*\"",
+      "message": "emit_signal(\"x\") -- use x.emit()",
+      "tag": "godot3"
+    },
+    {
+      "id": "yield",
+      "pattern": "(^|[^A-Za-z0-9_])yield\\(",
+      "message": "yield() -- use await",
+      "tag": "godot3"
+    },
+    {
+      "id": "bare-export-var",
+      "pattern": "^\\s*export\\s+var",
+      "message": "bare export -- use @export",
+      "tag": "godot3"
+    },
+    {
+      "id": "bare-export-call",
+      "pattern": "^\\s*export\\(",
+      "message": "bare export() -- use @export",
+      "tag": "godot3"
+    },
+    {
+      "id": "bare-onready",
+      "pattern": "^\\s*onready\\s+var",
+      "message": "bare onready -- use @onready",
+      "tag": "godot3"
+    },
+    {
+      "id": "bare-tool",
+      "pattern": "^\\s*tool\\s*$",
+      "message": "bare tool -- use @tool",
+      "tag": "godot3"
+    },
+    {
+      "id": "kinematic-body",
+      "pattern": "\\bKinematicBody2?D?\\b",
+      "message": "KinematicBody -- use CharacterBody2D/3D",
+      "tag": "godot3"
+    },
+    {
+      "id": "spatial",
+      "pattern": "\\bSpatial\\b",
+      "message": "Spatial -- use Node3D",
+      "tag": "godot3"
+    },
+    {
+      "id": "translation",
+      "pattern": "\\.translation\\b",
+      "message": ".translation -- use .position",
+      "tag": "godot3"
+    },
+    {
+      "id": "os-get-ticks",
+      "pattern": "\\bOS\\.get_ticks_(msec|usec)\\(",
+      "message": "OS.get_ticks_* -- use Time.get_ticks_*",
+      "tag": "godot3"
+    },
+    {
+      "id": "pool-array",
+      "pattern": "\\bPool[A-Za-z]*Array\\b",
+      "message": "PoolXArray -- use PackedXArray",
+      "tag": "godot3"
+    },
+    {
+      "id": "instance",
+      "pattern": "\\.instance\\(\\)",
+      "message": ".instance() -- use .instantiate()",
+      "tag": "godot3"
+    },
+    {
+      "id": "file-directory-new",
+      "pattern": "(^|[^A-Za-z0-9_])(File|Directory)\\.new\\(\\)",
+      "message": "File/Directory.new() -- use FileAccess/DirAccess",
+      "tag": "godot3"
+    },
+    {
+      "id": "rand-range",
+      "pattern": "(^|[^A-Za-z0-9_])rand_range\\(",
+      "message": "rand_range() -- use randf_range()/randi_range()",
+      "tag": "godot3"
+    },
+    {
+      "id": "inferred-declaration",
+      "pattern": "\\bvar\\s+[A-Za-z_][A-Za-z0-9_]*\\s*:=",
+      "message": "inferred_declaration is an error here -- write an explicit type",
+      "tag": "style"
+    },
+    {
+      "id": "bare-rpc",
+      "pattern": "@rpc\\s*$",
+      "message": "bare @rpc -- declare mode explicitly, e.g. @rpc(\"any_peer\", \"call_local\", \"reliable\")",
+      "tag": "net"
+    }
+  ]
+}
