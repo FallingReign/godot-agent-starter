@@ -30,6 +30,7 @@ graph TD
     tools["tools<br/><i>headless validators run by the gate, not shipped in the game</i>"]
 
     scenes --> scripts
+    scripts --> scripts_data
     tests_unit --> scripts_data
     tests_unit --> scripts_logic
 ```

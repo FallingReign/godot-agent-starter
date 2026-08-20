@@ -1,0 +1,13 @@
+[
+  {
+    "finding": "plan.html regenerated many times while iterating toward an approvable plan",
+    "date": "2026-08-18",
+    "by": "justin",
+    "reason": "proposaed change is a good experiment and I'd like to give it a try.",
+    "slug": "plan-html-regenerated-many-times-while-iterating-toward-an-approvable-plan",
+    "comment": "",
+    "state": "awaiting_review",
+    "updated_at": "2026-08-18",
+    "migrated_from": "pre-comment pipeline"
+  }
+]

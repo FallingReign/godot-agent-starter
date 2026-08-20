@@ -1949,29 +1949,34 @@ def stage_smoke(godot: str) -> None:
 # ---------------------------------------------------------------------- main
 
 def retro_nudge() -> None:
-    """Print one line if a retro is warranted. Never calls a model.
+    """Report whether a retrospective is due, from accumulated slice notes.
 
-    The gate must not spend quota. It reports; the human or the agent decides.
+    Never calls a model and never fires per slice. A retrospective looks for
+    patterns across slices, so triggering one after a single slice produces a
+    reviewer wearing a retrospective's name: it cannot see a correction made in
+    slice 3 and again in slice 4, which is the only class of finding that
+    justifies a separate agent.
+
+    The builder writes a note at slice end. This counts them.
     """
-    tool = ROOT / "tools" / "retro.py"
-    if not tool.exists():
+    tool = ROOT / "tools" / "retro_due.py"
+    notes = ROOT / "docs" / "retro" / "notes"
+    if not tool.exists() or not notes.is_dir():
         return
+    n = len([q for q in notes.glob("*.md") if q.name.lower() != "readme.md"])
+    if not n:
+        return
+    threshold = 10
     try:
-        r = subprocess.run(
-            [sys.executable, str(tool), "--why", "--quiet"],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            stdin=subprocess.DEVNULL,
-        )
-    except Exception:
-        return
-    out = (r.stdout or "").strip()
-    if out.startswith("warranted:"):
-        why = out.split(":", 1)[1].strip()
-        print(f"{YEL}retro warranted{RST} {DIM}({why}){RST}")
-        print(f"{DIM}  python tools/retro.py --print   (or --sdk){RST}")
+        cfg = json.loads((ROOT / "retro.config.json").read_text(encoding="utf-8"))
+        threshold = int(cfg.get("note_threshold", threshold)) or threshold
+    except (OSError, ValueError, TypeError):
+        pass
+    if n >= threshold:
+        print(f"{YEL}retrospective due{RST} {DIM}({n} unarchived slice note(s),"
+              f" threshold {threshold}){RST}")
+        print(f"{DIM}  copilot --agent retrospective -p \"Run a retrospective"
+              f" over the unarchived notes.\"{RST}")
 
 
 def main() -> int:

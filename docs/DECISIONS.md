@@ -72,7 +72,7 @@ change it deliberately rather than working around it.
 | No MCP | Add one later if you hit something the CLI cannot do |
 | Worktrees, not a shared directory | Close the editor instead, for short single-file turns |
 | Kit is genre-agnostic | n/a. Tailoring table is in `README.md` |
-| Decision log, not a shape questionnaire | Demanding nine fields on day one manufactured a wrong answer in a real session: an honest "unknown yet" was re-asked under gate pressure and replaced with a guess. Onboarding now asks name and pitch only; skills raise their question when work makes it answerable | Re-add fields to `project.shape.json` and make `shape` demand them |
+| Decision log, not a shape questionnaire | Demanding nine fields on day one manufactured a wrong answer in a real session: an honest "unknown yet" was re-asked under gate pressure and replaced with a guess. Onboarding now asks only the name, pitch and involvement level; skills raise game-direction questions when work makes them answerable | Re-add fields to `project.shape.json` and make `shape` demand them |
 | `shape` stage rejects placeholder answers | An absent decision makes the next agent ask. A recorded `unknown` makes it trust a non-answer as settled fact | Remove the placeholder list in `stage_shape` |
 | Declared project shape in `project.shape.json` | Skills must choose between designs that are all correct; entity count alone does not decide layout | Delete the file; agents infer intent instead |
 | Shape informs, never relaxes | "It's a narrative game" must not become an escape hatch from type discipline | Nothing reads it for enforcement, so there is nothing to reverse |

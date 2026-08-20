@@ -1,6 +1,6 @@
 # Integrity manifest for the verification gate.
 # Regenerate deliberately: python check.py --accept-gate-changes
-18fe0d2fe7f1e70f7453f467b1cf4dd8ecbb23fbf169e5171620c153cb930a72  check.py
+b3d535c0f75d472b37bc680b6d19dea4354e911868fdfd071a98846177f2bff8  check.py
 864791aa515fed2ce4962b9447d0e66298a393e56e8e0b3aa3033515d95a7a0c  arch.py
 d366ae6e271495fb15f2c4e99fd145e567b74acebccf4b1ddc50c98bd61bdeb5  sanitise.py
 797f1740f7dbfd6dc4901c49884c0478d7b4148e2ad90063cf05bbbb6a9e8d26  gate.rules.json

@@ -1,11 +1,29 @@
 # Scale and view distance
 
-_Resolution: direction_
+_Resolution: settled · updated 2026-08-14_
 
 Standing in a town you can see the shape of a building and the door you are
 walking towards. Pulling back, individual cells stop mattering and the road you
 are following becomes the thing you read. The world does not become a different
 picture when you zoom; it becomes a simpler one.
+
+## Fixed presentation scale
+
+The game preserves the same apparent world scale across common monitor
+resolutions. A 4K display should make the same 1920×1080 logical view clearer,
+not reveal four times as much map or make cells and interface elements feel
+smaller. A 1080p or 720p display should likewise show the same intended game
+view without enlarging the world beyond recognition.
+
+The logical viewport and default window are therefore 1920×1080 for the current
+presentation direction, with the whole view scaled uniformly to other window
+sizes. On displays that are not 16:9, preserve the whole logical view with
+letterboxing rather than stretching or cropping it.
+
+At the current logical cell pitch of 20 units, the viewport presents 96 cells
+across by 54 cells high. This is a view window, not a map-size constraint:
+authored maps can be larger or smaller, and the viewport shows the portion that
+fits within the logical frame.
 
 ## How distance simplifies
 

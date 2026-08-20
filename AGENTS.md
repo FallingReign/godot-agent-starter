@@ -196,6 +196,29 @@ that is what they are for. Do not guess in a domain a skill covers.
 
 Failing gate stages name the relevant skill. Load it rather than guessing again.
 
+## Which agent are you
+
+This repo has three agents. `AGENTS.md` is the shared layer every one of them
+reads. Personas live in `.github/agents/` and stack on top of it.
+
+| Agent | Invoked | Owns | Must not touch |
+|---|---|---|---|
+| `game-builder` | you, per slice | `src/`, `docs/design/`, `proposal.json` | gate files, rules, skills |
+| `retrospective` | when slice notes reach the threshold | `docs/retro/` only | everything else |
+| `kit-builder` | you, after promoting a finding | gate files, rules, skills, docs | `src/` |
+
+If you were invoked without a persona, you are the game builder.
+
+The permission split is the point. The builder is denied the rules it is judged
+against; the retrospective's entire output is proposals about those rules; the kit
+builder is the only one allowed to change them. That is three deny lists, not one
+agent with three moods.
+
+At the end of a slice the game builder writes a note to `docs/retro/notes/`.
+Testimony, not assessment: what was proposed, what changed, what the human
+corrected, what it got wrong, where it hit friction. No conclusions and no kit
+proposals - a single slice cannot show a pattern.
+
 ## Non-negotiables
 
 1. **Never ask the human to run a command you could run yourself.** Only installing Godot
@@ -307,9 +330,12 @@ Stages, remediation and engine quirks: **`docs/GATE.md`**.
    times, or the proposal needed several revisions, say so and ask whether a tool should
    exist. It only sees committed history, so anything you retried inside one turn is
    yours to report — you are the only observer of it. Skill: `godot-tooling-friction`.
-8. **When the gate says a retro is warranted, run one.** `python tools/retro.py --print`
-   writes an evidence pack and a prompt and calls no model; `--sdk` hands the pack to
-   copilot and resumes the thread within the same slice. Read
+8. **When the gate says a retro is warranted, run one.** The ordinary way is one click:
+   `plan.html` shows a **Run retrospective** banner when the board is up, and one click
+   spends the quota. By hand, `python tools/retro.py --print` writes an evidence pack and
+   a prompt and calls no model; `--sdk` hands the pack to copilot and resumes the thread
+   within the same slice. Read
    `sessions[].human_messages` first — every correction the human made is a candidate
    kit defect. Write findings to `docs/retro/`; never change a rule, skill or gate file
-   because of your own retro. Skill: `godot-retrospective`.
+   because of your own retro. The whole loop from findings to a dispatched kit-builder is
+   `docs/retro/README.md`. Skill: `godot-retrospective`.

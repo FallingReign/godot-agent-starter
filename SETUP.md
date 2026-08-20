@@ -33,6 +33,11 @@ Report what changed in one or two sentences. Do not paste raw output.
 
 One at a time, wait for confirmation, then re-run `--json` to verify rather than assuming.
 
+**`project-shape`** needs the human's three onboarding answers: the project name, a
+one- or two-sentence pitch, and the `involvement` level (`hands-off`, `module`, `file`,
+or `function`). Greet first, ask one question at a time, write the answers into
+`project.shape.json`, then re-run `--json`.
+
 **`godot`** is the only item that genuinely needs a person. Ask the user to download
 **Godot 4.7.x, Standard** from <https://godotengine.org/download> — *not* the .NET
 build. Then offer, and do the work yourself once they answer:

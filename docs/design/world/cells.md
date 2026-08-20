@@ -49,17 +49,20 @@ which is how a tree sits over ground without either being modified.
 
 | Tunable | Range | What it changes |
 |---|---|---|
-| `cell.pitch_px` | 12 to 24 | Distance between cell centres. Sets how much world fits on screen. |
-| `cell.inset_px` | 0 to 3 | Gap inside a cell. Zero reads as continuous surface, higher reads as tiling. |
+| `cell.pitch` | 12 to 24 | Distance between cell centres in logical units. Sets how much world fits on screen. |
+| `cell.inset` | 0 to 3 | Gap inside a cell in logical units. Zero reads as continuous surface, higher reads as tiling. |
 | `cell.palette_size` | 8 to 32 | How many colours a map may reference at once. |
 
 <!-- BEGIN GENERATED BINDINGS -->
 
 | Tunable | Value | Set in | Adjustable |
 |---|---|---|---|
-| `cell.inset_px` | — | — | **not bound** |
+| `cell.inset` | `1.0` | `src/scripts/main.gd:24` | yes |
 | `cell.palette_size` | — | — | **not bound** |
-| `cell.pitch_px` | — | — | **not bound** |
+| `cell.pitch` | `20.0` | `src/scripts/main.gd:20` | yes |
+
+- `cell.inset` — Gap inside each cell in logical units so the grid remains visibly composed of cells.
+- `cell.pitch` — Distance between cell centres in logical units.
 
 <!-- END GENERATED BINDINGS -->
 

@@ -25,28 +25,34 @@ sections might apply.
 
 ## Folder structure
 
-One concern per file, grouped by the kind of concern:
+Domains own their rules. There is no cross-domain folder.
 
 ```
 docs/design/
   INDEX.md              generated, do not edit
   README.md             how design works in this repo
-  experience/           the fantasy, session shape, what a player is doing
-  world/                setting, scale, structure, traversal
-  interaction/          controls, camera, movement feel, feedback
-  systems/              combat, progression, economy - one file each
-  content/              what content exists, who authors it, how it is validated
-  presentation/         visual language, audio, readability, accessibility
-  social/               multiplayer shape, authority, moderation
-  boundaries.md         what this game is deliberately not
+  pillars.md            goals every domain interprets for itself
+  world/                cells, terrain, structure, scale
+  movement/             movement, camera
+  frontend/             getting into the game, menu
+  combat/
+  loot/
+  ui/
+  multiplayer/          multiplayer, authority
+  ugc/                  format, authoring, moderation
 ```
 
-Folders appear when there is a second file that belongs in one. A single file
-about movement lives at `interaction/player-movement.md`; it does not need
-`interaction/` to exist first as an empty gesture.
+A domain starts as one file and grows a folder when a second document belongs in
+it. `multiplayer.md` becomes `multiplayer/multiplayer.md` plus
+`multiplayer/authority.md` when authority needs its own page.
 
-Depth beyond two levels usually means a file is trying to cover several
-concerns. Split it rather than nesting further.
+A shared rule lives in the domain that would be incoherent without it, and every
+other domain links to it. The cell grammar is in `world/cells.md` and `ui/`,
+`loot/` and `combat/` reference it rather than restating it. See
+`godot-design-sections` for the placement rule.
+
+Depth beyond two levels usually means a file covers several concerns. Split it
+rather than nesting further.
 
 ## Tunables
 

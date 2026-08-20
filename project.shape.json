@@ -1,41 +1,45 @@
 {
-  "_schema": "Every key below is validated. Run: python tools/schema.py --describe shape",
-  "_example": "Each array shows one example. Delete the _ keys and the examples before real use.",
-  "name": "",
-  "pitch": "",
-  "involvement": "",
+  "name": "Deglyph",
+  "pitch": "Deglyph is a 2D action co-op game played on a grid-based world with smooth movement and combat. Players explore a vast world, enter user-created dungeons, battle monsters, and find epic loot in a peer-to-peer session; the world is built from coloured, shaped cells that combine into images, spaces, and UI.",
+  "involvement": "function",
   "decisions": [
     {
-      "_": "delete. Append only: never edit or remove a settled entry.",
-      "id": "world-structure",
-      "question": "the question as it was actually asked",
-      "answer": "what was decided",
-      "because": "one line on what forced it now",
-      "date": "2026-01-01",
+      "id": "fixed-logical-viewport",
+      "question": "For the monitor experience, should we treat 1920×1080 as the fixed logical game viewport and uniformly scale that view to other resolutions, so a 4K monitor shows the same amount of world at the same apparent size rather than more map?",
+      "answer": "Yes—use 1920×1080 as both the default window resolution and fixed logical viewport; preserve the whole view with letterboxing on non-16:9 displays.",
+      "because": "Higher pixel density should improve clarity without changing the apparent size of cells, interface elements, or the amount of world visible.",
+      "date": "2026-08-14",
       "decided_by": "human",
-      "revisit_if": "what would invalidate this, or the word permanent",
-      "docs_at": "",
-      "note": ""
-    }
-  ],
-  "questions": [
+      "revisit_if": "Playtesting shows the fixed view or letterboxing makes the game unreadable or materially harms use on a target display.",
+      "docs_at": "docs/design/world/scale-and-camera.md",
+      "note": "I want essentially the same game looking the same across all three of those resolutions, but the difference is the quality and the clarity."
+    },
     {
-      "_": "delete. Delete an entry when answered; never mark it answered.",
-      "id": "cell-pitch",
-      "question": "the open question",
-      "blocks": "what work this blocks",
-      "raised": "2026-01-01",
-      "options": []
+      "id": "logical-cell-grid",
+      "question": "What logical cell pitch should the fixed 1920×1080 viewport use so the visible grid is easy to scale across resolutions?",
+      "answer": "Use 20 logical units per cell, giving a 96×54 visible-cell grid; maps remain free to be any width or height.",
+      "because": "Twenty divides evenly into both logical viewport dimensions, while keeping the current map data independent from the amount of world visible on screen.",
+      "date": "2026-08-14",
+      "decided_by": "human",
+      "revisit_if": "Playtesting shows 96×54 cells are too dense or too sparse for navigation, authoring, or readability.",
+      "docs_at": "docs/design/world/scale-and-camera.md"
     }
   ],
+  "questions": [],
   "direction": [
     {
-      "_": "delete",
-      "id": "maps-grow",
-      "heading": "the known heading, one line",
-      "accommodate": "what today's work must leave room for",
-      "not_yet": "what must NOT be built yet, despite the above",
-      "added": "2026-01-01"
+      "id": "map-editor-data",
+      "heading": "Maps will be authored through a shared in-game editor",
+      "accommodate": "The persisted map shape must be readable and writable by the runtime editor used by developers and the community, with room for layered cell placement plus future triggers, collision, walkability, and edit-authority metadata.",
+      "not_yet": "Do not build the editor, ownership enforcement, layers, triggers, collision, or walkability in this slice.",
+      "added": "2026-08-14"
+    },
+    {
+      "id": "cell-compositions",
+      "heading": "Cells will grow into reusable visual compositions",
+      "accommodate": "The map representation must leave room for reusable grouped shapes such as items and trees, with future primitive rotation, axis flipping, and multiple shape types without making today's two-shape map ambiguous.",
+      "not_yet": "Use only empty and filled-square shapes now; do not build stamps, item variants, rotation, flipping, or the larger primitive vocabulary.",
+      "added": "2026-08-14"
     }
   ]
 }

@@ -94,6 +94,22 @@ a failure, but the docs assume 4.7.1.
 
 Each of these should FAIL. Revert the change after each one.
 
+### B0. Generated retrospective board
+
+These checks cover the loopback board's generated-page integration. Run them from
+the repository root after changing `tools/board.py`, `tools/board_client.py`,
+`tools/plan_html.py`, or `tools/retro_html.py`.
+
+```
+python -c "from tools.board import _copilot_executable; assert _copilot_executable(), 'copilot was not resolved'"
+python tools/plan_html.py
+python tools/retro_html.py
+```
+
+**Check:** both generated pages contain links to `plan.html` and `retro.html`;
+Markdown links in `plan.html` point to `#doc-...` anchors rather than `.md`
+URLs; and the printed board URL responds with `/api/ping` and serves both pages.
+
 ### B1. Type checking
 
 Add to any file in `scripts/`:
@@ -525,17 +541,17 @@ still pass, because `arch.rules.json` is advisory rather than pinned.
 
 Revert the edit afterwards.
 
-### B20. Onboarding asks two things, and the log rejects placeholders
+### B20. Onboarding asks three things, and the log rejects placeholders
 
 ```
 python bootstrap.py --json
 ```
 
-**Expect** `project-shape` reported `MANUAL` with detail `name and pitch not yet
-written`, and a remedy that tells the agent to ask for the name and a one or two
-sentence description — and explicitly **not** to ask about entity counts, netcode
-or content pipeline. If it asks for more than two things, the questionnaire has
-crept back in.
+**Expect** `project-shape` reported `MANUAL` with detail that the name, pitch and
+involvement are not yet written, and a remedy that tells the agent to ask for the
+project name, a one or two sentence description, and the desired involvement level —
+and explicitly **not** to ask about entity counts, netcode or content pipeline. If it
+asks for more than those three things, the questionnaire has crept back in.
 
 ```
 python check.py --only shape
@@ -544,9 +560,9 @@ python check.py --only shape
 On a fresh clone, **expect** `SKIP shape (not onboarded)`. A skip, not a failure:
 a fresh clone must reach green before anything has been named.
 
-Now write a name and pitch into `project.shape.json`, leave `decisions` empty,
-and re-run. **Expect** `PASS shape` with zero decisions. Having decided nothing
-yet is the normal state of a new project and must never be a defect.
+Now write a name, pitch and involvement into `project.shape.json`, leave `decisions`
+empty, and re-run. **Expect** `PASS shape` with zero decisions. Having decided
+nothing else yet is the normal state of a new project and must never be a defect.
 
 ### B22. Non-technical decisions record as first-class
 
@@ -1477,6 +1493,319 @@ python tools/retro.py --sdk
 the pack is written, and suggests `--print`. It must not crash and must not leave a
 half-written report. With both present it prints the slice, whether the thread is new
 or resuming, and that the call counts toward your allowance, before calling anything.
+
+### B59. Dispatch prompts are artifacts, and dispatch reads no session log
+
+```
+python tools/tests/test_retro_queue.py
+```
+
+**Check:** 18 tests, `OK`. The one that matters is
+`TestNoSessionLogAccess.test_build_dispatch_queue_opens_no_session_log`: it replaces
+`session_digest.digest_one`, `session_digest.discover` and `retro_rank.citation_report`
+with functions that raise, then builds the full dispatch queue successfully. If that
+test starts failing, prompt construction has crept back into `/api/dispatch/prepare`
+and queue generation is minutes slow again.
+
+Then, against the real repository:
+
+```
+python tools/retro_queue.py --list
+python -c "import sys,time; sys.path.insert(0,'tools'); import board, session_digest; session_digest.digest_one = session_digest.discover = (lambda *a, **k: (_ for _ in ()).throw(AssertionError('session log opened'))); t=time.time(); q=board.build_dispatch_queue(); print(len(q), 'items in %.3fs' % (time.time()-t))"
+```
+
+**Check:** `--list` reports every artifact under `docs/retro/queue/` as `ok` (a `STALE`
+line means the findings markdown moved since ranking — re-run `python
+tools/retro_rank.py`). The second command completes in well under a second and does not
+raise.
+
+**Regeneration is ranking's job, not a second trigger.** `python tools/retro_rank.py`
+rewrites `docs/retro/queue/*.json` after it rewrites the findings file, and records the
+sha256 of the file as it then stands. A hand-edit to a findings file after ranking makes
+its artifacts stale, and a stale artifact is reported as stale rather than silently
+rebuilt from raw logs — the worker must receive the prompt the human approved.
+
+---
+
+### B60. Approval is the dispatch, and it is sequential
+
+```
+python tools/tests/test_board_api.py
+```
+
+**Check:** 40 tests, `OK`. Four of them are the behaviour this endpoint set exists for:
+
+- `TestApprove.test_comment_persists_and_is_dispatched` — the human's comment is written
+  into `accepted.json` *before* the spawn and the dispatched bytes are exactly
+  `retro_queue.render_prompt(item, comment)`. The comment is the amended proposal, so
+  losing it loses what the worker was actually told.
+- `TestApprove.test_approving_a_stale_artifact_is_refused` — a findings file edited under
+  an artifact makes approval a `409` with `"code": "stale"`, nothing is dispatched, and
+  nothing is recorded. Dispatching a silently rebuilt prompt would send something the
+  human never read.
+- `TestRealRunManagerQueue.test_only_one_runs_at_a_time` — a second approval while one run
+  is in flight is queued, not started. Two findings can name the same `fix_files`.
+- `TestOverHTTP.*` — the same paths over a real socket, including
+  `test_error_paths_are_json_not_html` and `test_an_unhandled_exception_is_json_not_a_traceback`.
+  A handler returning the right tuple and a server returning readable JSON are different
+  claims; the page only ever sees the second.
+
+Then against the real board:
+
+```
+python tools/board.py --ensure
+```
+
+Take the port it prints and, in a second terminal:
+
+```
+curl http://127.0.0.1:<port>/api/health
+curl http://127.0.0.1:<port>/api/state
+curl http://127.0.0.1:<port>/api/nonsense
+curl -X POST http://127.0.0.1:<port>/api/dispatch/prepare
+curl -X POST http://127.0.0.1:<port>/api/decision
+```
+
+**Check:** `/api/health` returns `{"ok": true, ..., "schema": 1}`. `/api/state` carries
+`board`, `retro_due`, `findings` and `runs`. Both 404s are `application/json` with a
+`code` and a usable `error` — never an HTML traceback. `/api/dispatch/prepare`,
+`/api/dispatch/run` and `/api/decision` are **gone**: `{"code": "no_such_endpoint"}`. A
+stale page hitting a deleted path must be told so, not silently served. `/api/decision`
+was the last surviving second approval path; one finding must have exactly one way to be
+approved, or the two drift and only one of them carries the comment.
+
+The endpoint list itself is not restated here. It lives once, in the module docstring of
+`tools/board.py`.
+
+### B61. A dead board is replaced, never trusted
+
+```
+python tools/board.py --ensure
+```
+
+Note the port and the `pid` in `docs/retro/board.state.json`. Kill that pid, then:
+
+```
+python tools/board.py --ensure
+```
+
+**Check:** it prints a *different* port, and `docs/retro/board.log` contains a line like
+`board: restarting -- pid <n> is gone and port <p> does not answer`. `board.state.json`
+existing is not evidence a board is alive — this is review finding 5, where a page kept
+posting to a recorded port with no listener behind it.
+
+The probe checks the payload, not merely that a socket accepted: a port recycled by an
+unrelated process is not a board. `TestLiveness.test_probe_rejects_a_port_answering_something_else`
+stands a foreign HTTP server on a loopback port and asserts `_probe` rejects it. Both
+halves — pid liveness **and** port response — must hold, and
+`TestLiveness.test_live_pid_but_dead_port_is_not_alive` fails if either is dropped.
+
+---
+
+### B62. A failed board request leaves the page usable
+
+The defect this exists for: the Generate button worked once, then appeared dead, because a
+`fetch()` with no `catch` left `disabled = true` for the rest of the page's life (review
+finding 4). The test runs the **generated page's own JavaScript**, not the generator.
+
+```
+python tools/retro_html.py
+python tools/plan_html.py
+node tools/tests/dom_harness.js retro.html
+node tools/tests/dom_harness.js plan.html
+```
+
+**Check:** both exit 0 and report `"failed": 0`. Between them the scenarios cover an
+approve that answers HTTP 500, an approve that answers HTML instead of JSON, a prompt
+preview that fails, a board that refuses the connection, and `file://`.
+
+To prove it is not passing vacuously, break the restore and watch it fail: copy the
+generated `retro.html`, delete the line
+
+```
+p.el.disabled = (mode === 'live') ? p.disabled : true;
+```
+
+from the copy, and run the harness against it. **Three checks must
+fail**: `approve button is re-enabled after a 500`, `the comment box is usable again`, and
+`approve button is re-enabled after a non-JSON reply`. If they still pass, the harness is
+not executing the page and is worthless — stop and fix it before trusting anything else
+here.
+
+The byte-level half runs without node:
+
+```
+python -m unittest discover -s tools/tests
+```
+
+`RetroPageBytes.test_no_bare_fetch_outside_the_shared_client` fails if any second `fetch(`
+appears in the page. Every board call must go through `Board.request`, which is the only
+place `response.ok`, a non-JSON body and a dead port are handled.
+
+### B63. Every board state is legible in a real browser
+
+```
+python tools/tests/browser_check.py
+```
+
+Starts `tools/tests/mock_board.py` (which serves the **real** generated pages and
+implements the HTTP contract), renders each page in headless Chrome or Edge, and asserts
+on the DOM after the scripts have run. Skips with exit 0 if no Chromium-based browser is
+installed; a browser is not a dependency of this kit.
+
+**Check:** the final line reads `N/N browser checks passed` with no `FAIL` above it. In
+particular:
+
+- **healthy** — controls enabled, no banner, and a worker silent for 27 minutes renders as
+  `status-slot stalled`: red, pulsing, and carrying the sentence *"It is not progressing on
+  its own — open the chat and look."* An item that says `working` forever must not look
+  like normal progress, and the human must never have to subtract two timestamps to find
+  that out.
+- **board unreachable** — body is `board-down`, the banner names the URL it tried and the
+  command that brings the board back, a Retry control re-probes without a reload, and every
+  `[data-board-control]` is `disabled` rather than clickable-but-inert.
+- **`file://`** — body is `board-file`, the banner says the report is readable but approval
+  and dispatch need the loopback board, and the prompts are still on the page.
+- **ordering** — see B67.
+- **plan.html** — the retrospective banner appears only when the board answers, and is
+  empty under `file://` or a dead board. It must degrade to nothing; a plan that looks
+  broken because an optional banner could not load is worse than no banner.
+
+### B64. The prompt shown is the prompt sent
+
+The human approves by writing a comment, and that approval dispatches immediately
+(decision 4), so the prompt has to be readable *before* the button is pressed.
+
+**Check:** open `retro.html`, expand *"The exact prompt that will be sent"* on any finding
+in **To action**. On a live board the text is refetched from
+`GET /api/finding/<slug>` (`prompt_preview`); with no board it stays as the artifact's own
+`prompt`. `RetroPageBytes.test_inlined_prompt_matches_render_prompt` asserts those two are
+the same bytes, because `render_prompt(item, "")` is by construction `item["prompt"]` —
+which is what makes the offline copy trustworthy rather than an approximation.
+
+### B65. The seams: the mock cannot drift, and the loop closes
+
+`tools/tests/mock_board.py` is what every frontend test talks to, so a mock that has
+drifted from `board.py` is a suite that goes green against a shape the product never
+serves. And each of B59-B64 proves one piece against the written contract; none of them
+proves the pieces against each other.
+
+```
+python tools/tests/test_integration.py
+```
+
+**Check:** 12 tests, `OK`. Three groups:
+
+- `TestMockRealParity` starts the **real** `board.Handler` and `mock_board.Handler` on
+  two loopback ports and compares the bytes they serve: the key set of `/api/health`,
+  `/api/state` and its `board`, `retro_due`, `findings[]` and `runs[]` members,
+  `/api/finding/<slug>` and its nested artifact, the error envelope, and the error `code`
+  vocabulary. It also asserts every `state` the mock invents is in `board.STATES`. When
+  they disagree the real server wins — the mock is a test double, not a second contract.
+- `TestEndToEnd` approves a finding over a real socket, through a real `RunManager`, to a
+  real spawned process, and asserts the prompt file on disk is
+  `render_prompt(item, comment)` and starts with the `prompt_preview` the page displayed
+  before the button was pressed. A no-comment approval must be byte-identical to the
+  preview. A second approval while the first runs must read `queued`, and must only start
+  after the first exits.
+- `TestAcceptedMigration` — a decision written before approvals carried a comment must
+  render as `awaiting_review`, not as a `queued` item no worker will ever pick up.
+
+**The spawned executable is a stub** — a script that sleeps and exits 0, injected by
+replacing `board._copilot_executable`. The plumbing (Popen, the watcher thread, session
+discovery, the state file, the queue) is exercised; no model is called and no quota is
+spent. Nothing under `tools/tests/` can reach a paid run.
+
+To do the same by hand against the real repository, put a stub `copilot` first on `PATH`
+before starting the board:
+
+```powershell
+$py = (Get-Command python).Source
+New-Item -ItemType Directory -Force -Path "$env:TEMP\stubbin" | Out-Null
+Set-Content "$env:TEMP\stubbin\copilot.cmd" -Encoding ASCII @"
+@echo off
+echo stub worker: spending no quota
+"$py" -c "import time; time.sleep(6)"
+exit /b 0
+"@
+$env:PATH = "$env:TEMP\stubbin;$env:PATH"
+python tools/board.py --ensure
+```
+
+Then approve a finding in `retro.html` with a comment. **Check:** the comment appears in
+`docs/retro/accepted.json`, `docs/retro/runs/<run_id>.prompt.md` ends with it under the
+*Amendment from the human who approved this finding* heading, the item reads `working`
+immediately and `done` when the stub exits, and a second approval reads
+`queued behind 1 run(s)` until the first finishes. Afterwards, restore `accepted.json`
+and delete the stub run from `docs/retro/runs/` — a stub run must not be left looking
+like an implemented finding.
+
+Note that the queue advances only after the finished worker's `retro_html.py` and
+`plan_html.py` regeneration returns, so a queued item can sit for up to a minute after
+the previous one reports `done`. That is latency, not a wedged queue.
+
+### B66. A pre-comment decision file does not look like a stuck queue
+
+```
+python tools/board.py --migrate
+```
+
+**Check:** `accepted.json` entries written before decision 3 (which have no `slug` and no
+`comment`) gain `slug`, `comment: ""`, `state: "awaiting_review"` and
+`migrated_from: "pre-comment pipeline"`, keeping their original `reason` and `by`.
+Re-running reports `nothing to migrate`. Entries this pipeline wrote are untouched.
+
+The board also migrates on start and normalises on every read, so a board pointed at an
+un-migrated file still cannot show a phantom item. `/api/state` must report such an entry
+as `awaiting_review` with `status_detail` *"accepted by the pre-comment pipeline; approve
+again with a comment to dispatch it"* — the old acceptance is kept as a record, but it
+carries no amended proposal, so it has to be approved again to dispatch.
+
+### B67. A settled finding never reads as one awaiting a decision
+
+```
+python tools/board.py --ensure
+python tools/retro_html.py
+python -m unittest tools.tests.test_frontend
+node tools/tests/dom_harness.js retro.html
+python tools/tests/browser_check.py
+```
+
+The page previously ran the two lists together in one flow, so an **Approved by justin**
+card sat directly under the *To action* heading and read as work still owed. Three
+things fix that, and all three are asserted rather than eyeballed.
+
+**Separation.** Three blocks, each with its own heading, border and count badge:
+`#list-toaction` (blue), `#list-approved` (green), `#list-deferred` (grey, and
+`<details>`-collapsed, because a deferral is settled, not work). No card whose
+`data-decided` is set may appear in `#list-toaction` — a recorded deferral wins over any
+live run state, since nothing was dispatched for it.
+
+**Ordering, stated where it is used.** One rule, `retro_html.order_rows`, mirrored in the
+page's own script and held to it by `Ordering.test_browser_uses_the_same_state_ranking`:
+
+| List | Order |
+| --- | --- |
+| To action | cost descending; findings that could not be ranked last |
+| Approved | `working`/`stalled`, then `queued`, then `done`, then `failed`; `updated_at` descending within each |
+| Deferred | `updated_at` descending |
+
+Every comparator ends on the finding's normalised title, which is unique, so no two rows
+compare equal and the output cannot depend on the input order.
+`Ordering.test_order_does_not_depend_on_input_order` shuffles the rows fifty times and
+requires identical output; the `ordering` scenario in `dom_harness.js` sends `/api/state`
+forwards and reversed and requires the same DOM order both times. Each caption is printed
+on the page from `ORDER_CAPTIONS`, the same constant the tests read, so the stated rule
+cannot drift from the sort.
+
+**Check** on the page itself: every card in a list carries `1.`, `2.`, `3.` — all or none,
+never two of five. A finding with no cost says so in its own words
+(*"No cost: no human_turns cited … It sits at the bottom of the list rather than carrying
+a number it has not earned."*) rather than looking like it lost its number. The
+**Approve & dispatch now** button is filled amber on near-black with a light border, wraps
+rather than overflowing, and sits within a screen of the card's top: problem, proposal,
+measure, notes, facts and evidence are kept, collapsed behind *"Full detail"*, so the
+decision controls are reachable without a long scroll and the prompt still precedes them.
 
 ---
 

@@ -2,9 +2,9 @@
 
 Agent-ready Godot **4.7.1** project skeleton. GDScript only, cross-platform.
 
-Genre-agnostic. It does not assume multiplayer, 3D, procedural content or a custom
-level format. Every game-shaped choice is a deletable file or a documented decision,
-not a baked-in assumption.
+The starter kit is genre-agnostic: it does not assume multiplayer, 3D, procedural
+content or a custom level format. The current game's direction is recorded separately
+in `project.shape.json` and `docs/design/`.
 
 The point of this repo is not the game code. It is the scaffolding that makes an AI
 agent's output **verifiable**: strict type enforcement, a gate script that does not
@@ -16,8 +16,8 @@ touch.
 Open a terminal in this folder, start your coding agent, and say **"let's begin"**.
 
 The agent reads `SETUP.md`, detects what is missing, installs and configures
-everything it can, and asks you only for the one thing it cannot do itself:
-downloading Godot. There is no human checklist.
+everything it can, and asks you only for the decisions or machine actions it
+cannot make itself. There is no human checklist.
 
 To see the state of your machine without an agent:
 
@@ -38,7 +38,7 @@ everything else is reference material pulled in on demand.
 
 **Retrieved on demand by the agent itself**
 
-- **[.agents/skills/](.agents/skills/)** — nine Godot skills. Only the `name` and
+- **[.agents/skills/](.agents/skills/)** — on-demand skills. Only the `name` and
   `description` load at startup (~100 tokens each); the agent pulls in a body when it
   hits a domain it is unsure about. Failing gate stages name the relevant skill.
 
@@ -50,8 +50,8 @@ everything else is reference material pulled in on demand.
 6. **[docs/GDSCRIPT.md](docs/GDSCRIPT.md)** — strict-mode idioms, generated from real code.
 7. **[docs/WORKFLOW.md](docs/WORKFLOW.md)** — the day-to-day loop.
 8. **[docs/DECISIONS.md](docs/DECISIONS.md)** — every choice, and how to reverse it.
-8. **[ARCHITECTURE.md](ARCHITECTURE.md)** — generated module graph.
-9. **[VERIFY.md](VERIFY.md)** — prove each gate actually bites.
+9. **[ARCHITECTURE.md](ARCHITECTURE.md)** — generated module graph.
+10. **[VERIFY.md](VERIFY.md)** — prove each gate actually bites.
 
 ## Layout
 
@@ -82,7 +82,7 @@ scripts/logic/         pure RefCounted logic, no engine deps, agent-owned
 scripts/data/          typed config + optional level format, agent-owned
 tests/unit/            GUT tests
 tests/smoke_test.tscn  headless boot check
-docs/GATE.md           the thirteen stages, remediation, engine quirks
+docs/GATE.md           the gate stages, remediation, engine quirks
 docs/RULES.md          full ownership, banned idioms, concurrency, rationale
 docs/SCENES.md         the rules for writing .tscn and .tres safely
 docs/GDSCRIPT.md       strict-mode idioms, GENERATED from passing code
@@ -95,6 +95,11 @@ tools/plan_html.py     regenerates plan.html from the JSON + code + git
 tools/friction.py       reports authoring churn worth solving with a tool
 tools/retro.py          builds a retrospective evidence pack from sessions + git
 tools/retro_sdk.py      optional copilot SDK adapter for retro.py --sdk
+tools/retro_rank.py     ranks findings and writes the dispatch prompt artifacts
+tools/retro_queue.py    the prompt artifacts themselves: docs/retro/queue/*.json
+tools/retro_html.py     regenerates retro.html: findings to action, and approved
+tools/board.py          loopback board: approve a finding, dispatch a kit-builder
+docs/retro/README.md    the retrospective loop, end to end, in one place
 tools/md.py            markdown -> HTML, so docs render inside plan.html
 tools/vendor/          mermaid.js, vendored by bootstrap so diagrams draw offline
 ```
@@ -222,11 +227,13 @@ hand-maintained architecture doc drifts within weeks; a generated one cannot.
 Unlisted modules are drawn but not constrained, so you can restructure freely and
 tighten the rules afterwards.
 
-**`project.shape.json` is an append-only decision log.** Onboarding asks two things:
-the project name, and one or two sentences on what the game is. Bootstrap reports
-`MANUAL` until those exist. Nothing else is ever demanded up front — a new project cannot
-honestly say how many entities update per frame or whether content will be player-made,
-and a gate that insists gets a fabricated answer that every later agent trusts.
+**`project.shape.json` contains an append-only `decisions[]` log plus current
+direction and open questions.** Onboarding asks three things: the project name, one or
+two sentences on what the game is, and how much structure the human wants to approve
+before code. Bootstrap reports `MANUAL` until those exist. Nothing else is ever
+demanded up front — a new project cannot honestly say how many entities update per frame
+or how content will be exchanged, and a gate that insists gets a fabricated answer that
+every later agent trusts.
 
 Everything else is recorded as it is settled, with the question, the answer, who decided,
 and one line on what forced it. Two rules fill the log: an agent raises a fork rather than

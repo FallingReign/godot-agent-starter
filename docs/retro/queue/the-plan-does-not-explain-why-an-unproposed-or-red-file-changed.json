@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "slug": "the-plan-does-not-explain-why-an-unproposed-or-red-file-changed",
+  "title": "the plan does not explain why an unproposed or red file changed",
+  "normalised_title": "the-plan-does-not-explain-why-an-unproposed-or-red-file-changed",
+  "severity": "none",
+  "sessions": [
+    "S20",
+    "S24"
+  ],
+  "fix_files": [
+    "tools/plan_html.py",
+    "tools/schema.py"
+  ],
+  "fix_lines": 40,
+  "human_turns": [
+    {
+      "cite": "S20:H2",
+      "quote": "Built now shows to do not written. It needs to. Say why the edit is happening. As it's unclear. with files outside a declared module. Why are these files being edited? Needs to be presented. And in these files, what functions are being edited, even if they're outside a declared module."
+    },
+    {
+      "cite": "S20:H3",
+      "quote": "I'm seeing a lot of unproposed functions here. They seem to exist in code. Were they something that was not previously discussed?"
+    },
+    {
+      "cite": "S20:H4",
+      "quote": "If there is no change, then historically they are built and green, which means we don't need to touch them. So the fact that they show up as red Which is unproposed makes me feel like they existed in code without going through the proper approval process and they were just created. So anything that has been approved explicit, even in historical needs to be green."
+    },
+    {
+      "cite": "S24:H10",
+      "quote": "Your plan is significantly lacking. There are unproposed items in here which I can't approve without a logical reasoning as to why they are red in the chart. Also I don't see any impacts to existing functions or modules. For example, resizing the window we currently have a hook there. I would expect that to be touched. Are we saying in this plan that that is not being affected?"
+    }
+  ],
+  "body": "\"Built now shows to do not written. It needs to. Say why the edit is\nhappening.\" (S20:H2) and \"I'm seeing a lot of unproposed functions here...\nwere they something that was not previously discussed?\" (S20:H3) both ask the\nsame question the plan does not answer. It recurred at S24:H10 (\"Your plan is\nsignificantly lacking. There are unproposed items in here which I can't\napprove without a logical reasoning as to why they are red in the chart.\").\n\n**Proposed change** — require a `why` string on every file entry in\nproposal.json and render it in plan.html at file level, so a red/unproposed\nentry carries its own justification instead of forcing the human to ask.",
+  "prompt": "You are the kit-builder, dispatched from the retrospective board to implement the finding below. Follow .github/agents/kit-builder.agent.md: name the finding you are implementing and quote the occurrences it cites before changing anything, do not touch src/, and finish with a green `python check.py`. If you changed a hash-checked gate file, re-baseline with `python bootstrap.py --fix` and say so; `--accept-gate-changes` is human-only and you must never run it.\n\n## Finding: the plan does not explain why an unproposed or red file changed\n\nsessions: S20; S24\nseverity: none\nfix_files: tools/plan_html.py; tools/schema.py\nfix_lines: 40\n\nHuman turns cited as evidence for this finding:\n  S20:H2: \"Built now shows to do not written. It needs to. Say why the edit is happening. As it's unclear. with files outside a declared module. Why are these files being edited? Needs to be presented. And in these files, what functions are being edited, even if they're outside a declared module.\"\n  S20:H3: \"I'm seeing a lot of unproposed functions here. They seem to exist in code. Were they something that was not previously discussed?\"\n  S20:H4: \"If there is no change, then historically they are built and green, which means we don't need to touch them. So the fact that they show up as red Which is unproposed makes me feel like they existed in code without going through the proper approval process and they were just created. So anything that has been approved explicit, even in historical needs to be green.\"\n  S24:H10: \"Your plan is significantly lacking. There are unproposed items in here which I can't approve without a logical reasoning as to why they are red in the chart. Also I don't see any impacts to existing functions or modules. For example, resizing the window we currently have a hook there. I would expect that to be touched. Are we saying in this plan that that is not being affected?\"\n\n\"Built now shows to do not written. It needs to. Say why the edit is\nhappening.\" (S20:H2) and \"I'm seeing a lot of unproposed functions here...\nwere they something that was not previously discussed?\" (S20:H3) both ask the\nsame question the plan does not answer. It recurred at S24:H10 (\"Your plan is\nsignificantly lacking. There are unproposed items in here which I can't\napprove without a logical reasoning as to why they are red in the chart.\").\n\n**Proposed change** — require a `why` string on every file entry in\nproposal.json and render it in plan.html at file level, so a red/unproposed\nentry carries its own justification instead of forcing the human to ask.\n",
+  "source_file": "docs/retro/2026-08-16-findings.md",
+  "source_sha256": "6d82388de556bf19eac2b4e189baabefa3e295c220a4e0b6d03d813ee7732d46",
+  "generated_at": "2026-08-19T04:06:35Z"
+}

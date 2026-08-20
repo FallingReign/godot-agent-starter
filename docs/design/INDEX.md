@@ -27,7 +27,7 @@ that document. Do not load the whole design body into context.
 | [Panels](ui/panels.md) | direction | A panel feels like a piece of the world folded into a frame.  |
 | [Interface](ui/ui.md) | settled | Opening a menu feels like rearranging the same material the world is made of, not like a layer arriving on top of it.  |
 | [The cell grammar](world/cells.md) | settled | Everything you can see is built the same way.  |
-| [Scale and view distance](world/scale-and-camera.md) | direction | Standing in a town you can see the shape of a building and the door you are walking towards.  |
+| [Scale and view distance](world/scale-and-camera.md) | settled | Standing in a town you can see the shape of a building and the door you are walking towards.  |
 | [How the world is structured](world/structure.md) | question | You leave one place and arrive somewhere else without the world feeling like it was assembled from panels.  |
 | [Terrain](world/terrain.md) | direction | The ground reads as ground.  |
 
@@ -50,8 +50,8 @@ Derived from resolution and binding state, not a stored backlog.
 - `ugc/ugc.md` — leaning, not committed — needs confirming or ruling out
 - `ui/icons.md` — leaning, not committed — needs confirming or ruling out
 - `ui/panels.md` — leaning, not committed — needs confirming or ruling out
-- `world/cells.md` — settled, nothing built — 3 tunable(s) unbound
-- `world/scale-and-camera.md` — leaning, not committed — needs confirming or ruling out
+- `world/cells.md` — partly built — 1 of 3 tunable(s) unbound
+- `world/scale-and-camera.md` — settled, nothing built — 2 tunable(s) unbound
 - `world/structure.md` — open question — has a stated way to settle it
 - `world/terrain.md` — leaning, not committed — needs confirming or ruling out
 
@@ -62,9 +62,9 @@ Derived from resolution and binding state, not a stored backlog.
 | `camera.deadzone_px` | `movement/camera.md` | **not bound** |
 | `camera.follow_lag` | `movement/camera.md` | **not bound** |
 | `camera.zoom_default` | `movement/camera.md` | **not bound** |
-| `cell.inset_px` | `world/cells.md` | **not bound** |
+| `cell.inset` | `world/cells.md` | `src/scripts/main.gd:24` |
 | `cell.palette_size` | `world/cells.md` | **not bound** |
-| `cell.pitch_px` | `world/cells.md` | **not bound** |
+| `cell.pitch` | `world/cells.md` | `src/scripts/main.gd:20` |
 | `movement.accel_time` | `movement/movement.md` | **not bound** |
 | `movement.max_speed` | `movement/movement.md` | **not bound** |
 | `movement.stop_time` | `movement/movement.md` | **not bound** |

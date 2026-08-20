@@ -21,7 +21,8 @@ good". Design work around that.
 4. Agent edits, runs `python check.py`, pastes the result.
 5. `git diff` and review.
 6. Alt-tab to the editor. Scripts reload automatically. Press F5 and judge.
-7. Commit or `git checkout -- .`.
+7. Commit or preserve the diff for review. Do not discard work with destructive
+   reset, checkout, or clean commands.
 
 **The agent is not done until it has pasted gate output.** Not "I ran the checks",
 the actual output. Without that you are hand-reviewing generated code, which is the

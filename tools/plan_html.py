@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import posixpath
 import re
 import shutil
 import subprocess
@@ -47,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import md as markdown  # noqa: E402  (sibling module, not a package)
+import board_client  # noqa: E402  (shared generated-page navigation)
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -177,17 +179,27 @@ def git(*args: str) -> Tuple[int, str]:
         return 1, ""
 
 
-SKIP_PREFIX = ("tests/", "addons/", "tools/")
+SKIP_PREFIX = ("tests/", "addons/", "tools/", ".godot/")
+SKIP_SUFFIX = (".import", ".uid")
+
+
+def is_authored_game_file(rel: str) -> bool:
+    """Return whether a relative src path is authored project content."""
+    if rel == "project.godot" or rel.startswith(SKIP_PREFIX):
+        return False
+    return not rel.endswith(SKIP_SUFFIX)
 
 
 def real_files() -> set:
-    """Game .gd files, relative to src/. Tests and addons are not structure."""
+    """Authored game files, relative to src/. Tests and addons are not structure."""
     out = set()
     if not SRC.is_dir():
         return out
-    for f in SRC.rglob("*.gd"):
+    for f in SRC.rglob("*"):
+        if not f.is_file():
+            continue
         rel = str(f.relative_to(SRC)).replace("\\", "/")
-        if rel.startswith(SKIP_PREFIX):
+        if not is_authored_game_file(rel):
             continue
         out.add(rel)
     return out
@@ -210,10 +222,11 @@ def touched_since(baseline: str) -> set | None:
     out = set()
     for line in (tracked + "\n" + untracked).splitlines():
         line = line.strip().replace("\\", "/")
-        if line.startswith("src/"):
-            rel = line[len("src/"):]
-            if not rel.startswith(SKIP_PREFIX) and rel.endswith(".gd"):
-                out.add(rel)
+        if not line.startswith("src/"):
+            continue
+        rel = line[len("src/"):]
+        if is_authored_game_file(rel):
+            out.add(rel)
     return out
 
 
@@ -268,7 +281,8 @@ def recent(limit: int = 12) -> List[Dict[str, str]]:
 
 
 def read_docs(folder: Path, prefix: str,
-              skip: Optional[Path] = None) -> List[Dict[str, str]]:
+              skip: Optional[Path] = None,
+              targets: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     """Documentation, with its body pre-rendered to HTML and inlined.
 
     Rendered here rather than fetched in the browser because file:// forbids
@@ -305,10 +319,50 @@ def read_docs(folder: Path, prefix: str,
         anchor = "doc-" + re.sub(r"[^a-z0-9]+", "-",
                                  f"{prefix}{f.relative_to(folder).as_posix()}".lower()).strip("-")
         rel = f.relative_to(folder).as_posix()
-        out.append({"path": f"{prefix}{rel}", "title": title,
+        source = f"{prefix}{rel}"
+        if targets:
+            text = rewrite_doc_links(text, source, targets)
+        out.append({"path": source, "title": title,
                     "anchor": anchor, "body": markdown.render(text),
                     "resolution": resolution_of(text)})
     return out
+
+
+def documentation_targets(specs: List[Tuple[Path, str, Optional[Path]]]) -> Dict[str, str]:
+    """Map source-relative Markdown paths to their rendered page anchors."""
+    targets: Dict[str, str] = {}
+    for folder, prefix, skip in specs:
+        if not folder.is_dir():
+            continue
+        for f in sorted(folder.rglob("*.md")):
+            if f.name.lower() in ("readme.md", "index.md"):
+                continue
+            if skip is not None and skip in f.parents:
+                continue
+            rel = f.relative_to(folder).as_posix()
+            source = f"{prefix}{rel}"
+            anchor = "doc-" + re.sub(
+                r"[^a-z0-9]+", "-", source.lower()
+            ).strip("-")
+            targets[source] = f"#{anchor}"
+    return targets
+
+
+def rewrite_doc_links(text: str, source: str,
+                      targets: Dict[str, str]) -> str:
+    """Point local Markdown links at their inlined document panes."""
+    pattern = re.compile(r"(\]\()([^\s)]+)")
+    base = source.rsplit("/", 1)[0]
+
+    def replace(match: "re.Match[str]") -> str:
+        url = match.group(2)
+        if not url.lower().endswith(".md") or url.startswith(("#", "/")):
+            return match.group(0)
+        target = posixpath.normpath(posixpath.join(base, url))
+        anchor = targets.get(target)
+        return f"{match.group(1)}{anchor}" if anchor else match.group(0)
+
+    return pattern.sub(replace, text)
 
 
 RE_RESOLUTION = re.compile(r"^_Resolution:\s*([a-z]+)", re.M | re.I)
@@ -472,6 +526,51 @@ a{color:var(--acc)}
 .sig{color:var(--dim)}
 .foot{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);
 color:var(--dim);font-size:12px}
+#retro-banner{margin:14px 0}
+#retro-banner .rb{padding:10px 14px;border-radius:7px;font-size:13px;
+border:1px solid var(--line);background:var(--card);margin-bottom:8px}
+#retro-banner .rb b{color:#e8edf3}
+#retro-banner .rb.due{border-color:#8a5a1f;background:#221b12}
+#retro-banner .rb.action{border-color:#2a5a8f;background:#111a24}
+#retro-banner .rb a{margin-left:6px}
+"""
+
+# Read from /api/state and nothing else. Every branch that is not "the board
+# answered and there is something to say" leaves the element empty, so a plan
+# opened from a file, or next to a board that has exited, looks exactly as it
+# did before this existed.
+RETRO_BANNER_JS = """
+<script>
+(function(){
+  var B = window.Board;
+  var host = document.getElementById('retro-banner');
+  if(!B || !host) return;
+  B.onState(function(state){
+    var parts = [];
+    var due = (state && state.retro_due) || {};
+    var findings = (state && state.findings) || [];
+    var waiting = findings.filter(function(f){
+      return (f.state || 'awaiting_review') === 'awaiting_review';
+    }).length;
+
+    if(due.due){
+      parts.push('<div class="rb due"><b>A retrospective is due.</b> '
+        + B.esc(due.unarchived) + ' unarchived slice note'
+        + (Number(due.unarchived) === 1 ? '' : 's')
+        + ' against a threshold of ' + B.esc(due.threshold) + '. '
+        + 'Running one spends quota.'
+        + '<a href="/retro.html">Open the retrospective board</a></div>');
+    }
+    if(waiting){
+      parts.push('<div class="rb action"><b>' + B.esc(waiting) + ' finding'
+        + (waiting === 1 ? '' : 's') + ' awaiting your decision.</b> '
+        + 'Approving one dispatches a kit-builder immediately.'
+        + '<a href="/retro.html">Review and action</a></div>');
+    }
+    host.innerHTML = parts.join('');
+  });
+})();
+</script>
 """
 
 
@@ -696,7 +795,8 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
            docs: List[Dict[str, str]], design: List[Dict[str, str]],
            snapshot: str, mermaid_path: str = "",
            tree: Dict[str, Any] | None = None,
-           history: Dict[str, Any] | None = None) -> str:
+           history: Dict[str, Any] | None = None,
+           doc_targets: Dict[str, str] | None = None) -> str:
     level = str(shape.get("involvement", "") or "").strip()
     depth = DEPTH.get(level, 3)
     name = shape.get("name") or "Untitled"
@@ -706,8 +806,10 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     a = p.append
     a("<!doctype html><html lang=en><head><meta charset=utf-8>")
     a('<meta name=viewport content="width=device-width,initial-scale=1">')
-    a(f"<title>{esc(name)} — plan</title><style>{CSS}</style></head><body>")
+    a(f"<title>{esc(name)} — plan</title><style>{CSS}{board_client.NAV_CSS}"
+      f"{board_client.CSS}</style></head><body>")
     a('<div class="wrap">')
+    a(board_client.navigation_html(1 if snapshot else 0))
     a(f"<h1>{esc(name)}</h1>")
     if pitch:
         a(f'<p class="sub">{esc(pitch)}</p>')
@@ -728,6 +830,13 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     if snapshot:
         bits.append(f"snapshot <b>{esc(snapshot)}</b>")
     a(f'<p class="sub">{" · ".join(bits)}</p>')
+    # The handoff that closes the loop. plan.html is the page a human has open
+    # mid-slice, so it is the only place a retrospective becoming due, or a
+    # finding waiting on a decision, can reach them without being asked for.
+    # Empty until /api/state says otherwise: under file:// or a dead board it
+    # renders nothing at all rather than an error (it must never make the plan
+    # look broken to say something optional).
+    a('<div id="retro-banner"></div>')
 
     # ---- experience first. Structure chosen before intended feel is a guess,
     # and every other artefact in this repo describes structure. This is the
@@ -1062,7 +1171,8 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
             a(f'<div class="m">revisit if: {esc(rev)}</div>')
         doc = str(d.get("docs_at", "") or "").strip()
         if doc:
-            a(f'<div class="m"><a href="{esc(doc)}"><code>{esc(doc)}</code></a></div>')
+            anchor = (doc_targets or {}).get(doc, doc)
+            a(f'<div class="m"><a href="{esc(anchor)}"><code>{esc(doc)}</code></a></div>')
         a(f'<div class="m mono">{esc(d.get("id"))} · {esc(d.get("date"))} ·'
           f' {esc(d.get("decided_by"))}'
           + (" · superseded" if dead else "") + "</div></div>")
@@ -1163,6 +1273,9 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
       "openTarget();"
       "</script>")
 
+    a(board_client.core_js())
+    a(RETRO_BANNER_JS)
+
     if mermaid_path:
         a(f'<script src="{esc(mermaid_path)}"></script>')
         # startOnLoad=false then an explicit run, because <details> content is
@@ -1196,13 +1309,15 @@ def main() -> int:
     scoped = touched_since(str(prop.get("baseline_sha", "") or "").strip())
     if scoped is not None:
         built &= scoped
-    kit_docs = read_docs(DOCS, "docs/", skip=DESIGN)
-    design_docs = read_docs(DESIGN, "docs/design/")
+    doc_specs = [(DOCS, "docs/", DESIGN), (DESIGN, "docs/design/", None)]
+    doc_targets = documentation_targets(doc_specs)
+    kit_docs = read_docs(DOCS, "docs/", skip=DESIGN, targets=doc_targets)
+    design_docs = read_docs(DESIGN, "docs/design/", targets=doc_targets)
 
     def build(depth: int) -> str:
         return render(shape, prop, mods, mermaid, built, recent(),
                       kit_docs, design_docs, args.slice, mermaid_src(depth),
-                      tree, history)
+                      tree, history, doc_targets)
 
     doc = build(0)
 

@@ -45,6 +45,11 @@ desktop.ini
 # they are the record of how the plan moved between slices.
 plan.html
 
+# Generated retrospective board, for the same reason: rewritten on every gate
+# run and on every board request. docs/retro/*-findings.md is the durable
+# record; this is only a view of it.
+retro.html
+
 # DO NOT ADD:
 #   *.import   - Godot import metadata. Ignoring it forces a full reimport on
 #                every clone and can change asset UIDs.
@@ -61,3 +66,10 @@ docs/retro/evidence.json
 docs/retro/prompt.md
 docs/retro/.sdk/
 docs/retro/.ran
+
+# Board runtime state and worker transcripts. The board rewrites these while it
+# runs and the logs are per-machine scratch, so they are noise in history. The
+# durable records are docs/retro/{accepted,deferred}.json and the findings.
+docs/retro/board.log
+docs/retro/board.state.json
+docs/retro/runs/

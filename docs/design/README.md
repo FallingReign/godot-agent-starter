@@ -43,7 +43,7 @@ answer everywhere would be "yes, as specified" — which is box-ticking.
 Every document declares its current maturity on the first line:
 
 ```
-<!-- resolution: settled -->
+_Resolution: settled
 ```
 
 - `question` — nothing decided. The document holds the shape of the question.
