@@ -117,7 +117,8 @@ func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void:
 	var background_index: int = LevelLayer.cell_background(cell_code)
 	var cell_position: Vector2 = Vector2(float(column) * cell_pitch, float(row) * cell_pitch)
 	var cell_size: Vector2 = Vector2(cell_pitch, cell_pitch)
-	var inset: Vector2 = Vector2(cell_inset, cell_inset)
+	var inset_amount: float = cell_inset if _grid_visible else 0.0
+	var inset: Vector2 = Vector2(inset_amount, inset_amount)
 	var cell_rect: Rect2 = Rect2(cell_position + inset, cell_size - inset * 2.0)
 	draw_rect(cell_rect, _map.palette[background_index])
 	_draw_shape(cell_rect, shape, _map.palette[foreground_index], quarter_turns)
