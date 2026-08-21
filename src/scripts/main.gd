@@ -17,7 +17,7 @@ const _DEFAULT_WINDOW_SIZE: Vector2i = Vector2i(1920, 1080)
 
 ## @tune cell.pitch
 ## Distance between cell centres in logical units.
-@export var cell_pitch: float = 20.0
+@export var cell_pitch: float = 15.0
 
 ## @tune cell.inset
 ## Gap inside each cell in logical units so the grid remains visibly composed of cells.

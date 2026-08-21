@@ -23,6 +23,18 @@
       "decided_by": "human",
       "revisit_if": "Playtesting shows 96×54 cells are too dense or too sparse for navigation, authoring, or readability.",
       "docs_at": "docs/design/world/scale-and-camera.md"
+    },
+    {
+      "id": "final-fullscreen-cell-scale",
+      "question": "Which default cell scale makes the fullscreen world comfortable to read while preserving enough visible context for navigation?",
+      "answer": "Use 15 logical units per cell as the permanent fullscreen presentation scale.",
+      "because": "The live comparison and the concept image made 15 units the clearest balance of composition readability and navigational context.",
+      "decided_by": "human",
+      "date": "2026-08-21",
+      "revisit_if": "Playtesting shows the permanent 15-unit presentation is unreadable or does not preserve enough navigational context.",
+      "docs_at": "docs/design/world/scale-and-camera.md",
+      "supersedes": "logical-cell-grid",
+      "note": "The temporary scale experiment was rolled back; this decision records the chosen value for clean reimplementation without experiment controls."
     }
   ],
   "questions": [],

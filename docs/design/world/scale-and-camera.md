@@ -20,8 +20,8 @@ presentation direction, with the whole view scaled uniformly to other window
 sizes. On displays that are not 16:9, preserve the whole logical view with
 letterboxing rather than stretching or cropping it.
 
-At the current logical cell pitch of 20 units, the viewport presents 96 cells
-across by 54 cells high. This is a view window, not a map-size constraint:
+At the permanent logical cell pitch, the viewport presents a deliberately
+chosen amount of world context rather than imposing a map-size constraint:
 authored maps can be larger or smaller, and the viewport shows the portion that
 fits within the logical frame.
 
@@ -42,6 +42,12 @@ using a road, that road has to still be legible when they pull back to plan.
 
 Where the camera sits and how it moves belongs to
 [the camera](../movement/camera.md).
+
+## Settled fullscreen scale
+
+The fullscreen presentation uses the pitch selected through live comparison
+against the concept image. It keeps individual cell compositions clear while
+preserving enough navigational context to follow routes and landmarks.
 
 ## Tunables
 
