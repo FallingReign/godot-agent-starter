@@ -49,6 +49,10 @@ The fullscreen presentation uses the pitch selected through live comparison
 against the concept image. It keeps individual cell compositions clear while
 preserving enough navigational context to follow routes and landmarks.
 
+The running game uses a borderless fullscreen surface with the fixed logical
+viewport. The current authored map is sized to cover that logical frame at the
+selected pitch, so fullscreen presentation does not expose empty map margins.
+
 ## Tunables
 
 | Tunable | Range | What it changes |

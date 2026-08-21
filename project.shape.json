@@ -35,6 +35,17 @@
       "docs_at": "docs/design/world/scale-and-camera.md",
       "supersedes": "logical-cell-grid",
       "note": "The temporary scale experiment was rolled back; this decision records the chosen value for clean reimplementation without experiment controls."
+    },
+    {
+      "id": "borderless-fullscreen-map-coverage",
+      "question": "How should the selected 15-unit presentation occupy a 4K display?",
+      "answer": "Run the game borderless fullscreen and author the current map to cover the fixed logical frame at the selected cell pitch.",
+      "because": "The fullscreen surface should have no decorated-window margins or empty map area while preserving the fixed logical viewport across resolutions.",
+      "decided_by": "human",
+      "date": "2026-08-21",
+      "revisit_if": "A target display or later camera design requires a different presentation surface.",
+      "docs_at": "docs/design/world/scale-and-camera.md",
+      "note": "At 15 logical units per cell, full logical-frame coverage requires 128 columns by 72 rows; the map remains ordinary authored content."
     }
   ],
   "questions": [],

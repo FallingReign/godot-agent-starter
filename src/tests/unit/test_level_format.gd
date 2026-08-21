@@ -122,7 +122,7 @@ func test_v1_map_remains_loadable() -> void:
 func test_authored_map_loads_with_repeated_row_tokens() -> void:
 	var level: LevelFormat = LevelFormat.load_from("res://content/maps/red_grid.json")
 	assert_not_null(level, "authored map should load")
-	assert_eq(level.size, Vector2i(96, 54), "authored map fills the logical view")
+	assert_eq(level.size, Vector2i(128, 72), "authored map fills the logical view")
 	var roof_code: int = level.layers[0].cell_code_at(17, 7)
 	assert_eq(LevelLayer.cell_shape(roof_code), LevelLayer.TRIANGLE_SHAPE)
 	assert_eq(LevelLayer.cell_foreground(roof_code), 2)

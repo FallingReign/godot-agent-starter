@@ -49,6 +49,8 @@ func _ready() -> void:
 func _configure_window() -> void:
 	var window: Window = get_window()
 	window.size = _DEFAULT_WINDOW_SIZE
+	window.borderless = true
+	window.mode = Window.MODE_FULLSCREEN
 
 
 func _configure_content_scale() -> void:

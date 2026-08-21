@@ -1,74 +1,118 @@
 {
-  "slice": "slice-6-final-cell-scale",
+  "slice": "slice-7-borderless-fullscreen-surface",
   "status": "approved",
   "approved_by": "human",
   "approved_on": "2026-08-21",
-  "baseline_sha": "33b627722ea4a8cc20acf241db5d031b8f224f84",
+  "baseline_sha": "60f5c5cda3ec5df498009e9287a8e649767f2c24",
   "experience": {
-    "player_does": "Launch the game, press Play, and move through the authored cell map at the selected 15-unit presentation scale.",
-    "feels_like": "The world has enough visible context for navigation while individual compositions remain close to the concept image's visual density. The throwaway scale experiment and its debug controls are not present.",
-    "camera": "Keep the existing fixed 1920x1080 logical view and top-left map presentation; only the permanent cell pitch changes.",
-    "controls": "Existing Play and Quit behavior remains unchanged. No scale-cycle or performance debug controls are added in this reimplementation.",
-    "not_this": "Not a zoom system, persisted user setting, camera redesign, world expansion, or new cell vocabulary."
+    "player_does": "Launch the game, press Play, and see the authored map fill the entire borderless display while keeping the selected 15-unit cell presentation.",
+    "feels_like": "The game opens as a seamless fullscreen surface rather than a decorated window, and the map reaches every edge of the fixed logical view without background margins.",
+    "camera": "Keep the fixed 1920x1080 logical viewport and current top-left map presentation; fullscreen changes the window surface, not the camera or cell geometry.",
+    "controls": "Existing Play and Quit behavior remains unchanged. No new fullscreen toggle or map-editing control is added in this slice.",
+    "not_this": "Not a resolution-dependent redraw, stretched cell geometry, camera zoom, streaming system, or map editor."
   },
   "design_refs": [
     {
       "section": "docs/design/world/scale-and-camera.md",
-      "why": "The settled presentation must preserve a readable balance between individual cell compositions and navigational context."
+      "why": "The settled presentation keeps a consistent logical view while the authored surface must provide enough world context to occupy it."
     },
     {
       "section": "docs/design/world/cells.md",
-      "why": "The chosen pitch changes presentation density only; the existing cell grammar and authored compositions remain unchanged."
+      "why": "The map grows around the permanent cell pitch without changing the existing cell grammar or persisted token format."
+    },
+    {
+      "section": "docs/design/ugc/format.md",
+      "why": "The expanded authored map remains versioned, strict, data-only content consumed by the existing validator."
     }
   ],
   "mockup": {
-    "not_possible": "The choice was made from live interaction and a raster concept image; a static vector mockup would not represent the relevant visual density."
+    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#08131C\"/><rect x=\"8\" y=\"8\" width=\"624\" height=\"344\" fill=\"#184C67\" stroke=\"#F2D16B\" stroke-width=\"4\"/><path d=\"M8 180H632M320 8V352\" stroke=\"#2A9D8F\" stroke-width=\"2\" opacity=\".7\"/></svg>",
+    "caption": "The authored surface reaches all edges of the borderless fullscreen logical frame."
   },
   "considered_existing": [
     {
       "path": "scripts/main.gd",
-      "why_not": "It already owns the exported cell pitch and cell placement, so changing that existing presentation value avoids introducing another renderer or configuration path."
+      "why_not": "It already owns the logical viewport, runtime window setup, cell pitch, and map rendering, so extending it avoids a second presentation path."
     },
     {
-      "path": "scripts/data/level_format.gd",
-      "why_not": "Cell pitch is presentation state and must not enter the typed persisted map boundary."
+      "path": "content/maps/red_grid.json",
+      "why_not": "It is the existing end-to-end authored map and can be expanded in its current compressed row-token format without inventing a new content format."
+    },
+    {
+      "path": "tests/unit/test_level_format.gd",
+      "why_not": "Its authored-map test already verifies the real map dimensions and landmarks, so the expected coverage belongs there rather than in a new fixture."
+    },
+    {
+      "path": "src/project.godot",
+      "why_not": "It is engine-owned in this repository; runtime window configuration belongs in the existing main presentation node."
     }
   ],
   "modules": [
     {
       "path": "scripts",
-      "role": "Own the permanent cell presentation pitch in the existing map renderer.",
-      "why": "The selected scale needs to be reimplemented without restoring the temporary experiment or changing authored map data.",
+      "role": "Own the fixed logical presentation and configure the running window as borderless fullscreen.",
+      "why": "The 4K surface should use the existing logical canvas and permanent cell pitch without introducing a second renderer or resolution-specific layout.",
       "action": "modify",
       "may_depend_on": [
         "scripts/data"
       ],
-      "boundary_data": "Reads typed LevelFormat and LevelLayer values and emits the existing canvas drawing at the permanent pitch."
+      "boundary_data": "Reads typed LevelFormat and LevelLayer values and emits the existing canvas presentation; window mode is local presentation state."
+    },
+    {
+      "path": "tests/unit",
+      "role": "Verify the expanded authored map still loads with the expected logical-frame coverage.",
+      "why": "The map dimensions are part of the visible outcome and should remain checked at the content boundary.",
+      "action": "modify",
+      "may_depend_on": [
+        "scripts/data"
+      ],
+      "boundary_data": "Loads typed LevelFormat values and observes dimensions and landmark cell values."
     }
   ],
   "files": [
     {
       "path": "scripts/main.gd",
       "action": "modify",
-      "why": "Set the permanent exported cell pitch to 15 logical units while preserving the existing map drawing and menu behavior.",
+      "why": "Configure the existing window as borderless fullscreen while preserving the fixed logical viewport and 15-unit cell pitch.",
       "module": "scripts"
+    },
+    {
+      "path": "content/maps/red_grid.json",
+      "action": "modify",
+      "why": "Expand the authored map to cover the full logical frame at the permanent cell pitch, retaining the existing map content and format.",
+      "module": "scripts"
+    },
+    {
+      "path": "tests/unit/test_level_format.gd",
+      "action": "modify",
+      "why": "Update the real authored-map coverage assertion to the expanded dimensions.",
+      "module": "tests/unit"
     },
     {
       "path": "../docs/design/world/scale-and-camera.md",
       "action": "modify",
-      "why": "Record the settled fullscreen scale and remove the open scale question from the design narrative.",
+      "why": "Record the borderless fullscreen surface and full-frame authored coverage as the current presentation direction.",
       "module": "scripts"
     },
     {
       "path": "../project.shape.json",
       "action": "modify",
-      "why": "Append the human's 15-unit decision and close the fullscreen-scale question without rewriting prior ledger entries.",
+      "why": "Append the human-settled fullscreen and map-coverage decision without rewriting earlier decisions.",
       "module": "scripts"
     },
     {
       "path": "../docs/design/INDEX.md",
       "action": "modify",
-      "why": "Regenerate the design index after the scale-and-camera section is settled.",
+      "why": "Regenerate the design index after the scale-and-camera section changes.",
+      "module": "scripts"
+    }
+  ],
+  "functions": [
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _configure_window() -> void",
+      "why": "Set the existing game window to borderless fullscreen without changing the fixed logical content scale.",
+      "action": "modify",
       "module": "scripts"
     }
   ]
