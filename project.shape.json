@@ -23,79 +23,9 @@
       "decided_by": "human",
       "revisit_if": "Playtesting shows 96×54 cells are too dense or too sparse for navigation, authoring, or readability.",
       "docs_at": "docs/design/world/scale-and-camera.md"
-    },
-    {
-      "id": "live-cell-scale-probe",
-      "question": "How should Deglyph evaluate whether fullscreen cells are too large before changing the default view scale?",
-      "answer": "Cycle the live cell pitches in the game with a debug key, reusing F3 rather than introducing another debug key.",
-      "because": "The current fullscreen cells feel large, and direct comparison while moving through the world is more useful than choosing a scale from static examples.",
-      "date": "2026-08-21",
-      "decided_by": "human",
-      "revisit_if": "The live comparison does not make the preferred fullscreen scale clear.",
-      "docs_at": "docs/design/world/scale-and-camera.md",
-      "note": "This settles how to evaluate the scale, not which pitch becomes the final default."
-    },
-    {
-      "id": "fullscreen-scale-probe-pitches",
-      "question": "Which pitches should the live fullscreen-scale probe compare?",
-      "answer": "Compare 12, 15, 20, 24, 30, and 60 logical units per cell.",
-      "because": "These pitches divide the fixed 1920×1080 logical view and remain integer-sized when uniformly scaled to 1280×720, 640×360, 4K, and 8K, while covering substantially smaller and larger cells around the current reference.",
-      "date": "2026-08-21",
-      "decided_by": "agent",
-      "revisit_if": "A target display uses a different scale or the six live comparisons do not make the preferred fullscreen scale clear.",
-      "docs_at": "docs/design/world/scale-and-camera.md",
-      "note": "The 20-unit pitch is the current reference; this does not choose the final default."
-    },
-    {
-      "id": "temporary-cell-scale-probe-key",
-      "question": "Which debug key should temporarily cycle the fullscreen cell-scale probe without changing the existing performance overlay key?",
-      "answer": "Use F4 for the temporary cell-scale experiment and leave F3 assigned to the performance overlay.",
-      "because": "F3 is already the established performance overlay key, and a separate adjacent key keeps both debug tools understandable while the experiment is running.",
-      "date": "2026-08-21",
-      "decided_by": "agent",
-      "revisit_if": "The temporary probe is retained beyond the experiment or the debug-key layout is redesigned.",
-      "docs_at": "docs/design/world/scale-and-camera.md",
-      "note": "This key is intentionally temporary and should be removed when the scale decision is settled."
-    },
-    {
-      "id": "revised-fullscreen-scale-probe-pitches",
-      "question": "Which pitches should the revised live fullscreen-scale probe compare?",
-      "answer": "Try pitches smaller than 12 and remove every candidate larger than the original 20-unit pitch; use 6, 8, 10, 12, 15, and 20 logical units per cell.",
-      "because": "The first live comparison made 12 units look right, so the next comparison should resolve the lower boundary without spending time on sizes already known to be too large.",
-      "decided_by": "human",
-      "date": "2026-08-21",
-      "revisit_if": "The smaller comparison set does not make the preferred fullscreen scale clear.",
-      "docs_at": "docs/design/world/scale-and-camera.md",
-      "supersedes": "fullscreen-scale-probe-pitches",
-      "note": "The exact lower candidates are chosen to divide the fixed 1920x1080 logical view; this still does not choose the final default."
-    },
-    {
-      "id": "large-world-field",
-      "question": "Which world structure should Deglyph use for slice 4?",
-      "answer": "Use one large world coordinate space; later add streaming so the whole world is not loaded in one shot.",
-      "because": "A single coordinate space is the chosen direction for leaving one screen and returning without making the world feel assembled from panels, while streaming is deliberately deferred until the larger-world probe proves the experience.",
-      "date": "2026-08-21",
-      "decided_by": "human",
-      "revisit_if": "The larger-world probe shows that one coordinate space cannot support authored continuity, towns, dungeons, or player-made places without unacceptable loading or authoring costs.",
-      "docs_at": "docs/design/world/structure.md",
-      "note": "one large field, but later we will add streaming so that we dont load it all in one shot",
-      "alternatives": "A graph of screen-sized places with declared adjacency; chunks resolved from a field on demand; or a hybrid of streamed regions and separately authored places"
     }
   ],
-  "questions": [
-    {
-      "id": "fullscreen-cell-scale",
-      "question": "Which default cell scale makes the fullscreen world comfortable to read while preserving enough visible context for navigation?",
-      "blocks": "Choosing the final view distance and binding the declared view scale tunables.",
-      "options": [
-        "Keep the current cell scale",
-        "Use a smaller cell scale so more of the world is visible",
-        "Use a larger cell scale so individual compositions read more clearly"
-      ],
-      "raised_by": "human",
-      "raised": "2026-08-21"
-    }
-  ],
+  "questions": [],
   "direction": [
     {
       "id": "map-editor-data",
