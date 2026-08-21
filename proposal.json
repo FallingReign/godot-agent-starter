@@ -1,430 +1,109 @@
 {
-  "slice": "slice-2-rotation",
+  "slice": "slice-5-cell-scale-probe",
   "status": "approved",
   "approved_by": "human",
-  "approved_on": "2026-08-14",
-  "baseline_sha": "9cbc09fe411504e8c9af9b303005c811cce0d3bd",
+  "approved_on": "2026-08-21",
+  "baseline_sha": "bcd9f21521a6bc3a6c575e5b8ef12d8bfb3cbc8a",
   "experience": {
-    "player_does": "Launch the game, press Play, and read a hand-authored cell map containing a roof, a directional arrow, and a water edge. Each catalogued shape can turn in quarter steps, and each cell's shape colour sits on its own palette-coloured background.",
-    "feels_like": "The map reads like a small visual alphabet rather than a tile texture: a few repeated squares and triangles are enough to sketch recognisable things, while contrasting foreground and background colours make each mark legible. Adding a future primitive should mean adding geometry to the catalog, not adding another renderer branch.",
-    "camera": "Keep the fixed 1920×1080 logical view and existing top-left map presentation; this slice changes cell grammar and drawing, not camera behaviour.",
-    "controls": "No new controls. Existing Play and Quit behaviour remains unchanged.",
-    "not_this": "Not free-form drawing, not layered shapes inside one cell, and not a map editor; the probe uses only two catalog entries even though the renderer is ready to consume more."
+    "player_does": "Launch the game, press Play, use F4 to cycle through six temporary cell pitches while panning across the world, and use F3 to show the current scale ID alongside performance stats so a preferred option can be reported precisely.",
+    "feels_like": "The same world remains intact while its presentation scale changes immediately, making it easy to judge cell clarity against navigational context rather than infer a choice from a static image. After a preference is chosen, the experiment checkpoint can be rolled back and the selected pitch reimplemented without the debug controls.",
+    "camera": "Keep the existing fixed 1920x1080 logical view, smooth panning, world bounds, and Home reset; change only the cell pitch used by the presentation.",
+    "controls": "F4 advances through scale IDs S1 through S6 for 12, 15, 20, 24, 30, and 60 logical units per cell and wraps to the first; F3 continues to toggle performance stats and prints the active scale ID; arrow keys and Home remain unchanged.",
+    "not_this": "Not a final scale decision, persisted user setting, zoom system, redesigned camera, or permanent debug control; this is a throwaway checkpoint whose debug code will be removed after the preference is selected."
   },
   "design_refs": [
     {
-      "section": "docs/design/world/cells.md",
-      "why": "The settled cell grammar requires one shape per cell, quarter-turn draw-time rotation, and two palette indices so recognizable compositions can be built from a small vocabulary."
+      "section": "docs/design/world/scale-and-camera.md",
+      "why": "The end state requires the world to remain readable at different distances while routes, boundaries, and landmarks survive; this probe supplies direct evidence for the unresolved fullscreen scale question."
     },
     {
-      "section": "docs/design/ugc/format.md",
-      "why": "The map probe must remain plain, versioned, strict, data-only text that a future runtime editor can read and write without ambiguity."
+      "section": "docs/design/world/cells.md",
+      "why": "The probe changes only presentation density while preserving the same cell grammar and compositions for judging readability."
     }
   ],
+  "mockup": {
+    "not_possible": "The question is the live readability and navigational feel of several scales while panning; a static vector mockup would not represent that interaction."
+  },
   "considered_existing": [
     {
-      "path": "scripts/data/level_layer.gd",
-      "why_not": "It already owns row-token parsing and packed cell access, so it is the correct owner to extend rather than creating a second cell or token module."
+      "path": "scripts/main.gd",
+      "why_not": "It already owns the fixed logical viewport, camera offset, cell pitch, debug overlay, and world drawing, so extending it avoids introducing a second renderer or debug subsystem."
     },
     {
       "path": "scripts/data/level_format.gd",
-      "why_not": "It already owns version checks, strict schema validation, and the external JSON boundary; the format version and layer parsing belong here."
-    },
-    {
-      "path": "scripts/main.gd",
-      "why_not": "It already owns map presentation and is the right thin node layer for drawing triangles and applying cell rotations; a renderer module would split a currently single-purpose view prematurely."
-    },
-    {
-      "path": "content/maps/red_grid.json",
-      "why_not": "The existing authored map is the end-to-end visual probe surface; replacing its rows with the slice-2 examples exercises the real loader instead of adding a disconnected fixture."
-    },
-    {
-      "path": "tests/unit/test_level_format.gd",
-      "why_not": "The existing map-format tests already cover the single validator and round-trip boundary, so the new grammar and compatibility cases belong beside them."
+      "why_not": "The map data must remain unchanged; cell pitch is presentation state and does not belong in the typed persisted map boundary."
     }
   ],
   "modules": [
     {
       "path": "scripts/data",
-      "role": "Own the strict versioned map document, the scalable shape catalog, and conversion of v1/v2 row tokens into typed packed cell values containing shape, rotation, foreground, and background indices.",
-      "why": "Rotation and a second colour change the persisted cell contract, while a catalog keeps primitive geometry out of the renderer; keeping both in the existing data module prevents Variant-backed map values from reaching presentation code.",
+      "role": "Remain the existing typed map and cell-data boundary consumed by the presentation layer.",
+      "why": "The scale probe changes presentation density only and continues to consume the existing typed LevelFormat and LevelLayer data without changing the persisted map.",
       "action": "modify",
       "may_depend_on": [],
-      "boundary_data": "External JSON enters as Variant-backed Dictionary/Array values and leaves as LevelFormat, LevelLayer, PackedColorArray, PackedStringArray, and packed integer cell values."
+      "boundary_data": "Continues to expose typed LevelFormat, LevelLayer, palette, and packed cell values to the node layer."
     },
     {
       "path": "scripts",
-      "role": "Render the typed cell values into the existing logical canvas, drawing the cell background first and any catalogued polygon foreground second.",
-      "why": "The slice must answer the visual hand-authoring question end to end; the existing presentation owner can use one generic polygon path so future primitives do not multiply renderer branches.",
+      "role": "Own the temporary presentation-only cell-scale cycle alongside the existing camera and performance debug controls.",
+      "why": "The unresolved scale question needs a live comparison in the existing world surface without adding a new module or changing authored content.",
       "action": "modify",
       "may_depend_on": [
         "scripts/data"
       ],
-      "boundary_data": "Receives typed LevelLayer values and palette colours, then emits CanvasItem draw calls only."
-    },
-    {
-      "path": "tests/unit",
-      "role": "Exercise the versioned cell grammar and map round-trip without instantiating the presentation scene.",
-      "why": "The parser and packed representation need deterministic coverage for two colours, four rotations, triangles, strict invalid tokens, and legacy v1 maps.",
-      "action": "modify",
-      "may_depend_on": [
-        "scripts/data"
-      ],
-      "boundary_data": "Constructs typed LevelFormat values from test dictionaries and observes validation, accessors, and serialization results."
+      "boundary_data": "Reads typed LevelFormat data and changes only local presentation values; no scale choice crosses into map data or logic."
     }
   ],
   "files": [
     {
-      "path": "scripts/data/level_layer.gd",
-      "action": "modify",
-      "why": "Extend row tokens from legacy shape-plus-colour to v2 shape-id-plus-foreground-plus-background-plus-rotation, while retaining explicit typed accessors and v1 loading.",
-      "module": "scripts/data"
-    },
-    {
       "path": "scripts/data/cell_shape_catalog.gd",
-      "action": "new",
-      "why": "Describe normalized polygon geometry and stable two-character shape ids in one typed catalog so adding primitives does not require a new draw function.",
-      "module": "scripts/data"
-    },
-    {
-      "path": "scripts/data/level_format.gd",
       "action": "modify",
-      "why": "Advance the authored map format to version 2, accept version 1 for compatibility, and pass the document version into the single layer validator.",
+      "why": "Carry forward the existing approved shape catalog dependency used unchanged by the renderer during the scale experiment.",
       "module": "scripts/data"
     },
     {
       "path": "scripts/main.gd",
       "action": "modify",
-      "why": "Draw every cell background from its background palette index, then render any catalogued polygon with the cell's quarter-turn rotation.",
+      "why": "Add the reversible F4 pitch cycle and recalculate the camera bounds and cell rendering from the active temporary pitch while leaving F3 performance stats intact.",
       "module": "scripts"
-    },
-    {
-      "path": "tests/unit/test_level_format.gd",
-      "action": "modify",
-      "why": "Prove v2 parsing, two-colour round trips, all quarter-turn values, catalogued triangle recognition, strict rejection, and v1 compatibility.",
-      "module": "tests/unit"
-    },
-    {
-      "path": "tests/unit/test_cell_shape_catalog.gd",
-      "action": "new",
-      "why": "Verify the shape catalog exposes stable ids and polygon geometry independently from the scene renderer.",
-      "module": "tests/unit"
-    },
-    {
-      "path": "content/maps/red_grid.json",
-      "action": "modify",
-      "why": "Hand-author the roof, arrow, and water-edge probe that makes the new vocabulary visible in the running game.",
-      "module": ""
-    }
-  ],
-  "revisions": [
-    {
-      "on": "2026-08-14",
-      "what": "Replaced the triangle-specific renderer function and four-character token with a generic polygon draw path backed by a two-character shape-id catalog.",
-      "why": "Human review identified that a special function would scale poorly as the primitive vocabulary grows toward dozens of shapes.",
-      "decided_by": "human"
-    },
-    {
-      "on": "2026-08-14",
-      "what": "The catalog initializes its typed polygon arrays in an instance and the generic renderer calls it through one catalog instance; the rotation parameter is named quarter_turns.",
-      "why": "Godot 4.7.1 rejects PackedVector2Array literals as constant expressions and Control already owns a rotation property, so the original static geometry and rotation parameter would not type-check.",
-      "decided_by": "agent"
     }
   ],
   "functions": [
     {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func from_dictionary(raw: Dictionary, format_version: int) -> LevelLayer",
-      "why": "Parse each layer with the document version so legacy two-character tokens and v2 five-character tokens with scalable shape ids have explicit compatibility rules.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func validate(map_size: Vector2i, palette_size: int, format_version: int) -> PackedStringArray",
-      "why": "Validate the correct token grammar and palette references before any layer becomes drawable.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func pack_cell(shape: int, rotation: int, foreground_index: int, background_index: int) -> int",
-      "why": "Keep the four typed cell attributes in one compact value at the data/presentation boundary.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func cell_shape(cell_code: int) -> int",
-      "why": "Expose the shape without duplicating bit layout knowledge in the node layer.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func cell_rotation(cell_code: int) -> int",
-      "why": "Expose the quarter-turn value to the renderer as a validated integer.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func cell_foreground(cell_code: int) -> int",
-      "why": "Expose the shape colour index to the renderer.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func cell_background(cell_code: int) -> int",
-      "why": "Expose the independent cell background colour index to the renderer.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func cell_code_at(column: int, row: int) -> int",
-      "why": "Keep the existing typed cell lookup as the presentation entry point while its packed value gains rotation and two colours.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_format.gd",
-      "signature": "func validate() -> PackedStringArray",
-      "why": "Accept only supported map versions and validate layers against the matching token grammar.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_format.gd",
-      "signature": "static func from_dictionary(raw: Dictionary) -> LevelFormat",
-      "why": "Pass the parsed document version into layer conversion so versioned content remains data-only and strict.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
       "file": "scripts/main.gd",
-      "signature": "func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void",
-      "why": "Render a cell background plus its square or triangle foreground using the typed shape and colour accessors.",
+      "signature": "func _process(delta: float) -> void",
+      "why": "Recalculate the bounded camera offset when the temporary pitch changes and continue the existing smooth presentation pan.",
       "action": "modify",
       "module": "scripts"
     },
     {
       "file": "scripts/main.gd",
-      "signature": "func _draw_shape(cell_rect: Rect2, shape: int, foreground: Color, quarter_turns: int) -> void",
-      "why": "Draw any catalogued polygon around the cell centre after applying its quarter-turn rotation, without a primitive-specific renderer branch.",
-      "action": "new",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "static func shape_code_for(token: String) -> int",
-      "why": "Convert a hand-readable two-character shape id into the stable packed shape code used by map cells.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "func polygon_for(shape: int) -> PackedVector2Array",
-      "why": "Return normalized polygon geometry from the catalog so presentation code does not know how any individual primitive is defined.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func _expand_row(row_text: String, row_index: int, problems: PackedStringArray, format_version: int) -> PackedStringArray",
-      "why": "Expand repeated row segments using the token width for the document version before validation.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func _parse_token(token: String, palette_size: int, format_version: int) -> int",
-      "why": "Dispatch legacy and v2 token parsing while keeping all external values inside the data boundary.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func _parse_v1_token(token: String, palette_size: int) -> int",
-      "why": "Retain strict loading of the original two-character map tokens.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func _parse_palette_digit(token: String, palette_size: int) -> int",
-      "why": "Validate each foreground or background palette index once at the map boundary.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func _parse_rotation(token: String) -> int",
-      "why": "Reject rotations outside the four supported quarter turns.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "func _init() -> void",
-      "why": "Initialize the typed normalized polygon table once per catalog instance because Godot does not allow these packed arrays as constant expressions.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "static func is_known_shape(shape: int) -> bool",
-      "why": "Give map validation one typed check for whether a packed shape code has catalogued geometry.",
-      "action": "new",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "func to_dictionary() -> Dictionary",
-      "why": "Carry forward the previously approved layer serialization surface; v2 keeps it available for the future editor while preserving the existing row text.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_format.gd",
-      "signature": "func to_dictionary() -> Dictionary",
-      "why": "Carry forward the previously approved map serialization surface so the v2 format remains round-trippable.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_format.gd",
-      "signature": "static func load_from(path: String) -> LevelFormat",
-      "why": "Carry forward the previously approved strict disk loader; it remains the single entry point for the new authored map.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/data/level_format.gd",
-      "signature": "func save_to(path: String) -> Error",
-      "why": "Carry forward the previously approved validated save path reserved for the runtime editor.",
-      "action": "modify",
-      "module": "scripts/data"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _ready() -> void",
-      "why": "Carry forward the approved startup wiring while the loaded map now uses the v2 cell grammar.",
-      "action": "modify",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _configure_window() -> void",
-      "why": "Carry forward the approved fixed logical viewport setup; rotation and colour changes do not alter the window policy.",
-      "action": "modify",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _configure_content_scale() -> void",
-      "why": "Carry forward the approved content-scale setup so the new probe remains visible on the same logical canvas.",
-      "action": "modify",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _on_play_pressed() -> void",
-      "why": "Carry forward the existing Play transition; this slice adds no new control flow.",
-      "action": "modify",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _on_quit_pressed() -> void",
-      "why": "Carry forward the existing Quit behavior; this slice adds no new control flow.",
-      "action": "modify",
-      "module": "scripts"
-    },
-    {
-      "file": "scripts/main.gd",
-      "signature": "func _on_resized() -> void",
-      "why": "Carry forward the existing redraw hook while the fixed logical canvas remains unchanged.",
+      "signature": "func _unhandled_input(event: InputEvent) -> void",
+      "why": "Handle F4 as the reversible pitch-cycle action without repurposing F3 or introducing a persistent input action.",
       "action": "modify",
       "module": "scripts"
     },
     {
       "file": "scripts/main.gd",
       "signature": "func _draw() -> void",
-      "why": "Carry forward the existing map draw loop; only the per-cell primitive rendering changes in this slice.",
+      "why": "Render the existing field and debug overlay using the currently selected temporary cell pitch.",
       "action": "modify",
       "module": "scripts"
     },
     {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_valid_map_reports_no_problems() -> void",
-      "why": "Carry forward the approved baseline validation regression while adding v2 cases.",
+      "file": "scripts/main.gd",
+      "signature": "func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void",
+      "why": "Place each existing cell using the active probe pitch while preserving the current map colors, shapes, and camera offset behavior.",
       "action": "modify",
-      "module": "tests/unit"
-    },
+      "module": "scripts"
+    }
+  ],
+  "revisions": [
     {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_two_colours_and_shape_round_trip() -> void",
-      "why": "Verify the packed shape, foreground, and background attributes survive a v2 round trip.",
-      "action": "modify",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_all_quarter_turns_round_trip() -> void",
-      "why": "Verify all four rotation values survive parsing and remain available to presentation.",
-      "action": "new",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_wrong_row_width_fails() -> void",
-      "why": "Carry forward the approved malformed-row rejection regression.",
-      "action": "modify",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_unknown_and_invalid_values_are_rejected() -> void",
-      "why": "Carry forward the approved strict data-only rejection regression.",
-      "action": "modify",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_future_version_is_rejected() -> void",
-      "why": "Carry forward the approved future-version guard while adding supported v1 compatibility.",
-      "action": "modify",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_v1_map_remains_loadable() -> void",
-      "why": "Verify existing hand-authored v1 maps continue to load with their original square semantics.",
-      "action": "new",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_level_format.gd",
-      "signature": "func test_authored_map_loads_with_repeated_row_tokens() -> void",
-      "why": "Carry forward the approved authored-map integration regression while replacing the probe content.",
-      "action": "modify",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_cell_shape_catalog.gd",
-      "signature": "func test_shape_ids_resolve_to_catalogued_geometry() -> void",
-      "why": "Prove square and triangle ids resolve through the generic catalog rather than renderer-specific code.",
-      "action": "new",
-      "module": "tests/unit"
-    },
-    {
-      "file": "tests/unit/test_cell_shape_catalog.gd",
-      "signature": "func test_unknown_shape_id_is_rejected() -> void",
-      "why": "Prove the catalog rejects an unrecognized future token instead of silently drawing an empty cell.",
-      "action": "new",
-      "module": "tests/unit"
+      "on": "2026-08-21T16:45:21+10:00",
+      "what": "Expanded the experiment description to state the comparison flow, the post-choice rollback and reimplementation step, and the scale ID shown in the performance overlay.",
+      "why": "Human review found the generated plan too status-heavy and asked for a clear free-form explanation of how the experiment works and how the temporary code will be removed.",
+      "decided_by": "human"
     }
   ]
 }

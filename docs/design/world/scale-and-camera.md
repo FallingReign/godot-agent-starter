@@ -43,6 +43,16 @@ using a road, that road has to still be legible when they pull back to plan.
 Where the camera sits and how it moves belongs to
 [the camera](../movement/camera.md).
 
+## Evaluating the fullscreen scale
+
+The current fullscreen presentation is a candidate, not a final readability
+verdict. Before changing it, compare live pitches while moving through the
+world so the choice accounts for both individual cell clarity and the amount
+of navigational context visible at once. The comparison set is chosen so cells
+remain whole pixels at the common uniformly scaled 16:9 resolutions the game
+supports; this keeps the probe about readability rather than interpolation
+artefacts.
+
 ## Tunables
 
 | Tunable | Range | What it changes |
@@ -65,3 +75,6 @@ How many distinct view distances are worth having.
 
 Whether a globe or whole-world view is a view distance or something else
 entirely.
+
+Which default cell scale makes the fullscreen world comfortable to read while
+preserving enough visible context for navigation.

@@ -57,9 +57,9 @@ which is how a tree sits over ground without either being modified.
 
 | Tunable | Value | Set in | Adjustable |
 |---|---|---|---|
-| `cell.inset` | `1.0` | `src/scripts/main.gd:24` | yes |
+| `cell.inset` | `1.0` | `src/scripts/main.gd:31` | yes |
 | `cell.palette_size` | — | — | **not bound** |
-| `cell.pitch` | `20.0` | `src/scripts/main.gd:20` | yes |
+| `cell.pitch` | `20.0` | `src/scripts/main.gd:27` | yes |
 
 - `cell.inset` — Gap inside each cell in logical units so the grid remains visibly composed of cells.
 - `cell.pitch` — Distance between cell centres in logical units.
