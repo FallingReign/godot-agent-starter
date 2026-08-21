@@ -16,10 +16,10 @@ const _LOGICAL_VIEWPORT_SIZE: Vector2i = Vector2i(1920, 1080)
 const _DEFAULT_WINDOW_SIZE: Vector2i = Vector2i(1920, 1080)
 const _PAN_SPEED: float = 480.0
 const _DEBUG_STATS_UPDATE_INTERVAL: float = 0.25
-const _DEBUG_STATS_PANEL: Rect2 = Rect2(16.0, 16.0, 320.0, 116.0)
+const _DEBUG_STATS_PANEL: Rect2 = Rect2(16.0, 16.0, 320.0, 144.0)
 const _DEBUG_STATS_PANEL_COLOR: Color = Color(0.02, 0.03, 0.05, 0.9)
 const _DEBUG_STATS_TEXT_COLOR: Color = Color(0.88, 0.96, 1.0, 1.0)
-const _SCALE_PROBE_PITCHES: Array[float] = [12.0, 15.0, 20.0, 24.0, 30.0, 60.0]
+const _SCALE_PROBE_PITCHES: Array[float] = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0]
 const _SCALE_PROBE_IDS: Array[String] = ["S1", "S2", "S3", "S4", "S5", "S6"]
 
 ## @tune cell.pitch
@@ -37,7 +37,7 @@ var _camera_offset: Vector2 = Vector2.ZERO
 var _debug_stats_visible: bool = false
 var _debug_stats_timer: float = 0.0
 var _debug_stats_text: String = ""
-var _scale_probe_index: int = 2
+var _scale_probe_index: int = 5
 
 @onready var _menu: CenterContainer = $Menu
 @onready var _play_button: Button = $Menu/Panel/Margin/Content/PlayButton
@@ -101,7 +101,10 @@ func _process(delta: float) -> void:
 			if video_memory_bytes > 0.0:
 				video_memory = "%.1f MB" % (video_memory_bytes / 1048576.0)
 			_debug_stats_text = (
-				("Scale: %s (%.0f units)\nFPS: %d (%.2f ms)\nDraw calls: %d\n" + "Primitives: %d\nGPU memory: %s")
+				(
+					"Scale ID: %s\nCell size: %.0f units\nFPS: %d (%.2f ms)\n"
+					+ "Draw calls: %d\nPrimitives: %d\nGPU memory: %s"
+				)
 				% [
 					_SCALE_PROBE_IDS[_scale_probe_index],
 					cell_pitch,

@@ -3,12 +3,12 @@
   "status": "approved",
   "approved_by": "human",
   "approved_on": "2026-08-21",
-  "baseline_sha": "bcd9f21521a6bc3a6c575e5b8ef12d8bfb3cbc8a",
+  "baseline_sha": "50e66c1f675dc0fea46d18d57f894c6759066589",
   "experience": {
-    "player_does": "Launch the game, press Play, use F4 to cycle through six temporary cell pitches while panning across the world, and use F3 to show the current scale ID alongside performance stats so a preferred option can be reported precisely.",
-    "feels_like": "The same world remains intact while its presentation scale changes immediately, making it easy to judge cell clarity against navigational context rather than infer a choice from a static image. After a preference is chosen, the experiment checkpoint can be rolled back and the selected pitch reimplemented without the debug controls.",
+    "player_does": "Launch the game, press Play, use F4 to cycle through six temporary cell pitches while panning across the world, and use F3 to show an explicit scale ID and numeric cell size alongside performance stats so a preferred option can be reported precisely.",
+    "feels_like": "The same world remains intact while its presentation scale changes immediately, making it easy to judge smaller cells against navigational context rather than infer a choice from a static image. After a preference is chosen, the experiment checkpoint can be rolled back and the selected pitch reimplemented without the debug controls.",
     "camera": "Keep the existing fixed 1920x1080 logical view, smooth panning, world bounds, and Home reset; change only the cell pitch used by the presentation.",
-    "controls": "F4 advances through scale IDs S1 through S6 for 12, 15, 20, 24, 30, and 60 logical units per cell and wraps to the first; F3 continues to toggle performance stats and prints the active scale ID; arrow keys and Home remain unchanged.",
+    "controls": "F4 advances through scale IDs S1 through S6 for 6, 8, 10, 12, 15, and 20 logical units per cell and wraps to the first; F3 continues to toggle performance stats and prints both `Scale ID: S#` and `Cell size: # units`; arrow keys and Home remain unchanged.",
     "not_this": "Not a final scale decision, persisted user setting, zoom system, redesigned camera, or permanent debug control; this is a throwaway checkpoint whose debug code will be removed after the preference is selected."
   },
   "design_refs": [
@@ -36,31 +36,15 @@
   ],
   "modules": [
     {
-      "path": "scripts/data",
-      "role": "Remain the existing typed map and cell-data boundary consumed by the presentation layer.",
-      "why": "The scale probe changes presentation density only and continues to consume the existing typed LevelFormat and LevelLayer data without changing the persisted map.",
-      "action": "modify",
-      "may_depend_on": [],
-      "boundary_data": "Continues to expose typed LevelFormat, LevelLayer, palette, and packed cell values to the node layer."
-    },
-    {
       "path": "scripts",
       "role": "Own the temporary presentation-only cell-scale cycle alongside the existing camera and performance debug controls.",
       "why": "The unresolved scale question needs a live comparison in the existing world surface without adding a new module or changing authored content.",
       "action": "modify",
-      "may_depend_on": [
-        "scripts/data"
-      ],
+      "may_depend_on": [],
       "boundary_data": "Reads typed LevelFormat data and changes only local presentation values; no scale choice crosses into map data or logic."
     }
   ],
   "files": [
-    {
-      "path": "scripts/data/cell_shape_catalog.gd",
-      "action": "modify",
-      "why": "Carry forward the existing approved shape catalog dependency used unchanged by the renderer during the scale experiment.",
-      "module": "scripts/data"
-    },
     {
       "path": "scripts/main.gd",
       "action": "modify",
@@ -103,6 +87,12 @@
       "on": "2026-08-21T16:45:21+10:00",
       "what": "Expanded the experiment description to state the comparison flow, the post-choice rollback and reimplementation step, and the scale ID shown in the performance overlay.",
       "why": "Human review found the generated plan too status-heavy and asked for a clear free-form explanation of how the experiment works and how the temporary code will be removed.",
+      "decided_by": "human"
+    },
+    {
+      "on": "2026-08-21T16:52:25+10:00",
+      "what": "Reduced the probe range to six pitches at or below the original 20-unit reference and made the overlay label the numeric cell size explicitly.",
+      "why": "The human found 12 units preferable, requested smaller comparisons, rejected candidates larger than the original 20-unit pitch, and reiterated that the size itself must be visible on screen.",
       "decided_by": "human"
     }
   ]

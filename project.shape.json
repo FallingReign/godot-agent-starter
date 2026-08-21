@@ -58,6 +58,18 @@
       "note": "This key is intentionally temporary and should be removed when the scale decision is settled."
     },
     {
+      "id": "revised-fullscreen-scale-probe-pitches",
+      "question": "Which pitches should the revised live fullscreen-scale probe compare?",
+      "answer": "Try pitches smaller than 12 and remove every candidate larger than the original 20-unit pitch; use 6, 8, 10, 12, 15, and 20 logical units per cell.",
+      "because": "The first live comparison made 12 units look right, so the next comparison should resolve the lower boundary without spending time on sizes already known to be too large.",
+      "decided_by": "human",
+      "date": "2026-08-21",
+      "revisit_if": "The smaller comparison set does not make the preferred fullscreen scale clear.",
+      "docs_at": "docs/design/world/scale-and-camera.md",
+      "supersedes": "fullscreen-scale-probe-pitches",
+      "note": "The exact lower candidates are chosen to divide the fixed 1920x1080 logical view; this still does not choose the final default."
+    },
+    {
       "id": "large-world-field",
       "question": "Which world structure should Deglyph use for slice 4?",
       "answer": "Use one large world coordinate space; later add streaming so the whole world is not loaded in one shot.",
