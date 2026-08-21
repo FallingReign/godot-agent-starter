@@ -24,6 +24,7 @@ const _DEFAULT_WINDOW_SIZE: Vector2i = Vector2i(1920, 1080)
 @export var cell_inset: float = 1.0
 
 var _screen_state: ScreenState = ScreenState.MENU
+var _grid_visible: bool = false
 var _map: LevelFormat = null
 var _shape_catalog: CellShapeCatalog = CellShapeCatalog.new()
 
@@ -63,13 +64,35 @@ func _configure_content_scale() -> void:
 func _on_play_pressed() -> void:
 	if _map == null:
 		return
-	_screen_state = ScreenState.WORLD
-	_menu.hide()
+	_set_menu_visible(false)
 	queue_redraw()
 
 
 func _on_quit_pressed() -> void:
 	get_tree().quit()
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if not event is InputEventKey:
+		return
+	var key_event: InputEventKey = event
+	if not key_event.pressed or key_event.echo:
+		return
+	if key_event.keycode == KEY_F2 and _screen_state == ScreenState.WORLD:
+		_grid_visible = not _grid_visible
+		queue_redraw()
+		get_viewport().set_input_as_handled()
+	elif key_event.keycode == KEY_ESCAPE and _screen_state == ScreenState.WORLD:
+		_set_menu_visible(true)
+		get_viewport().set_input_as_handled()
+
+
+func _set_menu_visible(show_menu: bool) -> void:
+	_screen_state = ScreenState.MENU if show_menu else ScreenState.WORLD
+	if show_menu:
+		_menu.show()
+	else:
+		_menu.hide()
 
 
 func _on_resized() -> void:
@@ -98,7 +121,8 @@ func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void:
 	var cell_rect: Rect2 = Rect2(cell_position + inset, cell_size - inset * 2.0)
 	draw_rect(cell_rect, _map.palette[background_index])
 	_draw_shape(cell_rect, shape, _map.palette[foreground_index], quarter_turns)
-	draw_rect(Rect2(cell_position, cell_size), _GRID_COLOR, false, 1.0)
+	if _grid_visible:
+		draw_rect(Rect2(cell_position, cell_size), _GRID_COLOR, false, 1.0)
 
 
 func _draw_shape(

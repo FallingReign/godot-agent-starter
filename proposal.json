@@ -1,117 +1,81 @@
 {
-  "slice": "slice-7-borderless-fullscreen-surface",
+  "slice": "slice-8-grid-toggle-and-escape-menu",
   "status": "approved",
   "approved_by": "human",
   "approved_on": "2026-08-21",
-  "baseline_sha": "60f5c5cda3ec5df498009e9287a8e649767f2c24",
+  "baseline_sha": "70281df3ff4171f680c82c1b93dc898c5b758adf",
   "experience": {
-    "player_does": "Launch the game, press Play, and see the authored map fill the entire borderless display while keeping the selected 15-unit cell presentation.",
-    "feels_like": "The game opens as a seamless fullscreen surface rather than a decorated window, and the map reaches every edge of the fixed logical view without background margins.",
-    "camera": "Keep the fixed 1920x1080 logical viewport and current top-left map presentation; fullscreen changes the window surface, not the camera or cell geometry.",
-    "controls": "Existing Play and Quit behavior remains unchanged. No new fullscreen toggle or map-editing control is added in this slice.",
-    "not_this": "Not a resolution-dependent redraw, stretched cell geometry, camera zoom, streaming system, or map editor."
+    "player_does": "Start the game, press F2 to show or hide the world gridlines, and press Escape while playing to bring back the menu so QUIT is available.",
+    "feels_like": "The grid is absent by default so the cell compositions read cleanly; F2 reveals a temporary alignment aid, while Escape opens the same quiet menu over the intact world.",
+    "camera": "The fixed logical viewport and map presentation do not change. Returning to the menu leaves the authored world underneath unchanged.",
+    "controls": "F2 toggles gridlines only while the world is active. Escape returns from the world to the existing menu; PLAY dismisses it again and QUIT exits.",
+    "not_this": "Not a persistent graphics setting, a new pause screen, a second menu, or a change to the map data."
   },
   "design_refs": [
     {
-      "section": "docs/design/world/scale-and-camera.md",
-      "why": "The settled presentation keeps a consistent logical view while the authored surface must provide enough world context to occupy it."
+      "section": "docs/design/frontend/menu.md",
+      "why": "The existing menu is the frontend surface for leaving play, and this slice makes it reachable again without inventing another screen."
+    },
+    {
+      "section": "docs/design/ui/ui.md",
+      "why": "The menu should feel like the same material as the world, so the existing overlay remains the only interface surface."
     },
     {
       "section": "docs/design/world/cells.md",
-      "why": "The map grows around the permanent cell pitch without changing the existing cell grammar or persisted token format."
-    },
-    {
-      "section": "docs/design/ugc/format.md",
-      "why": "The expanded authored map remains versioned, strict, data-only content consumed by the existing validator."
+      "why": "Grid visibility is a presentation aid around the settled cell grammar and must not alter authored cell compositions."
     }
   ],
   "mockup": {
-    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#08131C\"/><rect x=\"8\" y=\"8\" width=\"624\" height=\"344\" fill=\"#184C67\" stroke=\"#F2D16B\" stroke-width=\"4\"/><path d=\"M8 180H632M320 8V352\" stroke=\"#2A9D8F\" stroke-width=\"2\" opacity=\".7\"/></svg>",
-    "caption": "The authored surface reaches all edges of the borderless fullscreen logical frame."
+    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#08131C\"/><path d=\"M0 0H640M0 45H640M0 90H640M0 135H640M0 180H640M0 225H640M0 270H640M0 315H640M0 0V360M80 0V360M160 0V360M240 0V360M320 0V360M400 0V360M480 0V360M560 0V360\" stroke=\"#2A9D8F\" stroke-width=\"1\" opacity=\".35\"/><rect x=\"190\" y=\"92\" width=\"260\" height=\"176\" rx=\"8\" fill=\"#0E1E31\" stroke=\"#6EE7D8\" stroke-width=\"2\"/><text x=\"320\" y=\"145\" fill=\"#F2D16B\" font-size=\"24\" text-anchor=\"middle\">DEGLYPH</text><text x=\"320\" y=\"190\" fill=\"#F2D16B\" font-size=\"18\" text-anchor=\"middle\">PLAY</text><text x=\"320\" y=\"228\" fill=\"#F2D16B\" font-size=\"18\" text-anchor=\"middle\">QUIT</text></svg>",
+    "caption": "Escape restores the existing menu over the unchanged world; F2 controls the optional grid aid."
   },
   "considered_existing": [
     {
       "path": "scripts/main.gd",
-      "why_not": "It already owns the logical viewport, runtime window setup, cell pitch, and map rendering, so extending it avoids a second presentation path."
+      "why_not": "It already owns screen state, menu visibility, map drawing, and window input context, so extending it avoids a duplicate controller or overlay."
     },
     {
-      "path": "content/maps/red_grid.json",
-      "why_not": "It is the existing end-to-end authored map and can be expanded in its current compressed row-token format without inventing a new content format."
-    },
-    {
-      "path": "tests/unit/test_level_format.gd",
-      "why_not": "Its authored-map test already verifies the real map dimensions and landmarks, so the expected coverage belongs there rather than in a new fixture."
-    },
-    {
-      "path": "src/project.godot",
-      "why_not": "It is engine-owned in this repository; runtime window configuration belongs in the existing main presentation node."
+      "path": "scenes/main.tscn",
+      "why_not": "The existing Menu node and PLAY/QUIT buttons already provide the required return-and-quit surface; no scene structure needs to change."
     }
   ],
   "modules": [
     {
       "path": "scripts",
-      "role": "Own the fixed logical presentation and configure the running window as borderless fullscreen.",
-      "why": "The 4K surface should use the existing logical canvas and permanent cell pitch without introducing a second renderer or resolution-specific layout.",
+      "role": "Own the world presentation toggles and transition back to the existing menu.",
+      "why": "F2 and Escape are local presentation controls that belong beside the current screen-state and drawing logic.",
       "action": "modify",
-      "may_depend_on": [
-        "scripts/data"
-      ],
-      "boundary_data": "Reads typed LevelFormat and LevelLayer values and emits the existing canvas presentation; window mode is local presentation state."
-    },
-    {
-      "path": "tests/unit",
-      "role": "Verify the expanded authored map still loads with the expected logical-frame coverage.",
-      "why": "The map dimensions are part of the visible outcome and should remain checked at the content boundary.",
-      "action": "modify",
-      "may_depend_on": [
-        "scripts/data"
-      ],
-      "boundary_data": "Loads typed LevelFormat values and observes dimensions and landmark cell values."
+      "may_depend_on": [],
+      "boundary_data": "Consumes InputEvent values and updates typed screen state plus a boolean grid-visibility flag; emits the existing canvas and menu visibility."
     }
   ],
   "files": [
     {
       "path": "scripts/main.gd",
       "action": "modify",
-      "why": "Configure the existing window as borderless fullscreen while preserving the fixed logical viewport and 15-unit cell pitch.",
-      "module": "scripts"
-    },
-    {
-      "path": "content/maps/red_grid.json",
-      "action": "modify",
-      "why": "Expand the authored map to cover the full logical frame at the permanent cell pitch, retaining the existing map content and format.",
-      "module": "scripts"
-    },
-    {
-      "path": "tests/unit/test_level_format.gd",
-      "action": "modify",
-      "why": "Update the real authored-map coverage assertion to the expanded dimensions.",
-      "module": "tests/unit"
-    },
-    {
-      "path": "../docs/design/world/scale-and-camera.md",
-      "action": "modify",
-      "why": "Record the borderless fullscreen surface and full-frame authored coverage as the current presentation direction.",
-      "module": "scripts"
-    },
-    {
-      "path": "../project.shape.json",
-      "action": "modify",
-      "why": "Append the human-settled fullscreen and map-coverage decision without rewriting earlier decisions.",
-      "module": "scripts"
-    },
-    {
-      "path": "../docs/design/INDEX.md",
-      "action": "modify",
-      "why": "Regenerate the design index after the scale-and-camera section changes.",
+      "why": "Add the default-hidden gridline state, F2 handling, and Escape transition to the existing menu while preserving map contents.",
       "module": "scripts"
     }
   ],
   "functions": [
     {
       "file": "scripts/main.gd",
-      "signature": "func _configure_window() -> void",
-      "why": "Set the existing game window to borderless fullscreen without changing the fixed logical content scale.",
+      "signature": "func _unhandled_input(event: InputEvent) -> void",
+      "why": "Handle F2 and Escape after the menu controls have had first opportunity to consume input.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _set_menu_visible(visible: bool) -> void",
+      "why": "Keep screen-state changes and existing menu visibility synchronized for both PLAY and Escape paths.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void",
+      "why": "Draw cell boundary lines only when the F2-controlled grid state is enabled.",
       "action": "modify",
       "module": "scripts"
     }
