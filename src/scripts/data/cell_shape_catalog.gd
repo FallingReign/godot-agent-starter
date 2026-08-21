@@ -4,10 +4,18 @@ extends RefCounted
 const EMPTY_SHAPE: int = 0
 const FILLED_SQUARE_SHAPE: int = 1
 const TRIANGLE_SHAPE: int = 2
+const CIRCLE_SHAPE: int = 3
+const RIGHT_TRIANGLE_SHAPE: int = 4
+const HALF_CELL_SHAPE: int = 5
+const CORNER_SHAPE: int = 6
 
 const EMPTY_TOKEN: String = "EM"
 const FILLED_SQUARE_TOKEN: String = "SQ"
 const TRIANGLE_TOKEN: String = "TR"
+const CIRCLE_TOKEN: String = "CI"
+const RIGHT_TRIANGLE_TOKEN: String = "RT"
+const HALF_CELL_TOKEN: String = "HC"
+const CORNER_TOKEN: String = "CO"
 
 var _shape_points: Array[PackedVector2Array] = []
 
@@ -30,6 +38,47 @@ func _init() -> void:
 				Vector2(0.0, -0.5),
 			],
 		),
+		PackedVector2Array(
+			[
+				Vector2(0.0, -0.5),
+				Vector2(0.25, -0.433),
+				Vector2(0.433, -0.25),
+				Vector2(0.5, 0.0),
+				Vector2(0.433, 0.25),
+				Vector2(0.25, 0.433),
+				Vector2(0.0, 0.5),
+				Vector2(-0.25, 0.433),
+				Vector2(-0.433, 0.25),
+				Vector2(-0.5, 0.0),
+				Vector2(-0.433, -0.25),
+				Vector2(-0.25, -0.433),
+			],
+		),
+		PackedVector2Array(
+			[
+				Vector2(-0.5, -0.5),
+				Vector2(0.5, -0.5),
+				Vector2(-0.5, 0.5),
+			],
+		),
+		PackedVector2Array(
+			[
+				Vector2(-0.5, -0.5),
+				Vector2(0.0, -0.5),
+				Vector2(0.0, 0.5),
+				Vector2(-0.5, 0.5),
+			],
+		),
+		PackedVector2Array(
+			[
+				Vector2(-0.5, -0.5),
+				Vector2(0.5, -0.5),
+				Vector2(0.5, -0.25),
+				Vector2(-0.25, -0.25),
+				Vector2(-0.25, 0.5),
+				Vector2(-0.5, 0.5),
+			],
+		),
 	]
 
 
@@ -41,6 +90,14 @@ static func shape_code_for(token: String) -> int:
 			return FILLED_SQUARE_SHAPE
 		TRIANGLE_TOKEN:
 			return TRIANGLE_SHAPE
+		CIRCLE_TOKEN:
+			return CIRCLE_SHAPE
+		RIGHT_TRIANGLE_TOKEN:
+			return RIGHT_TRIANGLE_SHAPE
+		HALF_CELL_TOKEN:
+			return HALF_CELL_SHAPE
+		CORNER_TOKEN:
+			return CORNER_SHAPE
 		_:
 			return -1
 
@@ -52,4 +109,4 @@ func polygon_for(shape: int) -> PackedVector2Array:
 
 
 static func is_known_shape(shape: int) -> bool:
-	return shape >= EMPTY_SHAPE and shape <= TRIANGLE_SHAPE
+	return shape >= EMPTY_SHAPE and shape <= CORNER_SHAPE

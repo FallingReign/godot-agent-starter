@@ -1,65 +1,140 @@
 {
-  "slice": "slice-9-seamless-grid-off",
+  "slice": "slice-10-shape-vocabulary-batch",
   "status": "approved",
   "approved_by": "human",
   "approved_on": "2026-08-21",
-  "baseline_sha": "70c5b4dcd5b6acd8b0a23465ce26a19e87aa8c84",
+  "baseline_sha": "158775fcb7fc479bb8505ddb438fb6706c23ed69",
   "experience": {
-    "player_does": "Start the game with the grid hidden and see adjacent cells meet with no gaps; press F2 to reveal the separated grid aid, then press F2 again to return to the seamless surface.",
-    "feels_like": "Gridlines off reads as one continuous authored surface. Gridlines on intentionally exposes cell boundaries and spacing for alignment.",
-    "camera": "The fixed logical viewport, cell pitch, map, and menu behavior remain unchanged.",
-    "controls": "F2 continues to toggle grid visibility only while the world is active.",
-    "not_this": "Not a change to the persisted map, palette, cell pitch, or the meaning of the cell.inset design tunable when the grid aid is visible."
+    "player_does": "Launch the game and inspect a map probe containing circle, right-angle triangle, half-cell, and corner cells in all quarter-turn orientations.",
+    "feels_like": "The new primitives should make the cell language more expressive without changing the existing square and triangle compositions or the seamless world presentation.",
+    "camera": "Keep the existing fixed logical viewport, fullscreen surface, cell pitch, and map framing.",
+    "controls": "No new controls; the probe is authored content and remains visible through the existing PLAY flow and optional F2 grid aid.",
+    "not_this": "Not a replacement for the existing isosceles TR shape, not a new map format version, not layered geometry inside one cell, and not a final claim that all four shapes belong permanently."
   },
   "design_refs": [
     {
       "section": "docs/design/world/cells.md",
-      "why": "The settled cell grammar distinguishes a continuous surface from a deliberately tiled presentation; this makes the hidden-grid state honor that distinction."
+      "why": "The settled cell grammar says the vocabulary grows one primitive at a time and gains orientations through draw-time rotation; this slice tests four named candidates within that rule."
     },
     {
       "section": "docs/design/world/scale-and-camera.md",
-      "why": "The fixed logical presentation and selected cell pitch remain intact while only the optional boundary treatment changes."
+      "why": "The probe must be judged in the established 15-unit fullscreen presentation without changing the amount of world visible."
+    },
+    {
+      "section": "docs/design/ugc/format.md",
+      "why": "The probe remains ordinary versioned map content using the existing strict token boundary and no new persisted format."
     }
   ],
   "mockup": {
-    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#184C67\"/><rect x=\"0\" y=\"0\" width=\"160\" height=\"180\" fill=\"#184C67\"/><rect x=\"160\" y=\"0\" width=\"160\" height=\"180\" fill=\"#20627A\"/><rect x=\"320\" y=\"0\" width=\"160\" height=\"180\" fill=\"#184C67\"/><rect x=\"480\" y=\"0\" width=\"160\" height=\"180\" fill=\"#20627A\"/><path d=\"M0 180H640M160 0V360M320 0V360M480 0V360\" stroke=\"#2A9D8F\" stroke-width=\"2\" opacity=\".7\"/></svg>",
-    "caption": "Hidden grid: cells meet continuously; visible grid: boundaries and spacing return as an alignment aid."
+    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#08131C\"/><g stroke=\"#2A9D8F\" stroke-width=\"1\" opacity=\".35\"><path d=\"M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360\"/></g><circle cx=\"80\" cy=\"45\" r=\"28\" fill=\"#F2D16B\"/><path d=\"M188 72V18H242Z\" fill=\"#E86A5B\"/><rect x=\"320\" y=\"18\" width=\"54\" height=\"54\" fill=\"#2A9D8F\"/><path d=\"M426 18H482V30H438V72H426Z\" fill=\"#F4F1DE\"/><text x=\"80\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">CI</text><text x=\"215\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">RT</text><text x=\"347\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">HC</text><text x=\"454\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">CO</text><rect x=\"42\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"202\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"362\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"522\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/></svg>",
+    "caption": "A four-column probe shows each new primitive and leaves room to compare its quarter-turns in the running map."
   },
   "considered_existing": [
     {
-      "path": "scripts/main.gd",
-      "why_not": "It already owns cell inset, grid visibility, and cell rectangles, so changing the existing draw path avoids a second rendering mode."
+      "path": "scripts/data/cell_shape_catalog.gd",
+      "why_not": "It already owns shape IDs, token mapping, and reusable polygon geometry, so extending it avoids a second primitive registry."
     },
     {
-      "path": "docs/design/world/cells.md",
-      "why_not": "The design already defines cell.inset as the presentation gap; no new design section is needed for this implementation correction."
+      "path": "scripts/data/level_layer.gd",
+      "why_not": "It already translates catalogued shape tokens into packed cell codes, so adding aliases there keeps typed callers independent of raw token parsing."
+    },
+    {
+      "path": "scripts/main.gd",
+      "why_not": "Its generic polygon renderer already rotates and draws any catalogued geometry, so no renderer fork is needed."
+    },
+    {
+      "path": "content/maps/red_grid.json",
+      "why_not": "The existing authored map is the established visual probe surface and can host the new examples without changing the document format."
+    },
+    {
+      "path": "tests/unit/test_cell_shape_catalog.gd",
+      "why_not": "The existing catalog test is the right place to verify IDs and polygon geometry for the expanded vocabulary."
     }
   ],
   "modules": [
     {
-      "path": "scripts",
-      "role": "Own the conditional cell presentation for the existing world renderer.",
-      "why": "The seamless off state is a rendering detail coupled to the existing F2 grid toggle.",
+      "path": "scripts/data",
+      "role": "Own the typed primitive catalog and packed-cell aliases for the four new shape candidates.",
+      "why": "The parser and renderer already meet at this catalog boundary; extending it keeps shape identity and geometry in one place.",
       "action": "modify",
       "may_depend_on": [],
-      "boundary_data": "Reads the existing typed map and boolean grid state, then draws either inset cells with boundaries or full-cell surfaces."
+      "boundary_data": "Maps persisted shape tokens to typed integer codes and returns normalized polygon points for rendering."
+    },
+    {
+      "path": "content/maps",
+      "role": "Provide authored examples of each candidate and its rotations in the existing map.",
+      "why": "The shape batch must be judged in the same authored surface as the existing compositions.",
+      "action": "modify",
+      "may_depend_on": [
+        "scripts/data"
+      ],
+      "boundary_data": "Versioned JSON tokens consumed by LevelFormat and LevelLayer."
+    },
+    {
+      "path": "tests/unit",
+      "role": "Verify the catalog and authored map accept the expanded shape vocabulary.",
+      "why": "New persisted tokens must be rejected when unknown and round-trip correctly when catalogued.",
+      "action": "modify",
+      "may_depend_on": [
+        "scripts/data"
+      ],
+      "boundary_data": "Constructs typed catalog and level values and observes codes, polygons, and validation results."
     }
   ],
   "files": [
     {
-      "path": "scripts/main.gd",
+      "path": "scripts/data/cell_shape_catalog.gd",
       "action": "modify",
-      "why": "Apply cell inset only while gridlines are visible so the default hidden-grid state has no gaps between adjacent cells.",
-      "module": "scripts"
+      "why": "Add circle, right-angle triangle, half-cell rectangle, and corner IDs, tokens, and normalized polygon geometry while retaining existing shapes.",
+      "module": "scripts/data"
+    },
+    {
+      "path": "scripts/data/level_layer.gd",
+      "action": "modify",
+      "why": "Expose typed constants for the new catalogued shapes alongside the existing shape aliases.",
+      "module": "scripts/data"
+    },
+    {
+      "path": "content/maps/red_grid.json",
+      "action": "modify",
+      "why": "Add a visible four-shape probe with quarter-turn examples to the existing authored map without changing its version or dimensions.",
+      "module": "content/maps"
+    },
+    {
+      "path": "tests/unit/test_cell_shape_catalog.gd",
+      "action": "modify",
+      "why": "Verify each new token resolves to known geometry and that the polygon point counts distinguish the candidates.",
+      "module": "tests/unit"
     }
   ],
   "functions": [
     {
-      "file": "scripts/main.gd",
-      "signature": "func _draw_map_cell(layer: LevelLayer, column: int, row: int) -> void",
-      "why": "Choose a full-cell rectangle when the grid is hidden and the existing inset rectangle when it is shown.",
+      "file": "scripts/data/cell_shape_catalog.gd",
+      "signature": "func _init() -> void",
+      "why": "Register normalized polygon points for the four new primitives in the catalog.",
       "action": "modify",
-      "module": "scripts"
+      "module": "scripts/data"
+    },
+    {
+      "file": "scripts/data/cell_shape_catalog.gd",
+      "signature": "static func shape_code_for(token: String) -> int",
+      "why": "Resolve the new persisted two-character shape tokens without changing the existing token boundary.",
+      "action": "modify",
+      "module": "scripts/data"
+    },
+    {
+      "file": "scripts/data/cell_shape_catalog.gd",
+      "signature": "static func is_known_shape(shape: int) -> bool",
+      "why": "Extend validation to recognize the new catalog range.",
+      "action": "modify",
+      "module": "scripts/data"
+    },
+    {
+      "file": "scripts/data/level_layer.gd",
+      "signature": "static func cell_shape(cell_code: int) -> int",
+      "why": "Continue exposing packed shape identity to typed callers after the catalog range grows.",
+      "action": "modify",
+      "module": "scripts/data"
     }
   ]
 }

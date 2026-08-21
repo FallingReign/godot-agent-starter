@@ -10,6 +10,10 @@ extends RefCounted
 const EMPTY_SHAPE: int = CellShapeCatalog.EMPTY_SHAPE
 const FILLED_SQUARE_SHAPE: int = CellShapeCatalog.FILLED_SQUARE_SHAPE
 const TRIANGLE_SHAPE: int = CellShapeCatalog.TRIANGLE_SHAPE
+const CIRCLE_SHAPE: int = CellShapeCatalog.CIRCLE_SHAPE
+const RIGHT_TRIANGLE_SHAPE: int = CellShapeCatalog.RIGHT_TRIANGLE_SHAPE
+const HALF_CELL_SHAPE: int = CellShapeCatalog.HALF_CELL_SHAPE
+const CORNER_SHAPE: int = CellShapeCatalog.CORNER_SHAPE
 
 const _HEX_DIGITS: String = "0123456789ABCDEF"
 const _V1_TOKEN_WIDTH: int = 2
