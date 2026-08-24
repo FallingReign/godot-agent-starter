@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "slug": "the-hosted-plan-is-not-yet-a-canonical-control-surface",
+  "title": "the hosted plan is not yet a canonical control surface",
+  "normalised_title": "the-hosted-plan-is-not-yet-a-canonical-control-surface",
+  "severity": "none",
+  "sessions": [
+    "S19",
+    "S20"
+  ],
+  "fix_files": [
+    "tools/board.py",
+    "tools/board_client.py",
+    "tools/retro_html.py",
+    "tools/plan_html.py"
+  ],
+  "fix_lines": 150,
+  "human_turns": [
+    {
+      "cite": "S19:H5",
+      "quote": ""
+    },
+    {
+      "cite": "S19:H19",
+      "quote": ""
+    },
+    {
+      "cite": "S19:H20",
+      "quote": ""
+    },
+    {
+      "cite": "S20:H4",
+      "quote": "If there is no change, then historically they are built and green, which means we don't need to touch them. So the fact that they show up as red Which is unproposed makes me feel like they existed in code without going through the proper approval process and they were just created. So anything that has been approved explicit, even in historical needs to be green."
+    },
+    {
+      "cite": "S20:H10",
+      "quote": "so where did you acrually store it?"
+    }
+  ],
+  "body": "_Occurrences: S19:H5, S19:H19, S19:H20, S20:H4, S20:H10._\n\nThe human asked for a server-side Play control to launch the local game and avoid spending a chat turn on “run the game” (S19:H5), then asked whether the launch item had actually been captured (S19:H20). They reported the static-plan link twice (S19:H19 and S20:H4), and still had to say “ok run the game” in S20:H10. The generated plan currently has relative navigation links while its retrospective banner uses an absolute `/retro.html` link; the board contract has no game-launch or benchmark endpoint. The documentation describes a hosted board and a file:// fallback, but does not provide one canonical hosted URL or a game-control state, so the advertised control-hub workflow is incomplete.\n\n**Proposed kit/process change** — centralise URL generation in the shared page client: when served, emit the board origin and canonical plan/retro routes; when opened via file://, label controls read-only rather than presenting a misleading static link. Add an explicit, safety-scoped board action for launching the project and expose its last-known state, plus a link to the resumable builder/benchmark run. Do not add game code; this is local tooling and page workflow.\n\n**Confidence** — high: the request and follow-up recur across sessions, and the current generated-page/code surfaces contain navigation but no corresponding launch mechanism.\n**Cost** — medium-high: URL contract, local-process lifecycle, permissions/error handling, UI state, and browser/integration tests.\n**Mechanically checkable** — yes. Served-page tests can assert canonical same-origin links, file:// read-only behavior, and launch status transitions; an integration fixture can verify a bounded local process invocation without starting the real game.\n\n## Priority order for promotion\n\n1. Baseline/history-aware conformance and durable approval ledger — it is the highest direct source of repeated planning waste and can invalidate every later review.\n2. Priority contract plus reusable benchmark/export-size evidence — the human explicitly made this high priority, and it supplies the measurements needed to enforce it without guessing.\n3. Canonical hosted control surface and launch state — it removes repeated manual turns and makes the new evidence tools usable.\n\nNo source, gate, rule, skill, agent definition, proposal, or file outside `docs/retro/` was changed by this retrospective.",
+  "prompt": "You are the kit-builder, dispatched from the retrospective board to implement the finding below. Follow .github/agents/kit-builder.agent.md: name the finding you are implementing and quote the occurrences it cites before changing anything, do not touch src/, and finish with a green `python check.py`. If you changed a hash-checked gate file, re-baseline with `python bootstrap.py --fix` and say so; `--accept-gate-changes` is human-only and you must never run it.\n\n## Finding: the hosted plan is not yet a canonical control surface\n\nsessions: S19; S20\nseverity: none\nfix_files: tools/board.py; tools/board_client.py; tools/retro_html.py; tools/plan_html.py\nfix_lines: 150\n\nHuman turns cited as evidence for this finding:\n  S19:H5: (text not in digest window)\n  S19:H19: (text not in digest window)\n  S19:H20: (text not in digest window)\n  S20:H4: \"If there is no change, then historically they are built and green, which means we don't need to touch them. So the fact that they show up as red Which is unproposed makes me feel like they existed in code without going through the proper approval process and they were just created. So anything that has been approved explicit, even in historical needs to be green.\"\n  S20:H10: \"so where did you acrually store it?\"\n\n_Occurrences: S19:H5, S19:H19, S19:H20, S20:H4, S20:H10._\n\nThe human asked for a server-side Play control to launch the local game and avoid spending a chat turn on “run the game” (S19:H5), then asked whether the launch item had actually been captured (S19:H20). They reported the static-plan link twice (S19:H19 and S20:H4), and still had to say “ok run the game” in S20:H10. The generated plan currently has relative navigation links while its retrospective banner uses an absolute `/retro.html` link; the board contract has no game-launch or benchmark endpoint. The documentation describes a hosted board and a file:// fallback, but does not provide one canonical hosted URL or a game-control state, so the advertised control-hub workflow is incomplete.\n\n**Proposed kit/process change** — centralise URL generation in the shared page client: when served, emit the board origin and canonical plan/retro routes; when opened via file://, label controls read-only rather than presenting a misleading static link. Add an explicit, safety-scoped board action for launching the project and expose its last-known state, plus a link to the resumable builder/benchmark run. Do not add game code; this is local tooling and page workflow.\n\n**Confidence** — high: the request and follow-up recur across sessions, and the current generated-page/code surfaces contain navigation but no corresponding launch mechanism.\n**Cost** — medium-high: URL contract, local-process lifecycle, permissions/error handling, UI state, and browser/integration tests.\n**Mechanically checkable** — yes. Served-page tests can assert canonical same-origin links, file:// read-only behavior, and launch status transitions; an integration fixture can verify a bounded local process invocation without starting the real game.\n\n## Priority order for promotion\n\n1. Baseline/history-aware conformance and durable approval ledger — it is the highest direct source of repeated planning waste and can invalidate every later review.\n2. Priority contract plus reusable benchmark/export-size evidence — the human explicitly made this high priority, and it supplies the measurements needed to enforce it without guessing.\n3. Canonical hosted control surface and launch state — it removes repeated manual turns and makes the new evidence tools usable.\n\nNo source, gate, rule, skill, agent definition, proposal, or file outside `docs/retro/` was changed by this retrospective.\n",
+  "source_file": "docs/retro/2026-08-23-findings.md",
+  "source_sha256": "ce3ffc80a67765c06087a65cfcbb855e122f504e9bb02e20291f47391d00da33",
+  "generated_at": "2026-08-24T01:21:16Z"
+}

@@ -1,13 +1,46 @@
 [
   {
+    "finding": "POSIX shell idioms fail under this environment's PowerShell",
+    "date": "2026-08-20",
+    "by": "",
+    "reason": "double check the fix and ensure the skill is updated",
+    "comment": "double check the fix and ensure the skill is updated",
+    "slug": "posix-shell-idioms-fail-under-this-environment-s-powershell",
+    "updated_at": "2026-08-20T13:07:04+00:00",
+    "run_id": "20260820T130203Z",
+    "state": "done"
+  },
+  {
     "finding": "plan.html regenerated many times while iterating toward an approvable plan",
-    "date": "2026-08-18",
+    "date": "2026-08-20",
     "by": "justin",
-    "reason": "proposaed change is a good experiment and I'd like to give it a try.",
-    "slug": "plan-html-regenerated-many-times-while-iterating-toward-an-approvable-plan",
+    "reason": "",
     "comment": "",
-    "state": "awaiting_review",
-    "updated_at": "2026-08-18",
-    "migrated_from": "pre-comment pipeline"
+    "slug": "plan-html-regenerated-many-times-while-iterating-toward-an-approvable-plan",
+    "updated_at": "2026-08-20T13:31:25+00:00",
+    "run_id": "20260820T132806Z",
+    "state": "done"
+  },
+  {
+    "finding": "baseline and approval history still require manual conformance repair",
+    "date": "2026-08-24",
+    "by": "",
+    "reason": "I approve this as a bounded change to the kit, so please ensure you commit before and after.",
+    "comment": "I approve this as a bounded change to the kit, so please ensure you commit before and after.",
+    "slug": "baseline-and-approval-history-still-require-manual-conformance-repair",
+    "updated_at": "2026-08-24T01:34:43+00:00",
+    "run_id": "20260824T013346Z",
+    "state": "working"
+  },
+  {
+    "finding": "the newly stated priority ordering is not an agent or gate contract",
+    "date": "2026-08-24",
+    "by": "",
+    "reason": "",
+    "comment": "",
+    "slug": "the-newly-stated-priority-ordering-is-not-an-agent-or-gate-contract",
+    "updated_at": "2026-08-24T01:34:43+00:00",
+    "run_id": "20260824T013346Z",
+    "state": "working"
   }
 ]

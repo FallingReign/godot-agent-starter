@@ -817,6 +817,57 @@ this page was a list of things you could not read. Documents are rendered at
 generation time and inlined because `file://` forbids `fetch()`: a page opened by
 double-clicking cannot load a sibling file at all.
 
+### B33b — an inline span that wraps across a soft-wrapped list line still renders
+
+`tools/md.py` renders a list item's text from a single physical line. A `**bold**`
+span that an editor has soft-wrapped onto the next line of the same bullet has its
+closing `**` on that continuation line — if the continuation is not joined to the
+item before inline spans are matched, the markers never pair and print literally.
+
+```
+python -c "
+from tools import md
+text = '''- Because approval dispatches, the **displayed prompt must be shown before the
+  approve control is used**, not after.'''
+out = md.render(text)
+assert '<strong>displayed prompt must be shown before the approve control is used</strong>' in out, out
+print('OK')
+"
+```
+
+**Expect:** `OK`. If it instead prints the assertion's `out` value with literal
+`**` characters still in it, the continuation line was not joined to its list item
+before `_inline()` ran.
+
+### B33c — the vendored diagram script loads through the board server, not just file://
+
+`plan.html` references its diagram bundle with a disk-relative
+`<script src="tools/vendor/mermaid.min.js">`. Opened via `file://` the browser
+resolves that against the sibling folder with no help from anyone; opened
+through `tools/board.py` the same relative src is a request to the server, and
+without a matching route it 404s — mermaid never defines itself and every
+diagram silently stays as source text, with a `ReferenceError: mermaid is not
+defined` in the console.
+
+```
+python tools/board.py --serve --port 0 &
+```
+
+Note the printed port, then:
+
+```
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://127.0.0.1:<port>/tools/vendor/mermaid.min.js
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:<port>/tools/vendor/../../check.py"
+```
+
+**Expect:** the first line is `200 application/javascript; charset=utf-8`; the
+second is `404` — the route serves only `tools/vendor/*.js` by name, not an
+arbitrary path underneath it.
+
+Open `http://127.0.0.1:<port>/plan.html` in a browser (not the file on disk) and
+check the console: no `Loading failed for the <script>` or `mermaid is not
+defined` errors, and **Actual architecture** draws as boxes and arrows.
+
 ### B34 — diagrams draw rather than showing their source
 
 ```

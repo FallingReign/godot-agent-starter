@@ -41,10 +41,14 @@ for it explicitly rather than movement providing it.
 
 | Tunable | Value | Set in | Adjustable |
 |---|---|---|---|
-| `movement.accel_time` | — | — | **not bound** |
-| `movement.max_speed` | — | — | **not bound** |
-| `movement.stop_time` | — | — | **not bound** |
+| `movement.accel_time` | `0.08` | `src/scripts/data/game_config.gd:35` | code only |
+| `movement.max_speed` | `300.0` | `src/scripts/data/game_config.gd:31` | code only |
+| `movement.stop_time` | `0.08` | `src/scripts/data/game_config.gd:39` | code only |
 | `movement.wall_slide_friction` | — | — | **not bound** |
+
+- `movement.accel_time` — Seconds for the controllable character to reach full speed.
+- `movement.max_speed` — Peak horizontal speed in pixels per second for the controllable character.
+- `movement.stop_time` — Seconds for the controllable character to come to rest after release.
 
 <!-- END GENERATED BINDINGS -->
 

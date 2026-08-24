@@ -588,6 +588,15 @@ DISPATCH_JS = """
     }
 
     var stalledCount = 0;
+    // Moving a node blurs anything focused inside it, so a poll that reorders
+    // while the human is mid-sentence eats the caret. The order still has to
+    // update, so capture the selection, let the reorder happen, then put it
+    // back -- rather than skipping the reorder and letting the list lie.
+    var active = document.activeElement;
+    var restore = null;
+    if(active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')){
+      restore = {el: active, start: active.selectionStart, end: active.selectionEnd};
+    }
     ['toaction','approved','deferred'].forEach(function(kind){
       var host = hosts[kind];
       buckets[kind].sort(COMPARATORS[kind]);
@@ -602,6 +611,22 @@ DISPATCH_JS = """
       var count = document.querySelector('[data-count-for="' + kind + '"]');
       if(count) count.textContent = buckets[kind].length;
     });
+
+    // Put the caret back where the human left it. Guarded on the node still
+    // being in the document: a card that moved to another list keeps its
+    // textarea, but one that was replaced outright must not steal focus.
+    if(restore && restore.el && document.body
+       && typeof document.body.contains === 'function'
+       && document.body.contains(restore.el)
+       && document.activeElement !== restore.el){
+      try{
+        restore.el.focus();
+        if(restore.start !== null && restore.start !== undefined
+           && typeof restore.el.setSelectionRange === 'function'){
+          restore.el.setSelectionRange(restore.start, restore.end);
+        }
+      }catch(e){ /* a detached or read-only node is not worth throwing over */ }
+    }
 
     // The wedge banner and the Activity tab's red badge: the alarm must be
     // visible from any tab, so this lives above the tabs, not in a panel.

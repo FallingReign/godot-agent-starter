@@ -1,6 +1,8 @@
 [gd_scene format=3]
 
 [ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/performance_overlay.gd" id="2_debug"]
+[ext_resource type="Script" path="res://scripts/world_map_renderer.gd" id="3_world_map"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_menu"]
 bg_color = Color(0.055, 0.085, 0.14, 0.97)
@@ -14,6 +16,18 @@ corner_radius_top_right = 8
 corner_radius_bottom_right = 8
 corner_radius_bottom_left = 8
 
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_debug"]
+bg_color = Color(0.02, 0.035, 0.06, 0.96)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.95, 0.82, 0.42, 0.9)
+corner_radius_top_left = 6
+corner_radius_top_right = 6
+corner_radius_bottom_right = 6
+corner_radius_bottom_left = 6
+
 [node name="Main" type="Control"]
 layout_mode = 3
 anchors_preset = 15
@@ -23,6 +37,18 @@ grow_horizontal = 2
 grow_vertical = 2
 clip_contents = true
 script = ExtResource("1_main")
+
+[node name="WorldMapViewport" type="SubViewport" parent="."]
+size = Vector2i(1, 1)
+
+[node name="WorldMap" type="Node2D" parent="WorldMapViewport"]
+show_behind_parent = true
+script = ExtResource("3_world_map")
+
+[node name="WorldMapTexture" type="Sprite2D" parent="."]
+visible = false
+show_behind_parent = true
+centered = false
 
 [node name="Menu" type="CenterContainer" parent="."]
 layout_mode = 1
@@ -74,3 +100,26 @@ custom_minimum_size = Vector2(0, 42)
 layout_mode = 2
 focus_neighbor_top = NodePath("../PlayButton")
 text = "QUIT"
+
+[node name="DebugPanel" type="PanelContainer" parent="."]
+visible = false
+layout_mode = 0
+offset_left = 24.0
+offset_top = 24.0
+offset_right = 544.0
+offset_bottom = 248.0
+mouse_filter = 2
+script = ExtResource("2_debug")
+theme_override_styles/panel = SubResource("StyleBoxFlat_debug")
+
+[node name="Margin" type="MarginContainer" parent="DebugPanel"]
+layout_mode = 2
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_top = 12
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_bottom = 12
+
+[node name="Label" type="Label" parent="DebugPanel/Margin"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.96, 0.97, 1, 1)
+theme_override_font_sizes/font_size = 16

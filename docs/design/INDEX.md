@@ -41,7 +41,7 @@ Derived from resolution and binding state, not a stored backlog.
 - `loot/loot.md` — leaning, not committed — needs confirming or ruling out
 - `loot/rarity.md` — leaning, not committed — needs confirming or ruling out
 - `movement/camera.md` — leaning, not committed — needs confirming or ruling out
-- `movement/movement.md` — settled, nothing built — 4 tunable(s) unbound
+- `movement/movement.md` — partly built — 1 of 4 tunable(s) unbound
 - `multiplayer/authority.md` — leaning, not committed — needs confirming or ruling out
 - `multiplayer/multiplayer.md` — leaning, not committed — needs confirming or ruling out
 - `ugc/authoring.md` — leaning, not committed — needs confirming or ruling out
@@ -62,12 +62,12 @@ Derived from resolution and binding state, not a stored backlog.
 | `camera.deadzone_px` | `movement/camera.md` | **not bound** |
 | `camera.follow_lag` | `movement/camera.md` | **not bound** |
 | `camera.zoom_default` | `movement/camera.md` | **not bound** |
-| `cell.inset` | `world/cells.md` | `src/scripts/main.gd:24` |
+| `cell.inset` | `world/cells.md` | `src/scripts/main.gd:27` |
 | `cell.palette_size` | `world/cells.md` | **not bound** |
-| `cell.pitch` | `world/cells.md` | `src/scripts/main.gd:20` |
-| `movement.accel_time` | `movement/movement.md` | **not bound** |
-| `movement.max_speed` | `movement/movement.md` | **not bound** |
-| `movement.stop_time` | `movement/movement.md` | **not bound** |
+| `cell.pitch` | `world/cells.md` | `src/scripts/main.gd:23` |
+| `movement.accel_time` | `movement/movement.md` | `src/scripts/data/game_config.gd:35` |
+| `movement.max_speed` | `movement/movement.md` | `src/scripts/data/game_config.gd:31` |
+| `movement.stop_time` | `movement/movement.md` | `src/scripts/data/game_config.gd:39` |
 | `movement.wall_slide_friction` | `movement/movement.md` | **not bound** |
 | `panel.min_cell_size_px` | `ui/panels.md` | **not bound** |
 | `rarity.tier_count` | `loot/rarity.md` | **not bound** |

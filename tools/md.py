@@ -138,8 +138,19 @@ def render(md: str) -> str:
                 mk = re.match(r"^\s*([-*+]|\d+[.)])\s+(.*)$", raw)
                 depth = indent // 2
                 ordered_at.setdefault(depth, bool(re.match(r"\d", mk.group(1))))
-                items.append((depth, mk.group(2)))
+                parts = [mk.group(2).strip()]
                 i += 1
+                # A soft-wrapped continuation line belongs to this item, not a
+                # new paragraph, so inline spans (e.g. **bold**) that wrap
+                # across the line break still get their closing marker joined
+                # before _inline() looks for a pair.
+                while i < n and lines[i].strip() and not re.match(
+                        r"^\s*([-*+]|\d+[.)])\s+", lines[i]) and not re.match(
+                        r"^\s*(#{1,6}\s|```|\||>|(-{3,}|\*{3,}|_{3,})\s*$)",
+                        lines[i]):
+                    parts.append(lines[i].strip())
+                    i += 1
+                items.append((depth, " ".join(parts)))
             depth_now = -1
             stack: List[int] = []
             for depth, text in items:

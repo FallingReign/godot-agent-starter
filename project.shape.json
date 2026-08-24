@@ -46,6 +46,15 @@
       "revisit_if": "A target display or later camera design requires a different presentation surface.",
       "docs_at": "docs/design/world/scale-and-camera.md",
       "note": "At 15 logical units per cell, full logical-frame coverage requires 128 columns by 72 rows; the map remains ordinary authored content."
+    },
+    {
+      "id": "contiguous-two-by-two-world",
+      "question": "For the four-screen map, should the circle move continuously through one contiguous 2×2 world while the camera follows, or should it cross between four discrete screen panels with a boundary transition?",
+      "answer": "Use one contiguous 2×2 world with a following camera.",
+      "because": "The first larger-map slice should test leaving and returning across continuous world space without introducing panel seams or boundary transitions.",
+      "decided_by": "human",
+      "date": "2026-08-22",
+      "revisit_if": "Playtesting shows a contiguous authored field is not the right structure for larger regions or player-made places."
     }
   ],
   "questions": [],

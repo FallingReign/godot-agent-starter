@@ -70,6 +70,7 @@ import argparse
 import http.server
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -568,7 +569,16 @@ class RunManager:
               slug: str | None = None) -> dict:
         cfg = _config()
         model = cfg.get("dispatch_model") or cfg.get("model") or ""
-        allow_tools = cfg.get("dispatch_allow_tools") or ["read", "edit", "search", "execute"]
+        # `--allow-all-tools` is REQUIRED for non-interactive mode: without it
+        # the child prompts for permission, nothing answers, and every write is
+        # denied. An earlier default of ["read","edit","search","execute"] named
+        # tools that do not exist -- the real ones are `write` and `shell(...)`
+        # -- so a dispatched worker burned a full run and could change nothing.
+        # `--allow-all-paths` because the kit-builder edits docs/ and tools/ and
+        # runs `python check.py`. The persona's deny list, not the CLI, is what
+        # keeps it out of src/.
+        allow_all = cfg.get("dispatch_allow_all", True)
+        allow_tools = cfg.get("dispatch_allow_tools") or []
         deny_tools = cfg.get("dispatch_deny_tools") or []
 
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -583,6 +593,8 @@ class RunManager:
         cmd = [executable, "--agent", "kit-builder", "-p", prompt]
         if model:
             cmd += ["--model", model]
+        if allow_all:
+            cmd += ["--allow-all-tools", "--allow-all-paths"]
         for t in allow_tools:
             cmd += ["--allow-tool", t]
         for t in deny_tools:
@@ -1135,7 +1147,8 @@ def api_run(run_id: str) -> tuple[int, dict]:
 # --------------------------------------------------------------- HTTP
 
 
-def _serve_static(handler: http.server.BaseHTTPRequestHandler, name: str) -> None:
+def _serve_static(handler: http.server.BaseHTTPRequestHandler, name: str,
+                  content_type: str = "text/html; charset=utf-8") -> None:
     path = ROOT / name
     try:
         body = path.read_bytes()
@@ -1144,10 +1157,29 @@ def _serve_static(handler: http.server.BaseHTTPRequestHandler, name: str) -> Non
         handler.end_headers()
         return
     handler.send_response(200)
-    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _serve_vendor(handler: http.server.BaseHTTPRequestHandler, path: str) -> None:
+    """Serve a file plan.html referenced with a disk-relative <script src>.
+
+    file:// resolves `tools/vendor/mermaid.min.js` against the sibling folder
+    with no help from us; the same relative src requested through this server
+    has nothing else to answer it, so without this route the bundle 404s and
+    mermaid never defines itself -- diagrams silently stay as source text.
+    Restricted to `tools/vendor/*.js`: the one asset plan.html actually
+    references, not general static file serving.
+    """
+    name = path[len("/tools/vendor/"):]
+    if not re.match(r"^[\w.-]+\.js$", name):
+        handler.send_response(404)
+        handler.end_headers()
+        return
+    _serve_static(handler, f"tools/vendor/{name}",
+                 content_type="application/javascript; charset=utf-8")
 
 
 def _json(handler: http.server.BaseHTTPRequestHandler, code: int, payload: dict) -> None:
@@ -1221,6 +1253,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _serve_static(self, "plan.html")
         elif method == "GET" and path == "/retro.html":
             _serve_static(self, "retro.html")
+        elif method == "GET" and path.startswith("/tools/vendor/"):
+            _serve_vendor(self, path)
         else:
             _json(self, 404, {"ok": False, "code": "not_found",
                                "error": f"no such path: {path}"})

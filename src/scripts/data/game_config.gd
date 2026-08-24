@@ -26,6 +26,18 @@ var move_speed: float = 6.0
 var gravity: float = 24.0
 var max_players: int = 4
 
+## @tune movement.max_speed
+## Peak horizontal speed in pixels per second for the controllable character.
+var movement_max_speed: float = 300.0
+
+## @tune movement.accel_time
+## Seconds for the controllable character to reach full speed.
+var movement_accel_time: float = 0.08
+
+## @tune movement.stop_time
+## Seconds for the controllable character to come to rest after release.
+var movement_stop_time: float = 0.08
+
 
 func _init(overrides: Dictionary = {}) -> void:
 	for key: String in overrides:
@@ -38,6 +50,9 @@ func _validate() -> void:
 	tick_rate = clampi(tick_rate, 1, 240)
 	move_speed = maxf(move_speed, 0.0)
 	max_players = clampi(max_players, 1, 64)
+	movement_max_speed = clampf(movement_max_speed, 180.0, 420.0)
+	movement_accel_time = clampf(movement_accel_time, 0.0, 0.2)
+	movement_stop_time = clampf(movement_stop_time, 0.0, 0.15)
 
 
 ## Stable hash of every tuning value.

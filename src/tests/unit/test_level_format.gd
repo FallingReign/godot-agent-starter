@@ -122,7 +122,7 @@ func test_v1_map_remains_loadable() -> void:
 func test_authored_map_loads_with_repeated_row_tokens() -> void:
 	var level: LevelFormat = LevelFormat.load_from("res://content/maps/red_grid.json")
 	assert_not_null(level, "authored map should load")
-	assert_eq(level.size, Vector2i(128, 72), "authored map fills the logical view")
+	assert_eq(level.size, Vector2i(256, 144), "authored map covers four logical views")
 	var roof_code: int = level.layers[0].cell_code_at(17, 7)
 	assert_eq(LevelLayer.cell_shape(roof_code), LevelLayer.TRIANGLE_SHAPE)
 	assert_eq(LevelLayer.cell_foreground(roof_code), 2)
@@ -137,3 +137,9 @@ func test_authored_map_loads_with_repeated_row_tokens() -> void:
 	assert_eq(LevelLayer.cell_shape(half_cell_code), LevelLayer.HALF_CELL_SHAPE)
 	var corner_code: int = level.layers[0].cell_code_at(8, 48)
 	assert_eq(LevelLayer.cell_shape(corner_code), LevelLayer.CORNER_SHAPE)
+	var lower_left_code: int = level.layers[0].cell_code_at(0, 72)
+	assert_eq(LevelLayer.cell_background(lower_left_code), 3)
+	var upper_right_code: int = level.layers[0].cell_code_at(128, 0)
+	assert_eq(LevelLayer.cell_background(upper_right_code), 4)
+	var lower_right_code: int = level.layers[0].cell_code_at(128, 72)
+	assert_eq(LevelLayer.cell_background(lower_right_code), 6)

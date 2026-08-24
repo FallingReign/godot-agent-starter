@@ -31,6 +31,8 @@ graph TD
 
     scenes --> scripts
     scripts --> scripts_data
+    scripts --> scripts_logic
+    scripts_logic --> scripts_data
     tests_unit --> scripts_data
     tests_unit --> scripts_logic
 ```

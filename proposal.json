@@ -1,140 +1,458 @@
 {
-  "slice": "slice-10-shape-vocabulary-batch",
+  "slice": "slice-14-static-map-rendering",
   "status": "approved",
   "approved_by": "human",
-  "approved_on": "2026-08-21",
-  "baseline_sha": "158775fcb7fc479bb8505ddb438fb6706c23ed69",
+  "approved_on": "2026-08-23",
+  "baseline_sha": "5da2d3c8d49680a56a2cdef6e7c8d57931374175",
   "experience": {
-    "player_does": "Launch the game and inspect a map probe containing circle, right-angle triangle, half-cell, and corner cells in all quarter-turn orientations.",
-    "feels_like": "The new primitives should make the cell language more expressive without changing the existing square and triangle compositions or the seamless world presentation.",
-    "camera": "Keep the existing fixed logical viewport, fullscreen surface, cell pitch, and map framing.",
-    "controls": "No new controls; the probe is authored content and remains visible through the existing PLAY flow and optional F2 grid aid.",
-    "not_this": "Not a replacement for the existing isosceles TR shape, not a new map format version, not layered geometry inside one cell, and not a final claim that all four shapes belong permanently."
+    "player_does": "Walk continuously through the four-screen world while optionally toggling the F2 grid view and F3 diagnostics.",
+    "feels_like": "Camera-following movement should stay smooth because static map geometry is rendered once while only a texture transform and circle position change.",
+    "camera": "The camera keeps following and clamping the circle as before, while a one-shot world-map viewport texture receives the inverse camera translation.",
+    "controls": "Existing movement, F2 grid, F3 diagnostics, and Escape controls remain unchanged.",
+    "not_this": "Not a change to movement rules, map appearance, shipping VSync policy, or a native rewrite; this separates static presentation work from per-frame player presentation."
   },
   "design_refs": [
     {
-      "section": "docs/design/world/cells.md",
-      "why": "The settled cell grammar says the vocabulary grows one primitive at a time and gains orientations through draw-time rotation; this slice tests four named candidates within that rule."
-    },
-    {
       "section": "docs/design/world/scale-and-camera.md",
-      "why": "The probe must be judged in the established 15-unit fullscreen presentation without changing the amount of world visible."
-    },
-    {
-      "section": "docs/design/ugc/format.md",
-      "why": "The probe remains ordinary versioned map content using the existing strict token boundary and no new persisted format."
+      "why": "The fixed fullscreen presentation must remain readable as the authored world grows; runtime measurements make the cost of that presentation observable before changing its implementation."
     }
   ],
   "mockup": {
-    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" fill=\"#08131C\"/><g stroke=\"#2A9D8F\" stroke-width=\"1\" opacity=\".35\"><path d=\"M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360\"/></g><circle cx=\"80\" cy=\"45\" r=\"28\" fill=\"#F2D16B\"/><path d=\"M188 72V18H242Z\" fill=\"#E86A5B\"/><rect x=\"320\" y=\"18\" width=\"54\" height=\"54\" fill=\"#2A9D8F\"/><path d=\"M426 18H482V30H438V72H426Z\" fill=\"#F4F1DE\"/><text x=\"80\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">CI</text><text x=\"215\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">RT</text><text x=\"347\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">HC</text><text x=\"454\" y=\"125\" fill=\"#F2D16B\" font-size=\"16\" text-anchor=\"middle\">CO</text><rect x=\"42\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"202\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"362\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/><rect x=\"522\" y=\"190\" width=\"76\" height=\"76\" fill=\"#184C67\" stroke=\"#F2D16B\"/></svg>",
-    "caption": "A four-column probe shows each new primitive and leaves room to compare its quarter-turns in the running map."
+    "not_possible": "This slice changes retained rendering work and runtime frame timing without changing the intended visual composition; a static vector picture cannot represent the performance boundary."
   },
   "considered_existing": [
     {
-      "path": "scripts/data/cell_shape_catalog.gd",
-      "why_not": "It already owns shape IDs, token mapping, and reusable polygon geometry, so extending it avoids a second primitive registry."
+      "path": "scripts/main.gd",
+      "why_not": "It already owns the screen-level input and draw pass, so the diagnostic panel can stay a small presentation extension rather than adding a second runtime service."
     },
     {
-      "path": "scripts/data/level_layer.gd",
-      "why_not": "It already translates catalogued shape tokens into packed cell codes, so adding aliases there keeps typed callers independent of raw token parsing."
+      "path": "scenes/main.tscn",
+      "why_not": "The panel can be drawn in the existing root Control above the translated map, so a new scene node would add structure without improving measurement."
+    },
+    {
+      "path": "docs/retro/notes/slice-11-four-screen-movement.md",
+      "why_not": "It records the observed performance concern but is testimony rather than a runtime measurement source."
+    },
+    {
+      "path": "src/project.godot",
+      "why_not": "The project setting supplies the current VSync default, but it is engine-owned and the debug slice should report rather than silently change the presentation policy."
     },
     {
       "path": "scripts/main.gd",
-      "why_not": "Its generic polygon renderer already rotates and draws any catalogued geometry, so no renderer fork is needed."
-    },
-    {
-      "path": "content/maps/red_grid.json",
-      "why_not": "The existing authored map is the established visual probe surface and can host the new examples without changing the document format."
-    },
-    {
-      "path": "tests/unit/test_cell_shape_catalog.gd",
-      "why_not": "The existing catalog test is the right place to verify IDs and polygon geometry for the expanded vocabulary."
+      "why_not": "It remains the coordinator for input, movement, camera state, and the circle, but its redraw callback is the source of the movement hitch; retaining static map drawing there would rebuild the map on every player update."
     }
   ],
   "modules": [
     {
-      "path": "scripts/data",
-      "role": "Own the typed primitive catalog and packed-cell aliases for the four new shape candidates.",
-      "why": "The parser and renderer already meet at this catalog boundary; extending it keeps shape identity and geometry in one place.",
+      "path": "scripts",
+      "role": "Coordinate input, movement, camera transforms, and the circle while delegating static map rendering to a one-shot viewport texture.",
+      "why": "Movement profiling shows that rebuilding the visible map on every player update is the remaining frame-time cost; the node layer should update a texture transform rather than regenerate geometry or process the full world each frame.",
       "action": "modify",
       "may_depend_on": [],
-      "boundary_data": "Maps persisted shape tokens to typed integer codes and returns normalized polygon points for rendering."
+      "boundary_data": "Reads typed float and integer monitor values from Engine and Performance, formats them as overlay text, and emits no gameplay state."
+    },
+    {
+      "path": "scripts/data",
+      "role": "Provide the typed movement configuration consumed by the existing player motion object.",
+      "why": "This module was already changed in the uncommitted map slice represented by the proposal baseline and remains part of the current source surface.",
+      "action": "modify",
+      "may_depend_on": [],
+      "boundary_data": "Constructs GameConfig values and passes typed movement floats into scripts/logic."
+    },
+    {
+      "path": "scenes",
+      "role": "Provide the fixed debug panel structure that updates independently from the map canvas.",
+      "why": "Separating the diagnostics Control from Main prevents an overlay refresh from invalidating and redrawing thousands of map cells.",
+      "action": "modify",
+      "may_depend_on": [
+        "scripts"
+      ],
+      "boundary_data": "Declares PanelContainer, MarginContainer, and Label nodes consumed by PerformanceOverlay."
+    },
+    {
+      "path": "scripts/logic",
+      "role": "Own the existing headless-testable continuous player motion and world-bound clamping.",
+      "why": "This module was already added in the uncommitted map slice represented by the proposal baseline and must remain visible rather than reading as unplanned code.",
+      "action": "modify",
+      "may_depend_on": [
+        "scripts/data"
+      ],
+      "boundary_data": "Receives typed Vector2 input, delta, GameConfig, and world size; exposes typed position and velocity."
     },
     {
       "path": "content/maps",
-      "role": "Provide authored examples of each candidate and its rotations in the existing map.",
-      "why": "The shape batch must be judged in the same authored surface as the existing compositions.",
+      "role": "Provide the existing authored 256×144 field used by the camera traversal probe.",
+      "why": "The enlarged map predates this diagnostics slice in the working tree but is part of the measured rendering workload.",
       "action": "modify",
       "may_depend_on": [
         "scripts/data"
       ],
-      "boundary_data": "Versioned JSON tokens consumed by LevelFormat and LevelLayer."
+      "boundary_data": "Versioned JSON rows consumed by LevelFormat and LevelLayer."
     },
     {
       "path": "tests/unit",
-      "role": "Verify the catalog and authored map accept the expanded shape vocabulary.",
-      "why": "New persisted tokens must be rejected when unknown and round-trip correctly when catalogued.",
+      "role": "Cover the existing movement rules and enlarged authored map while diagnostics are measured.",
+      "why": "These tests were added with the map slice and should be listed in the same baseline-aware plan.",
       "action": "modify",
       "may_depend_on": [
+        "scripts/logic",
         "scripts/data"
       ],
-      "boundary_data": "Constructs typed catalog and level values and observes codes, polygons, and validation results."
+      "boundary_data": "Constructs typed motion/config objects and loads typed LevelFormat data."
     }
   ],
   "files": [
     {
-      "path": "scripts/data/cell_shape_catalog.gd",
+      "path": "scripts/main.gd",
       "action": "modify",
-      "why": "Add circle, right-angle triangle, half-cell rectangle, and corner IDs, tokens, and normalized polygon geometry while retaining existing shapes.",
+      "why": "Keep input, movement, camera, and circle presentation in the coordinator while moving static map drawing into a one-shot viewport texture and only panning that texture per frame.",
+      "module": "scripts"
+    },
+    {
+      "path": "scripts/world_map_renderer.gd",
+      "action": "new",
+      "why": "Render the authored map into a dedicated one-shot viewport so camera movement samples a texture instead of rebuilding or rasterizing the full world every frame.",
+      "module": "scripts"
+    },
+    {
+      "path": "scripts/performance_overlay.gd",
+      "action": "new",
+      "why": "Update the diagnostics Label independently from Main's map draw pass so live metrics do not force a 9,000-cell world redraw.",
+      "module": "scripts"
+    },
+    {
+      "path": "scenes/main.tscn",
+      "action": "modify",
+      "why": "Declare the static map viewport, its renderer child, and the panned texture surface alongside the existing screen-fixed debug panel.",
+      "module": "scenes"
+    },
+    {
+      "path": "scripts/data/game_config.gd",
+      "action": "modify",
+      "why": "Retain the typed movement tunables already present in the working tree so the diagnostics plan accounts for the full source delta from its baseline.",
       "module": "scripts/data"
     },
     {
-      "path": "scripts/data/level_layer.gd",
-      "action": "modify",
-      "why": "Expose typed constants for the new catalogued shapes alongside the existing shape aliases.",
-      "module": "scripts/data"
+      "path": "scripts/logic/character_motion.gd",
+      "action": "new",
+      "why": "Retain the pure movement implementation whose draw workload is being investigated by this diagnostics slice.",
+      "module": "scripts/logic"
     },
     {
       "path": "content/maps/red_grid.json",
       "action": "modify",
-      "why": "Add a visible four-shape probe with quarter-turn examples to the existing authored map without changing its version or dimensions.",
+      "why": "Retain the authored 256×144 map whose four-screen rendering workload the diagnostics overlay measures.",
       "module": "content/maps"
     },
     {
-      "path": "tests/unit/test_cell_shape_catalog.gd",
+      "path": "tests/unit/test_character_motion.gd",
+      "action": "new",
+      "why": "Retain the headless movement regression coverage associated with the enlarged map slice.",
+      "module": "tests/unit"
+    },
+    {
+      "path": "tests/unit/test_level_format.gd",
       "action": "modify",
-      "why": "Verify each new token resolves to known geometry and that the polygon point counts distinguish the candidates.",
+      "why": "Retain the authored-map dimension and quadrant assertions associated with the enlarged map slice.",
       "module": "tests/unit"
     }
   ],
   "functions": [
     {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "func _init() -> void",
-      "why": "Register normalized polygon points for the four new primitives in the catalog.",
+      "file": "scripts/main.gd",
+      "signature": "func _unhandled_input(event: InputEvent) -> void",
+      "why": "Preserve the existing F2 grid and F3 diagnostics controls while routing the grid toggle to the batched renderer.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _draw() -> void",
+      "why": "Draw only the fixed background and dynamic circle so player movement no longer rebuilds static map geometry.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _update_world_map_position() -> void",
+      "why": "Apply the camera translation to the texture surface without invalidating or re-rendering the static viewport.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _refresh_world_map_viewport() -> void",
+      "why": "Request exactly one viewport update after initial map configuration or an F2 grid-state change.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _ready() -> void",
+      "why": "Configure the dedicated world-map renderer with the typed map and place it at the initial camera offset.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _physics_process(delta: float) -> void",
+      "why": "Advance movement, update the map transform only when the camera changes, and redraw the coordinator only for the dynamic circle.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _set_menu_visible(show_menu: bool) -> void",
+      "why": "Show the static map only during PLAY and hide it with the existing menu state.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/data/game_config.gd",
+      "signature": "func _validate() -> void",
+      "why": "Validate the movement tunables already used by the measured player motion.",
       "action": "modify",
       "module": "scripts/data"
     },
     {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "static func shape_code_for(token: String) -> int",
-      "why": "Resolve the new persisted two-character shape tokens without changing the existing token boundary.",
-      "action": "modify",
-      "module": "scripts/data"
+      "file": "scripts/logic/character_motion.gd",
+      "signature": "func _init(start_position: Vector2, world_size: Vector2, config: GameConfig) -> void",
+      "why": "Construct the existing motion state that drives the player marker during performance observation.",
+      "action": "new",
+      "module": "scripts/logic"
     },
     {
-      "file": "scripts/data/cell_shape_catalog.gd",
-      "signature": "static func is_known_shape(shape: int) -> bool",
-      "why": "Extend validation to recognize the new catalog range.",
-      "action": "modify",
-      "module": "scripts/data"
+      "file": "scripts/logic/character_motion.gd",
+      "signature": "func step(input_direction: Vector2, delta: float) -> void",
+      "why": "Advance the existing continuous movement state while the renderer workload is measured.",
+      "action": "new",
+      "module": "scripts/logic"
     },
     {
-      "file": "scripts/data/level_layer.gd",
-      "signature": "static func cell_shape(cell_code: int) -> int",
-      "why": "Continue exposing packed shape identity to typed callers after the catalog range grows.",
+      "file": "scripts/logic/character_motion.gd",
+      "signature": "func _clamp_position() -> void",
+      "why": "Keep the existing player position inside the enlarged authored world.",
+      "action": "new",
+      "module": "scripts/logic"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _movement_input() -> Vector2",
+      "why": "Translate the existing keyboard controls into typed motion input.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _camera_target_for(target_position: Vector2) -> Vector2",
+      "why": "Keep the existing following camera inside the measured four-screen world.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _set_menu_visible(show_menu: bool) -> void",
+      "why": "Hide the independent diagnostics panel with the menu and restore it when PLAY resumes.",
       "action": "modify",
-      "module": "scripts/data"
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/main.gd",
+      "signature": "func _draw_player() -> void",
+      "why": "Render the existing circle marker above the measured map.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func configure(level: LevelFormat, pitch: float, inset: float) -> void",
+      "why": "Receive the already-typed map presentation data once so the static renderer can build retained draw commands independently of movement.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func set_grid_visible(should_show: bool) -> void",
+      "why": "Invalidate the static map texture only when the optional F2 inspection mode changes.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw() -> void",
+      "why": "Draw the full authored map into the one-shot viewport texture once per map or grid-state change instead of once per movement frame.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_map_backgrounds(layer: LevelLayer, first_column: int, last_column: int, first_row: int, last_row: int) -> void",
+      "why": "Merge adjacent map cells with the same background into retained draw runs across the full static world.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_background_run(row: int, start_column: int, end_column: int, background_index: int) -> void",
+      "why": "Render one world-space rectangle for each contiguous background run.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_map_shapes(layer: LevelLayer, first_column: int, last_column: int, first_row: int, last_row: int) -> void",
+      "why": "Retain only non-empty foreground shapes in the static map draw list.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_map_shape(column: int, row: int, cell_code: int) -> void",
+      "why": "Draw one non-empty world-space cell shape without repeating its background.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_grid_lines(first_column: int, last_column: int, first_row: int, last_row: int) -> void",
+      "why": "Retain shared grid boundaries for F2 without creating a per-cell border command.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _world_cell_rect(column: int, row: int) -> Rect2",
+      "why": "Centralize static world-space cell geometry independently of camera position.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/world_map_renderer.gd",
+      "signature": "func _draw_shape(cell_rect: Rect2, shape: int, foreground: Color, quarter_turns: int) -> void",
+      "why": "Build each retained polygon from the typed shape catalog during the static map draw.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "tests/unit/test_character_motion.gd",
+      "signature": "func _configured_motion() -> CharacterMotion",
+      "why": "Construct the existing deterministic motion fixture for headless coverage.",
+      "action": "new",
+      "module": "tests/unit"
+    },
+    {
+      "file": "tests/unit/test_character_motion.gd",
+      "signature": "func test_accelerates_and_stops() -> void",
+      "why": "Verify the existing movement ramp and release behaviour.",
+      "action": "new",
+      "module": "tests/unit"
+    },
+    {
+      "file": "tests/unit/test_character_motion.gd",
+      "signature": "func test_diagonal_input_is_normalized() -> void",
+      "why": "Verify the existing diagonal speed boundary.",
+      "action": "new",
+      "module": "tests/unit"
+    },
+    {
+      "file": "tests/unit/test_character_motion.gd",
+      "signature": "func test_position_is_clamped_to_world() -> void",
+      "why": "Verify the existing world-boundary behaviour.",
+      "action": "new",
+      "module": "tests/unit"
+    },
+    {
+      "file": "tests/unit/test_level_format.gd",
+      "signature": "func test_authored_map_loads_with_repeated_row_tokens() -> void",
+      "why": "Verify the existing four-screen map dimensions and quadrant content.",
+      "action": "modify",
+      "module": "tests/unit"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func _ready() -> void",
+      "why": "Keep the diagnostics updater disabled until F3 enables it.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func set_diagnostics_visible(should_show: bool) -> void",
+      "why": "Toggle the independent panel and its per-frame metric refresh from Main.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func refresh() -> void",
+      "why": "Collect current FPS, engine timings, render workload, object counts, memory values, VSync mode, and software FPS cap into the overlay Label.",
+      "action": "modify",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func _process(_delta: float) -> void",
+      "why": "Refresh visible metrics without invalidating Main's map CanvasItem.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func _format_memory(bytes: float) -> String",
+      "why": "Keep byte-based memory monitors readable in KiB, MiB, or GiB units.",
+      "action": "new",
+      "module": "scripts"
+    },
+    {
+      "file": "scripts/performance_overlay.gd",
+      "signature": "func _format_vsync(mode: int) -> String",
+      "why": "Translate the engine's VSync mode into a scan-friendly diagnostic label so a refresh-rate cap is not mistaken for a renderer limit.",
+      "action": "new",
+      "module": "scripts"
+    }
+  ],
+  "revisions": [
+    {
+      "on": "2026-08-23",
+      "what": "Expanded the approved file and function inventory to include the earlier map and movement changes still present in the working tree.",
+      "why": "Conformance compares against the commit baseline, so omitting those uncommitted files made the rendered plan report valid existing work as unplanned.",
+      "decided_by": "human"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Separated the diagnostics panel from Main and changed the map renderer to avoid idle redraws and merge contiguous background cells.",
+      "why": "The reported 4 FPS while stationary was consistent with queue_redraw on every physics tick plus thousands of per-cell background draws; the overlay also needed to update without invalidating the map CanvasItem.",
+      "decided_by": "agent"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Added a performance-focused follow-up to batch the F2 grid view and report VSync and the software FPS cap in diagnostics.",
+      "why": "Runtime sampling showed the normal world path at about 390 FPS with VSync disabled, the old grid path at about 89 FPS with VSync disabled, and the default project VSync enabled; the human also set performance, maintainability, and distribution size as standing priorities.",
+      "decided_by": "human"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Implemented the approved gridline batching and cap diagnostics, removing the obsolete per-cell draw helper.",
+      "why": "The shared grid boundary path preserves the inspection view while reducing draw calls and keeping the renderer surface free of dead fallback code.",
+      "decided_by": "agent"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Drafted a static-map rendering slice after profiling movement through the world.",
+      "why": "The moving-world sample averaged 59–68 FPS with VSync disabled even though stationary frames were fast, showing that the remaining cost is rebuilding map draw commands whenever the player moves.",
+      "decided_by": "agent"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Revised the static map from a retained full-world CanvasItem to a one-shot SubViewport texture.",
+      "why": "The direct CanvasItem removed script rebuilds but still rasterized the entire four-screen world every frame, measuring 37–60 FPS; a viewport texture keeps the retained render cost out of the movement frame.",
+      "decided_by": "agent"
+    },
+    {
+      "on": "2026-08-23",
+      "what": "Implemented the one-shot SubViewport texture and panned its Sprite2D surface during camera movement.",
+      "why": "After warm-up, controlled held movement measured 390–393 FPS uncapped in both normal and F2 grid views; the remaining startup samples were the one-time static texture build.",
+      "decided_by": "agent"
     }
   ]
 }
