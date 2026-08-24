@@ -28,9 +28,9 @@
     "reason": "I approve this as a bounded change to the kit, so please ensure you commit before and after.",
     "comment": "I approve this as a bounded change to the kit, so please ensure you commit before and after.",
     "slug": "baseline-and-approval-history-still-require-manual-conformance-repair",
-    "updated_at": "2026-08-24T01:34:43+00:00",
+    "updated_at": "2026-08-24T01:38:34+00:00",
     "run_id": "20260824T013346Z",
-    "state": "working"
+    "state": "done"
   },
   {
     "finding": "the newly stated priority ordering is not an agent or gate contract",
@@ -39,8 +39,8 @@
     "reason": "",
     "comment": "",
     "slug": "the-newly-stated-priority-ordering-is-not-an-agent-or-gate-contract",
-    "updated_at": "2026-08-24T01:34:43+00:00",
-    "run_id": "20260824T013346Z",
+    "updated_at": "2026-08-24T01:38:45+00:00",
+    "run_id": "20260824T013842Z",
     "state": "working"
   }
 ]
