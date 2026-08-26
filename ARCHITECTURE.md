@@ -1,7 +1,7 @@
 # Architecture
 
 Two sections. The diagram below is **generated from the code** by `arch.py` and
-verified by `python check.py --only arch`, so it cannot drift. The prose after it
+verified by `kit verify --stage arch`, so it cannot drift. The prose after it
 is hand-written and explains *why* the boundaries exist, which is the only thing
 the code cannot express.
 
@@ -12,7 +12,7 @@ contradicted by a grep, it does not belong here.
 Regenerate with:
 
 ```
-python arch.py --write
+kit architecture update
 ```
 
 ## Module graph
@@ -21,19 +21,12 @@ python arch.py --write
 
 ```mermaid
 graph TD
-    scenes["scenes<br/><i>scene files, presentation only</i>"]
-    scripts["scripts<br/><i>node layer, wiring</i>"]
-    scripts_data["scripts/data<br/><i>typed config + level format</i>"]
     scripts_logic["scripts/logic<br/><i>pure rules, no engine deps</i>"]
     tests["tests<br/><i>harnesses</i>"]
+    tests_fixtures["tests/fixtures"]
     tests_unit["tests/unit<br/><i>logic tests</i>"]
     tools["tools<br/><i>headless validators run by the gate, not shipped in the game</i>"]
 
-    scenes --> scripts
-    scripts --> scripts_data
-    scripts --> scripts_logic
-    scripts_logic --> scripts_data
-    tests_unit --> scripts_data
     tests_unit --> scripts_logic
 ```
 
@@ -74,7 +67,8 @@ every single edit.
 `arch.rules.json` declares which module may depend on which. It is the source of
 truth for what is *allowed*; the code is the source of truth for what *is*. The
 gate compares the two and fails on any edge that is not declared, plus any
-reference to an autoload from `src/scripts/logic/` or `src/scripts/data/`.
+reference to an autoload from `scripts/logic/` or `scripts/data/` inside the
+configured game root.
 
 A module not listed in `arch.rules.json` is drawn but not constrained, so new
 directories can be added freely and tightened later.
@@ -82,8 +76,9 @@ directories can be added freely and tightened later.
 ## Layout: why this differs from common practice
 
 Community practice usually groups by feature — `entities/player/` holding that
-entity's scene, script and art together. This kit ships layer folders instead
-(`src/scripts/logic/`, `src/scripts/data/`, `scripts/`).
+entity's scene, script and art together. This kit recommends layer folders
+inside the configured game root instead (`scripts/logic/`, `scripts/data/`,
+and `scripts/`).
 
 That is a deliberate trade, not a claim that feature folders are wrong. The
 logic-versus-data split is the one boundary a machine can check: the `types`
@@ -91,7 +86,7 @@ stage uses it to catch untyped external data before it spreads, which is the
 single most expensive class of error observed with agent-written GDScript.
 
 **Feature folders inside a layer are fine and encouraged at scale** —
-`src/scripts/logic/items/`, `src/scripts/logic/movement/`. Group data with the system
+`scripts/logic/items/`, `scripts/logic/movement/`. Group data with the system
 that owns it. The boundary is between layers, not between features.
 
 **Reorganising entirely is supported.** `arch.rules.json` declares both the

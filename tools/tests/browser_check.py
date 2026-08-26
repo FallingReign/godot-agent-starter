@@ -19,14 +19,20 @@ working/stalled, failed, done, queued.
 """
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 MOCK = ROOT / "tools" / "tests" / "mock_board.py"
@@ -41,6 +47,9 @@ BROWSERS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ]
 
 failures: list[str] = []
@@ -58,6 +67,16 @@ def check(scenario: str, name: str, cond: bool, extra: str = "") -> None:
 
 
 def find_browser() -> str:
+    for variable in ("BROWSER_BIN", "CHROME_BIN"):
+        configured = os.environ.get(variable, "").strip()
+        if not configured:
+            continue
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        found = shutil.which(configured)
+        if found:
+            return found
     for path in BROWSERS:
         if Path(path).exists():
             return path
@@ -77,6 +96,9 @@ def dump_dom(browser: str, url: str, profile: Path) -> str:
          "--dump-dom", url],
         capture_output=True, text=True, errors="replace", timeout=180,
     )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        detail = (proc.stderr or "browser returned an empty document").strip()[:500]
+        print(f"browser dump failed for {url}: {detail}", file=sys.stderr)
     return proc.stdout
 
 
@@ -150,36 +172,139 @@ def wait_for(port: int, timeout: float = 10.0) -> bool:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1):
                 return True
+        except urllib.error.HTTPError:
+            # A deliberate non-2xx health scenario is still a listening,
+            # ready server; the page itself must exercise that response.
+            return True
         except (urllib.error.URLError, OSError):
             time.sleep(0.2)
     return False
 
 
-def start_board(port: int, scenario: str) -> subprocess.Popen:
+def start_board(port: int, scenario: str, fixture_root: Path) -> subprocess.Popen:
     proc = subprocess.Popen(
-        [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario],
+        [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario,
+         "--fixture-root", str(fixture_root)],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    wait_for(port)
+    if not wait_for(port):
+        stop_board(proc)
+        raise RuntimeError(f"mock board did not become ready for scenario {scenario}")
     return proc
 
 
-def main() -> int:
-    browser = find_browser()
-    if not browser:
-        print("no Chromium-based browser found; browser check skipped")
-        return 0
-    for page in ("retro.html", "plan.html"):
-        if not (ROOT / page).exists():
-            print(f"{page} not generated; run tools/{page.split('.')[0]}_html.py first")
-            return 1
+def stop_board(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
-    profile = ROOT / ".checklogs" / "browser-profile"
+
+def _fixture_items() -> list[dict]:
+    titles = (
+        "awaiting review fixture",
+        "approved fixture",
+        "silent worker fixture",
+        "blocked worker fixture",
+        "unverified worker fixture",
+        "failed worker fixture",
+        "finished worker fixture",
+        "queued worker fixture",
+    )
+    return [
+        {
+            "slug": retro_html.retro_queue.slug_for(title),
+            "title": title,
+            "severity": "none",
+            "dispatchable": True,
+            "dispatch_blockers": [],
+            "evidence_snapshot": "fixture",
+            "generated_at": "2026-08-19T00:00:00Z",
+            "prompt": f"Implement the reviewed correction for {title}.",
+        }
+        for title in titles
+    ]
+
+
+def _fixture_findings(items: list[dict]) -> str:
+    blocks = ["# Deterministic browser fixture", ""]
+    for index, item in enumerate(items):
+        blocks.extend([
+            f"## Finding: {item['title']}",
+            "",
+            "sessions: []",
+            "human_turns: []",
+            "mechanical: []",
+            "recurs: false",
+            "severity: none",
+            f"fix_files: [tools/browser-fixture-{index + 1}.py]",
+            f"fix_lines: {index + 1}",
+            f"cost: {80 - index * 5}.0",
+            "effort: 1",
+            "",
+            f"**Problem** - Browser state {index + 1} must be readable.",
+            "",
+            f"**Proposal** - Render browser state {index + 1} on its decision card.",
+            "",
+            f"**Measure** - Browser state {index + 1} appears in the real rendered DOM.",
+            "",
+        ])
+    return "\n".join(blocks)
+
+
+@contextlib.contextmanager
+def browser_fixture():
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    base = Path(configured) if configured else ROOT / ".checklogs" / "tests"
+    fixture_root = base / f"browser-check-{uuid.uuid4().hex}"
+    fixture_root.mkdir(parents=True)
+    try:
+        items = _fixture_items()
+        findings = fixture_root / "fixture-findings.md"
+        findings.write_text(_fixture_findings(items), encoding="utf-8")
+        by_title = {
+            retro_html.retro_rank.normalise_title(item["title"]): item for item in items
+        }
+        with mock.patch.object(retro_html, "load_accepted", return_value=[]), \
+                mock.patch.object(retro_html.retro_rank, "load_deferred", return_value=[]), \
+                mock.patch.object(retro_html.retro_queue, "is_stale", return_value=False), \
+                mock.patch.object(
+                    retro_html.retro_queue,
+                    "load_by_title",
+                    side_effect=lambda title: by_title.get(
+                        retro_html.retro_rank.normalise_title(title)
+                    ),
+                ), \
+                mock.patch.object(
+                    retro_html.retro_queue,
+                    "render_prompt",
+                    side_effect=lambda item, comment: item["prompt"] + (
+                        f"\n\n{comment}" if comment else ""
+                    ),
+                ):
+            rendered = retro_html.render([findings])
+        (fixture_root / "retro.html").write_text(rendered, encoding="utf-8")
+        shutil.copyfile(ROOT / "plan.html", fixture_root / "plan.html")
+        (fixture_root / "fixture-items.json").write_text(
+            json.dumps(items, indent=2) + "\n", encoding="utf-8"
+        )
+        yield fixture_root
+    finally:
+        shutil.rmtree(fixture_root, ignore_errors=True)
+
+
+def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
+
+    profile = fixture_root / "browser-profile"
     profile.mkdir(parents=True, exist_ok=True)
     port = free_port()
 
     # ---------------------------------------------------------- healthy
-    proc = start_board(port, "healthy")
+    proc = start_board(port, "healthy", fixture_root)
     try:
         html = dump_dom(browser, f"http://127.0.0.1:{port}/retro.html", profile)
         s = "live/healthy"
@@ -219,7 +344,7 @@ def main() -> int:
         check(s, "unranked findings say why they carry no cost",
               all("unranked-note" in html for c in to_action
                   if c.get("data-cost", "") == "") if to_action else True)
-        check(s, "the approved list runs live work first, then queued, done, failed",
+        check(s, "the approved list runs attention first, then live, queued and verified",
               _states_ascend(html), _state_order(html))
         for kind in ("toaction", "approved", "deferred"):
             got = page_parts.ranks(html, f"list-{kind}")
@@ -239,10 +364,10 @@ def main() -> int:
               "awaiting your decision" in rb)
         check(s, "the plan links into the retro board", 'href="/retro.html"' in rb)
     finally:
-        proc.terminate()
+        stop_board(proc)
 
     # ------------------------------------------------- board unreachable
-    proc = start_board(port, "nohealth")
+    proc = start_board(port, "nohealth", fixture_root)
     try:
         html = dump_dom(browser, f"http://127.0.0.1:{port}/retro.html", profile)
         s = "live/board-down"
@@ -250,7 +375,7 @@ def main() -> int:
         check(s, "body is board-down", "board-down" in body_class(html), body_class(html))
         check(s, "the page says the board is not reachable", "not reachable" in b, b[:80])
         check(s, "the page names the URL it tried", f"127.0.0.1:{port}" in b)
-        check(s, "the page says how to bring the board back", "board.py --ensure" in b)
+        check(s, "the page says how to bring the board back", "kit serve" in b)
         check(s, "a retry control is offered", "board-retry" in html)
         total, disabled = controls(html)
         check(s, "every control is visibly disabled", total > 0 and disabled == total,
@@ -260,11 +385,11 @@ def main() -> int:
         check("live/board-down", "the plan banner degrades to nothing",
               banner(plan, "retro-banner").strip() == "")
     finally:
-        proc.terminate()
+        stop_board(proc)
 
     # ------------------------------------------------------ file:// mode
     for page in ("retro.html", "plan.html"):
-        url = (ROOT / page).as_uri()
+        url = (fixture_root / page).as_uri()
         html = dump_dom(browser, url, profile)
         s = f"file/{page}"
         check(s, "body is board-file", "board-file" in body_class(html), body_class(html))
@@ -284,6 +409,19 @@ def main() -> int:
 
     print(f"\n{checks - len(failures)}/{checks} browser checks passed")
     return 1 if failures else 0
+
+
+def main() -> int:
+    browser = find_browser()
+    if not browser:
+        print("no Chromium-based browser found; browser check skipped")
+        return 0
+    for page in ("retro.html", "plan.html"):
+        if not (ROOT / page).exists():
+            print(f"{page} not generated; run tools/{page.split('.')[0]}_html.py first")
+            return 1
+    with browser_fixture() as fixture_root:
+        return _run_browser_scenarios(browser, fixture_root)
 
 
 if __name__ == "__main__":

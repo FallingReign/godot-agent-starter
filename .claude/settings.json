@@ -21,8 +21,11 @@
       "Write(export_presets.cfg)",
       "Edit(addons/**)",
       "Write(addons/**)",
-      "Bash(python check.py --accept-gate-changes)",
-      "Bash(python3 check.py --accept-gate-changes)",
+      "Bash(./kit integrity accept:*)",
+      "Bash(.\\kit.cmd integrity accept:*)",
+      "Bash(kit integrity accept:*)",
+      "Bash(python check.py --accept-gate-changes:*)",
+      "Bash(python3 check.py --accept-gate-changes:*)",
       "Bash(git push:*)",
       "Bash(git rebase:*)",
       "Bash(git reset --hard:*)",
@@ -32,6 +35,7 @@
       "Bash(git checkout --:*)",
       "Bash(git clean:*)",
       "Bash(git reset:*)",
+      "Edit(tools/gen_gdscript_doc.py)",
       "Write(tools/gen_gdscript_doc.py)",
       "Edit(gate.rules.json)",
       "Write(gate.rules.json)",
@@ -40,11 +44,11 @@
     ],
     "_comment": [
       "Scenes: .tscn and .tres are deliberately NOT denied. The sanitise and resources gate stages verify them, so they meet the same bar as everything else the agent owns. Read docs/SCENES.md before writing one.",
-      "The gate: check.py, arch.py, sanitise.py, tools/validate_resources.gd and .gate.sha256 are denied because editing the gate is the one route to a false green. The integrity stage catches it even if this deny list is bypassed.",
-      "--accept-gate-changes is denied because re-baselining the manifest must be a human decision.",
-      "ARCHITECTURE.md is generated: run `python arch.py --write` instead of editing it.",
-      "arch.rules.json and gate.rules.json are intentionally NOT denied. The agent may propose rule changes; AGENTS.md requires it to ask before widening a boundary.",
-      "project.godot is denied so the [debug] warnings block and [importer_defaults] cannot be quietly altered. Use bootstrap.py --import-profile for import defaults."
+      "The default game-building policy denies the protected gate, generated reference and rule files. Integrity still catches protected-file changes if this provider policy is bypassed.",
+      "Every public and legacy integrity-acceptance route is denied because re-baselining the manifest must be a human decision.",
+      "ARCHITECTURE.md is generated: run `kit architecture update` instead of editing it.",
+      "Kit-builder maintenance needs a separately reviewed provider permission change; the default game-building policy cannot distinguish personas.",
+      "project.godot is denied so the [debug] warnings block and [importer_defaults] cannot be quietly altered. After explicit approval, use `kit setup profile <name>` for import defaults."
     ]
   }
 }

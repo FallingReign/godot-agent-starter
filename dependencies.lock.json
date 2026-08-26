@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "python": {
+    "minimum": "3.10"
+  },
+  "tools": {
+    "gdtoolkit": {
+      "version": "4.5.0",
+      "source": "https://pypi.org/project/gdtoolkit/4.5.0/",
+      "url": "https://files.pythonhosted.org/packages/36/fe/afcf23a58b3e20897484b546d86741a7ea0d8cf57ae616c1677482b47f61/gdtoolkit-4.5.0-py3-none-any.whl",
+      "sha256": "f25c5bf7f7fe861e1127164c5d73e0a7fb204ec74cf05d375b76a5dcf8610cdb",
+      "bytes": 62698,
+      "filename": "gdtoolkit-4.5.0-py3-none-any.whl",
+      "license": "MIT"
+    }
+  },
+  "artifacts": {
+    "gut": {
+      "version": "9.7.1",
+      "url": "https://github.com/bitwes/Gut/archive/refs/tags/v9.7.1.zip",
+      "sha256": "14969aa46adc84aa08cdd21b9f6d1a64addd92ae60b36f02d0521ed305aa4086",
+      "bytes": 1118303,
+      "archive_prefix": "Gut-9.7.1/addons/gut/",
+      "commit": "aeb5d4f3f7f0a6c9b5e178876d6c99b791fda605",
+      "license": "MIT",
+      "files": 259,
+      "tree_sha256": "8173b561db2618901ac3500ebeb569ace15a09aa64c6132a21e4525a5eb23369"
+    },
+    "mermaid": {
+      "version": "11.17.1",
+      "url": "https://registry.npmjs.org/mermaid/-/mermaid-11.17.1.tgz",
+      "sha256": "31fcee47c5e6284f6dabac9e7b9e8da44ba246881a4d6198daf72ba2d2805de8",
+      "bytes": 17798858,
+      "member": "package/dist/mermaid.min.js",
+      "member_sha256": "b7a4cda9e88e187d4e1f279b8a14a3df651edd8dc704b9b56ed8e84659735570",
+      "member_bytes": 3572657,
+      "license_member": "package/LICENSE",
+      "license_sha256": "ec9fb67dcb25eccc416ed56e1aab819222c805a2a4bfe4cb19e7556bf2ffde80",
+      "license_bytes": 1089
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Banned-idiom patterns for `python check.py --only grep`.",
+    "Banned-idiom patterns for `kit verify --stage grep`.",
     "External so you can tailor the kit to your game without editing check.py.",
     "Delete any rule that does not apply: the `net` tag is meaningless in a",
     "single-player game, for instance.",

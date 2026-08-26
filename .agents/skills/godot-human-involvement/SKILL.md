@@ -46,7 +46,7 @@ draft, and the human reviews the rendered view rather than a wall of prose.
 4. Fill the structure to the depth the involvement level implies: modules at
    `module`, plus files at `file`, plus signatures at `function`. Set
    `baseline_sha` to `git rev-parse HEAD` and `"status": "draft"`.
-5. Run `python tools/plan_html.py`.
+5. Run `kit plan`.
 6. Tell the human the draft is ready with a **clickable link** using the
    absolute file URI, for example
    `[Open plan.html](file:///C:/path/to/repo/plan.html)`. Do not only name the
@@ -63,18 +63,17 @@ graph, `arch.rules.json` is boundaries, the proposal is modules and files.
 **Nothing else records intended feel**, so when it is absent, feel gets inferred
 from whatever the code happens to do.
 
-That inference has already been wrong in this repo: a cell-based renderer was
-read as cell-stepped movement, when what was wanted was continuous movement with
-a following camera. The structure was fine and the feel was the opposite of the
-intent.
+That inference can produce structurally valid work with the wrong interaction.
+Experience makes the intended response reviewable before implementation gives
+one interpretation accidental authority.
 
 So `experience` is required whenever the proposal contains structure, at every
 involvement level including `hands-off`. `player_does` and `feels_like` are the
 minimum; the `conformance` stage fails without them.
 
 `not_this` earns its place. One line naming the nearest wrong reading kills a
-whole class of inference: "not cell-stepped and not a screen that snaps at the
-edge" is worth more than three lines describing what it is.
+whole class of inference: "inline acknowledgement, not a modal confirmation"
+is worth more than three lines describing what it is.
 
 ## Cite the design, do not restate it
 
@@ -87,9 +86,9 @@ needs it.
 `docs/design/`; the `why` is one line connecting this slice to that end state.
 
 The reference must reach an **end state**, not the feature immediately above.
-"The world must be visible" is one step up and rules nothing out. "Content must
-be composable from a vocabulary small enough that a player can author it and a
-peer can validate it" tells you what to build and what to reject.
+"The interface must respond" is one step up and rules nothing out. "Every
+accepted action acknowledges immediately and preserves enough context to
+understand its result" tells you what to build and what to reject.
 
 **If the only answer available is one step up, the design body is thin there.**
 That is not a reason to write a shallow rationale — it is the signal to enter
@@ -142,8 +141,8 @@ stage repeat them next run.
 
 ## What a proposal contains
 
-**Do not guess the field names.** Run `python tools/schema.py --describe
-proposal` and use exactly what it prints. The gate validates every key, and an
+**Do not guess the field names.** Run `kit schema describe proposal` and use
+exactly what it prints. The gate validates every key, and an
 invented one fails with the correct name in the error. This matters because it
 has already gone wrong: a proposal written with `change`, `why` and
 `responsibility` instead of `action`, `purpose` and `role` rendered as a list of
@@ -157,8 +156,8 @@ Every layer states **why**, not just what:
 - A function: the full signature, `new` or `modify`, and why.
 
 `why` at file and module level is the part most often skipped, and it is the one
-a reviewer needs most. "modify world_view.gd" is unreviewable. "clamp the camera
-to the authored world rectangle while the marker stays free" can be agreed or
+a reviewer needs most. "modify interaction_view.gd" is unreviewable. "preserve
+focus after a rejected action and show the reason inline" can be agreed or
 argued with.
 
 Keep it short enough to read in one screen. A proposal nobody reads is worse
@@ -173,6 +172,6 @@ than none, because it manufactures the appearance of approval.
 - Treat a green gate as approval. Conformance reports; it does not consent.
 - Leave `baseline_sha` empty. Without it, every pre-existing file reads as
   unproposed and the report becomes noise the human learns to skip.
-- Edit `proposal.html` or `plan.html`. Both are generated.
+- Edit `plan.html` or `retro.html`. Both are generated.
 - Invent a key because the one you want is not in the schema. If a field is
   genuinely missing, say so and propose adding it.

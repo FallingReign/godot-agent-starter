@@ -1,156 +1,161 @@
-# WORKFLOW
+# Workflow
 
-Day-to-day loop. Assumes `SETUP.md` is complete.
+The public entry point is `kit` (`\.\kit.cmd` on Windows, `./kit` on
+macOS/Linux). Internal implementation scripts are not part of the developer
+workflow.
 
-## Who owns what
+## Start every session safely
 
-`AGENTS.md` is the single source of truth for ownership. Read the table there
-rather than a second copy here -- an earlier version of this file carried its
-own table, it drifted, and an agent read the stale one and reported the repo
-as self-contradicting.
-
-The one thing worth repeating, because it shapes every task: the gate gives a
-fast, reliable "is this broken" signal and **no signal at all** on "is this
-good". Design work around that.
-
-## A turn
-
-1. Commit first. `git add -A && git commit -m "wip: before agent turn"`.
-2. Close editor tabs for any file the agent will touch, or use a worktree.
-3. Prompt.
-4. Agent edits, runs `python check.py`, pastes the result.
-5. `git diff` and review.
-6. Alt-tab to the editor. Scripts reload automatically. Press F5 and judge.
-7. Commit or preserve the diff for review. Do not discard work with destructive
-   reset, checkout, or clean commands.
-
-**The agent is not done until it has pasted gate output.** Not "I ran the checks",
-the actual output. Without that you are hand-reviewing generated code, which is the
-thing the gate exists to avoid.
-
-## Worktrees
-
-Use a worktree for anything long-running or multi-file. Use tab-closing for quick
-single-file edits, where a worktree is more ceremony than the change deserves.
-
-```bash
-git worktree add ../wt-agent -b agent/feature-x
-cd ../wt-agent && python check.py
+```text
+kit doctor --json
 ```
 
-Two Godot processes must never share one project directory. They fight over `.godot/`,
-which holds `uid_cache.bin`, `global_script_class_cache.cfg` and the import cache, with
-no arbitration. There is no supported way to relocate `.godot`, so a separate directory
-is the only isolation. Budget one reimport per worktree.
+Doctor is offline and read-only. If readiness is incomplete, handle only the
+named prerequisite or decision. Do not turn a diagnosis into permission for a
+download, editor edit, Git mutation, import, format, model call, or Godot launch.
 
-If a second Godot instance needs to run at the same time, give it explicit ports;
-6005 and 6006 are fixed defaults your editor already holds:
+Before changing files, inspect `git status --short` and preserve unrelated work.
+Use a worktree for long-running or multi-file work when practical.
 
-```bash
-godot --path . --lsp-port 6105 --dap-port 6106
+## One delivery slice
+
+1. State one observable outcome and the question this increment answers.
+2. Retrieve only the relevant design sections. If no end state grounds the work,
+   switch to design discovery instead of inventing intent.
+3. Check `project.shape.json` for settled decisions, direction, open questions and
+   the configured human involvement level.
+4. At `module`, `file` or `function` involvement, write the required proposal to
+   `proposal.json`, regenerate with `kit plan`, and wait for human approval.
+5. Build the thinnest increment that runs and can be judged. Do not deliver an
+   invisible infrastructure layer as though it answered an experience question.
+6. Run `kit verify --static` while engine evidence is unnecessary or unsafe. Run
+   full `kit verify` only when the native-engine boundary is intended and safe.
+7. Regenerate `kit plan`. If the result needs visual judgement, launch it through
+   the approved project workflow and report what automation cannot prove.
+8. At the slice boundary, run `kit friction` and record the factual slice note.
+   If retrospective status is due, follow `kit retro status` and the public retro
+   workflow.
+
+Nothing is complete merely because a narrow test passed. Report the exact evidence
+for the outcome and name every visual, engine, provider, device or platform property
+that remains unverified.
+
+## Approval and change control
+
+`proposal.json` is the durable proposal; chat is not. Write experience first,
+then an inline SVG mockup when the outcome is vector-approximable, then structure.
+Draft status is non-binding. Only the human changes it to approved.
+
+If implementation needs a materially different structure:
+
+1. stop before silently deviating;
+2. append the reason to `revisions`;
+3. return the proposal to draft;
+4. run `kit plan`;
+5. ask for the changed decision.
+
+An absent design reference is not something an agent acknowledges for itself.
+Offer the human the choice between discovery and an explicitly recorded inference.
+
+## Worktrees and the editor
+
+Godot processes must not share one project directory. `.godot/` contains import,
+UID and script-class caches with no cross-process arbitration.
+
+Create and enter a worktree using normal Git commands for the developer's shell:
+
+```text
+git worktree add ../wt-feature -b codex/feature
+git -C ../wt-feature status --short
 ```
 
-Pull the work when you want to see it:
+Each worktree pays for its own initial import. If the editor is open in the main
+checkout, keep agent engine work in the worktree. Do not switch branches, pull,
+rebase, or remove a worktree while Godot has that directory open.
 
-```bash
-git -C /path/to/main merge agent/feature-x
-git worktree remove ../wt-agent
+When integrating, use the project's reviewed Git workflow. Agents never use hard
+reset, destructive checkout, clean, force push, or any recovery operation that can
+discard unrelated work.
+
+## After a native engine failure
+
+Stop launching the engine. Use only:
+
+```text
+kit doctor --json
+kit verify --static
+kit self-test
 ```
 
-**Never `git pull`, `git rebase` or `git checkout <branch>` while the editor is open.**
-Branch switches are the classic trigger for the scene-overwrite bug and for reimport
-storms.
+Doctor reports the executable path without running it. Static verification cannot
+discover or launch it. Self-test additionally sets an enforced no-engine boundary.
+Resume a full verification only after the human explicitly approves one bounded
+retry. The gate performs one health check and suppresses all later native stages
+after the first failure.
 
-## Prompt patterns
+## Architecture changes
 
-**Good.** Scoped to logic, verifiable headlessly:
+The module graph is derived from code; allowed dependencies live in
+`arch.rules.json`.
 
-> Add a stamina system in `src/scripts/logic/stamina.gd`. Plain `RefCounted`, no node
-> dependency. Drains while sprinting, regenerates after 2s idle, clamps at 0 and max.
-> GUT tests for drain, regen delay and both clamps. Run `python check.py` and paste output.
+After an approved module or dependency change:
 
-**Bad.** Unverifiable, and touches a file the agent does not own:
-
-> Make the player movement feel better and add a sprint animation.
-
-Split it: the agent writes the stamina rules and the movement maths, you tune the
-numbers and wire the animation.
-
-**When the gate fails**, paste the failing stage output back rather than describing it.
-The error text is what the agent needs.
-
-## Moving scripts
-
-UIDs are engine-generated. When relocating a script, move both files in one commit:
-
-```bash
-git mv scripts/logic/old.gd scripts/logic/new.gd
-git mv scripts/logic/old.gd.uid scripts/logic/new.gd.uid
+```text
+kit architecture update
+kit verify --static
 ```
 
-Never hand-write a `uid://` value. Never copy a `.tscn` on disk to duplicate it: that
-duplicates its UID and Godot may resolve references to the wrong file, with no automated
-fix. Duplicate scenes inside the editor, or write a fresh file with no UID at all.
+Review both the generated graph and the difference from the approved proposal.
+An undeclared module and a forbidden dependency are different facts: declare a
+clear module, but redesign a boundary violation unless widening the boundary was
+the actual decision.
 
-## When the agent needs a scene
+## Scenes, assets and persisted content
 
-It writes one. `docs/SCENES.md` has the rules; the short version is omit every optional
-field, never invent a `uid://`, one root node. Two gate stages verify the result:
-`sanitise` strips anything fabricated, `resources` makes the engine load and instantiate
-it. Run `python check.py --only sanitise,resources` after any scene change.
+Before editing `.tscn` or `.tres`, use the scene-file guidance. Never invent a
+`uid://` value or hand-edit `.uid`/`.import` sidecars. A resource-load pass proves
+that a scene parses and instantiates; it does not prove appearance or feel.
 
-Three things to expect. The editor will rewrite the file the first time it saves,
-adding a header UID and stripping comments, which is normal. A passing `resources` stage
-proves the scene loads, not that it looks right, so anything visual still needs your eye.
-And for a genuinely complex scene, building the tree in code then using **Remote tab ->
-Save Branch as Scene** is still the safest route, since the engine does the serialising.
+Before importing the first asset, select an import profile explicitly. Changing
+defaults after import does not rewrite existing sidecars.
 
-The concurrency rule is unchanged and now carries all the weight: **close the editor, or
-put the agent in a worktree.** Godot never reloads an open scene from disk and will
-overwrite the file from its stale in-memory copy on the next save, with no warning and no
-undo entry.
+Before inventing a save, map, level, item or user-authored format, read current
+direction and the content-pipeline guidance. Leave room for known future content
+without implementing fields that today's slice does not need.
 
-## Next additions, in order
+## Retrospectives
 
-1. **Game capture autoload.** ~20 lines, writes a PNG plus a structured state dump on a
-   key press, so the agent can check its own visual work. Note `--headless` forces the
-   dummy renderer and produces black or empty images, so captures need a real window.
-   The state dump matters more than the screenshot: a JSON dump of every light's
-   `visible`, `light_energy` and `layers` answers "why is it dark" exactly, with no
-   vision tokens and no hallucination.
-2. **Multi-process netcode harness.** Spawn host and two clients headlessly over
-   loopback, run scripted inputs, assert identical end state. Catches desync and RPC
-   authority bugs that are brutal to reproduce by hand.
-3. **Editor selection plugin.** Dumps selected node plus properties to JSON so you can
-   say "this asset is lacking X".
-4. **Golden-frame diffing.** Only once scenes are stable enough to have baselines.
-5. **C++ / GDExtension.** Only when the profiler names a specific hot path.
+At a warranted boundary:
 
-## When the architecture gate fails
-
-Two different failures, two different fixes.
-
-**"diagram is stale"** — you changed module dependencies. Run `python arch.py --write`
-and commit `ARCHITECTURE.md` alongside the code change. This is routine and expected.
-
-**"boundary violation"** — you introduced a dependency `arch.rules.json` does not
-allow. This is usually real. The most common one is game logic reaching for a node
-class or an autoload, which is exactly the thing that makes logic untestable.
-
-Widening a rule is occasionally correct, but treat it as an architectural decision
-rather than a fix. If an agent proposes it, ask what the alternative was.
-
-## Adding a module
-
-```
-mkdir scripts/ai
-# ... write code ...
-python arch.py --write        # graph now shows scripts/ai
+```text
+kit retro status
+kit retro run
+kit retro publish
+kit plan
 ```
 
-The module is drawn but unconstrained until you add it to `arch.rules.json`. Add it
-once its role is clear:
+The default analyzer is manual and costs nothing. An automatic analyzer requires
+the explicit `--confirm-spend` action. Findings cite immutable repository-scoped
+snapshots and propose a change plus success measure; they do not directly rewrite
+the gate or skills.
 
-```json
-"scripts/ai": { "description": "behaviour trees", "may_depend_on": ["scripts/logic", "scripts/data"] }
+Approval and worker dispatch are separate decisions. Dispatch is sequential and
+stops at the first failure. Automatic workers are limited to the approved
+non-executable documentation scope and finish with static verification on the
+trusted host. See `docs/retro/README.md` for the complete lifecycle.
+
+## Release handoff
+
+Before claiming a distributable:
+
+```text
+kit self-test
+kit verify --static
+kit release build ../godot-agent-kit.zip
+kit release verify ../godot-agent-kit.zip
 ```
+
+Legal metadata and a version are mandatory. Full `kit verify --strict` and the
+three-platform CI matrix remain required release evidence and may run only after
+the engine boundary is safe. Building an archive is local; publishing is a
+separate human-controlled action.

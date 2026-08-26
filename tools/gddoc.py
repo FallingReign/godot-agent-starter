@@ -6,10 +6,10 @@ whatever version the URL says. `godot --doctool` dumps the class reference
 for *exactly* the engine binary on this machine, offline. That is the only
 source of API truth that cannot drift from what will actually run.
 
-    python tools/gddoc.py --build             # generate/refresh the dump
-    python tools/gddoc.py Color               # class summary
-    python tools/gddoc.py Color.from_string   # one member
-    python tools/gddoc.py --search from_string
+    kit godot-docs build
+    kit godot-docs show Color
+    kit godot-docs show Color.from_string
+    kit godot-docs search from_string
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def find_godot() -> Optional[str]:
 def build() -> int:
     godot = find_godot()
     if godot is None:
-        print("godot not found. Set GODOT_BIN or run: python bootstrap.py --json")
+        print("godot not found. Set GODOT_BIN or run: kit doctor")
         return 2
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     # --doctool writes <path>/doc/classes/*.xml for engine classes.
@@ -89,7 +89,7 @@ def find_class(name: str) -> Optional[Path]:
 
 def show(target: str) -> int:
     if not xml_files():
-        print("no class reference yet. Run: python tools/gddoc.py --build")
+        print("no class reference yet. Run: kit godot-docs build")
         return 2
     cls, _, member = target.partition(".")
     path = find_class(cls)
@@ -132,13 +132,13 @@ def show(target: str) -> int:
     props = sorted({m.get("name", "") for m in root.iter("member")})
     if props:
         print(f"  properties: {', '.join(props)}")
-    print(f"  detail: python tools/gddoc.py {cls}.<member>")
+    print(f"  detail: kit godot-docs show {cls}.<member>")
     return 0
 
 
 def search(term: str) -> int:
     if not xml_files():
-        print("no class reference yet. Run: python tools/gddoc.py --build")
+        print("no class reference yet. Run: kit godot-docs build")
         return 2
     needle = term.lower()
     found = 0

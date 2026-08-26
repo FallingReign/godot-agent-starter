@@ -22,17 +22,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 NOTES = ROOT / "docs" / "retro" / "notes"
 ARCHIVE = ROOT / "docs" / "retro" / "archive"
-CONFIG = ROOT / "retro.config.json"
 DEFAULT_THRESHOLD = 10
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_paths  # noqa: E402
 
 
 def threshold() -> int:
-    try:
-        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-        v = int(cfg.get("note_threshold", DEFAULT_THRESHOLD))
-        return v if v > 0 else DEFAULT_THRESHOLD
-    except (OSError, ValueError, TypeError):
-        return DEFAULT_THRESHOLD
+    cfg = runtime_paths.load_config(ROOT)
+    value = cfg.get("note_threshold", DEFAULT_THRESHOLD)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise runtime_paths.RuntimeConfigError(
+            "kit.config.json note_threshold must be a positive integer"
+        )
+    return value
 
 
 def unarchived() -> list[Path]:
@@ -60,7 +63,11 @@ def main() -> int:
     ap.add_argument("--quiet", action="store_true", help="no output, exit 1 if due")
     a = ap.parse_args()
 
-    s = state()
+    try:
+        s = state()
+    except runtime_paths.RuntimeConfigError as exc:
+        print(f"retro status unavailable: {exc}", file=sys.stderr)
+        return 2
     if a.json:
         print(json.dumps(s, indent=2))
         return 0
@@ -69,8 +76,8 @@ def main() -> int:
 
     if s["due"]:
         print(f"retrospective due: {s['unarchived']} unarchived note(s), threshold {s['threshold']}")
-        print("  copilot --agent retrospective -p \"Run a retrospective over the unarchived notes.\"")
-        print("  or ask your agent to run it, or lower the threshold in retro.config.json")
+        print("  kit retro run")
+        print("  or lower note_threshold in kit.config.json")
     else:
         remaining = s["threshold"] - s["unarchived"]
         print(f"{s['unarchived']}/{s['threshold']} slice note(s); {remaining} more before a retrospective is due")

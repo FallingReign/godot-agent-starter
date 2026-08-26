@@ -75,7 +75,7 @@ what would change that. Otherwise the next session re-litigates it.
 
 ## What the report can and cannot see
 
-`python tools/friction.py` reports churn from committed history. It sees a file
+`kit friction` reports churn from committed history. It sees a file
 rewritten across many commits. It cannot see six attempts inside one turn,
 because nothing is committed between them.
 

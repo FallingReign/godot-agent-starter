@@ -248,7 +248,8 @@ function response(status, body, ok) {
 
 function makeFetch(routes, log) {
   return function (url, init) {
-    log.push({url: url, method: (init && init.method) || 'GET'});
+    log.push({url: url, method: (init && init.method) || 'GET',
+              headers: (init && init.headers) || {}, body: (init && init.body) || null});
     const r = routes[url] || routes['*'];
     if (typeof r === 'function') { return r(url, init); }
     if (r === undefined) { return Promise.reject(new Error('no route: ' + url)); }
@@ -258,6 +259,12 @@ function makeFetch(routes, log) {
 
 function run(html, opts) {
   const built = buildDocument(html);
+  if ((opts.protocol || 'http:') !== 'file:') {
+    const capability = new El('meta');
+    capability.setAttribute('name', 'kit-board-token');
+    capability.setAttribute('content', 'dom-harness-capability');
+    built.root.appendChild(capability);
+  }
   const log = [];
   const timers = [];
   const ctx = {
@@ -295,11 +302,15 @@ function check(scenario, name, cond, detail) {
   results.push({scenario: scenario, name: name, pass: !!cond, detail: detail || ''});
 }
 
-const HEALTH_OK = () => response(200, JSON.stringify({ok: true, port: 8899, pid: 1, schema: 1}));
+let ACTIVE_BOARD_VERSION = '';
+const HEALTH_OK = () => response(200, JSON.stringify({
+  ok: true, port: 8899, pid: 1, schema: 2, version: ACTIVE_BOARD_VERSION
+}));
 function stateBody(overrides) {
   return JSON.stringify(Object.assign({
-    board: {port: 8899, pid: 1, schema: 1},
+    board: {port: 8899, pid: 1, schema: 2, version: ACTIVE_BOARD_VERSION},
     retro_due: {unarchived: 11, threshold: 10, due: true},
+    providers: {worker: {automatic: false, available: true, kind: 'manual'}},
     findings: [],
     runs: []
   }, overrides || {}));
@@ -313,6 +324,8 @@ function firstSlug(doc) {
 async function main() {
   const file = process.argv[2] || 'retro.html';
   const html = fs.readFileSync(path.resolve(file), 'utf8');
+  const versionMatch = html.match(/EXPECTED_VERSION = ("[0-9a-f]+"|"unavailable")/);
+  ACTIVE_BOARD_VERSION = versionMatch ? JSON.parse(versionMatch[1]) : '';
   /* The retro page is identified by the element, not by the string: plan.html
      renders docs inline and can quite legitimately *mention* #list-toaction. */
   const isRetro = /<div id="list-toaction"/.test(html);
@@ -356,6 +369,31 @@ async function main() {
       const list = env.doc.getElementById('list-toaction');
       const open = list ? list.querySelector('.approve-btn') : null;
       check(S, 'an unsettled approve button is enabled', open ? open.disabled === false : true);
+      check(S, 'manual worker mode labels approval as a decision only',
+            open && open.textContent === 'Approve finding', open ? open.textContent : 'no button');
+      const manualForm = open && open.parentNode ? open.parentNode.parentNode : null;
+      const manualQuota = manualForm ? manualForm.querySelector('.quota-warn') : null;
+      check(S, 'manual worker mode says no worker will launch',
+            manualQuota && /does not launch a worker/.test(manualQuota.innerHTML),
+            manualQuota ? manualQuota.innerHTML : 'no copy');
+
+      const automaticEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          providers: {worker: {automatic: true, available: true, kind: 'copilot-cli'}},
+          findings: [], runs: []
+        }))
+      }});
+      const auto = automaticEnv.doc.querySelector('.approve-btn');
+      check(S, 'automatic worker mode names the isolated queue action',
+            auto && auto.textContent === 'Approve & queue isolated implementation',
+            auto ? auto.textContent : 'no button');
+      const automaticForm = auto && auto.parentNode ? auto.parentNode.parentNode : null;
+      const automaticQuota = automaticForm ? automaticForm.querySelector('.quota-warn') : null;
+      check(S, 'automatic worker mode warns about quota and baseline fallback',
+            automaticQuota && /may spend quota/.test(automaticQuota.innerHTML)
+            && /decision is still recorded/.test(automaticQuota.innerHTML),
+            automaticQuota ? automaticQuota.innerHTML : 'no copy');
 
       /* ---- tabs: exactly one panel visible, ever ---- */
       const panelsBefore = env.doc.querySelectorAll('.panel').filter(p => !p.hidden);
@@ -381,7 +419,8 @@ async function main() {
 
       /* ---- only one text field visible per action card until Defer ---- */
       const isVisible = el => { let n = el; while (n) { if (n.hidden) { return false; } n = n.parentNode; } return true; };
-      const form0 = env.doc.querySelector('.decision-form');
+      const actionList = env.doc.getElementById('list-toaction');
+      const form0 = actionList ? actionList.querySelector('.decision-form') : null;
       if (form0) {
         const inputsOf = () => form0.querySelectorAll('textarea')
           .concat(form0.querySelectorAll('input')).filter(isVisible);
@@ -421,7 +460,8 @@ async function main() {
     const slugs = cards.map(c => c.getAttribute('data-slug'));
     const decided = {};
     cards.forEach(c => { decided[c.getAttribute('data-slug')] = c.getAttribute('data-decided') || ''; });
-    const STATES = ['done', 'working', 'queued', 'failed', 'awaiting_review'];
+    const STATES = ['done', 'approved', 'working', 'queued', 'failed', 'blocked',
+                    'unverified', 'awaiting_review'];
     const findings = slugs.map((s, i) => ({
       slug: s, title: 't' + i, severity: 'none', state: STATES[i % STATES.length],
       comment: '', stale: false, run_id: null, status_detail: '',
@@ -453,7 +493,8 @@ async function main() {
           LISTS.reduce((n, id) => n + order(forward, id).length, 0) === slugs.length,
           JSON.stringify(LISTS.map(id => order(forward, id))));
 
-    const liveStates = {working: 1, stalled: 1, queued: 1, done: 1, failed: 1};
+    const liveStates = {blocked: 1, unverified: 1, failed: 1, approved: 1,
+                        working: 1, stalled: 1, queued: 1, done: 1};
     const toaction = order(forward, 'list-toaction');
     const byState = {};
     findings.forEach(f => { byState[f.slug] = f.state; });
@@ -465,9 +506,10 @@ async function main() {
     check(S, 'every approved card is live or recorded as approved',
           approved.every(s => liveStates[byState[s]] || decided[s] === 'approved'),
           JSON.stringify(approved.map(s => [s, byState[s], decided[s]])));
-    const rankOf = s => ({working: 0, stalled: 0, queued: 1, done: 2, failed: 3})[byState[s]];
-    const ranksSeen = approved.map(s => (rankOf(s) === undefined ? 4 : rankOf(s)));
-    check(S, 'approved runs live-first, then queued, done, failed',
+    const rankOf = s => ({blocked: 0, unverified: 0, failed: 0, approved: 1,
+                         working: 2, stalled: 2, queued: 3, done: 4})[byState[s]];
+    const ranksSeen = approved.map(s => (rankOf(s) === undefined ? 5 : rankOf(s)));
+    check(S, 'activity runs attention-first, then accepted, live, queued and verified',
           ranksSeen.every((v, i) => i === 0 || ranksSeen[i - 1] <= v),
           JSON.stringify(ranksSeen));
 
@@ -497,6 +539,10 @@ async function main() {
     const before = btn.textContent;
     btn.fire('click');
     await settle();
+    const mutation = env.log.find(x => x.method === 'POST');
+    check(S, 'mutation carries JSON and the board capability',
+          mutation && mutation.headers['Content-Type'] === 'application/json'
+          && mutation.headers['X-Kit-Board-Token'] === 'dom-harness-capability');
     check(S, 'approve button is re-enabled after a 500', btn.disabled === false);
     check(S, 'approve button label is restored', btn.textContent === before, btn.textContent);
     const errs = env.doc.querySelectorAll('.board-error');
@@ -558,7 +604,7 @@ async function main() {
       check(S, 'the page names the URL it tried',
             banner && /127\.0\.0\.1:8899/.test(banner.innerHTML), banner ? banner.innerHTML : '');
       check(S, 'the page says how to bring the board back',
-            banner && /board\.py --ensure/.test(banner.innerHTML));
+            banner && /kit serve/.test(banner.innerHTML));
       check(S, 'a retry control exists that does not need a reload',
             !!env.doc.getElementById('board-retry'));
       const ctrls = env.doc.querySelectorAll('[data-board-control]');
@@ -572,6 +618,19 @@ async function main() {
     check(S, 'polling backs off rather than hammering a dead port',
           polls.length > 0 && polls[polls.length - 1].ms >= 10000,
           JSON.stringify(polls.map(t => t.ms)));
+
+    const stale = await run(html, {routes: {
+      '/api/health': response(200, JSON.stringify({
+        ok: true, port: 8899, pid: 1, schema: 2, version: 'stale-version'
+      }))
+    }});
+    check(S, 'a stale board revision is refused rather than reused',
+          stale.doc.body.classList.contains('board-down'));
+    const staleErrors = stale.doc.querySelectorAll('.board-error');
+    check(S, 'a stale board revision names the version mismatch and recovery',
+          staleErrors.length > 0 && /different kit versions/.test(staleErrors[0].innerHTML)
+          && /kit serve/.test(staleErrors[0].innerHTML),
+          staleErrors.length ? staleErrors[0].innerHTML : 'no error');
   }
 
   /* ------------------------------------------------- 6. file:// read-only */

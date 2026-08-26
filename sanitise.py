@@ -20,10 +20,9 @@ What it never does
   Invent a UID. Reorder or reformat anything. Touch .import or .uid files.
   Touch a line it does not recognise.
 
-Usage
-  python sanitise.py            report only, exit 1 if changes are needed
-  python sanitise.py --write    apply changes in place
-  python sanitise.py --json     machine-readable report
+Public usage
+  kit sanitize                  report only, exit 1 if changes are needed
+  kit sanitize --write          apply changes in place
 """
 from __future__ import annotations
 
@@ -35,8 +34,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
-PROJECT_DIR = ROOT / "src"
-EXCLUDED = {".godot", "addons", "build", "export", ".git", ".checklogs"}
+sys.path.insert(0, str(ROOT / "tools"))
+import project_context  # noqa: E402
+
+CONTEXT = project_context.load_configured_context(ROOT)
+PROJECT_DIR = CONTEXT.game_root
+EXCLUDED = {
+    ".agents", ".checklogs", ".git", ".github", ".godot", ".godot_doc",
+    ".kit", "addons", "build", "docs", "export", "plan", "tools",
+}
 
 HEADER_RE = re.compile(r"^\[gd_(scene|resource)\b")
 NODE_RE = re.compile(r"^\[node\b")
@@ -255,7 +261,7 @@ def main() -> int:
         return 1
     if changed and not args.write:
         print(f"\n{len(changed)} file(s) need sanitising. Apply with:"
-              " python sanitise.py --write")
+              " kit sanitize --write")
         return 1
     if changed:
         print(f"\nsanitised {len(changed)} file(s)")

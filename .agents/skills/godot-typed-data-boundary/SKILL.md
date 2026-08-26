@@ -51,7 +51,7 @@ failure path.
 standard route to numeric and enumerated values.
 
 Confirm the exact signature of any conversion function you use with
-`python tools/gddoc.py <Type>.<member>` rather than assuming it exists.
+`kit godot-docs show <Type>.<member>` rather than assuming it exists.
 
 ## Designing the format so this is cheap
 

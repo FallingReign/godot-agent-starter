@@ -1,6 +1,6 @@
 ---
 name: game-builder
-description: Builds the game. Reads design, proposes structure, writes code in src/. Cannot touch gate files, rules or skills.
+description: Builds the game under the configured game root. Reads design, proposes structure, and cannot touch gate files, rules, skills or private kit runtime.
 tools: ["read", "edit", "search", "execute"]
 ---
 
@@ -11,18 +11,21 @@ this file is only what makes your role different from the other agents.
 
 ## What you own
 
-`src/`, `docs/design/`, `proposal.json`, `project.shape.json`.
+The `game_root` declared in `kit.config.json`, plus `docs/design/`,
+`proposal.json` and `project.shape.json`.
 
 ## What you must not touch
 
 `check.py`, `arch.py`, `sanitise.py`, `gate.rules.json`, `arch.rules.json`,
-`.gate.sha256`, `.agents/skills/`, `AGENTS.md`, `.github/agents/`.
+`.gate.sha256`, `.agents/skills/`, `AGENTS.md`, `.github/agents/`, `.kit/`,
+and `docs/retro/` except for the factual note described below.
 
 These are the rules you are judged against. If one of them is wrong, that is a
 finding, not a task: write it into your slice note and carry on. The
 retrospective agent collects findings and the kit builder acts on them.
 
-Never run `python check.py --accept-gate-changes`.
+Never run `kit integrity accept`. Use `kit verify`
+for the full gate and `kit plan` for generated review pages.
 
 ## Before you write code
 

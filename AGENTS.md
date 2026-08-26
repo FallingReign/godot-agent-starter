@@ -2,39 +2,55 @@
 
 ## First action, every session — no exceptions
 
-```
-python bootstrap.py --json
+Resolve `kit` to the repository launcher (`.\kit.cmd` on Windows, `./kit` on
+macOS/Linux). Python entry points are internal implementation details.
+
+```text
+kit doctor --json
 ```
 
-Before answering anything about this project, and before any edit.
+Before answering anything about this project, and before any edit. `doctor` is
+offline and read-only: it never installs, downloads, imports, formats, edits
+user/game files, changes Git state or calls a model.
 
-- `complete: false` → run `python bootstrap.py --fix`, then `SETUP.md` for anything still
-  `MANUAL`. Setup is your job, not the user's.
+- `complete: false` → run `kit setup repair` only for safe repo-local
+  repairs, then follow `SETUP.md`. Network, editor, Git, import, formatting,
+  project-name and import-profile changes each have an explicit opt-in flag;
+  never infer consent for one from a setup request.
 - `complete: true` → done. Do not re-run or mention it.
 
-**If setup is incomplete, say so before you ask anything.** Acknowledge the person, tell
-them this is a fresh project needing one-time setup, say roughly how long it takes and
-what you will need from them, then ask the first question. A cold question as the opening
-line of a session reads as an interrogation, and the person has no idea how many follow.
+**If setup is incomplete, say so before you ask anything.** Acknowledge the person,
+name the specific missing prerequisite or decision, estimate the work, and state
+which explicit side effect (if any) needs their approval. A cold question as the
+opening line reads as an interrogation, and an unexplained setup command hides risk.
 
-Then `python check.py` before any code. Nothing is complete until it passes and you have
-pasted the result.
+Then `kit verify` before any code. Nothing is complete until it passes
+and you have pasted the result. Use `kit verify --strict` for release
+or production evidence; a missing dependency is not proof.
 
 ## Layout
 
-**Game code lives in `src/`.** That is the Godot project: `godot --path src`. Everything
-outside it is the gate — scripts, docs, rule files, skills — and is not loaded by the
-engine. Paths in `arch.rules.json` and `proposal.json` are relative to `src/`.
+The kit root is the nearest ancestor containing `.agent-kit.json`.
+`kit.config.json` declares `game_root` (`src` or `.`), the private
+`runtime_root`, providers and dispatch ownership. Resolve those values; do not
+infer the project boundary from a game file or the current working directory.
+Paths in `arch.rules.json` and `proposal.json` are relative to the configured
+game root.
 
-Before writing `proposal.json` or `project.shape.json`, run `python
-tools/schema.py --describe proposal` (or `shape`) and use exactly those keys.
+`.kit/runtime/` is private, machine-local and release-excluded. It may contain
+session evidence, prompts and logs. Never cite it as durable product intent,
+commit it, or copy it into documentation.
+
+Before writing `proposal.json` or `project.shape.json`, run `kit schema describe
+proposal` (or `shape`) and use exactly those keys.
 Every key is validated by the `schema` stage. An invented key is rejected with
 the correct name, rather than being silently discarded by every reader.
-GDScript the engine runs must be inside `src/` for `res://` to reach it.
+GDScript the engine runs must be inside the configured game root for `res://` to
+reach it.
 
 ## Project
 
-Godot **4.7.1**, GDScript only. No C#, no GDExtension. Genre-agnostic: nothing assumes
+Godot **4.7.2**, GDScript only. No C#, no GDExtension. Genre-agnostic: nothing assumes
 multiplayer, 3D or procedural content. Choices made: `docs/DECISIONS.md`.
 
 **Read `project.shape.json` before designing anything.** Three tenses in one file:
@@ -50,15 +66,16 @@ eventually hold. Skill: `godot-content-pipeline`.
 
 **`plan.html` is the living view** of all of this: what is approved, what is built against
 it, open questions, direction, recent changes, the real module graph, and every document
-in `docs/` and `docs/design/` rendered inline. The gate regenerates it every run. Point the
+in `docs/` and `docs/design/` rendered inline. `kit plan` regenerates
+it and `retro.html` coherently. Point the
 human at it rather than describing state in prose. It is generated — never edit it, edit
 the JSON.
 
 **Two kinds of documentation, and they do not mix.** `docs/` documents the kit: the gate,
-the rules, the workflow. `docs/design/` documents the game: what a cell is, how the world
-is structured, what a content format guarantees. **How design works — resolution levels, why
-it precedes code, where sections come from — is `docs/design/README.md`. Read it before
-writing or citing any design section.**
+the rules, the workflow. `docs/design/` documents the game: intended experience and the
+rules code must preserve. **How design works — resolution levels, why it precedes code,
+where sections come from — is `docs/DESIGN.md`. Read it before writing or citing any
+design section.**
 
 When a `direction[]` entry or a decision is settled enough to be written for a reader, draft
 the section, get it approved, and add a `docs_at` pointer on the decision entry. Nothing is
@@ -70,10 +87,10 @@ crossing them, then wait. `file` — that plus every file you create or modify. 
 that plus signatures and how they connect. It never relaxes a gate check.
 
 **Before you write a proposal, read `docs/design/INDEX.md` and ask one question: what end
-state does this work serve?** Not the feature above it — the end state. "The world must be
-visible" is true and constrains nothing; "content must be composable from a vocabulary
-small enough that a player can author it and a peer can validate it without trusting the
-sender" tells you what to build. Start at the index and open only the two or three sections
+state does this work serve?** Not the feature above it — the end state. "The interface must
+respond" is true and constrains nothing; "every accepted action acknowledges immediately
+and preserves enough context for the player to understand its result" tells you what to
+build. Start at the index and open only the two or three sections
 that matter; never load the whole design body. Put the section you land on in `design_refs`
 with one line on why. If nothing answers it, that is the signal: enter discovery and write
 the section, rather than reasoning up from the feature. Skills:
@@ -98,7 +115,7 @@ At `module` and above, **propose in the file, not in the chat.** Order matters: 
 `not_this` the nearest thing it deliberately is not. Then a `mockup` as inline SVG **if the
 outcome is vector-approximable** (grids, shapes, layout, UI arrangement); if it is not, say
 why in `mockup.not_possible`. Then the structure. Then `"status": "draft"` and
-`baseline_sha` from `git rev-parse HEAD`, run `python tools/plan_html.py`, and give the
+`baseline_sha` from `git rev-parse HEAD`, run `kit plan`, and give the
 human a **clickable link** using the absolute file URI, e.g.
 `[Open plan.html](file:///C:/path/to/repo/plan.html)` — do not only name the file. Two or
 three lines of summary at most. Wait. On approval set `"status": "approved"`, then build.
@@ -159,9 +176,9 @@ removed much of the API and 4.x keeps changing it. Do not write an engine API ca
 from memory — look it up first:
 
 ```
-python tools/gddoc.py --build          # once, dumps the class reference for THIS engine
-python tools/gddoc.py Color.from_string
-python tools/gddoc.py --search from_str
+kit godot-docs build                   # once, dumps the reference for THIS engine
+kit godot-docs show Color.from_string
+kit godot-docs search from_str
 ```
 
 That reference is generated by the installed engine binary, so it cannot be stale.
@@ -203,7 +220,7 @@ reads. Personas live in `.github/agents/` and stack on top of it.
 
 | Agent | Invoked | Owns | Must not touch |
 |---|---|---|---|
-| `game-builder` | you, per slice | `src/`, `docs/design/`, `proposal.json` | gate files, rules, skills |
+| `game-builder` | you, per slice | configured game root, `docs/design/`, `proposal.json` | gate files, rules, skills |
 | `retrospective` | when slice notes reach the threshold | `docs/retro/` only | everything else |
 | `kit-builder` | you, after promoting a finding | gate files, rules, skills, docs | `src/` |
 
@@ -221,10 +238,13 @@ proposals - a single slice cannot show a pattern.
 
 ## Non-negotiables
 
-1. **Never ask the human to run a command you could run yourself.** Only installing Godot
-   needs a person.
+1. **Never ask the human to run a command you could run yourself.** Ask for
+   authorization before an explicit network, editor, Git or game mutation, then
+   perform and verify the authorized action yourself. Installing Godot may still
+   need a person.
 2. **Never edit a human-owned file** (below).
-3. **Never modify the `[debug]` warnings block in `src/project.godot`.** Fix the code.
+3. **Never modify the `[debug]` warnings block in the configured game root's
+   `project.godot`.** Fix the code.
 4. **Never edit the gate to make a failure go away.** If `integrity` fails, stop and
    report. `--accept-gate-changes` is human-only.
 5. **Never trust a Godot exit code.** The gate greps output; do the same.
@@ -241,8 +261,8 @@ proposals - a single slice cannot show a pattern.
 A test asserting bad input is **rejected** legitimately prints error output, and the gut
 stage fails on error text by default. Do not delete the `push_error` to make the gate
 green — a parser that fails silently is a worse design than one the gate complained about.
-Declare the expected line in `src/tests/expected_errors.json` with a `why`. Anything
-undeclared still fails.
+Declare the expected line in `<game_root>/tests/expected_errors.json` with a
+`why`. Anything undeclared still fails.
 
 ## When the gate keeps failing
 
@@ -255,25 +275,28 @@ work, and never claim "the repo is in a bad state" without naming the error.
 
 ## Ownership
 
-**Yours:** everything under `src/`, plus `docs/**` and `*.md`. `*.tscn`/`*.tres` too, but
-read `docs/SCENES.md` first. Assets: drop in, then `python check.py --only import`.
+**Yours:** everything under the configured game root, plus `docs/**` and `*.md`.
+`*.tscn`/`*.tres` too, but
+read `docs/SCENES.md` first. Assets: drop in, then `kit verify --stage import`.
 
 **Never touch:** `check.py`, `arch.py`, `sanitise.py`, `*.rules.json` (the gate,
-hash-checked) · `.gate.sha256` (human-only) · `src/project.godot` (engine-owned; the gate
+hash-checked) · `.gate.sha256` (human-only) · the game root's `project.godot`
+(engine-owned; the gate
 reports changes but does not fail) · `*.import`, `*.uid` (machine-generated — commit,
-never edit) · `plan.html`, `plan/*.html` (generated — edit the JSON) · `export_presets.cfg`,
-`src/addons/**`.
+never edit) · `plan.html`, `plan/*.html` (generated — edit the JSON) ·
+`export_presets.cfg` · the configured game root's `addons/**`.
 
 Full table and permanent human-only work: **`docs/RULES.md`**.
 ## The core architecture rule
 
-**Game logic lives in plain `RefCounted` classes under `scripts/logic/`, with no scene,
+**Game logic lives in plain `RefCounted` classes under `scripts/logic/` inside
+the configured game root, with no scene,
 node or autoload dependency.** Nodes are a thin layer that reads input and displays
 results. Logic you can verify headlessly; node code you cannot verify at all. Push as
 much as possible across that line. Config is a typed data object under `scripts/data/`,
 constructed once and passed in — no config autoload, and no autoload reference from
-`logic/` or `data/`. Gate-enforced. Examples: `src/scripts/logic/health.gd`,
-`src/scripts/data/game_config.gd`.
+`logic/` or `data/`. Gate-enforced. Paths under `scripts/logic/` and
+`scripts/data/` are always relative to the configured game root.
 
 **The type boundary runs the same direction.** External data is `Variant`, and GDScript
 has no safe cast from `Variant`. Convert it **once** in `scripts/data/` into typed
@@ -300,21 +323,25 @@ button.pressed.connect(_on_pressed)       # correct
 
 ## Gate
 
-```
-python check.py                    # all stages
-python check.py --only typecheck   # one stage, comma-separated for several
-python check.py --fix-format       # fix formatting (never bare `gdformat .`)
+```text
+kit verify                  # public full verification
+kit verify --strict         # release/production proof; no unsupported SKIP
+kit verify --static         # all non-engine diagnostics; never completion proof
+kit verify --stage typecheck # low-level stage diagnostic
+kit setup format            # explicit game-format mutation
 ```
 
 Stages, remediation and engine quirks: **`docs/GATE.md`**.
 
 ## Definition of done
 
-1. `python check.py` passes, output pasted.
+1. `kit verify` passes, output pasted. Release claims require
+   `kit verify --strict`.
 2. Only agent-owned files changed.
-3. New logic-layer code has GUT tests, named `test_<name>.gd` under `src/tests/unit/` — the
-   `tests` stage fails on a test file the runner would silently ignore.
-4. `python arch.py --write` re-run if module dependencies changed. At `involvement`
+3. New logic-layer code has GUT tests, named `test_<name>.gd` under the
+   configured game root's `tests/unit/` — the `tests` stage fails on a test file
+   the runner would silently ignore.
+4. `kit architecture update` re-run if module dependencies changed. At `involvement`
    `module` or above, report which modules and edges differ from what was approved —
    the diff is the human's check, not the picture.
 5. **Anything you cannot verify called out explicitly** — anything visual, feel, timing,
@@ -326,16 +353,23 @@ Stages, remediation and engine quirks: **`docs/GATE.md`**.
    and asking them to do the launching adds a step to every review. A passing `resources`
    stage proves a scene loads, not that it looks right. Never claim a game "is running"
    from a headless run.
-7. **At a slice boundary, run `python tools/friction.py`.** If a file was rewritten many
+7. **At a slice boundary, run `kit friction`.** If a file was rewritten many
    times, or the proposal needed several revisions, say so and ask whether a tool should
    exist. It only sees committed history, so anything you retried inside one turn is
    yours to report — you are the only observer of it. Skill: `godot-tooling-friction`.
-8. **When the gate says a retro is warranted, run one.** The ordinary way is one click:
-   `plan.html` shows a **Run retrospective** banner when the board is up, and one click
-   spends the quota. By hand, `python tools/retro.py --print` writes an evidence pack and
-   a prompt and calls no model; `--sdk` hands the pack to copilot and resumes the thread
-   within the same slice. Read
-   `sessions[].human_messages` first — every correction the human made is a candidate
-   kit defect. Write findings to `docs/retro/`; never change a rule, skill or gate file
-   because of your own retro. The whole loop from findings to a dispatched kit-builder is
-   `docs/retro/README.md`. Skill: `godot-retrospective`.
+8. **When the gate says a retro is warranted, inspect `kit retro
+   status`.** Capture is deterministic and calls no model. Analyzer and worker
+   providers default to `manual`; `kit retro run` prepares evidence
+   without a model, and an automatic analyzer additionally requires
+   `--confirm-spend`. `kit retro publish` validates a completed findings report,
+   builds dispatch artifacts and refreshes the decision views. Findings must cite the immutable,
+   repository-scoped snapshot used to produce them. A human reviews the proposed
+   change and success measure before approval; dispatch is authenticated,
+   idempotent, sequential and verified against the configured ownership policy.
+   Write findings to `docs/retro/`; never change a rule, skill or gate file
+   because of your own retro. The whole loop is `docs/retro/README.md`. Skill:
+   `godot-retrospective`.
+9. **For a distributable, build the kit rather than copying the repository.**
+   `kit release build <archive>` uses a closed allowlist and excludes
+   the game, current design/proposal/retro state and `.kit/runtime/`. Release
+   requires version and legal metadata and verifies the archive it wrote.

@@ -18,6 +18,8 @@ node is not a dependency of this kit and must not become one.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import random
 import re
@@ -26,6 +28,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS = ROOT / "tools" / "tests" / "dom_harness.js"
@@ -39,14 +42,25 @@ import retro_html  # noqa: E402
 def generated(name: str, build) -> str:
     path = ROOT / name
     if not path.exists():
-        build()
+        # Generator entry points use argparse. Discovery's argv belongs to
+        # unittest, not to those entry points; leaking it makes a clean checkout
+        # fail only when the ignored generated page is absent.
+        arguments = [f"generate-{name}"]
+        if name == "retro.html":
+            # A regression test must never leave a background board behind.
+            arguments.append("--no-board")
+        with mock.patch.object(sys, "argv", arguments):
+            build()
     return path.read_text(encoding="utf-8")
 
 
 class RetroPageBytes(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.html = generated("retro.html", lambda: retro_html.main())
+        # The distributable's honest first-run page can contain no findings.
+        # Byte-level action assertions use the same deterministic actionable
+        # fixture as the DOM harness instead of depending on repository history.
+        cls.html = Harness._retro_fixture().read_text(encoding="utf-8")
 
     def test_no_bare_fetch_outside_the_shared_client(self) -> None:
         """Every board call goes through Board.request (review finding 4).
@@ -76,17 +90,19 @@ class RetroPageBytes(unittest.TestCase):
         self.assertIn("prompt-block", self.html)
         self.assertIn("read it before approving", self.html)
 
-    def test_approving_says_it_spends_quota(self) -> None:
-        self.assertIn("spends quota", self.html)
-        self.assertIn("no second confirmation", self.html)
+    def test_approval_copy_distinguishes_decision_from_optional_spend(self) -> None:
+        self.assertIn("may spend quota", self.html)
+        self.assertIn("does not launch a worker", self.html)
+        self.assertIn("committed baseline is unavailable", self.html)
 
     def test_stalled_state_has_its_own_visual(self) -> None:
         self.assertIn("stall-pulse", self.html)
         self.assertIn(".status-slot.stalled", self.html)
 
     def test_dead_endpoints_are_gone(self) -> None:
+        scripts = "\n".join(re.findall(r"<script[^>]*>(.*?)</script>", self.html, re.S))
         for path in ("/api/dispatch/prepare", "/api/dispatch/run", "/api/decision"):
-            self.assertNotIn(path, self.html, f"{path} was removed by the contract")
+            self.assertNotIn(path, scripts, f"{path} was removed by the browser contract")
 
     def test_inlined_prompt_matches_render_prompt(self) -> None:
         """What the page shows with no board is what the board would send."""
@@ -136,21 +152,22 @@ class Ordering(unittest.TestCase):
         {"title": "e", "cost": None, "state": "done", "updated_at": "2026-01-08"},
         {"title": "f", "cost": 60.0, "state": "stalled", "updated_at": "2026-01-04"},
         {"title": "g", "cost": 0.0, "state": "", "updated_at": ""},
+        {"title": "h", "cost": None, "state": "approved", "updated_at": "2026-01-05"},
     ]
 
     def test_to_action_is_cost_descending_then_unranked(self) -> None:
         got = [r["title"] for r in retro_html.order_rows("toaction", self.ROWS)]
-        self.assertEqual(got, ["c", "d", "f", "a", "g", "b", "e"])
+        self.assertEqual(got, ["c", "d", "f", "a", "g", "b", "e", "h"])
 
-    def test_approved_puts_live_work_first_then_queued_done_failed(self) -> None:
+    def test_approved_puts_attention_before_live_queue_and_verified(self) -> None:
         got = [r["title"] for r in retro_html.order_rows("approved", self.ROWS)]
-        # working/stalled (b, f -- newest first), queued (d), done (e),
-        # failed (c), then anything with no state at all (a, g).
-        self.assertEqual(got, ["f", "b", "d", "e", "c", "a", "g"])
+        # failed needs attention; accepted-without-worker follows; then
+        # working/stalled (f, b -- newest first), queued, verified, unknown.
+        self.assertEqual(got, ["c", "h", "f", "b", "d", "e", "a", "g"])
 
     def test_deferred_is_most_recent_first(self) -> None:
         got = [r["title"] for r in retro_html.order_rows("deferred", self.ROWS)]
-        self.assertEqual(got, ["c", "e", "f", "d", "b", "a", "g"])
+        self.assertEqual(got, ["c", "e", "h", "f", "d", "b", "a", "g"])
 
     def test_order_does_not_depend_on_input_order(self) -> None:
         """Same set in any order renders the same list.
@@ -193,7 +210,7 @@ class ListsOnThePage(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.html = generated("retro.html", lambda: retro_html.main())
+        cls.html = Harness._retro_fixture().read_text(encoding="utf-8")
 
     def test_three_lists_each_with_a_heading_of_its_own(self) -> None:
         for kind in ("toaction", "approved", "deferred"):
@@ -240,12 +257,26 @@ class ListsOnThePage(unittest.TestCase):
             self.assertEqual(got, [f"{i}." for i in range(1, len(got) + 1)], kind)
 
     def test_an_unranked_finding_says_why_it_has_no_cost(self) -> None:
-        unranked = [c for c in page_parts.cards(self.html, "list-toaction")
-                    if c.get("data-cost", "") == ""]
-        if not unranked:
-            self.skipTest("no unranked finding in the current evidence")
-        self.assertIn("unranked-note", self.html)
-        self.assertIn("carrying a number it has not earned", self.html)
+        finding = {
+            "title": "synthetic observation",
+            "cost": None,
+            "effort": None,
+            "notes": ["unranked: no attributable human turns"],
+            "body": "**Problem** - Evidence is incomplete.\n\n"
+                    "**Proposal** - Capture evidence.\n\n"
+                    "**Measure** - The next report has a citation.",
+            "sessions": [],
+            "human_turns": [],
+            "mechanical": [],
+            "recurs": False,
+            "severity": "none",
+            "fix_files": [],
+            "fix_lines": 1,
+        }
+        rendered = retro_html.render_finding(1, finding, {}, {}, {})
+        self.assertIn("unranked-note", rendered)
+        self.assertIn("Observation only", rendered)
+        self.assertIn("no attributable human turns", rendered)
 
     def test_the_primary_control_is_legible(self) -> None:
         """Filled, in the accent blue -- not amber, which is reserved for the
@@ -259,16 +290,30 @@ class ListsOnThePage(unittest.TestCase):
         self.assertIn("white-space:normal", rule)
         self.assertIn("box-sizing:border-box", rule)
 
-    def test_detail_is_collapsed_so_the_controls_are_reachable(self) -> None:
-        """Full detail is kept, just not between the human and the decision."""
+    def test_decision_content_precedes_collapsed_audit_detail(self) -> None:
+        """Problem, recommendation and measure are visible before the action."""
         self.assertIn('<details class="detail-block">', self.html)
+        self.assertIn("Evidence and dispatch details", self.html)
         for card in page_parts.cards(self.html, "list-toaction"):
             slug = card.get("data-slug", "")
             if not slug:
                 continue
             start = self.html.index('data-slug="%s"' % slug)
-            end = self.html.index("prompt-block", start)
-            self.assertLess(self.html.count("<p>", start, end), 40)
+            decision = self.html.index('<div class="decision', start)
+            detail = self.html.index('<details class="detail-block">', start)
+            self.assertIn("Recommended change", self.html[start:decision])
+            self.assertIn("Success looks like", self.html[start:decision])
+            self.assertLess(decision, detail)
+
+    def test_legacy_findings_expose_the_recommendation(self) -> None:
+        sections = retro_html.decision_sections(
+            "The workflow requires five scripts.\n\n"
+            "**Proposed kit/process change** — expose one command.\n\n"
+            "**Mechanically checkable** — the command routes all operations."
+        )
+        self.assertEqual(sections["problem"], "The workflow requires five scripts.")
+        self.assertEqual(sections["proposal"], "expose one command.")
+        self.assertEqual(sections["measure"], "the command routes all operations.")
 
 
 class PlanPageBytes(unittest.TestCase):
@@ -289,17 +334,158 @@ class PlanPageBytes(unittest.TestCase):
         plan look broken. It is retro.html that has something to say about it."""
         self.assertNotIn('id="board-banner"', self.html)
 
+    def test_plan_leads_with_decisions_and_collapses_the_record(self) -> None:
+        summary = self.html.index('aria-label="Plan summary"')
+        decisions = self.html.index("Needs your decision")
+        record = self.html.index("Review full plan and project record")
+        architecture = self.html.index("Actual architecture")
+        self.assertLess(summary, decisions)
+        self.assertLess(decisions, record)
+        self.assertLess(record, architecture)
+        self.assertIn('<details class="record"><summary>', self.html)
+        self.assertNotIn('<details class="record" open', self.html)
+
+    def test_plan_does_not_offer_unsaved_question_controls(self) -> None:
+        self.assertNotIn('type="radio"', self.html)
+        page = plan_html.render(
+            {"questions": [{"id": "q1", "question": "Choose?", "options": ["A", "B"]}]},
+            {}, [], "", set(), [], [], [], "",
+        )
+        self.assertNotIn('type="radio"', page)
+        self.assertIn("This page never pretends a local click was saved", page)
+
+    def test_repository_observation_is_not_presented_as_verification(self) -> None:
+        self.assertIn("Observed repository change scope, not a completion claim", self.html)
+
+    def test_plan_only_calls_baseline_diff_paths_unapproved_changes(self) -> None:
+        without_baseline = plan_html.render(
+            {}, {"status": "approved"}, [], "", {"existing.gd"}, [], [], [], "",
+        )
+        self.assertNotIn("unapproved change", without_baseline)
+        self.assertIn("Change scope is unavailable", without_baseline)
+
+        with_baseline = plan_html.render(
+            {}, {"status": "approved", "baseline_sha": "a" * 40},
+            [], "", set(), [], [], [], "",
+            changed={"removed.gd"}, deleted={"removed.gd"},
+        )
+        self.assertIn("1 unapproved change", with_baseline)
+        self.assertIn("removed.gd</code> (deleted)", with_baseline)
+
+    def test_invalid_source_preserves_the_last_valid_plan(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(
+                plan_html, "artefact_errors",
+                return_value=[
+                    ("proposal.json", "status must be draft or approved")
+                ]
+        ), mock.patch.object(Path, "write_text") as write_text, \
+                mock.patch.object(sys, "argv", ["plan_html.py"]), \
+                contextlib.redirect_stderr(stderr):
+            code = plan_html.main()
+
+        self.assertEqual(1, code)
+        write_text.assert_not_called()
+        self.assertIn("existing output was preserved", stderr.getvalue())
+        self.assertIn("kit schema describe proposal", stderr.getvalue())
+
 
 class Harness(unittest.TestCase):
     """Run the page's own JavaScript. Skips without node -- not a dependency."""
+
+    @staticmethod
+    def _retro_fixture() -> Path:
+        """Render one actionable card independent of repository retro history."""
+        def finding(title: str, cost: float) -> dict:
+            return {
+                "title": title,
+                "sessions": ["S1"],
+                "human_turns": [],
+                "mechanical": [],
+                "recurs": True,
+                "severity": "none",
+                "fix_files": ["tools/example.py"],
+                "fix_lines": 8,
+                "cost": cost,
+                "effort": 1,
+                "notes": [],
+                "body": (
+                    "**Problem** - The action contract needs a fixture.\n\n"
+                    "**Proposal** - Render one actionable finding.\n\n"
+                    "**Measure** - Every browser state is exercised."
+                ),
+                "session_snapshot": "",
+                "_digests": {},
+            }
+
+        findings = [
+            finding("Frontend harness finding", 8.0),
+            finding("Not rendered on this page", 4.0),
+        ]
+        rows = [
+            {"finding": item,
+             "title": retro_html.retro_rank.normalise_title(item["title"]),
+             "cost": item["cost"], "state": "", "updated_at": ""}
+            for item in findings
+        ]
+        data = {
+            "findings": findings,
+            "digests": {},
+            "accepted": {},
+            "deferred": {},
+            "accepted_entries": [],
+            "rows": {"toaction": rows, "approved": [], "deferred": []},
+        }
+        artifacts = {
+            retro_html.retro_rank.normalise_title(item["title"]): {
+                "slug": retro_html.retro_rank.normalise_title(item["title"]),
+                "generated_at": "2026-01-01T00:00:00Z",
+                "prompt": (
+                    "Implement the approved frontend contract.\n" + "evidence " * 30
+                ),
+            }
+            for item in findings
+        }
+        with mock.patch.object(retro_html, "collect", return_value=data), \
+                mock.patch.object(retro_html, "mark_resolved_if_absent", return_value=False), \
+                mock.patch.object(
+                    retro_html.retro_queue, "load_by_title",
+                    side_effect=lambda title: artifacts.get(
+                        retro_html.retro_rank.normalise_title(title)
+                    ),
+                ), \
+                mock.patch.object(retro_html.retro_queue, "is_stale", return_value=False):
+            html = retro_html.render([])
+        target = ROOT / ".checklogs" / "tests" / "retro-harness.html"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(html, encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _plan_fixture() -> Path:
+        """Generate a private plan page without relying on ignored root output."""
+        target = ROOT / ".checklogs" / "tests" / "plan-harness.html"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        output = io.StringIO()
+        with mock.patch.object(plan_html, "OUT", target), \
+                mock.patch.object(sys, "argv", ["plan_html.py"]), \
+                contextlib.redirect_stdout(output):
+            result = plan_html.main()
+        if result != 0 or not target.is_file():
+            raise RuntimeError(
+                "could not generate the deterministic plan harness fixture: "
+                + output.getvalue().strip()
+            )
+        return target
 
     def _run(self, page: str) -> dict:
         node = shutil.which("node")
         if not node:
             self.skipTest("node not on PATH; DOM harness skipped")
-        if not (ROOT / page).exists():
-            self.skipTest(f"{page} not generated")
-        proc = subprocess.run([node, str(HARNESS), page], cwd=ROOT,
+        target = (
+            self._retro_fixture() if page == "retro.html" else self._plan_fixture()
+        )
+        proc = subprocess.run([node, str(HARNESS), str(target)], cwd=ROOT,
                               capture_output=True, text=True)
         try:
             data = json.loads(proc.stdout)

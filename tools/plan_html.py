@@ -19,25 +19,22 @@ The page holds nothing of its own, so overwriting it is free. Anything it shows
 is either intent (from a json file a human approved) or reality (from code and
 git). It never invents a third thing.
 
-    python tools/plan_html.py                # write plan.html
-    python tools/plan_html.py --slice slice-1  # also write plan/slice-1.html
-    python tools/plan_html.py --stdout
+Public generation is `kit plan`. The optional internal `--slice` mode writes a
+review snapshot in addition to the living page.
 
 Snapshots exist so a slice that goes wrong can be compared against the plan as
 it stood when the slice started, rather than as it stands after the damage.
 
-Conventions kept so this page works inside Lavish (npx -y lavish-axi), which
-wraps a local HTML file in an iframe and adds an annotation and chat layer:
-  - diagrams go in <div class="mermaid"> so they become editable whiteboards
-  - questions use native <input type=radio> so they are interactive as-is
-  - all paths are relative
-The page renders identically in a plain browser; Lavish is optional.
+Diagrams use inert local markup, open questions retain stable decision IDs, and
+all paths are relative so the page works directly from disk or through the
+authenticated loopback board without an external wrapper.
 """
 from __future__ import annotations
 
 import argparse
 import html
 import json
+import os
 import posixpath
 import re
 import shutil
@@ -49,9 +46,13 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import md as markdown  # noqa: E402  (sibling module, not a package)
 import board_client  # noqa: E402  (shared generated-page navigation)
+import schema as artifact_schema  # noqa: E402  (shared artefact contract)
+import project_context  # noqa: E402  (shared configured roots)
+import release as kit_release  # noqa: E402  (authoritative fixed kit paths)
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "src"
+CONTEXT = project_context.load_configured_context(ROOT)
+GAME_ROOT = CONTEXT.game_root
 SHAPE = ROOT / "project.shape.json"
 PROPOSAL = ROOT / "proposal.json"
 DOCS = ROOT / "docs"
@@ -69,6 +70,15 @@ def load(path: Path) -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def artefact_errors() -> List[Tuple[str, str]]:
+    """Return schema failures before an invalid plan can replace a valid one."""
+    found: List[Tuple[str, str]] = []
+    for path, spec in ((PROPOSAL, "PROPOSAL"), (SHAPE, "SHAPE")):
+        errors, _warnings = artifact_schema.validate(path, spec)
+        found.extend((path.name, error) for error in errors)
+    return found
 
 
 def esc(value: Any) -> str:
@@ -179,34 +189,56 @@ def git(*args: str) -> Tuple[int, str]:
         return 1, ""
 
 
-SKIP_PREFIX = ("tests/", "addons/", "tools/", ".godot/")
+SKIP_PREFIX = (
+    "tests/", "addons/", "tools/", ".checklogs/", ".git/", ".kit/",
+    ".godot/", ".godot_doc/",
+)
+ROOT_KIT_PREFIX = (
+    ".agents/", ".checklogs/", ".git/", ".github/", ".kit/",
+    ".godot_doc/", "docs/", "plan/",
+)
+ROOT_PROJECT_STATE = {
+    "plan.html", "retro.html", "project.shape.json", "proposal.json",
+    "retro.config.json",
+}
 SKIP_SUFFIX = (".import", ".uid")
 
 
 def is_authored_game_file(rel: str) -> bool:
-    """Return whether a relative src path is authored project content."""
+    """Return whether a ``res://``-relative path is authored game content."""
     if rel == "project.godot" or rel.startswith(SKIP_PREFIX):
+        return False
+    if CONTEXT.game_layout == "." and (
+        rel in ROOT_PROJECT_STATE
+        or rel.startswith(ROOT_KIT_PREFIX)
+        or kit_release.is_allowlisted(rel)
+    ):
         return False
     return not rel.endswith(SKIP_SUFFIX)
 
 
 def real_files() -> set:
-    """Authored game files, relative to src/. Tests and addons are not structure."""
+    """Authored game files relative to ``res://``; kit state is excluded."""
     out = set()
-    if not SRC.is_dir():
+    if not GAME_ROOT.is_dir():
         return out
-    for f in SRC.rglob("*"):
-        if not f.is_file():
-            continue
-        rel = str(f.relative_to(SRC)).replace("\\", "/")
-        if not is_authored_game_file(rel):
-            continue
-        out.add(rel)
+    for directory, names, files in os.walk(GAME_ROOT):
+        base = Path(directory)
+        relative_base = base.relative_to(GAME_ROOT).as_posix()
+        prefix = "" if relative_base == "." else relative_base + "/"
+        names[:] = [
+            name for name in names
+            if is_authored_game_file(prefix + name + "/placeholder")
+        ]
+        for name in files:
+            rel = prefix + name
+            if is_authored_game_file(rel):
+                out.add(rel)
     return out
 
 
 def touched_since(baseline: str) -> set | None:
-    """Files under src/ changed since the approval sha, or None if unknown.
+    """Game files changed since the approval sha, or ``None`` if unknown.
 
     Without this, every file that predates the slice reads as "unproposed",
     which buries the two or three that genuinely are. Untracked files must be
@@ -215,16 +247,19 @@ def touched_since(baseline: str) -> set | None:
     """
     if not baseline or not shutil.which("git"):
         return None
-    code, tracked = git("diff", "--name-only", baseline, "--", "src")
+    pathspec = CONTEXT.git_pathspec
+    code, tracked = git("diff", "--name-only", baseline, "--", pathspec)
     if code != 0:
         return None
-    _, untracked = git("ls-files", "--others", "--exclude-standard", "--", "src")
+    _, untracked = git(
+        "ls-files", "--others", "--exclude-standard", "--", pathspec
+    )
     out = set()
     for line in (tracked + "\n" + untracked).splitlines():
         line = line.strip().replace("\\", "/")
-        if not line.startswith("src/"):
+        rel = CONTEXT.game_relative(line)
+        if rel is None:
             continue
-        rel = line[len("src/"):]
         if is_authored_game_file(rel):
             out.add(rel)
     return out
@@ -526,6 +561,34 @@ a{color:var(--acc)}
 .sig{color:var(--dim)}
 .foot{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);
 color:var(--dim);font-size:12px}
+.front{margin:18px 0 26px}
+.front-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(260px,.65fr);
+gap:12px;margin:12px 0}
+.front-card{background:var(--card);border:1px solid var(--line);border-radius:9px;
+padding:15px 17px}
+.front-card h2{border:0;margin:0 0 9px;padding:0;font-size:12px;color:var(--dim)}
+.outcome{font-size:17px;font-weight:650;line-height:1.4;margin:0 0 7px}
+.front-meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+.metric{border:1px solid var(--line);border-radius:999px;padding:2px 9px;
+font-size:11.5px;color:var(--dim)}
+.metric.bad{color:var(--bad);border-color:#5c2224}
+.metric.warn{color:var(--warn);border-color:#5a4410}
+.metric.ok{color:var(--ok);border-color:#1f4d2b}
+.decision-stack{display:grid;gap:8px}
+.decision-card{background:#1a1710;border:1px solid #5a4410;border-left:3px solid var(--warn);
+border-radius:7px;padding:11px 13px}
+.decision-card .ask{font-weight:650;margin-bottom:3px}
+.decision-card .answer{color:#c5ced8;font-size:12.5px}
+.decision-card ul{margin:6px 0 0;padding-left:19px;color:#c5ced8}
+.decision-card code{user-select:all}
+.clear{background:#101b14;border-color:#1f4d2b;border-left-color:var(--ok)}
+.record{margin-top:22px;border:1px solid var(--line);border-radius:9px;background:#11141b}
+.record>summary{cursor:pointer;padding:14px 16px;font-weight:650;list-style:none}
+.record>summary::-webkit-details-marker{display:none}
+.record>summary::before{content:"▸";color:var(--dim);font-size:11px;margin-right:8px}
+.record[open]>summary::before{content:"▾"}
+.record>.record-body{padding:0 16px 18px;border-top:1px solid var(--line)}
+@media(max-width:760px){.front-grid{grid-template-columns:1fr}}
 #retro-banner{margin:14px 0}
 #retro-banner .rb{padding:10px 14px;border-radius:7px;font-size:13px;
 border:1px solid var(--line);background:var(--card);margin-bottom:8px}
@@ -564,7 +627,7 @@ RETRO_BANNER_JS = """
     if(waiting){
       parts.push('<div class="rb action"><b>' + B.esc(waiting) + ' finding'
         + (waiting === 1 ? '' : 's') + ' awaiting your decision.</b> '
-        + 'Approving one dispatches a kit-builder immediately.'
+        + 'Approval is recorded even when no automatic worker is configured.'
         + '<a href="/retro.html">Review and action</a></div>');
     }
     host.innerHTML = parts.join('');
@@ -651,7 +714,7 @@ def file_state(path: str, prop_files: Dict[str, Any], built: set,
 
 def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
               depth: int, history: Dict[str, Any] | None = None) -> str:
-    """A mermaid graph from src/ down to functions, coloured by state.
+    """A mermaid graph from ``res://`` to functions, coloured by state.
 
     The module graph answers "what depends on what". It cannot answer "does the
     thing I approved exist", because approval happens at file and function level
@@ -712,8 +775,8 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
     lines = ["graph LR"]
     states: Dict[str, List[str]] = {"built": [], "missing": [], "extra": []}
 
-    root = nid("src/")
-    lines.append(f'    {root}(["src/"])')
+    root = nid("res://")
+    lines.append(f'    {root}(["res://"])')
 
     # folders, deepest-first ownership so a file appears exactly once
     folders = sorted({str(Path(f).parent).replace("\\", "/")
@@ -796,7 +859,9 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
            snapshot: str, mermaid_path: str = "",
            tree: Dict[str, Any] | None = None,
            history: Dict[str, Any] | None = None,
-           doc_targets: Dict[str, str] | None = None) -> str:
+           doc_targets: Dict[str, str] | None = None,
+           changed: set | None = None,
+           deleted: set | None = None) -> str:
     level = str(shape.get("involvement", "") or "").strip()
     depth = DEPTH.get(level, 3)
     name = shape.get("name") or "Untitled"
@@ -837,6 +902,140 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     # renders nothing at all rather than an error (it must never make the plan
     # look broken to say something optional).
     a('<div id="retro-banner"></div>')
+    # The plan has no board controls and therefore needs no connectivity
+    # banner, but a page/server protocol mismatch is security-relevant and
+    # must remain visible instead of falling through to console-only output.
+    a('<div id="board-errors"></div>')
+
+    # ---- decision-first front door. The old page put the current decision,
+    # the implementation tree, every historical decision and every document
+    # at one visual level. Preserve that record below, but first answer the
+    # three questions a reviewer actually arrives with: what are we trying to
+    # achieve, what needs my decision, and what evidence changed since approval?
+    front_questions = rows(shape, "questions")
+    front_refs = [r for r in rows(prop, "design_refs") if r.get("section")]
+    front_slice = str(prop.get("slice", "") or "").strip()
+    front_acks = {
+        str(x.get("warning", "") or "").strip(): x
+        for x in rows(prop, "acknowledged")
+        if str(x.get("slice", "") or "").strip() == front_slice
+    }
+    front_has_struct = any(rows(prop, key) for key in ("modules", "files", "functions"))
+    needs_design_decision = (front_has_struct and not front_refs
+                             and "no-design-refs" not in front_acks)
+    front_prop_files = {
+        str(f.get("path", "")).strip().replace("\\", "/")
+        for f in rows(prop, "files") if f.get("path")
+    }
+    front_history = {
+        str(f.get("path", "")).strip().replace("\\", "/")
+        for f in rows(history or {}, "files") if f.get("path")
+    }
+    missing_paths = sorted(
+        path for path in front_prop_files
+        if file_state(path, {path: {}}, built, front_history) == "missing"
+    )
+    deleted_paths = set(deleted or ())
+    extra_paths = sorted((changed or set()) - front_prop_files)
+    decision_count = (1 if status == "draft" else 0) + len(front_questions)
+    decision_count += 1 if needs_design_decision else 0
+    decision_count += 1 if status == "approved" and extra_paths else 0
+    exp = prop.get("experience")
+    player_does = (str(exp.get("player_does", "") or "").strip()
+                   if isinstance(exp, dict) else "")
+    feels_like = (str(exp.get("feels_like", "") or "").strip()
+                  if isinstance(exp, dict) else "")
+    outcome = player_does or front_slice or pitch or "No active outcome has been recorded."
+
+    a('<section class="front" aria-label="Plan summary">')
+    a('<div class="front-grid">')
+    a('<div class="front-card"><h2>Current outcome</h2>')
+    a(f'<div class="outcome">{esc(outcome)}</div>')
+    if feels_like:
+        a(f'<div class="m">Intended feel: {esc(feels_like)}</div>')
+    if front_slice and player_does:
+        a(f'<div class="m mono">slice {esc(front_slice)}</div>')
+    a('<div class="front-meta">')
+    status_label = ("approval required" if status == "draft" else
+                    "approved" if status == "approved" else
+                    status or "not proposed")
+    status_cls = "warn" if status == "draft" else "ok" if status == "approved" else ""
+    a(f'<span class="metric {status_cls}">{esc(status_label)}</span>')
+    a(f'<span class="metric{(" bad" if decision_count else " ok")}">'
+      f'{decision_count} decision{("" if decision_count == 1 else "s")} needed</span>')
+    if front_prop_files:
+        a(f'<span class="metric{(" warn" if missing_paths else " ok")}">'
+          f'{len(front_prop_files) - len(missing_paths)}/{len(front_prop_files)} '
+          'planned changes observed</span>')
+    if extra_paths:
+        a(f'<span class="metric bad">{len(extra_paths)} unapproved change'
+          f'{("" if len(extra_paths) == 1 else "s")}</span>')
+    a('</div></div>')
+
+    a('<div class="front-card"><h2>Latest evidence</h2>')
+    baseline = str(prop.get("baseline_sha", "") or "").strip()
+    if baseline:
+        a(f'<div class="t">Compared with <code>{esc(baseline[:12])}</code></div>')
+    if changed is None:
+        a('<div class="empty">Change scope is unavailable because the proposal has no '
+          'usable Git baseline.</div>')
+    else:
+        a(f'<div class="m">{len(changed)} authored game file'
+          f'{("" if len(changed) == 1 else "s")} changed since baseline.</div>')
+        if deleted_paths:
+            a(f'<div class="m">{len(deleted_paths)} of those '
+              f'{("was" if len(deleted_paths) == 1 else "were")} deleted.</div>')
+    a('<div class="m" style="margin-top:8px">Observed repository change scope, not a '
+      'completion claim. Only verification can prove the result.</div>')
+    a('</div></div>')
+
+    a('<h2>Needs your decision</h2>')
+    a('<div class="decision-stack">')
+    if status == "draft":
+        a('<div class="decision-card"><div class="ask">Approve this outcome and plan?</div>'
+          '<div class="answer">Review the experience and implementation detail below, then '
+          'tell the agent to approve it or name the change you need.</div></div>')
+    if needs_design_decision:
+        a('<div class="decision-card"><div class="ask">Build without a recorded design end state?</div>'
+          '<div class="answer">Recommended: settle the missing design section first. If you '
+          'accept the inference, tell the agent why; it cannot acknowledge this for you.</div></div>')
+    for q in front_questions:
+        qid = str(q.get("id", "") or "").strip()
+        a('<div class="decision-card">')
+        a(f'<div class="ask">{esc(q.get("question"))}</div>')
+        if q.get("blocks"):
+            a(f'<div class="answer">Blocks: {esc(q.get("blocks"))}</div>')
+        opts = q.get("options")
+        if isinstance(opts, list) and opts:
+            a('<ul>')
+            for opt in opts:
+                a(f'<li>{esc(opt)}</li>')
+            a('</ul>')
+        if qid:
+            a(f'<div class="m">Reply in chat with <code>{esc(qid)}</code> and your choice.</div>')
+        a('</div>')
+    if status == "approved" and extra_paths:
+        a('<div class="decision-card"><div class="ask">The implementation differs from the approved plan.</div>')
+        a('<div class="answer">Decide whether to revise and re-approve the plan before work continues: ')
+        a(', '.join(
+            f'<code>{esc(path)}</code>{" (deleted)" if path in deleted_paths else ""}'
+            for path in extra_paths[:4]
+        ))
+        if len(extra_paths) > 4:
+            a(f' and {len(extra_paths) - 4} more')
+        a('</div></div>')
+    if decision_count == 0:
+        remaining = (f' {len(missing_paths)} approved file'
+                     f'{(" remains" if len(missing_paths) == 1 else "s remain")} to be observed.'
+                     if missing_paths else "")
+        a('<div class="decision-card clear"><div class="ask">No decision is waiting.</div>'
+          '<div class="answer">No unresolved product choice is recorded.'
+          + esc(remaining) + '</div></div>')
+    a('</div>')
+    a('<details class="record"><summary>Review full plan and project record</summary>'
+      '<div class="record-body">')
+    a('<p class="legend">Implementation detail, design ancestry, history, architecture and '
+      'reference documentation are retained here for audit and deep review.</p>')
 
     # ---- experience first. Structure chosen before intended feel is a guess,
     # and every other artefact in this repo describes structure. This is the
@@ -1003,7 +1202,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     if hier:
         a('<p class="legend">Every folder, file'
           + (" and function" if depth >= 3 else "")
-          + " in this slice, from <code>src/</code> down."
+          + " in this slice, from <code>res://</code> down."
             " Green is built as approved, dashed amber is approved but not"
             " written, red exists without approval.</p>")
         a(f'<div class="mermaid">{esc(hier)}</div>')
@@ -1113,10 +1312,10 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
             a(f'<div class="m">blocks: {esc(q.get("blocks"))}</div>')
         opts = q.get("options")
         if isinstance(opts, list) and opts:
-            qid = esc(q.get("id") or "q")
-            for i, opt in enumerate(opts):
-                a(f'<label class="opt"><input type="radio" name="{qid}"'
-                  f' value="{i}"> {esc(opt)}</label>')
+            for opt in opts:
+                a(f'<div class="opt">• {esc(opt)}</div>')
+            a(f'<div class="m">Reply in chat with <code>{esc(q.get("id") or "q")}</code> '
+              'and your choice. This page never pretends a local click was saved.</div>')
         a(f'<div class="m mono">{esc(q.get("id"))} · raised'
           f' {esc(q.get("raised"))} by {esc(q.get("raised_by"))}</div>')
         a("</div>")
@@ -1256,6 +1455,8 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
               f'<code class="m">{esc(d["path"])}</code></summary>'
               f'<div class="body">{d["body"]}</div></details>')
 
+    a('</div></details></section>')
+
     a('<p class="foot">Generated by <code>tools/plan_html.py</code>. Do not edit'
       " this file: it is overwritten. Change <code>project.shape.json</code> or"
       " <code>proposal.json</code> and regenerate.</p>")
@@ -1289,7 +1490,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
           "</script>")
     else:
         a("<!-- No vendored mermaid at tools/vendor/mermaid.min.js. Diagrams"
-          " render as source text. Run: python bootstrap.py --fix -->")
+          " render as source text. Run: kit setup dependency mermaid -->")
     a("</div></body></html>")
     return "\n".join(p)
 
@@ -1301,14 +1502,27 @@ def main() -> int:
                     help="also write plan/NAME.html as a comparable snapshot")
     args = ap.parse_args()
 
+    invalid = artefact_errors()
+    if invalid:
+        print("plan: source artefact validation failed; existing output was preserved",
+              file=sys.stderr)
+        for name, error in invalid:
+            print(f"  {name}: {error}", file=sys.stderr)
+        affected = {name for name, _error in invalid}
+        if "proposal.json" in affected:
+            print("  inspect the contract: kit schema describe proposal", file=sys.stderr)
+        if "project.shape.json" in affected:
+            print("  inspect the contract: kit schema describe shape", file=sys.stderr)
+        return 1
+
     shape = load(SHAPE)
     prop = load(PROPOSAL)
     history = approved_history()
     mods, mermaid, tree = module_graph()
-    built = real_files()
+    present = real_files()
     scoped = touched_since(str(prop.get("baseline_sha", "") or "").strip())
-    if scoped is not None:
-        built &= scoped
+    built = present if scoped is None else present & scoped
+    deleted = set() if scoped is None else scoped - present
     doc_specs = [(DOCS, "docs/", DESIGN), (DESIGN, "docs/design/", None)]
     doc_targets = documentation_targets(doc_specs)
     kit_docs = read_docs(DOCS, "docs/", skip=DESIGN, targets=doc_targets)
@@ -1317,7 +1531,7 @@ def main() -> int:
     def build(depth: int) -> str:
         return render(shape, prop, mods, mermaid, built, recent(),
                       kit_docs, design_docs, args.slice, mermaid_src(depth),
-                      tree, history, doc_targets)
+                      tree, history, doc_targets, scoped, deleted)
 
     doc = build(0)
 

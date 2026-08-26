@@ -12,11 +12,9 @@ gdtoolkit's parser is documented as unstable and has hard-failed on new syntax
 after every engine release. So this parses the stable text formats directly,
 with no dependencies and no Godot binary.
 
-Usage:
-  python arch.py --check     exit 1 if ARCHITECTURE.md is stale or rules violated
-  python arch.py --write     regenerate the diagram in place
-  python arch.py --print     print the mermaid block to stdout
-  python arch.py --json      dump the raw graph
+Public usage:
+  kit verify --stage arch    check the graph and boundaries
+  kit architecture update    regenerate the diagram in place
 """
 
 from __future__ import annotations
@@ -29,15 +27,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
-PROJECT_DIR = ROOT / "src"
+sys.path.insert(0, str(ROOT / "tools"))
+import project_context  # noqa: E402
+
+CONTEXT = project_context.load_configured_context(ROOT)
+PROJECT_DIR = CONTEXT.game_root
 RULES_FILE = ROOT / "arch.rules.json"
 ARCH_DOC = ROOT / "ARCHITECTURE.md"
 
 BEGIN = "<!-- BEGIN GENERATED GRAPH -->"
 END = "<!-- END GENERATED GRAPH -->"
 
-EXCLUDED_DIRS = {".godot", "addons", "build", "export", ".git", ".checklogs",
-                 "__pycache__", ".claude"}
+EXCLUDED_DIRS = {
+    ".agents", ".checklogs", ".claude", ".git", ".github", ".godot",
+    ".godot_doc", ".kit", "__pycache__", "addons", "build", "docs",
+    "export", "plan",
+}
 
 # --- extraction patterns. Deliberately simple and format-stable. -------------
 RE_CLASS_NAME = re.compile(r"^\s*class_name\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
@@ -91,7 +96,7 @@ RE_FUNC = re.compile(
 
 
 def file_tree() -> Dict[str, Any]:
-    """Every source file under src/, with the functions each declares.
+    """Every source file under the configured game root, with its functions.
 
     The module graph answers "what depends on what". It cannot answer "does the
     thing I approved exist yet", because a module is a directory and approval
@@ -329,12 +334,12 @@ def main() -> int:
     # --check
     failed = False
     if not ARCH_DOC.is_file():
-        print(f"{ARCH_DOC.name} is missing; run: python arch.py --write")
+        print(f"{ARCH_DOC.name} is missing; run: kit architecture update")
         failed = True
     else:
         current = ARCH_DOC.read_text(encoding="utf-8")
         if splice(current, block) != current:
-            print(f"{ARCH_DOC.name} diagram is stale; run: python arch.py --write")
+            print(f"{ARCH_DOC.name} diagram is stale; run: kit architecture update")
             failed = True
     for line in violations:
         print(f"boundary violation: {line}")

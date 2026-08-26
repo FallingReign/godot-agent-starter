@@ -25,30 +25,26 @@ sections might apply.
 
 ## Folder structure
 
-Domains own their rules. There is no cross-domain folder.
+The kit contract is in `docs/DESIGN.md`. Project intent lives under
+`docs/design/`. Domains own their rules; there is no cross-domain folder.
 
 ```
 docs/design/
   INDEX.md              generated, do not edit
-  README.md             how design works in this repo
   pillars.md            goals every domain interprets for itself
-  world/                cells, terrain, structure, scale
-  movement/             movement, camera
-  frontend/             getting into the game, menu
-  combat/
-  loot/
-  ui/
-  multiplayer/          multiplayer, authority
-  ugc/                  format, authoring, moderation
+  <domain>.md           one concern starts as one document
+  <domain>/             when that concern needs child documents
+    <domain>.md         rules true of the whole concern
+    <child>.md          one narrower concern
 ```
 
 A domain starts as one file and grows a folder when a second document belongs in
-it. `multiplayer.md` becomes `multiplayer/multiplayer.md` plus
-`multiplayer/authority.md` when authority needs its own page.
+it. For example, `audio.md` can become `audio/audio.md` plus
+`audio/dynamic-mix.md` when mixing needs its own page.
 
 A shared rule lives in the domain that would be incoherent without it, and every
-other domain links to it. The cell grammar is in `world/cells.md` and `ui/`,
-`loot/` and `combat/` reference it rather than restating it. See
+other domain links to it. A controller-remapping rule belongs to the input domain;
+menus, accessibility and tutorials reference it rather than restating it. See
 `godot-design-sections` for the placement rule.
 
 Depth beyond two levels usually means a file covers several concerns. Split it
@@ -66,15 +62,15 @@ Design declares:
 
 | Tunable | What it controls | Range that still feels right |
 |---|---|---|
-| `movement.max_speed` | Peak horizontal speed | 260 to 380 |
+| `audio.music_level_db` | Music level relative to effects | -18 dB to -6 dB |
 ```
 
 Code claims:
 
 ```gdscript
-## @tune movement.max_speed
-## Peak horizontal speed. Above 380 it starts to feel floaty.
-@export var max_speed: float = 320.0
+## @tune audio.music_level_db
+## Music level relative to effects.
+@export var music_level_db: float = -12.0
 ```
 
 `tools/design.py` then generates a table inside the design section showing the

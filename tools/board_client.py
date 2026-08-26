@@ -29,11 +29,37 @@ both generated pages and works from a file:// double-click with no network.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BOARD_STATE = ROOT / "docs" / "retro" / "board.state.json"
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_paths  # noqa: E402
+
+BOARD_STATE = runtime_paths.resolve(ROOT).board_state
+PROTOCOL_SCHEMA = 2
+PROTOCOL_FILES = (
+    "board.py", "board_client.py", "providers.py", "run_result.py",
+    "runtime_paths.py", "retro_queue.py", "retro_rank.py", "retro_due.py",
+    "session_digest.py", "retro_html.py", "plan_html.py",
+)
+
+
+def protocol_version() -> str:
+    """Fingerprint the server/client contract so stale board code is refused."""
+    digest = hashlib.sha256()
+    tools = Path(__file__).resolve().parent
+    for name in PROTOCOL_FILES:
+        path = tools / name
+        try:
+            content = path.read_bytes()
+        except OSError:
+            return "unavailable"
+        digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
+    return digest.hexdigest()[:16]
 
 NAV_CSS = """
 .page-nav{display:flex;gap:12px;margin:0 0 18px;padding-bottom:10px;
@@ -121,10 +147,12 @@ def core_js(board_url_hint: str = "") -> str:
     print the loopback URL it should have been opened on.
     """
     hint = json.dumps(board_url_hint or "")
+    version = json.dumps(protocol_version())
     return """
 <script>
 window.Board = (function(){
   var HINT = __HINT__;
+  var EXPECTED_SCHEMA = __SCHEMA__, EXPECTED_VERSION = __VERSION__;
   var POLL_MS = __POLL__, POLL_MAX_MS = __POLLMAX__;
   var isFile = (location.protocol === 'file:');
   var mode = 'unknown';            // unknown | file | live | down
@@ -140,6 +168,10 @@ window.Board = (function(){
   }
   function byId(id){ return document.getElementById(id); }
   function boardUrl(){ return isFile ? (HINT || 'the loopback board') : location.origin + '/'; }
+  function capability(){
+    var meta = document.querySelector('meta[name="kit-board-token"]');
+    return meta ? String(meta.getAttribute('content') || '') : '';
+  }
 
   /* ------------------------------------------------------------ request
      Never throws, never returns a half-answer. Callers branch on .ok and
@@ -152,9 +184,18 @@ window.Board = (function(){
             + 'requests to the board. Open it on the loopback board instead'
             + (HINT ? ' (' + HINT + ').' : '.')});
     }
-    var init = {method: opts.method || 'GET'};
+    var method = String(opts.method || 'GET').toUpperCase();
+    var init = {method: method};
+    if(method !== 'GET'){
+      var token = capability();
+      if(!token){
+        return Promise.resolve({ok:false, status:0, path:path,
+          error:'This page has no live board capability. Reload it from the board URL.'});
+      }
+      init.headers = {'Content-Type':'application/json',
+                      'X-Kit-Board-Token':token};
+    }
     if(opts.body !== undefined){
-      init.headers = {'Content-Type':'application/json'};
       init.body = JSON.stringify(opts.body);
     }
     var status = 0;
@@ -262,8 +303,7 @@ window.Board = (function(){
         + '<div class="how">Open '
         + (HINT ? '<code>' + esc(HINT) + '</code>' : 'the board URL')
         + ' instead. If nothing is listening, run '
-        + '<code>python tools/retro_html.py</code>, which starts the board and '
-        + 'prints the URL.</div>';
+        + '<code>kit serve</code>, which starts the board and prints the URL.</div>';
       return;
     }
     el.className = 'show down';
@@ -272,9 +312,7 @@ window.Board = (function(){
       + '<code>' + esc(boardUrl()) + '</code>. The page you are reading may have '
       + 'outlived the board process that served it.'
       + '<div class="how">Bring it back with '
-      + '<code>python tools/board.py --ensure</code> (or '
-      + '<code>python tools/retro_html.py</code>, which starts it and regenerates '
-      + 'this page), then press Retry.</div>'
+      + '<code>kit serve</code>, then press Retry.</div>'
       + '<button type="button" id="board-retry">Retry now</button>';
     var btn = byId('board-retry');
     if(btn) btn.addEventListener('click', function(){
@@ -301,7 +339,15 @@ window.Board = (function(){
   function probe(){
     if(isFile){ setMode('file'); return Promise.resolve(false); }
     return request('/api/health').then(function(h){
-      if(!h.ok || !h.data || h.data.ok !== true){ setMode('down'); return false; }
+      if(!h.ok || !h.data || h.data.ok !== true
+         || h.data.schema !== EXPECTED_SCHEMA || h.data.version !== EXPECTED_VERSION){
+        setMode('down');
+        if(h.ok && h.data && (h.data.schema !== EXPECTED_SCHEMA
+                              || h.data.version !== EXPECTED_VERSION)){
+          showError('This page and board use different kit versions. Restart with kit serve.');
+        }
+        return false;
+      }
       setMode('live');
       return request('/api/state').then(function(s){
         if(!s.ok){ showError(s.error, s.path); return true; }
@@ -344,10 +390,10 @@ window.Board = (function(){
   }
 
   /* ------------------------------------------------- run status strip */
-  function labelClass(label){
-    label = String(label || '');
-    if(label === 'finished' || label.indexOf('finished') === 0) return 'finished';
-    if(label.indexOf('failed') === 0) return 'failed';
+  function labelClass(status){
+    status = String(status || '');
+    if(status === 'completed' || status === 'finished') return 'finished';
+    if(status === 'failed' || status === 'blocked' || status === 'unverified') return 'failed';
     return 'running';
   }
   function renderRuns(runs){
@@ -357,7 +403,7 @@ window.Board = (function(){
     el.innerHTML = runs.map(function(r){
       return '<div class="run">'
         + (r.queue_total ? '<span>' + esc(r.queue_position) + ' of ' + esc(r.queue_total) + '</span>' : '')
-        + '<span class="label ' + labelClass(r.status_label || r.status) + '">'
+        + '<span class="label ' + labelClass(r.status) + '">'
         + esc(r.status_label || r.status) + '</span>'
         + '<span>' + esc(r.persona || 'kit-builder')
         + (r.finding ? ' \\u2014 ' + esc(r.finding) : '') + '</span>'
@@ -386,9 +432,9 @@ window.Board = (function(){
           isFile:function(){ return isFile; }, mode:function(){ return mode; }};
 })();
 </script>
-""".replace("__HINT__", hint).replace("__POLL__", str(_POLL_MS)).replace(
-        "__POLLMAX__", str(_POLL_MAX_MS)
-    )
+""".replace("__HINT__", hint).replace("__SCHEMA__", str(PROTOCOL_SCHEMA)).replace(
+        "__VERSION__", version
+    ).replace("__POLL__", str(_POLL_MS)).replace("__POLLMAX__", str(_POLL_MAX_MS))
 
 
 def shell_html() -> str:

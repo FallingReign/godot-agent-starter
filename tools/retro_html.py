@@ -112,15 +112,16 @@ def mark_resolved_if_absent(entries: list[dict], present_titles: set[str]) -> bo
 # A row is {"title", "cost", "state", "updated_at"}; `state` is "" when only
 # the on-disk decision is known and the board has not spoken.
 
-# working/stalled first because live activity is what the human must see
-# immediately; failed last because it is over. Anything unrecognised sorts
-# after all of them rather than silently landing at the top.
-APPROVED_STATE_ORDER = {"working": 0, "stalled": 0, "queued": 1, "done": 2, "failed": 3}
-UNKNOWN_STATE_RANK = 4
+# Outcomes that require a decision come first, then live work, then the queue,
+# then verified history. Anything unrecognised sorts after all of them.
+APPROVED_STATE_ORDER = {"blocked": 0, "unverified": 0, "failed": 0,
+                        "approved": 1, "working": 2, "stalled": 2,
+                        "queued": 3, "done": 4}
+UNKNOWN_STATE_RANK = 5
 
 ORDER_CAPTIONS = {
     "toaction": "Ordered by cost, highest first. Findings that could not be ranked come last.",
-    "approved": "Ordered working or stalled first, then queued, then done, then failed; "
+    "approved": "Ordered attention needed first, then accepted, active, queued, and verified; "
                 "most recently updated first within each.",
     "deferred": "Ordered most recently deferred first.",
 }
@@ -197,8 +198,8 @@ border-radius:7px;padding:9px 13px;font-size:13px;margin:0 0 16px}
 
 .finding{background:var(--card);border:1px solid var(--line);border-radius:8px;
 padding:16px 18px 15px;margin:0 0 11px;display:grid;
-grid-template-columns:66px minmax(0,1fr);column-gap:16px}
-.finding .gutter{border-right:1px solid var(--line);padding-right:14px;text-align:right}
+grid-template-columns:30px minmax(0,1fr);column-gap:13px}
+.finding .gutter{border-right:1px solid var(--line);padding-right:10px;text-align:right}
 .finding .rank{display:block;color:#5c6473;font-size:11px;font-weight:700;letter-spacing:.06em}
 .finding .cost{display:block;font-size:21px;font-weight:700;color:var(--acc);
 line-height:1.15;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
@@ -216,6 +217,12 @@ padding:1.5px 7px;border-radius:9px;border:1px solid var(--line);color:var(--dim
 .finding .section .label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
 color:var(--dim);margin-bottom:2px}
 .finding .section .body p{margin:2px 0}
+.finding .section.recommend{background:#111c27;border:1px solid #26496b;
+border-left:3px solid var(--acc);border-radius:7px;padding:10px 12px;margin:11px 0}
+.finding .section.recommend .label{color:#9fcaff}
+.finding .section.success{background:#101b14;border:1px solid #1f4d2b;
+border-radius:7px;padding:9px 11px;margin:9px 0}
+.finding .section.success .label{color:var(--ok)}
 .finding .facts{color:var(--dim);font-size:12.5px;margin:8px 0 0}
 .finding details.evidence{margin:8px 0 0;padding:4px 12px;background:#0d1117;
 border-radius:6px;border:1px solid var(--line)}
@@ -231,9 +238,8 @@ font-family:inherit;box-sizing:border-box}
 .decision-form textarea{width:100%;min-height:44px;display:block;margin:0 0 2px;resize:vertical}
 .decision-form textarea:focus,.decision-form input:focus{outline:none;border-color:var(--acc)}
 
-/* Approving dispatches (decision 4). The primary action uses the accent
-   blue, not amber -- amber is reserved for the warning line below the
-   button row, which is where "no second confirmation" belongs. */
+/* Approval is the primary durable decision. A configured automatic provider
+   may also queue an isolated worker; amber is reserved for that consequence. */
 .btn{appearance:none;border-radius:6px;font:inherit;font-weight:600;cursor:pointer;
 padding:7px 14px;border:1px solid;font-size:13px}
 .approve-btn{background:var(--acc);color:#08111d;border-color:var(--acc);
@@ -294,12 +300,16 @@ border:1px solid var(--line);margin-right:8px}
 .status-slot .detail{color:var(--dim);margin-top:5px}
 .status-slot code{background:#151b24;padding:1px 6px;border-radius:4px;user-select:all}
 .status-slot.queued .pill{color:var(--dim)}
+.status-slot.approved{border-color:#785f24;background:#1d190f}
+.status-slot.approved .pill{color:var(--warn);border-color:#785f24}
 .status-slot.working{border-color:#2a5a8f}
 .status-slot.working .pill{color:var(--acc);border-color:#2a5a8f}
 .status-slot.done{border-color:#1f4d2b}
 .status-slot.done .pill{color:var(--ok);border-color:#1f4d2b}
-.status-slot.failed,.status-slot.stalled{border-color:var(--bad);background:#241416}
-.status-slot.failed .pill,.status-slot.stalled .pill{color:#fff;background:var(--bad);
+.status-slot.failed,.status-slot.blocked,.status-slot.unverified,.status-slot.stalled{
+border-color:var(--bad);background:#241416}
+.status-slot.failed .pill,.status-slot.blocked .pill,.status-slot.unverified .pill,
+.status-slot.stalled .pill{color:#fff;background:var(--bad);
 border-color:var(--bad)}
 .status-slot.stalled{animation:stall-pulse 1.6s ease-in-out infinite}
 .status-slot.stalled .detail{color:#f0c9c9}
@@ -328,16 +338,15 @@ DISPATCH_JS = """
   var STALL = __STALL__;
 
   /* ------------------------------------------------ exact prompt preview
-     Decision 4 dispatches on approval, so the human must be able to read
-     the prompt BEFORE approving. The card ships with the on-disk artifact
+     The human must be able to read the implementation prompt BEFORE approving.
+     The card ships with the on-disk artifact
      prompt inlined (so file:// can read it too); opening the disclosure on
      a live board replaces it with prompt_preview from the board, which is
      render_prompt(item, "") -- the same function the spawn path calls. */
   function wirePromptPreview(det){
-    /* A settled finding's prompt is history: it was already sent (or, for a
-       deferral, deliberately not sent). Refetching the live preview here
-       would overwrite the past-tense caption with "will be sent" and make a
-       dispatched item read as one still awaiting a decision. */
+    /* A settled finding's prompt is approved history, whether it was handed
+       off automatically, kept for manual work, or deliberately deferred.
+       Refetching it would blur that durable decision boundary. */
     if(det.getAttribute('data-settled')) return;
     var slug = det.getAttribute('data-slug');
     var loaded = false;
@@ -360,7 +369,7 @@ DISPATCH_JS = """
           + 'board. Your comment is appended below it.'
           + (d.stale ? '<span class="stale"> The findings file has changed since '
                      + 'this prompt was built \\u2014 it is stale. Re-run '
-                     + '<code>python tools/retro_queue.py</code>.</span>' : '');
+                     + '<code>kit retro publish</code>.</span>' : '');
       });
     });
   }
@@ -377,9 +386,12 @@ DISPATCH_JS = """
     var all = [comment, approve, toggle, reason, confirmDefer, cancel];
 
     if(approve) approve.addEventListener('click', function(){
-      B.guard(all, 'dispatching\\u2026', function(){
+      var requestId = (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : ('req-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+      B.guard(all, 'approving\\u2026', function(){
         return B.request('/api/finding/approve', {method:'POST',
-          body:{slug:slug, comment:(comment ? comment.value : '')}})
+          body:{slug:slug, comment:(comment ? comment.value : ''), request_id:requestId}})
           .then(function(res){
             if(!res.ok){ B.showError(res.error, res.path); return; }
             B.refresh();
@@ -460,12 +472,18 @@ DISPATCH_JS = """
         ? ' \\u2014 last output ' + B.esc(B.fmtMinutes(silent)) + ' ago.' : '.');
     } else if(state === 'queued'){
       head = 'Queued behind a running worker. One finding runs at a time.';
+    } else if(state === 'approved'){
+      head = 'Accepted. No implementation worker was started.';
     } else if(state === 'failed'){
       head = 'The worker exited non-zero'
            + (run && run.exit_code != null ? ' (exit ' + B.esc(run.exit_code) + ')' : '')
            + '. The queue is halted until this is dealt with.';
+    } else if(state === 'blocked'){
+      head = 'The worker reported a blocker. The queue is halted; review the reason before retrying.';
+    } else if(state === 'unverified'){
+      head = 'The worker did not supply evidence that proves implementation. Nothing is marked done.';
     } else if(state === 'done'){
-      head = 'Finished.';
+      head = 'Implemented and independently verified.';
     } else if(state === 'deferred'){
       head = 'Deferred. Nothing was dispatched.';
     }
@@ -494,8 +512,9 @@ DISPATCH_JS = """
      sorted by the SAME rule retro_html.order_rows() used when the page was
      generated (retro_html.APPROVED_STATE_ORDER / _cmp_*). Pure function of
      the row data: no DOM order, no findings[] order, no dict order. */
-  var STATE_ORDER = {working:0, stalled:0, queued:1, done:2, failed:3};
-  var UNKNOWN_RANK = 4;
+  var STATE_ORDER = {blocked:0, unverified:0, failed:0, approved:1,
+                     working:2, stalled:2, queued:3, done:4};
+  var UNKNOWN_RANK = 5;
 
   function cmp(a, b){ return a > b ? 1 : (a < b ? -1 : 0); }
 
@@ -558,6 +577,8 @@ DISPATCH_JS = """
     var findings = (state && state.findings) || [];
     var runs = (state && state.runs) || [];
     var byRun = {}, bySlug = {};
+    var worker = state && state.providers ? state.providers.worker : null;
+    var automaticWorker = !!(worker && worker.automatic);
     runs.forEach(function(r){ if(r && r.run_id) byRun[r.run_id] = r; });
     findings.forEach(function(f){ if(f && f.slug) bySlug[f.slug] = f; });
 
@@ -578,6 +599,16 @@ DISPATCH_JS = """
       card.classList.toggle('is-stale', !!(f && f.stale));
       var settled = bucketOf(row.decided, row.state, row.stalled) !== 'toaction';
       var form = card.querySelector('.decision-form');
+      var approve = card.querySelector('.approve-btn');
+      var quota = card.querySelector('.quota-warn');
+      if(approve) approve.textContent = automaticWorker
+        ? 'Approve & queue isolated implementation' : 'Approve finding';
+      if(quota) quota.innerHTML = automaticWorker
+        ? '<b>Approval will attempt to start an isolated worker and may spend quota.</b> '
+          + 'If the provider or committed baseline is unavailable, the decision is still '
+          + 'recorded and Activity states why nothing ran.'
+        : '<b>Approval records the decision only; it does not launch a worker.</b> '
+          + 'The exact implementation prompt remains available for a manual handoff.';
       if(form) form.style.display = settled ? 'none' : '';
       // "Awaiting review" on an item the board is already running is a lie the
       // human has to reconcile; hide the whole unticked block, not just its
@@ -722,11 +753,44 @@ def render_evidence(f: dict, digests: dict[str, dict]) -> str:
             + "".join(quotes) + "".join(mech_lines) + "</details>")
 
 
-def render_section(label: str, text: str) -> str:
+def render_section(label: str, text: str, kind: str = "") -> str:
     if not text:
         return ""
-    return (f'<div class="section"><div class="label">{esc(label)}</div>'
+    suffix = f" {kind}" if kind else ""
+    return (f'<div class="section{suffix}"><div class="label">{esc(label)}</div>'
             f'<div class="body">{md.render(text)}</div></div>')
+
+
+LEGACY_PROPOSAL_RE = re.compile(
+    r"(?ims)^\*\*(?:proposed(?:\s+kit/process)?\s+change|proposed\s+fix|proposal)\*\*"
+    r"\s*[\u2014\u2013:-]*\s*(.*?)(?=^\*\*|\Z)"
+)
+LEGACY_MEASURE_RE = re.compile(
+    r"(?ims)^\*\*(?:mechanically\s+checkable|measure|success)\*\*"
+    r"\s*[\u2014\u2013:-]*\s*(.*?)(?=^\*\*|\Z)"
+)
+
+
+def decision_sections(body: str) -> dict[str, str]:
+    """Return decision-facing sections, including honest legacy extraction.
+
+    Older findings predate the explicit Problem/Proposal/Measure headings but
+    consistently used bold ``Proposed change`` and ``Mechanically checkable``
+    paragraphs. Treating their whole body as one opaque note buried the actual
+    recommendation. This is a display adapter only; evidence files stay
+    untouched and new analyzer output must still satisfy the strict schema.
+    """
+    sections = retro_rank.extract_sections(body)
+    if any(sections.values()):
+        return sections
+    proposal_match = LEGACY_PROPOSAL_RE.search(body)
+    if not proposal_match:
+        return sections
+    measure_match = LEGACY_MEASURE_RE.search(body)
+    problem = body[:proposal_match.start()].strip()
+    proposal = proposal_match.group(1).strip()
+    measure = measure_match.group(1).strip() if measure_match else ""
+    return {"problem": problem, "proposal": proposal, "measure": measure}
 
 
 # Tense follows the decision, because the same block means three different
@@ -735,19 +799,19 @@ def render_section(label: str, text: str) -> str:
 # taken and cannot be taken again; on a deferral nothing was ever sent at all.
 PROMPT_SUMMARY = {
     "": "The exact prompt that will be sent &mdash; read it before approving",
-    "approved": "The exact prompt that was sent",
+    "approved": "The exact implementation prompt that was approved",
     "deferred": "The prompt that would have been sent &mdash; this finding was deferred, "
                 "so nothing was dispatched",
 }
 PROMPT_COMMENT_NOTE = {
     "": "Your comment is appended below it.",
-    "approved": "Your comment was appended below it.",
+    "approved": "Your approved comment is appended below it.",
     "deferred": "Nothing was dispatched.",
 }
 
 
 def render_prompt_block(item: dict | None, decided: str = "") -> str:
-    """The exact prompt, readable before approval (decision 4).
+    """The exact implementation prompt, readable before approval.
 
     The artifact's own prompt is inlined so a `file://` reader sees it too;
     `render_prompt(item, "")` is by construction identical to `item["prompt"]`,
@@ -759,13 +823,13 @@ def render_prompt_block(item: dict | None, decided: str = "") -> str:
         if decided:
             return '<div class="stale-flag">No dispatch artifact for this finding.</div>'
         return ('<div class="stale-flag">No dispatch artifact for this finding. Run '
-                "<code>python tools/retro_queue.py</code> to build one; until then it "
+                "<code>kit retro publish</code> to build one; until then it "
                 "cannot be approved.</div>")
     # Staleness is a warning about a decision still to be made. On a settled
     # finding the prompt shown is the record of what was (or was not) sent, so
     # there is nothing to re-run before doing anything.
     stale = ('<div class="stale-flag">The findings file has changed since this prompt was '
-             "built, so it is stale. Re-run <code>python tools/retro_queue.py</code> before "
+             "built, so it is stale. Re-run <code>kit retro publish</code> before "
              "approving.</div>") if (retro_queue.is_stale(item) and not decided) else ""
     prompt = retro_queue.render_prompt(item, "")
     settled_attr = f' data-settled="{esc(decided)}"' if decided else ""
@@ -774,7 +838,7 @@ def render_prompt_block(item: dict | None, decided: str = "") -> str:
         + f'<details class="prompt-block" data-slug="{esc(item["slug"])}"{settled_attr}>'
         + f'<summary>{PROMPT_SUMMARY[decided]}</summary>'
         + '<div class="src">From the on-disk artifact '
-        + f'<code>docs/retro/queue/{esc(item["slug"])}.json</code>, built '
+        + f'<code>.kit/runtime/retro/queue/{esc(item["slug"])}.json</code>, built '
         + f'{esc(item.get("generated_at", "") or "unknown")}. '
         + f'{PROMPT_COMMENT_NOTE[decided]}</div>'
         + f"<pre>{esc(prompt)}</pre></details>"
@@ -782,12 +846,14 @@ def render_prompt_block(item: dict | None, decided: str = "") -> str:
 
 
 def render_decision(title: str, item: dict | None,
-                    accepted: dict[str, dict], deferred: dict[str, dict]) -> str:
+                    accepted: dict[str, dict], deferred: dict[str, dict],
+                    block_reason: str = "") -> str:
     """Recorded decision, or the approve-with-comment control.
 
-    One control, not two clicks: writing the comment is the conscious act and
-    approving dispatches immediately (decision 4). The warning therefore lives
-    on the button, because there is no confirmation step behind it.
+    The board updates the action copy from live provider state: a manual
+    provider records the decision only, while an automatic provider attempts a
+    project-isolated dispatch. The server remains authoritative if readiness
+    changes between the latest poll and the click.
     """
     key = retro_rank.normalise_title(title)
     acc = accepted.get(key)
@@ -816,6 +882,9 @@ def render_decision(title: str, item: dict | None,
         if dfr.get("recurred_at"):
             parts.append('<div class="note">recurred with new evidence since being deferred '
                          "-- score boosted</div>")
+    elif block_reason:
+        parts.append("<b>&#9744; Not dispatchable yet.</b>")
+        parts.append(f'<div class="note">{esc(block_reason)}</div>')
     else:
         parts.append("<b>&#9744; Awaiting review.</b>")
         if item:
@@ -833,17 +902,16 @@ def render_decision(title: str, item: dict | None,
                 f'<div class="decision-form" data-slug="{esc(item["slug"])}">'
                 '<textarea class="comment" rows="3" data-board-control '
                 'placeholder="Decisions or tweaks to the proposed solution. '
-                'Leave empty to dispatch the proposal as written."></textarea>'
+                'Leave empty to approve the proposal as written."></textarea>'
                 '<div class="row">'
                 '<button type="button" class="approve-btn" data-board-control>'
-                "Approve &amp; dispatch now</button>"
+                "Approve finding</button>"
                 '<button type="button" class="defer-toggle-btn" data-board-control '
                 'data-defer>Defer instead</button>'
                 "</div>"
-                '<span class="quota-warn"><b>Approving starts a kit-builder worker '
-                "immediately and spends quota.</b> There is no second confirmation: this "
-                "comment is the conscious decision. Whatever you write is appended to the "
-                "prompt above and wins where it disagrees with the proposal.</span>"
+                '<span class="quota-warn"><b>Approval records this decision.</b> '
+                "The live board states whether the configured provider will also attempt "
+                "an isolated implementation.</span>"
                 '<div class="deferbox" hidden>'
                 '<input class="defer-reason" data-board-control '
                 'placeholder="reason for deferring, in your words">'
@@ -887,7 +955,7 @@ def render_finding(rank: int | None, f: dict, digests: dict[str, dict],
     notes = f.get("notes") or []
     raw_note = next((n for n in notes if n.startswith("raw cost")), "")
     raw_m = RAW_COST_RE.search(raw_note) if raw_note else None
-    sections = retro_rank.extract_sections(f.get("body", ""))
+    sections = decision_sections(f.get("body", ""))
     slug = (item or {}).get("slug", "")
     key = retro_rank.normalise_title(f["title"])
     acc, dfr = accepted.get(key), deferred.get(key)
@@ -903,23 +971,15 @@ def render_finding(rank: int | None, f: dict, digests: dict[str, dict],
         f' data-title="{esc(key)}" data-decided="{decided}"'
         f' data-updated="{esc(updated)}">'
     ]
-    # Left gutter: rank, cost, effort -- separated from the content by a
-    # hairline. The title, not the cost, is the largest thing on the card.
+    # The score still drives deterministic ordering and remains in the audit
+    # disclosure, but the decision surface only needs rank. A four-decimal
+    # cost and raw discount calculation look precise without helping a person
+    # decide whether the proposed correction is sound.
     gutter = [f'<span class="rank">{"" if rank is None else f"{rank}."}</span>']
-    if cost is not None:
-        gutter.append(f'<span class="cost">{cost:.2f}</span>')
-        if effort is not None:
-            gutter.append(f'<span class="effort">effort {effort}</span>')
-    else:
-        gutter.append('<span class="effort">unranked</span>')
     out.append('<div class="gutter">' + "".join(gutter) + "</div>")
 
     out.append('<div>')
     out.append(f'<h3 class="title">{esc(f["title"])}</h3>')
-    # The discount explanation is prose, so it belongs in the content column --
-    # inside the 66px gutter it wraps to one word a line.
-    if cost is not None and raw_m:
-        out.append(f'<div class="raw">{esc(raw_note)}</div>')
     badges = []
     quick_win = cost is not None and effort is not None and retro_rank.is_quick_win(cost, effort)
     if quick_win:
@@ -930,26 +990,47 @@ def render_finding(rank: int | None, f: dict, digests: dict[str, dict],
         out.append('<div class="badges">' + "".join(badges) + "</div>")
     if cost is None:
         reason = unranked_reason(notes)
-        out.append('<div class="unranked-note">No cost: ' + esc(reason or "this finding could "
-                   "not be ranked") + ". It sits at the bottom of the list rather than "
-                   "carrying a number it has not earned.</div>")
+        out.append('<div class="unranked-note">Observation only: '
+                   + esc(reason or "insufficient attributable evidence to prioritise")
+                   + ".</div>")
 
-    # Everything the human reads only when deciding *this* finding is collapsed
-    # so the decision controls are reachable without a long scroll. Nothing is
-    # dropped -- a citation that does not support its finding is the one failure
-    # only a reader can catch.
-    detail: list[str] = []
-    detail.append(render_section("Problem", sections["problem"]))
-    detail.append(render_section("Proposal", sections["proposal"]))
-    detail.append(render_section("Measure", sections["measure"]))
+    # Decision content stays in the open. The previous page collapsed the
+    # problem, proposed change and success measure while giving rank maths and
+    # dispatch plumbing more visual weight. That made the review fast to scan
+    # but impossible to decide from. Evidence and mechanics remain available
+    # immediately below as an audit disclosure.
+    out.append(render_section("Problem", sections["problem"]))
+    out.append(render_section("Recommended change", sections["proposal"], "recommend"))
+    success = sections["measure"]
+    if sections["proposal"] and not success:
+        success = ("Not recorded in this legacy finding. Define a checkable outcome before "
+                   "dispatching it; do not ask a worker to decide when the work is done.")
+    out.append(render_section("Success looks like", success, "success"))
     if not (sections["problem"] or sections["proposal"] or sections["measure"]) and f.get("body", "").strip():
         # Predates the problem/proposal/measure schema -- show the raw prose
         # rather than silently dropping it; it still needs re-deriving by a
         # fresh retro run, not hand-filled.
-        detail.append(render_section("Notes (predates diagnosis schema)", f["body"]))
+        out.append(render_section("Finding summary", f["body"]))
+
+    # Status and the actual decision follow the recommendation directly.
+    out.append('<div class="status-host"></div>')
+    block_reason = ""
+    if sections["proposal"] and not sections["measure"]:
+        block_reason = ("This legacy finding has no checkable success measure. Re-run the "
+                        "retrospective so it can be re-derived from immutable evidence.")
+    out.append(render_decision(f["title"], item, accepted, deferred, block_reason))
+
+    detail: list[str] = []
+    if cost is not None:
+        score = f"priority score {cost:.2f}"
+        if effort is not None:
+            score += f" · estimated effort {effort}"
+        detail.append(f'<div class="facts">{esc(score)}</div>')
+    if cost is not None and raw_m:
+        detail.append(f'<div class="raw">{esc(raw_note)}</div>')
     for note in notes:
         if note.startswith("raw cost") or UNRANKED_RE.match(note.strip()):
-            continue  # already shown next to the cost figure, or as the no-cost line
+            continue
         detail.append(f'<div class="note">{esc(note)}</div>')
     detail.append(
         f'<div class="facts">sessions {esc("; ".join(f["sessions"]) or "none")}'
@@ -958,13 +1039,9 @@ def render_finding(rank: int | None, f: dict, digests: dict[str, dict],
         f' &middot; fix_lines {f["fix_lines"]}</div>'
     )
     detail.append(render_evidence(f, digests))
-    out.append('<details class="detail-block"><summary>Full detail &mdash; problem, proposal, '
-               "measure, evidence</summary>" + "".join(detail) + "</details>")
-    # Filled by the board with state, status_detail, the approval comment and
-    # the resume command. Empty and invisible until there is something to say.
-    out.append('<div class="status-host"></div>')
-    out.append(render_prompt_block(item, decided))
-    out.append(render_decision(f["title"], item, accepted, deferred))
+    detail.append(render_prompt_block(item, decided))
+    out.append('<details class="detail-block"><summary>Evidence and dispatch details</summary>'
+               + "".join(detail) + "</details>")
     # Mount point for a future per-finding comment thread. Empty by design.
     out.append('<div class="thread-slot"></div>')
     out.append("</div>")  # closes the content column
@@ -975,14 +1052,14 @@ def render_finding(rank: int | None, f: dict, digests: dict[str, dict],
 LIST_HEADS = {
     "toaction": (
         "To action",
-        "Findings awaiting your decision. Each carries the exact prompt that will be sent, "
-        "because approving dispatches a worker immediately.",
+        "Findings awaiting your decision. Review the problem, recommended correction and "
+        "success measure; evidence and the exact dispatch prompt remain one click away.",
     ),
     "approved": (
-        "Approved &mdash; already sent",
-        "Settled. Nothing here is waiting on you, except an item that says <b>working</b> "
-        "with no output for a while: that is shown in red and pulsing, and it is not "
-        "progress, it is something to go and look at in the chat.",
+        "Activity",
+        "Accepted findings and their implementation evidence. An <b>approved</b> item "
+        "has no worker yet; a silent <b>working</b> item is shown in red when it needs "
+        "attention; only independently verified work is marked done.",
     ),
     "deferred": (
         "Deferred",
@@ -1007,23 +1084,29 @@ def collect(files: list[Path]) -> dict:
     deferred = {retro_rank.normalise_title(e.get("finding", "")): e for e in deferred_entries}
 
     all_findings: list[dict] = []
+    digests: dict[str, dict] = {}
     seen: set[str] = set()
     for path in files:
         text = path.read_text(encoding="utf-8")
         _header, findings = retro_rank.parse_findings(text)
+        cited_in_file = [f for f in findings if f["human_turns"] or f["mechanical"]]
+        file_digests: dict[str, dict] = {}
+        if cited_in_file:
+            file_digests, warnings, _personas = retro_rank.citation_report(cited_in_file)
+            for warning in warnings:
+                print(f"warning: {path.name}: {warning}", file=sys.stderr)
+        # Keep the resolver with the finding: S1 in two immutable snapshots is
+        # intentionally two different sessions and must never cross-resolve.
+        for finding in findings:
+            finding["_digests"] = file_digests
+        digests.update({key: value for key, value in file_digests.items()
+                        if key not in digests})
         for f in findings:
             key = retro_rank.normalise_title(f["title"])
             if key in seen:
                 continue  # first occurrence wins, matching retro_queue.build()
             seen.add(key)
             all_findings.append(f)
-
-    cited = [f for f in all_findings if f["human_turns"] or f["mechanical"]]
-    digests: dict[str, dict] = {}
-    if cited:
-        digests, warnings, _personas = retro_rank.citation_report(cited)
-        for w in warnings:
-            print(f"warning: {w}", file=sys.stderr)
 
     rows: dict[str, list[dict]] = {"toaction": [], "approved": [], "deferred": []}
     for f in all_findings:
@@ -1078,7 +1161,8 @@ def render(files: list[Path]) -> str:
         # Every card in a list is numbered by its position in that list, or
         # none is -- a page where 2 of 5 carry a number reads as broken.
         return [
-            render_finding(i, row["finding"], digests, accepted, deferred,
+            render_finding(i, row["finding"], row["finding"].get("_digests", {}),
+                           accepted, deferred,
                            retro_queue.load_by_title(row["finding"]["title"]))
             for i, row in enumerate(order_rows(kind, rows[kind]), start=1)
         ]
@@ -1156,13 +1240,14 @@ def latest_and_all_findings_files() -> list[Path]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stdout", action="store_true", help="print instead of writing")
+    ap.add_argument("--no-board", action="store_true",
+                    help="write the static report without starting or probing the board")
     args = ap.parse_args()
 
     files = latest_and_all_findings_files()
-    if not files:
-        print("no docs/retro/*-findings.md file found", file=sys.stderr)
-        return 1
-
+    # A newly distributed kit has no repository-specific findings yet. Its
+    # decision surface is still a valid, useful empty state and must render on
+    # day one instead of making the public `kit.py plan` workflow fail.
     doc = render(files)
     unreviewed, highest_cost = retro_rank.unreviewed_summary()
     if args.stdout:
@@ -1172,7 +1257,8 @@ def main() -> int:
     print(f"wrote {OUT.relative_to(ROOT)}")
     if unreviewed:
         print(f"{unreviewed} finding(s) awaiting review -- highest cost {highest_cost:.2f}")
-    _print_board_url()
+    if not args.no_board:
+        _print_board_url()
     return 0
 
 

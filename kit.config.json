@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "game_root": "src",
+  "runtime_root": ".kit/runtime",
+  "note_threshold": 10,
+  "providers": {
+    "analyzer": {
+      "kind": "manual",
+      "model": "",
+      "timeout_minutes": 30
+    },
+    "worker": {
+      "kind": "manual",
+      "model": "",
+      "persona": "kit-builder",
+      "timeout_minutes": 30
+    }
+  },
+  "dispatch_policy": {
+    "owned": [
+      ".agents",
+      ".github/agents",
+      "docs",
+      "tools",
+      "AGENTS.md",
+      "ARCHITECTURE.md",
+      "CLAUDE.md",
+      "README.md",
+      "SETUP.md",
+      "VERIFY.md",
+      "arch.py",
+      "arch.rules.json",
+      "bootstrap.py",
+      "check.py",
+      "gate.rules.json",
+      "import_profiles.json",
+      "kit.config.json",
+      "sanitise.py"
+    ],
+    "forbidden": [
+      ".agent-kit.json",
+      ".agents",
+      ".gate.sha256",
+      ".github/agents",
+      ".github/workflows",
+      ".kit",
+      "AGENTS.md",
+      "CLAUDE.md",
+      "arch.py",
+      "arch.rules.json",
+      "bootstrap.py",
+      "check.py",
+      "dependencies.lock.json",
+      "docs/design",
+      "docs/retro",
+      "gate.rules.json",
+      "import_profiles.json",
+      "kit",
+      "kit.cmd",
+      "kit.config.json",
+      "kit.py",
+      "project.shape.json",
+      "proposal.json",
+      "sanitise.py",
+      "src",
+      "tools"
+    ]
+  }
+}

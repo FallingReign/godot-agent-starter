@@ -50,19 +50,27 @@ evidence and stay in scope.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 RETRO_DIR = ROOT / "docs" / "retro"
 DEFERRED_FILE = RETRO_DIR / "deferred.json"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_paths  # noqa: E402
 import session_digest  # noqa: E402  (needs sys.path set first)
+import session_evidence  # noqa: E402
+
+_RUNTIME = runtime_paths.resolve(ROOT)
+SESSION_EVIDENCE_DIR = _RUNTIME.session_evidence
+BOARD_STATE_FILE = _RUNTIME.board_state
 
 # --------------------------------------------------------------- tunables
 #
@@ -178,6 +186,7 @@ KIT_BUILDER_PERSONA = "kit-builder"
 # ever reads them: that is what keeps a diagnosis from being able to raise a
 # finding's cost the way a banned "confidence" or "impact" field could.
 SECTION_RE = re.compile(r"\*\*(Problem|Proposal|Measure)\*\*\s*(?:[—-]{1,2}|:)?\s*", re.I)
+SNAPSHOT_RE = re.compile(r"^session_snapshot:\s*(\S+)\s*$", re.M)
 
 
 def extract_sections(body: str) -> dict[str, str]:
@@ -230,10 +239,9 @@ def implemented_findings() -> list[dict]:
     if not accepted:
         return []
 
-    board_state_file = RETRO_DIR / "board.state.json"
     try:
-        board_state = (json.loads(board_state_file.read_text(encoding="utf-8"))
-                        if board_state_file.exists() else {})
+        board_state = (json.loads(BOARD_STATE_FILE.read_text(encoding="utf-8"))
+                       if BOARD_STATE_FILE.exists() else {})
     except (OSError, ValueError):
         board_state = {}
     runs = board_state.get("runs", [])
@@ -248,7 +256,7 @@ def implemented_findings() -> list[dict]:
         if not f or not f.get("fix_files"):
             continue
         finished = any(
-            normalise_title(r.get("finding", "")) == key and r.get("status") == "finished"
+            normalise_title(r.get("finding", "")) == key and r.get("status") == "completed"
             for r in runs
         )
         if not finished:
@@ -361,6 +369,8 @@ def parse_findings(text: str) -> tuple[str, list[dict]]:
     boundaries = list(SECTION_BOUNDARY_RE.finditer(text))
     header = text[: matches[0].start()] if matches else text
     findings: list[dict] = []
+    snapshot_match = SNAPSHOT_RE.search(header)
+    session_snapshot = snapshot_match.group(1) if snapshot_match else ""
     for i, m in enumerate(matches):
         title = m.group(1).strip()
         start = m.end()
@@ -432,38 +442,114 @@ def parse_findings(text: str) -> tuple[str, list[dict]]:
             "effort": _int_field(fields["effort"]) if "effort" in fields else None,
             "notes": annotations,
             "body": body,
+            "session_snapshot": session_snapshot,
         })
     return header, findings
 
 
 # ------------------------------------------------------------ validation
 
-def citation_report(findings: list[dict]) -> tuple[dict[str, dict], list[str], dict[str, str]]:
-    """Resolve every citation against a live session_digest run.
+def _snapshot_citations(relative: str) -> tuple[dict[str, dict], dict[str, str], list[str]]:
+    warnings: list[str] = []
+    if (not isinstance(relative, str) or not relative or "\\" in relative
+            or any(ord(char) < 32 for char in relative)):
+        return {}, {}, [f"unsafe session snapshot path: {relative!r}"]
+    lexical = PurePosixPath(relative)
+    if (lexical.is_absolute() or not lexical.parts
+            or any(part in ("", ".", "..") for part in lexical.parts)
+            or ":" in lexical.parts[0]):
+        return {}, {}, [f"unsafe session snapshot path: {relative!r}"]
+    path = ROOT.joinpath(*lexical.parts)
+    try:
+        root_resolved = ROOT.resolve(strict=True)
+        allowed = SESSION_EVIDENCE_DIR.resolve(strict=False)
+        allowed.relative_to(root_resolved)
+        path.resolve(strict=False).relative_to(allowed)
+        path.relative_to(SESSION_EVIDENCE_DIR)
+    except (OSError, RuntimeError, ValueError):
+        return {}, {}, [f"unsafe session snapshot path: {relative!r}"]
+    cursor = ROOT
+    for part in lexical.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return {}, {}, [f"symlinked session snapshot path: {relative!r}"]
+    if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+        return {}, {}, [f"session snapshot is not content-addressed: {relative!r}"]
+    try:
+        content = path.read_bytes()
+        manifest = json.loads(content.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return {}, {}, [f"cannot read session snapshot {relative!r}: {exc}"]
+    actual = hashlib.sha256(content).hexdigest()
+    if path.stem != actual:
+        return {}, {}, [f"session snapshot hash mismatch: {relative!r}"]
+    if not isinstance(manifest, dict) or session_evidence.canonical_bytes(manifest) != content:
+        return {}, {}, [f"session snapshot is not canonical: {relative!r}"]
+    if (manifest.get("schema") != session_evidence.SCHEMA
+            or manifest.get("kind") != session_evidence.KIND):
+        return {}, {}, [f"unexpected session snapshot kind: {relative!r}"]
+    canonical_repository = os.path.normcase(os.path.abspath(ROOT)).replace("\\", "/").rstrip("/")
+    if manifest.get("repository") != canonical_repository:
+        return {}, {}, [f"session snapshot repository provenance mismatch: {relative!r}"]
+    sessions = manifest.get("sessions")
+    if not isinstance(sessions, list):
+        return {}, {}, [f"invalid session records in {relative!r}"]
+    digests: dict[str, dict] = {}
+    personas: dict[str, str] = {}
+    for ordinal, session in enumerate(sessions, 1):
+        if (not isinstance(session, dict) or session.get("ordinal") != ordinal
+                or not isinstance(session.get("session_id"), str)
+                or not session.get("session_id")
+                or not isinstance(session.get("evidence"), dict)):
+            return {}, {}, [f"invalid session records in {relative!r}"]
+        tag = f"S{ordinal}"
+        evidence = session["evidence"]
+        messages = evidence.get("human_messages")
+        if not isinstance(messages, list):
+            return {}, {}, [f"invalid human-message records in {relative!r}"]
+        human: list[str] = []
+        for number, message in enumerate(messages, 1):
+            expected = f"{session['session_id']}:H{number}"
+            if (not isinstance(message, dict) or message.get("citation") != expected
+                    or not isinstance(message.get("text"), str)):
+                return {}, {}, [f"invalid human-message records in {relative!r}"]
+            human.append(message["text"])
+        digests[tag] = {
+            "id": session.get("session_id", ""),
+            "started": session.get("started", ""),
+            "updated": session.get("updated", ""),
+            "model": evidence.get("model", ""),
+            "human": human,
+            "loops": evidence.get("loops") or {},
+            "rewrites": evidence.get("rewrites") or {},
+            "gate_fails": evidence.get("gate_fails") or {},
+            "warnings": session.get("warnings") or [],
+            "sources": session.get("sources") or {},
+        }
+        personas[tag] = evidence.get("persona") or "unattributed"
+    return digests, personas, warnings
 
-    Only digests the sessions actually cited -- the whole point of the
-    digest tool is that a full run is cheap, but there is no reason to parse
-    27 session logs to check three citations. Also returns the persona each
-    cited session ran under, so scoring can exclude kit-builder sessions.
+
+def citation_report(findings: list[dict]) -> tuple[dict[str, dict], list[str], dict[str, str]]:
+    """Resolve citations against the immutable snapshot bound to the report.
+
+    Legacy reports without a snapshot remain readable but are not reinterpreted
+    against today's mutable session discovery order.
     """
-    cited: set[str] = set()
-    for f in findings:
-        cited |= _sessions_from_text(
-            " ".join(f["sessions"]), " ".join(f["human_turns"]), " ".join(f["mechanical"])
-        )
-    found = session_digest.discover(ROOT)
-    by_index = {i: s for i, s in enumerate(found, 1)}
     warnings: list[str] = []
     digests: dict[str, dict] = {}
     personas: dict[str, str] = {}
-    for tag in sorted(cited, key=lambda t: int(t[1:])):
-        idx = int(tag[1:])
-        sess = by_index.get(idx)
-        if sess is None:
-            warnings.append(f"citation {tag}: no such session (only {len(found)} found for this repo)")
-            continue
-        digests[tag] = session_digest.digest_one(sess, idx)
-        personas[tag] = session_persona(sess["log"])
+    snapshots = {f.get("session_snapshot", "") for f in findings
+                 if f.get("session_snapshot")}
+    if len(snapshots) == 1:
+        digests, personas, snapshot_warnings = _snapshot_citations(next(iter(snapshots)))
+        warnings.extend(snapshot_warnings)
+    elif len(snapshots) > 1:
+        warnings.append("findings from multiple evidence snapshots must be resolved per file")
+    else:
+        warnings.append(
+            "legacy findings have no immutable session snapshot; citations were not resolved"
+        )
     for f in findings:
         for cite in f["human_turns"]:
             m = CITE_RE.fullmatch(cite.strip())

@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Import defaults, written into project.godot's [importer_defaults] block by",
-    "`python bootstrap.py --import-profile <name>`.",
+    "`kit setup profile <name>`.",
     "",
     "WHY THIS IS A DAY-ONE DECISION, not a later one:",
     "Godot writes every parameter individually into each .import sidecar rather",

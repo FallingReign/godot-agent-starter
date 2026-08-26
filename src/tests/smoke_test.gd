@@ -1,30 +1,31 @@
 extends Node
 
-## Headless boot check. Loads the real main scene and asserts it survives a few frames.
-## Catches missing assets, broken imports and init crashes, which --check-only misses.
+## Headless boot check. Loads the neutral maintainer fixture and asserts it
+## survives a few frames. Catches broken imports and init crashes, which
+## --check-only misses.
 ##
 ## Run: godot --headless --path . res://tests/smoke_test.tscn
 
-const MAIN_SCENE_PATH: String = "res://scenes/main.tscn"
+const BOOT_TARGET_PATH: String = "res://tests/fixtures/boot_target.tscn"
 const FRAMES_TO_SURVIVE: int = 10
 
 var _frames: int = 0
 
 
 func _ready() -> void:
-	if not ResourceLoader.exists(MAIN_SCENE_PATH):
-		_fail("main scene not found at %s" % MAIN_SCENE_PATH)
+	if not ResourceLoader.exists(BOOT_TARGET_PATH):
+		_fail("boot target not found at %s" % BOOT_TARGET_PATH)
 		return
-	var packed: PackedScene = load(MAIN_SCENE_PATH) as PackedScene
+	var packed: PackedScene = load(BOOT_TARGET_PATH) as PackedScene
 	if packed == null:
-		_fail("failed to load %s as PackedScene" % MAIN_SCENE_PATH)
+		_fail("failed to load %s as PackedScene" % BOOT_TARGET_PATH)
 		return
 	var instance: Node = packed.instantiate()
 	if instance == null:
-		_fail("failed to instantiate %s" % MAIN_SCENE_PATH)
+		_fail("failed to instantiate %s" % BOOT_TARGET_PATH)
 		return
 	add_child(instance)
-	print("SMOKE: instantiated %s" % MAIN_SCENE_PATH)
+	print("SMOKE: instantiated %s" % BOOT_TARGET_PATH)
 
 
 func _process(_delta: float) -> void:
@@ -32,7 +33,7 @@ func _process(_delta: float) -> void:
 	if _frames < FRAMES_TO_SURVIVE:
 		return
 	if get_child_count() == 0:
-		_fail("main scene vanished before frame %d" % _frames)
+		_fail("boot target vanished before frame %d" % _frames)
 		return
 	print("SMOKE: PASS after %d frames" % _frames)
 	get_tree().quit(0)

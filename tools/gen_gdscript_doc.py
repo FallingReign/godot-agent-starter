@@ -1,115 +1,109 @@
 #!/usr/bin/env python3
-"""Generate docs/GDSCRIPT.md from real code in this repo.
+"""Generate docs/GDSCRIPT.md from reviewed, project-neutral examples.
 
-Strict-mode GDScript demands specific idioms that a model trained on ordinary
-GDScript will not produce: typed loop iterators, typed locals, and explicit
-narrowing of Variant values. An authored cookbook would be a second source of
-truth that drifts. This derives every example from files that currently pass
-the gate, so the document is a projection of working code.
+The public reference must be useful in every project and must never become a
+copy of whichever game happened to be present when a maintainer built a kit.
+Examples therefore live here as a small reviewed corpus rather than being
+scraped from the configured game root.
 
-Run:  python tools/gen_gdscript_doc.py --write
+This is a kit-maintainer implementation detail, not a public project command.
 """
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
-SKIP = {".godot", "addons", "build", "export", ".git", ".checklogs"}
 
-# Constructs strict mode most often rejects. Each pattern matches a line that
-# demonstrates the CORRECT form, so examples come from code, never from here.
-PATTERNS: List[Tuple[str, str, re.Pattern]] = [
-    ("typed for-loop iterator",
-     'An untyped iterator fails: "for" iterator variable has an implicitly '
-     "inferred static type.",
-     re.compile(r"^\s*for\s+\w+\s*:\s*[\w\[\], .]+\s+in\s+")),
-    ("typed local declaration",
-     'An untyped or inferred local fails: cannot infer the type of a variable '
-     "because the value doesn't have a set type.",
-     re.compile(r"^\s*var\s+\w+\s*:\s*[\w\[\], .]+\s*=")),
-    ("Variant held in a typed local before use",
-     "Calling a method or passing a Variant directly fails. Assign it to a "
-     "typed local first, or narrow it.",
-     re.compile(r"^\s*var\s+\w+\s*:\s*Variant\s*=")),
-    ("narrowing a Variant to a number",
-     'int() and float() reject Variant: argument 1 should be "int" but is '
-     '"Variant". Wrap in str() or assign to a typed local first.',
-     re.compile(r"(int|float)\(\s*str\(")),
-    ("narrowing a Variant to a Dictionary or Array",
-     "An unsafe cast fails. Type the destination explicitly and check the "
-     "source type first.",
-     re.compile(r"^\s*var\s+\w+\s*:\s*(Dictionary|Array)[\w\[\], ]*\s*=")),
-    ("typed function signature",
-     "Every parameter needs a type and every function needs a return type, "
-     "including -> void.",
-     re.compile(r"^\s*(static\s+)?func\s+\w+\(.*:.*\)\s*->\s*\w+")),
-    ("typed constant",
-     "An inferred const fails the same way an inferred var does.",
-     re.compile(r"^\s*const\s+\w+\s*:\s*[\w\[\], .]+\s*=")),
-    ("signal connection, Godot 4 form",
-     "The Godot 3 string form parses but never fires. Use the Signal object.",
-     re.compile(r"\.\w+\.connect\(")),
+ExampleMap = Dict[str, List[str]]
+SECTIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
+    (
+        "typed for-loop iterator",
+        'An untyped iterator fails: "for" iterator variable has an implicitly '
+        "inferred static type.",
+        ("for label: String in labels:\n\tprint(label)",),
+    ),
+    (
+        "typed local declaration",
+        "An untyped or inferred local fails. Give every local an explicit type.",
+        ("var elapsed_seconds: float = 0.0",),
+    ),
+    (
+        "Variant held in a typed local before use",
+        "Hold data returned by a loose container as Variant until it has been validated.",
+        ('var raw_title: Variant = record.get("title", "")',),
+    ),
+    (
+        "narrowing a Variant to a number",
+        'int() and float() reject Variant under strict warnings. Convert through str() '
+        "after validating the accepted representation.",
+        ("var count: int = int(str(raw_count))",),
+    ),
+    (
+        "narrowing a Variant to a Dictionary or Array",
+        "Use an `is` branch so the analyser can prove the narrowed type.",
+        (
+            "var options: Dictionary = {}\n"
+            "if raw_options is Dictionary:\n"
+            "\toptions = raw_options",
+        ),
+    ),
+    (
+        "typed function signature",
+        "Every parameter needs a type and every function needs a return type, "
+        "including `-> void`.",
+        (
+            "func retained_strength(value: float) -> float:\n"
+            "\treturn value",
+        ),
+    ),
+    (
+        "typed constant",
+        "An inferred constant fails the same way an inferred variable does.",
+        ("const DEFAULT_LIMIT: int = 10",),
+    ),
+    (
+        "signal connection, Godot 4 form",
+        "The Godot 3 string form parses but never fires. Connect the Signal object.",
+        ("confirm_button.pressed.connect(_on_confirm_pressed)",),
+    ),
 ]
 
 
-def gd_files() -> List[Path]:
-    out: List[Path] = []
-    for p in sorted(ROOT.rglob("*.gd")):
-        if any(part in SKIP for part in p.relative_to(ROOT).parts):
-            continue
-        out.append(p)
-    return out
+def collect() -> ExampleMap:
+    """Return a copy of the reviewed neutral example corpus."""
+    return {name: list(examples) for name, _why, examples in SECTIONS}
 
 
-def collect() -> Dict[str, List[Tuple[str, str]]]:
-    """Map each construct to (location, source line) examples found in the repo."""
-    found: Dict[str, List[Tuple[str, str]]] = {name: [] for name, _, _ in PATTERNS}
-    for path in gd_files():
-        rel = path.relative_to(ROOT).as_posix()
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for num, line in enumerate(lines, start=1):
-            if line.strip().startswith("#"):
-                continue
-            for name, _, pat in PATTERNS:
-                if pat.search(line):
-                    found[name].append((f"{rel}:{num}", line.strip()))
-    return found
-
-
-def render(found: Dict[str, List[Tuple[str, str]]], per: int = 3) -> str:
+def render(found: ExampleMap, per: int = 3) -> str:
     out: List[str] = [
         "# GDScript under strict mode",
         "",
-        "**Generated** by `tools/gen_gdscript_doc.py` from code in this repo that",
-        "currently passes the gate. Do not edit by hand — regenerate instead.",
+        "**Generated** by the kit-maintainer documentation tool from reviewed,",
+        "project-neutral examples. Do not edit by hand.",
         "",
         "The `[debug]` warnings block in `project.godot` promotes untyped and unsafe",
         "operations to errors. That rejects several forms an LLM produces by default.",
-        "Every example below is a real line from this repo.",
+        "The examples deliberately contain no source from the configured game.",
         "",
     ]
-    for name, why, _ in PATTERNS:
-        examples = found.get(name, [])
+    for name, why, _examples in SECTIONS:
         out.append(f"## {name}")
         out.append("")
         out.append(why)
         out.append("")
+        examples = found.get(name, [])
         if not examples:
-            out.append("_No example in this repo yet._")
+            out.append("_No reviewed example available._")
             out.append("")
             continue
-        out.append("```gdscript")
-        for loc, src in examples[:per]:
-            out.append(f"{src}    # {loc}")
-        out.append("```")
-        out.append("")
+        for source in examples[:per]:
+            out.append("```gdscript")
+            out.extend(source.splitlines())
+            out.append("```")
+            out.append("")
     out.append("## The boundary rule (this is the one that matters)")
     out.append("")
     out.append(TAIL_BOUNDARY.strip())
@@ -122,20 +116,19 @@ def render(found: Dict[str, List[Tuple[str, str]]], per: int = 3) -> str:
     out.append("")
     out.append("Anything reaching you from a `Dictionary`, `Array`, `JSON.parse_string`,")
     out.append("`get()` or `FileAccess` is a `Variant`. Give it a typed home before you")
-    out.append("use it. One extra line per value, and the error disappears.")
+    out.append("use it. One explicit conversion per value keeps the looseness at the edge.")
     out.append("")
     return "\n".join(out)
 
 
 TAIL_BOUNDARY = """
-There is **no safe cast from Variant** in GDScript. `value as Type` trips
-`unsafe_cast`, direct assignment trips `unsafe_property_access`, and
-`Color(variant)` or `int(variant)` trip `unsafe_call_argument`. So fixing
-individual use sites never converges: each fix reveals the next one downstream.
-A field report of this loop ran for 242 turns and 19M tokens without finishing.
+There is **no general safe cast from Variant** in GDScript. `value as Type` can
+trip `unsafe_cast`, direct member access can trip `unsafe_property_access`, and
+passing an unchecked Variant to a typed constructor can trip
+`unsafe_call_argument`.
 
-The fix is structural, not syntactic. Convert external data **once**, at the
-boundary, then pass only typed values inward:
+The fix is structural, not a trail of casts. Convert external data **once**, at
+the boundary, then pass only typed values inward:
 
 - `scripts/data/` is the boundary. It parses, validates, and returns typed
   objects. Loose `Dictionary` and `Variant` are correct here.
@@ -143,26 +136,24 @@ boundary, then pass only typed values inward:
   calls `JSON.parse_string`, `FileAccess.open` or `ConfigFile`, and its
   signatures never contain a bare `Dictionary`, `Array` or `Variant`.
 
-The `types` gate stage enforces this direction. If it fires, do not add casts:
-move the conversion to the boundary and change the signature to accept the
-typed object.
+The `types` gate stage enforces this direction. If it fires, move conversion to
+the boundary and change the interior signature to accept the typed object.
 
-Two mechanisms are safe inside the boundary. `is` narrowing, because the
-analyser tracks the type inside the branch:
+Two mechanisms are safe inside the boundary. `is` narrowing lets the analyser
+track the type inside a branch:
 
 ```gdscript
-static func as_dict(v: Variant) -> Dictionary:
-	if v is Dictionary:
-		return v
+static func as_dictionary(value: Variant) -> Dictionary:
+	if value is Dictionary:
+		return value
 	return {}
 ```
 
-And `str()`, because it is vararg and accepts Variant. That is why
-`int(str(v))` works where `int(v)` does not.
+`str()` accepts Variant. After validating that a numeric representation is
+allowed, `int(str(value))` provides an explicit conversion path.
 
-For colours, store hex strings in your data format and use
-`Color.from_string(str(v), Color.MAGENTA)`. One call, no per-channel unpacking,
-and hex is readable to anyone hand-editing content.
+For colours stored as text, `Color.from_string(str(value), Color.MAGENTA)` keeps
+the external representation readable and provides an explicit fallback.
 """
 
 TAIL_LINT = """
@@ -170,32 +161,34 @@ TAIL_LINT = """
 enums, constants, static variables, variables, `_init`, then other methods.
 gdlint fails the file otherwise.
 
-GUT doubles have no annotatable type. `stub()` and `double()` return an untyped
-object, and there is no `Stub` class in scope, so a type annotation cannot be
-satisfied. Assign with `:=` and let inference handle it, or use
-`partial_double()` and hold the result as the real class. Inventing a type name
-produces `Could not find type "Stub" in the current scope`, which under `-d`
-sends Godot's debugger into a break loop.
+GUT's dynamic doubles do not provide a stable annotatable type. In a project
+that bans inferred declarations, prefer a small typed fake or a partial double
+held as the real collaborator type. Do not weaken strict typing just to store a
+test double.
 """
 
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true", help="write docs/GDSCRIPT.md")
-    ap.add_argument("--check", action="store_true", help="fail if the file is stale")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true", help="write docs/GDSCRIPT.md")
+    parser.add_argument("--check", action="store_true", help="fail if the file is stale")
+    arguments = parser.parse_args()
 
     text = render(collect())
     target = ROOT / "docs" / "GDSCRIPT.md"
 
-    if args.check:
+    if arguments.check:
         current = target.read_text(encoding="utf-8") if target.is_file() else ""
         if current.strip() != text.strip():
-            print("docs/GDSCRIPT.md is stale. Run: python tools/gen_gdscript_doc.py --write")
+            print(
+                "docs/GDSCRIPT.md is stale; refresh it through the kit-builder "
+                "maintenance workflow"
+            )
             return 1
         print("docs/GDSCRIPT.md current")
         return 0
 
-    if args.write:
+    if arguments.write:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8", newline="")
         print(f"wrote {target.relative_to(ROOT).as_posix()}")

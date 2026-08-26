@@ -1,9 +1,9 @@
 {
   "_comment": [
-    "Boundary rules, enforced by arch.py and by `python check.py --only arch`.",
+    "Boundary rules, enforced through `kit verify --stage arch`.",
     "This file is the source of truth for ALLOWED dependencies; the mermaid",
     "diagram in ARCHITECTURE.md is generated from this plus the actual code.",
-    "Paths are relative to src/ (the Godot project). Gate scripts and docs live",
+    "Paths are relative to the configured game root (Godot res://). Kit scripts and docs live",
     "at the repo root and are not part of the game's dependency graph.",
     "A module absent from `modules` is drawn but not constrained, so you can",
     "add directories freely and tighten them later. At involvement 'module' or",
@@ -20,7 +20,7 @@
       ]
     },
     "scripts/data": {
-      "description": "typed config + level format",
+      "description": "typed configuration and external-data boundary",
       "may_depend_on": []
     },
     "scripts": {

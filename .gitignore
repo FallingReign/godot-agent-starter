@@ -6,7 +6,12 @@ src/.godot/
 .checklogs/
 .godot_doc/
 
-# Vendored third-party bundle, fetched by bootstrap.py --fix. Not source, and
+# Private kit runtime. May contain reduced session evidence, dispatch prompts,
+# worker logs, process state and provider thread ids. Never commit or package.
+.kit/
+
+# Vendored third-party bundle, fetched only by an explicit `kit setup dependency`
+# action. Not source, and
 # a few MB of minified JS in every diff is noise. plan.html degrades to
 # readable diagram source without it.
 tools/vendor/
@@ -72,4 +77,5 @@ docs/retro/.ran
 # durable records are docs/retro/{accepted,deferred}.json and the findings.
 docs/retro/board.log
 docs/retro/board.state.json
+docs/retro/queue/
 docs/retro/runs/

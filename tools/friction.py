@@ -13,8 +13,10 @@ What this can and cannot see, stated honestly:
   - The gate captures FINAL STATE. `.checklogs/` holds only the latest run per
     stage, has no history and is gitignored, so nothing in it can be compared
     against anything.
-  - Git sees committed history. A file rewritten across many commits is real
-    signal. A file rewritten six times inside one turn leaves no trace at all.
+  - Git sees committed history. A current file rewritten across many commits is
+    real signal. Deleted files are excluded because they cannot justify tooling
+    work in the project that exists now. A file rewritten six times inside one
+    turn leaves no trace at all.
   - So this under-reports. A clean report does not mean there was no friction;
     it means none reached the commit log.
 
@@ -32,6 +34,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import project_context  # noqa: E402
+
+CONTEXT = project_context.load_configured_context(ROOT)
 
 # A file touched this many times since the baseline is being iterated on rather
 # than written. Deliberately not tuned: the point is to surface candidates for a
@@ -52,7 +58,7 @@ def git(*args: str) -> Tuple[int, str]:
 
 
 def churn(since: str) -> Counter:
-    """How many commits touched each file since `since`."""
+    """How many commits touched each current game file since `since`."""
     rng = f"{since}..HEAD" if since else "HEAD"
     code, out = git("log", "--format=%H", "--name-only", rng)
     if code != 0:
@@ -62,8 +68,9 @@ def churn(since: str) -> Counter:
         line = line.strip().replace("\\", "/")
         if not line or len(line) == 40 and " " not in line:
             continue
-        if line.startswith("src/") or line.startswith("content/"):
-            counts[line] += 1
+        relative = CONTEXT.game_relative(line)
+        if relative is not None and (CONTEXT.game_root / relative).is_file():
+            counts[relative] += 1
     return counts
 
 
@@ -109,7 +116,7 @@ def classify(path: str) -> str:
     if path.startswith("content/") or p.endswith((".map", ".json", ".tres", ".txt")):
         return ("hand-authored content — a generator or in-game editor is"
                 " usually in scope anyway")
-    if "/tests/" in p or p.startswith("src/tests/"):
+    if p.startswith("tests/") or "/tests/" in p:
         return "test churn — fixtures or a builder may be missing"
     if p.endswith(".tscn") or p.endswith(".tres"):
         return "scene or resource churn — consider building it from a script"

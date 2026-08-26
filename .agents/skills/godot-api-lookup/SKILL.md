@@ -25,10 +25,10 @@ describes exactly the engine that will run this project, so it cannot be out of
 date relative to reality.
 
 ```
-python tools/gddoc.py --build             # once, generates the reference
-python tools/gddoc.py Color               # class summary
-python tools/gddoc.py Color.from_string   # exact signature and description
-python tools/gddoc.py --search from_str   # find a member across all classes
+kit godot-docs build                    # once, generates the reference
+kit godot-docs show Color               # class summary
+kit godot-docs show Color.from_string   # exact signature and description
+kit godot-docs search from_str          # find a member across all classes
 ```
 
 Never read the generated XML directly, and never dump it into context. It is

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Retrospective evidence pack.
+"""Retrospective evidence pack over immutable repository-scoped capture.
 
-Reconstructs what happened during a slice from four deterministic sources:
-agent session logs, git history, the kit artefacts, and the gate logs.
+Reconstructs what happened during a slice from reduced session evidence,
+unarchived notes, git history, kit artefacts, and gate logs.
 
 The evidence pack is the deliverable. A model reading it is one adapter.
-
-    python tools/retro.py --print          write pack + prompt, no model call
-    python tools/retro.py --sdk            call copilot via the SDK adapter
-    python tools/retro.py --sessions DIR   override session log location
+The public workflow is ``kit retro status``, ``kit retro run`` and
+``kit retro publish``; this module's flags are private implementation details.
 
 The pack never contains a conclusion. It contains counts, sequences and
 verbatim quotes, so a reader can disagree with it.
@@ -16,45 +14,28 @@ verbatim quotes, so a reader can disagree with it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RETRO_DIR = ROOT / "docs" / "retro"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import session_digest  # noqa: E402
+import session_evidence  # noqa: E402
+import runtime_paths  # noqa: E402
 
-# Where copilot keeps session logs, per platform.
-SESSION_DIRS = [
-    Path.home() / ".copilot" / "session-state",
-    Path(os.environ.get("APPDATA", "/nonexistent")) / "copilot" / "session-state",
-]
-
-# Low-recall hint layer only. Tested against a real session: caught 0 of 4
-# genuine friction messages, because real friction reads as observation
-# ("Built now shows to do not written") rather than accusation. Every human
-# message is therefore included verbatim in the pack and the model classifies.
-# These tags are a convenience for the terminal summary, never the signal.
-FRICTION_HINTS = [
-    (r"\b(?:not|isn'?t) (?:what|right|correct|working)", "correction"),
-    (r"\bi (?:did ?n[o']?t|never) (?:ask|want|say|expect)", "correction"),
-    (r"\bwhy (?:did|are|is|would|has)\b", "questioning"),
-    (r"\b(?:missed|forgot|skipped|ignored|lost|broke)\b", "gap"),
-    (r"\b(?:i )?(?:expected|thought|assumed)\b", "expectation gap"),
-    (r"\b(?:revert|undo|roll ?back)\b", "rework"),
-    (r"\b(?:irks|annoying|frustrating|tedious|unclear|confusing)\b", "irritation"),
-    (r"\b(?:needs to|should|must)\b", "requirement"),
-    (r"\bwe (?:seem(?:ed)? to have )?lost\b", "regression"),
-    (r"\bdo we (?:have|follow|currently)\b", "process gap"),
-]
-
-# Commands that legitimately repeat (verification). Anything else repeating
-# many times inside one session is a candidate loop.
-EXPECTED_REPEATS = ("check.py", "git status", "git diff", "git log")
+_RUNTIME = runtime_paths.resolve(ROOT)
+EVIDENCE_DIR = _RUNTIME.evidence
+PROMPT_DIR = _RUNTIME.retro_sdk
+THREAD_FILE = _RUNTIME.retro_thread
+RAN_FILE = _RUNTIME.retro_ran
 
 
 def sh(*args: str, cwd: Path | None = None) -> str:
@@ -67,320 +48,9 @@ def sh(*args: str, cwd: Path | None = None) -> str:
         return ""
 
 
-# ---------------------------------------------------------------- session logs
-
-def find_session_logs(override: str | None) -> list[Path]:
-    """Locate events.jsonl files, newest first."""
-    roots: list[Path] = []
-    if override:
-        roots.append(Path(override))
-    else:
-        roots.extend(d for d in SESSION_DIRS if d.is_dir())
-    out: list[Path] = []
-    for r in roots:
-        if not r.exists():
-            continue
-        if r.is_file():
-            out.append(r)
-            continue
-        out.extend(r.rglob("events.jsonl"))
-        out.extend(p for p in r.glob("*.jsonl") if p.name != "events.jsonl")
-    out = [p for p in out if p.stat().st_size > 0]
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
-
-
-def read_events(path: Path) -> list[dict]:
-    """Tolerant line-delimited JSON reader. Unknown event types survive."""
-    events: list[dict] = []
-    try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except Exception:
-                    continue
-    except Exception:
-        return []
-    return events
-
-
-def _ts(e: dict) -> str:
-    return e.get("timestamp") or ""
-
-
-def _short(text: str, n: int = 200) -> str:
+def _short(text: str, limit: int = 200) -> str:
     text = " ".join((text or "").split())
-    return text if len(text) <= n else text[: n - 1] + "\u2026"
-
-
-def detect_format(events: list[dict]) -> str:
-    """Which agent wrote this log. Unknown formats are skipped, not guessed."""
-    for e in events[:40]:
-        if e.get("type") in ("session.start", "assistant.turn_start", "tool.execution_start"):
-            return "copilot"
-        if e.get("type") in ("user", "gemini") or "$set" in e:
-            return "gemini"
-        if "sessionId" in e and "projectHash" in e:
-            return "gemini"
-    return "unknown"
-
-
-def analyse_gemini(path: Path, events: list[dict]) -> dict:
-    """Gemini CLI logs: a header line, then message batches under $set/$push."""
-    msgs: list[dict] = []
-    started = ""
-    for e in events:
-        if "startTime" in e and "sessionId" in e:
-            started = e.get("startTime", "")
-        for key in ("$set", "$push"):
-            block = e.get(key)
-            if isinstance(block, dict):
-                got = block.get("messages")
-                if isinstance(got, list):
-                    msgs.extend(m for m in got if isinstance(m, dict))
-        if e.get("type") in ("user", "gemini"):
-            msgs.append(e)
-
-    def text_of(m: dict) -> str:
-        c = m.get("content")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return " ".join(
-                part.get("text", "") for part in c if isinstance(part, dict)
-            )
-        return ""
-
-    human: list[dict] = []
-    first_human = ""
-    turns = 0
-    for m in msgs:
-        kind = m.get("type") or m.get("role") or ""
-        body = text_of(m)
-        if kind in ("gemini", "assistant", "model"):
-            turns += 1
-            continue
-        if kind != "user" or not body.strip():
-            continue
-        if body.lstrip().startswith(("<session_context", "<skill-context", "<system")):
-            continue
-        first_human = first_human or body
-        if body == first_human:
-            continue
-        hints = [lab for pat, lab in FRICTION_HINTS if re.search(pat, body, re.I)]
-        human.append(
-            {"at": m.get("timestamp", ""), "text": _short(body, 1200), "hints": sorted(set(hints))}
-        )
-
-    return {
-        "log": str(path),
-        "format": "gemini",
-        "session_id": next((e.get("sessionId", "") for e in events if "sessionId" in e), ""),
-        "model": "gemini",
-        "started": started,
-        "branch": "",
-        "head": "",
-        "turns": turns,
-        "nano_aiu": 0,
-        "events": len(events),
-        "gate_runs": [],
-        "stage_failures": {},
-        "command_loops": [],
-        "file_rewrites": [],
-        "file_rereads": [],
-        "task_prompt": _short(first_human, 800),
-        "human_messages": human[:60],
-        "tool_failures": [],
-        "user_message_count": len(human) + 1,
-        "injected_context_messages": 0,
-        "skills_invoked": [],
-        "note": "gemini format: tool detail not extracted, human messages only",
-    }
-
-
-def analyse_session(path: Path) -> dict | None:
-    """Extract friction signals from one session log. No conclusions."""
-    events = read_events(path)
-    if not events:
-        return None
-
-    fmt = detect_format(events)
-    if fmt == "gemini":
-        return analyse_gemini(path, events)
-    if fmt == "unknown":
-        return {
-            "log": str(path),
-            "format": "unknown",
-            "events": len(events),
-            "note": "unrecognised session log format, skipped",
-            "turns": 0,
-            "nano_aiu": 0,
-            "started": "",
-            "model": "",
-            "gate_runs": [],
-            "stage_failures": {},
-            "command_loops": [],
-            "file_rewrites": [],
-            "file_rereads": [],
-            "human_messages": [],
-            "task_prompt": "",
-            "skills_invoked": [],
-            "tool_failures": [],
-        }
-
-    start = next((e for e in events if e.get("type") == "session.start"), None)
-    sd = (start or {}).get("data", {})
-
-    commands: Counter[str] = Counter()
-    cmd_first: dict[str, str] = {}
-    tool_fails: list[dict] = []
-    user_msgs: list[dict] = []
-    skills: list[dict] = []
-    gate_runs: list[dict] = []
-    stage_fails: Counter[str] = Counter()
-    file_writes: Counter[str] = Counter()
-    reads: Counter[str] = Counter()
-    injected = 0
-    first_human = ""
-    nano_aiu = 0
-    turns = 0
-    pending: dict[str, dict] = {}
-
-    for e in events:
-        t = e.get("type")
-        d = e.get("data")
-        if not isinstance(d, dict):
-            d = {}
-
-        if t == "assistant.turn_start":
-            turns += 1
-
-        elif t == "session.usage_checkpoint":
-            nano_aiu = max(nano_aiu, int(d.get("totalNanoAiu") or 0))
-
-        elif t == "user.message":
-            content = d.get("content") or ""
-            # Skill bodies and system context are injected as user messages.
-            # They are not human input and must not be scanned for friction.
-            if content.lstrip().startswith(("<skill-context", "<system", "<current_datetime")):
-                injected += 1
-                continue
-            first_human = first_human or content
-            tags = [
-                label
-                for pat, label in FRICTION_HINTS
-                if re.search(pat, content, re.I)
-            ]
-            user_msgs.append(
-                {
-                    "at": _ts(e),
-                    "text": _short(content, 1200),
-                    "hints": sorted(set(tags)),
-                    "is_task": content == first_human,
-                }
-            )
-
-        elif t == "skill.invoked":
-            skills.append({"at": _ts(e), "name": d.get("name") or "?"})
-
-        elif t == "tool.execution_start":
-            cid = d.get("toolCallId")
-            args = d.get("arguments")
-            if not isinstance(args, dict):
-                args = {"command": args} if isinstance(args, str) else {}
-            cmd = args.get("command") or args.get("cmd") or ""
-            if cmd:
-                cmd = _short(str(cmd), 160)
-                commands[cmd] += 1
-                cmd_first.setdefault(cmd, _ts(e))
-            target = args.get("filePath") or args.get("path") or args.get("file") or ""
-            if target:
-                reads[_short(str(target), 120)] += 1
-            if cid:
-                pending[cid] = {"cmd": cmd, "at": _ts(e), "tool": d.get("toolName")}
-            tool = (d.get("toolName") or "").lower()
-            if tool in ("write", "create_file", "edit", "str_replace", "apply_patch"):
-                fp = args.get("filePath") or args.get("path") or args.get("file") or ""
-                if fp:
-                    file_writes[_short(str(fp), 120)] += 1
-
-        elif t == "tool.execution_complete":
-            cid = d.get("toolCallId")
-            info = pending.pop(cid, {}) if cid else {}
-            result = d.get("result")
-            if isinstance(result, dict):
-                content = result.get("content")
-            elif isinstance(result, str):
-                content = result
-            else:
-                content = ""
-            if not isinstance(content, str):
-                try:
-                    content = json.dumps(content)[:4000]
-                except Exception:
-                    content = ""
-            if d.get("success") is False:
-                tool_fails.append(
-                    {
-                        "at": _ts(e),
-                        "cmd": info.get("cmd", "?"),
-                        "error": _short(content, 300),
-                    }
-                )
-            if "GATE PASSED" in content or "GATE FAILED" in content:
-                passed = "GATE PASSED" in content
-                failed_stages = re.findall(r"^\s*FAIL\s+(\w+)", content, re.M)
-                for s in failed_stages:
-                    stage_fails[s] += 1
-                gate_runs.append(
-                    {"at": _ts(e), "passed": passed, "failed": failed_stages}
-                )
-
-    loops = [
-        {"cmd": c, "count": n, "first": cmd_first.get(c, "")}
-        for c, n in commands.most_common()
-        if n >= 4 and not any(x in c for x in EXPECTED_REPEATS)
-    ]
-    rewrites = [
-        {"file": f, "count": n} for f, n in file_writes.most_common() if n >= 4
-    ]
-    rereads = [
-        {"file": f, "count": n} for f, n in reads.most_common() if n >= 6
-    ]
-
-    return {
-        "log": str(path),
-        "format": "copilot",
-        "session_id": sd.get("sessionId", ""),
-        "model": sd.get("selectedModel", ""),
-        "started": sd.get("startTime", ""),
-        "branch": (sd.get("context") or {}).get("branch", ""),
-        "head": (sd.get("context") or {}).get("headCommit", "")[:8],
-        "turns": turns,
-        "nano_aiu": nano_aiu,
-        "events": len(events),
-        "gate_runs": gate_runs,
-        "stage_failures": dict(stage_fails.most_common()),
-        "command_loops": loops[:10],
-        "file_rewrites": rewrites[:10],
-        "tool_failures": tool_fails[:15],
-        "file_rereads": rereads[:10],
-        "task_prompt": _short(first_human, 800),
-        # Every human message after the task, verbatim. This is the primary
-        # friction channel. Classify these; do not rely on the hints.
-        "human_messages": [
-            {"at": m["at"], "text": m["text"], "hints": m["hints"]}
-            for m in user_msgs
-            if not m["is_task"]
-        ][:60],
-        "user_message_count": len(user_msgs),
-        "injected_context_messages": injected,
-        "skills_invoked": skills,
-    }
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
 # ------------------------------------------------------------------ repo state
@@ -468,13 +138,74 @@ def checklog_evidence() -> dict:
 
 # ------------------------------------------------------------------ pack + emit
 
+def _session_pack(args) -> tuple[list[dict], dict, Path, int]:
+    """Capture the exact reduced session evidence used by this retro."""
+    roots = [Path(args.sessions)] if args.sessions else None
+    found = session_digest.discover(ROOT, roots)
+    selected = found[-args.max_sessions:]
+    digests = [session_digest.digest_one(session, index)
+               for index, session in enumerate(selected, 1)]
+    manifest = session_evidence.build_manifest(ROOT, digests)
+    snapshot = session_evidence.write_manifest(EVIDENCE_DIR / "sessions", manifest)
+
+    sessions: list[dict] = []
+    for source in manifest["sessions"]:
+        evidence = source["evidence"]
+        sessions.append({
+            "tag": f"S{source['ordinal']}",
+            "session_id": source["session_id"],
+            "started": source["started"],
+            "updated": source["updated"],
+            "model": evidence["model"],
+            "persona": evidence.get("persona", "unattributed"),
+            "turns": evidence["turns"],
+            "cost": evidence["cost"],
+            "stage_failures": evidence["gate_fails"],
+            "gate_passes": evidence["gate_passes"],
+            "command_loops": [
+                {"cmd": command, "count": count}
+                for command, count in evidence["loops"].items()
+            ],
+            "file_rewrites": [
+                {"file": path, "count": count}
+                for path, count in evidence["rewrites"].items()
+            ],
+            "human_messages": [
+                {"citation": f"S{source['ordinal']}:H{message_index}",
+                 "source_citation": message["citation"], "text": message["text"],
+                 "hints": []}
+                for message_index, message in enumerate(
+                    evidence["human_messages"], 1
+                )
+            ],
+            "warnings": source["warnings"],
+            "sources": source["sources"],
+        })
+    return sessions, manifest, snapshot, len(found)
+
+
+def _note_evidence() -> list[dict]:
+    notes: list[dict] = []
+    notes_dir = RETRO_DIR / "notes"
+    for path in sorted(notes_dir.glob("*.md")):
+        if path.name.lower() == "readme.md":
+            continue
+        try:
+            content = path.read_bytes()
+            text = content.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        notes.append({
+            "path": path.relative_to(ROOT).as_posix(),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+            "text": text,
+        })
+    return notes
+
+
 def build_pack(args) -> dict:
-    logs = find_session_logs(args.sessions)
-    sessions = []
-    for p in logs[: args.max_sessions]:
-        a = analyse_session(p)
-        if a:
-            sessions.append(a)
+    sessions, _manifest, snapshot, sessions_found = _session_pack(args)
     baseline = args.baseline
     if not baseline:
         prop = ROOT / "proposal.json"
@@ -484,10 +215,16 @@ def build_pack(args) -> dict:
             except Exception:
                 baseline = None
     return {
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "repo": str(ROOT),
-        "sessions_found": len(logs),
+        "schema": 2,
+        "kind": "retro-evidence-pack",
+        "repository": ROOT.name,
+        "session_snapshot": {
+            "path": snapshot.relative_to(ROOT).as_posix(),
+            "sha256": snapshot.stem,
+        },
+        "sessions_found": sessions_found,
         "sessions": sessions,
+        "notes": _note_evidence(),
         "git": git_evidence(baseline),
         "artefacts": artefact_evidence(),
         "gate_logs": checklog_evidence(),
@@ -509,19 +246,27 @@ def slice_key() -> str:
 
 
 def already_ran(key: str) -> bool:
-    lock = RETRO_DIR / ".ran"
-    if not lock.exists():
+    if not RAN_FILE.exists():
         return False
     try:
-        return key in lock.read_text(encoding="utf-8").splitlines()
-    except Exception:
+        value = json.loads(RAN_FILE.read_text(encoding="utf-8"))
+        return key in value.get("slices", []) if isinstance(value, dict) else False
+    except (OSError, ValueError):
         return False
 
 
 def mark_ran(key: str) -> None:
-    lock = RETRO_DIR / ".ran"
-    prev = lock.read_text(encoding="utf-8") if lock.exists() else ""
-    lock.write_text(prev + key + "\n", encoding="utf-8")
+    slices: list[str] = []
+    if RAN_FILE.exists():
+        try:
+            value = json.loads(RAN_FILE.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and isinstance(value.get("slices"), list):
+                slices = [str(item) for item in value["slices"] if str(item)]
+        except (OSError, ValueError):
+            slices = []
+    if key not in slices:
+        slices.append(key)
+    _atomic_json_write(RAN_FILE, {"schema": 1, "slices": slices})
 
 
 def should_trigger(pack: dict) -> tuple[bool, str]:
@@ -562,76 +307,153 @@ def should_trigger(pack: dict) -> tuple[bool, str]:
     return True, "; ".join(dict.fromkeys(reasons))
 
 
-PROMPT = """You are running a retrospective on one slice of work in a Godot project
-that uses an agent starter kit. The kit's job is to guide an AI agent so a
-human intervenes as little as possible.
+PROMPT = """Run a retrospective over the immutable evidence pack at {pack}.
+It contains reduced, repository-scoped session evidence, unarchived slice
+notes, Git facts, and gate facts. It contains no conclusions. Read every note
+and every sessions[].human_messages entry. Each message has a citation such as
+S2:H4 that is stable within the pack named above.
 
-Read the evidence pack at {pack}. It is deterministic output: counts,
-sequences and verbatim human quotes. It contains no conclusions.
+Find defects in the KIT, not mistakes to blame on one worker. A useful finding
+states the underlying decision or workflow failure, a small proposed
+experiment, and an observable measure. Repetition strengthens a finding, but a
+single work-destroying or false-green event may stand alone when labelled
+honestly. Do not promote generic agent advice, game design, or game code.
 
-The single most important field is sessions[].human_messages. Every message
-the human sent after the opening task is there verbatim. Read all of them.
-Each carries a "hints" array from a crude regex; it is low-recall and tested
-to miss most real friction, so treat an empty hints array as meaningless.
-Real friction reads as observation, not complaint: "Built now shows to do
-not written" is a kit defect report.
-
-You may read files in this repo to check anything in the pack. You may not
-write to any file.
-
-Your job is to find where the KIT failed, not where the agent failed. Every
-human correction is a candidate kit defect: something the kit should have
-supplied, checked or prevented. A command run many times is a candidate loop.
-A file rewritten many times is candidate missing tooling.
-
-Answer as JSON only, matching this shape exactly:
+You may read repository files to validate a claim. You may not write files.
+Return JSON only with this exact shape:
 
 {{
-  "slice": "<slice name from the pack, or unknown>",
-  "summary": "<two sentences on how the slice went>",
+  "slice": "<slice name or unknown>",
+  "summary": "<at most two decision-relevant sentences>",
   "findings": [
     {{
-      "title": "<short>",
-      "evidence": "<what in the pack supports this, quote it>",
-      "kit_gap": "<what the kit should have done, or 'none - agent error'>",
-      "severity": "high|medium|low",
-      "confidence": "high|medium|low"
+      "title": "<short causal title>",
+      "sessions": ["S1", "S2"],
+      "human_turns": ["S1:H2", "S2:H4"],
+      "mechanical": ["LOOP python check.py x4 (S1)"],
+      "recurs": true,
+      "severity": "work-destroyed|false-green|wrong-built|none",
+      "fix_files": ["tools/example.py"],
+      "fix_lines": 20,
+      "problem": "<cause, not symptom>",
+      "proposal": "<small concrete kit change to test>",
+      "measure": "<observable evidence that would show improvement>"
     }}
   ],
-  "proposed_goals": [
-    {{
-      "goal": "<what to change in the kit>",
-      "because": "<which finding it addresses>",
-      "checkable": true|false
-    }}
-  ],
-  "friction_not_visible": "<what you suspect happened but the pack cannot show>"
+  "observations": ["<suspected issue that lacks enough evidence to promote>"]
 }}
 
-Rules. Cite evidence for every finding or omit it. If the pack shows nothing
-worth reporting, return empty arrays rather than inventing findings. Prefer
-'confidence: low' over a confident guess. Say when a proposed goal is not
-mechanically checkable."""
+Every human_turn citation must exist in the pack and support the finding. Every
+session named must contribute cited evidence. Do not invent a file or exact
+line estimate when repository inspection cannot support it; use an empty
+fix_files list and a conservative fix_lines estimate. If there is no supported
+kit finding, return an empty findings array. Do not include prose outside the
+JSON object."""
 
 
 def emit_print(pack: dict, pack_path: Path) -> None:
-    prompt_path = RETRO_DIR / "prompt.md"
-    prompt_path.write_text(PROMPT.format(pack=pack_path.relative_to(ROOT)), encoding="utf-8")
-    print(f"evidence pack   {pack_path.relative_to(ROOT)}")
-    print(f"prompt          {prompt_path.relative_to(ROOT)}")
+    PROMPT_DIR.mkdir(parents=True, exist_ok=True)
+    prompt_path = PROMPT_DIR / "prompt.md"
+    _atomic_text_write(
+        prompt_path,
+        PROMPT.format(pack=pack_path.relative_to(ROOT).as_posix()),
+    )
+    print(f"evidence pack   {pack_path.relative_to(ROOT).as_posix()}")
+    print(f"prompt          {prompt_path.relative_to(ROOT).as_posix()}")
     print()
-    print("Hand both to any agent, or run:")
-    print(f"  copilot -p \"$(cat {prompt_path.relative_to(ROOT)})\" --allow-tool read --deny-tool write")
+    print("Hand both files to the analyzer you choose. When its findings report is")
+    print("under docs/retro/, validate and publish it with: kit retro publish")
+    print("For the configured automatic analyzer, use: kit retro run --confirm-spend")
+
+
+def write_pack(pack: dict) -> Path:
+    """Write an immutable pack plus a small mutable pointer for diagnostics."""
+    pack_path = session_evidence.write_manifest(EVIDENCE_DIR / "packs", pack)
+    pointer = EVIDENCE_DIR / "latest.json"
+    value = {
+        "schema": 1,
+        "latest": pack_path.relative_to(ROOT).as_posix(),
+        "sha256": pack_path.stem,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _atomic_json_write(pointer, value)
+    return pack_path
+
+
+def _atomic_text_write(path: Path, text: str) -> None:
+    """Publish one complete private text artifact in its final directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_json_write(path: Path, value: object) -> None:
+    _atomic_text_write(path, json.dumps(value, indent=2) + "\n")
+
+
+def archive_notes(pack: dict) -> tuple[bool, str]:
+    """Archive exactly the note bytes captured by this successful retro."""
+    archive = RETRO_DIR / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    for note in pack.get("notes") or []:
+        source = ROOT / str(note.get("path") or "")
+        try:
+            source.resolve().relative_to((RETRO_DIR / "notes").resolve())
+        except ValueError:
+            return False, f"unsafe note path in evidence: {source}"
+        if not source.is_file():
+            return False, f"captured note disappeared before archive: {source.name}"
+        content = source.read_bytes()
+        if hashlib.sha256(content).hexdigest() != note.get("sha256"):
+            return False, f"captured note changed before archive: {source.name}"
+        target = archive / source.name
+        if target.exists():
+            if target.read_bytes() != content:
+                return False, f"archive already contains different {source.name}"
+            source.unlink()
+        else:
+            os.replace(source, target)
+    return True, ""
+
+
+def finalise_retro(pack: dict, pack_path: Path) -> int:
+    """Rank the generated report, then consume only its captured notes."""
+    reports = sorted(RETRO_DIR.glob(f"*-{pack_path.stem[:10]}-findings.md"))
+    if not reports:
+        print("retro analyzer produced no validated findings report")
+        return 1
+    report = reports[-1]
+    ranked = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "retro_rank.py"), str(report)],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+    )
+    if ranked.returncode != 0:
+        print("ranking failed; notes were not archived")
+        print((ranked.stderr or ranked.stdout)[-1500:])
+        return 1
+    ok, error = archive_notes(pack)
+    if not ok:
+        print(f"notes were not archived: {error}")
+        return 1
+    subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "retro_html.py"), "--no-board"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=180,
+    )
+    return 0
 
 
 def summarise(pack: dict) -> None:
     print(f"sessions        {len(pack['sessions'])} analysed of {pack['sessions_found']} found")
-    skipped = [s for s in pack["sessions"] if s.get("format") == "unknown"]
     for s in pack["sessions"]:
-        if s.get("format") == "unknown":
-            continue
-        aiu = s["nano_aiu"] / 1e9
-        label = s["model"] or s.get("format", "")
+        aiu = float(s.get("cost") or 0.0)
+        label = s.get("model") or "unknown model"
         print(f"  {s['started'][:16] or '?':16s}  {s['turns']:3d} turns  {aiu:6.2f} AIU  {label}")
         if s["stage_failures"]:
             print(f"      gate failures: {s['stage_failures']}")
@@ -643,10 +465,12 @@ def summarise(pack: dict) -> None:
             print(f"      rewritten x{top['count']}: {top['file'][:60]}")
         hinted = [m for m in s["human_messages"] if m["hints"]]
         if s["human_messages"]:
-            print(f"      human messages after task: {len(s['human_messages'])}"
+            print(f"      human messages: {len(s['human_messages'])}"
                   f" ({len(hinted)} hint at friction)")
-    if skipped:
-        print(f"  {len(skipped)} log(s) in an unrecognised format, skipped")
+        if s.get("warnings"):
+            print(f"      capture warnings: {len(s['warnings'])}")
+    print(f"notes           {len(pack.get('notes') or [])} unarchived")
+    print(f"snapshot        {pack['session_snapshot']['path']}")
     g = pack["git"]
     print(f"git             {g['commit_count']} commits since {g['baseline']}")
     if g["churn"]:
@@ -665,7 +489,7 @@ def main() -> int:
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="write pack and prompt, no model call (default)")
     ap.add_argument("--sdk", action="store_true",
-                    help="call copilot via the SDK adapter (needs node >=22)")
+                    help="call the explicitly configured analyzer provider")
     ap.add_argument("--sessions", help="session log file or directory override")
     ap.add_argument("--baseline", help="git ref to diff from (default proposal baseline_sha)")
     ap.add_argument("--max-sessions", type=int, default=3)
@@ -679,9 +503,9 @@ def main() -> int:
     args = ap.parse_args()
 
     RETRO_DIR.mkdir(parents=True, exist_ok=True)
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     pack = build_pack(args)
-    pack_path = RETRO_DIR / "evidence.json"
-    pack_path.write_text(json.dumps(pack, indent=2), encoding="utf-8")
+    pack_path = write_pack(pack)
 
     if args.why or args.if_warranted:
         warranted, reason = should_trigger(pack)
@@ -711,7 +535,17 @@ def main() -> int:
             print(f"SDK adapter unavailable: {exc}")
             print("the evidence pack is written; use --print instead")
             return 2
-        return run_sdk(pack_path, PROMPT, RETRO_DIR)
+        result = run_sdk(
+            pack_path,
+            PROMPT,
+            RETRO_DIR,
+            root=ROOT,
+            work_dir=PROMPT_DIR,
+            thread_file=THREAD_FILE,
+        )
+        if result != 0:
+            return result
+        return finalise_retro(pack, pack_path)
     emit_print(pack, pack_path)
     return 0
 

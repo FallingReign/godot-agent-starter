@@ -24,7 +24,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DESIGN = ROOT / "docs" / "design"
-SRC = ROOT / "src"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import project_context  # noqa: E402
+
+CONTEXT = project_context.load_configured_context(ROOT)
+GAME_ROOT = CONTEXT.game_root
 
 INDEX_NAME = "INDEX.md"
 SKIP_FILES = {"README.md", INDEX_NAME}
@@ -44,6 +48,10 @@ RE_DECL = re.compile(
 )
 
 RESOLUTIONS = ("question", "direction", "settled")
+EXCLUDED_GAME_DIRS = {
+    ".agents", ".checklogs", ".git", ".github", ".godot", ".godot_doc",
+    ".kit", "addons", "docs", "tests", "tools",
+}
 
 
 def design_files() -> list[Path]:
@@ -127,10 +135,10 @@ def parse_design(path: Path) -> dict:
 def scan_tunables() -> dict[str, dict]:
     """Find `## @tune <id>` claims in GDScript."""
     found: dict[str, dict] = {}
-    if not SRC.is_dir():
+    if not GAME_ROOT.is_dir():
         return found
-    for gd in sorted(SRC.rglob("*.gd")):
-        if "addons" in gd.parts:
+    for gd in sorted(GAME_ROOT.rglob("*.gd")):
+        if EXCLUDED_GAME_DIRS.intersection(gd.relative_to(GAME_ROOT).parts):
             continue
         try:
             lines = gd.read_text(encoding="utf-8", errors="replace").splitlines()

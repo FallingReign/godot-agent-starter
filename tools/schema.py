@@ -36,14 +36,14 @@ FUNC = {
 }
 
 FILE_ = {
-    "path":   ("str", True, "path relative to repo root, e.g. src/scripts/player.gd"),
+    "path":   ("str", True, "path relative to the configured game root, e.g. scripts/player.gd"),
     "action": ("enum:new|modify", True, "new file, or a change to one that exists"),
     "why":    ("str", True, "why this file is being created or touched in this slice"),
     "module": ("str", False, "owning module path, if any"),
 }
 
 MODULE = {
-    "path":          ("str", True,  "directory path, e.g. src/scripts/logic"),
+    "path":          ("str", True,  "directory under the configured game root, e.g. scripts/logic"),
     "role":          ("str", True,  "what this module is responsible for"),
     "why":           ("str", True,  "why this module is being created or changed now"),
     "action":        ("enum:new|modify", True, "new module, or a change to one that exists"),
@@ -315,7 +315,7 @@ def main(argv: List[str]) -> int:
             print(f"error: {e}")
         bad += len(errs)
     if bad:
-        print(f"\n{bad} problem(s). Run 'python tools/schema.py --describe proposal' "
+        print(f"\n{bad} problem(s). Run 'kit schema describe proposal' "
               "for the field list.")
         return 1
     print("artefacts valid")

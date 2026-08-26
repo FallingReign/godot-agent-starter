@@ -8,21 +8,35 @@ description: Use when a slice finishes, when the gate says a retro is warranted,
 The kit's job is to guide an agent so the human intervenes as little as
 possible. A retro measures whether it did, and turns the gaps into changes.
 
-Run it with `python tools/retro.py --print`. That writes a deterministic
-evidence pack and a prompt, and calls no model. `--sdk` hands the same pack to
-copilot and can resume a thread within the same slice. `--why` reports whether
-a retro is warranted without doing anything.
+Use only the repository launcher:
+
+```text
+kit retro status
+kit retro run
+kit retro publish
+```
+
+`kit retro status` reports whether a retro is warranted and changes nothing.
+`kit retro run` freezes repository-scoped evidence and prepares the pack with
+the default manual provider; it calls no model. If the project explicitly
+configures an automatic analyzer, the human must consciously authorize that
+one provider action with `kit retro run --confirm-spend`. Never invoke the
+internal Python entry point, install a provider, infer consent to spend quota,
+or expose implementation commands to the human.
+
+After an analyzer or reviewer writes a findings report, `kit retro publish`
+validates the snapshot binding, citations and success measures, then refreshes
+the decision views. It does not approve or dispatch a recommendation.
 
 The pack is the deliverable. The model reading it is one adapter, so a retro
 works with any agent, or with none.
 
 ## Read the human messages first
 
-`sessions[].human_messages` holds every message the human sent after the
-opening task, verbatim. It is the primary signal and everything else is
-context. Each carries a `hints` array from a crude regex; it was tested
-against a real session and missed most genuine friction, so an empty `hints`
-array means nothing.
+The frozen evidence pack's session records hold every in-scope human message,
+including the opening task that established expectations. Read those first:
+they are the primary signal and everything else is context. Heuristic hints can
+miss genuine friction, so an empty hints list means nothing.
 
 Real friction reads as observation, not complaint:
 

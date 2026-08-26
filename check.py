@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verification gate for the Godot 4.7.1 co-op project.
+"""Verification gate for a Godot 4.7.2 project using this portable kit.
 
-Cross-platform: Windows, macOS and Linux, on any Python 3.8+.
+Cross-platform: Windows, macOS and Linux, on Python 3.10+.
 Python is used rather than a shell script because gdtoolkit already requires
 it, so this adds no new dependency, and because Godot's own failure modes need
 real logic rather than shell plumbing.
@@ -12,11 +12,10 @@ Godot's exit codes are not reliable:
 So every stage scans output for error markers, and every invocation has a
 hard timeout because Godot can hang on import.
 
-Usage:
-  python check.py                     run every stage
-  python check.py --only typecheck    run one stage (repeatable, or comma-separated)
-  python check.py --fast              skip import (use when only .gd files changed)
-  python check.py --list              show stage names and exit
+Public usage:
+  kit verify                         run every stage
+  kit verify --stage typecheck       run one stage (repeatable)
+  kit verify --fast                  skip import (use when only .gd files changed)
 
 Stages: format lint import typecheck grep gut smoke
 Exit codes: 0 gate passed, 1 gate failed, 2 could not run (missing Godot)
@@ -26,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -33,6 +33,7 @@ import datetime as _dt
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -41,12 +42,76 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # separate means an agent working on game code never has the gate's own files
 # in scope, and `godot --path src` cannot import a tool script by accident.
 ROOT = Path(__file__).resolve().parent
-PROJECT_DIR = ROOT / "src"
+KIT_CONFIG_FILE = ROOT / "kit.config.json"
+DEPENDENCY_LOCK_FILE = ROOT / "dependencies.lock.json"
+
+
+def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
+    """Resolve portable project facts from their two authoritative files."""
+    errors: List[str] = []
+    game_layout = "src"
+    gdtoolkit_version = ""
+    note_threshold = 10
+    try:
+        config = json.loads(KIT_CONFIG_FILE.read_text(encoding="utf-8"))
+        if config.get("schema") != 1:
+            errors.append("kit.config.json schema must be 1")
+        candidate = config.get("game_root")
+        if candidate not in (".", "src"):
+            errors.append("kit.config.json game_root must be '.' or 'src'")
+        else:
+            game_layout = candidate
+        runtime = config.get("runtime_root")
+        runtime_path = Path(runtime) if isinstance(runtime, str) else Path(".")
+        if (not isinstance(runtime, str) or runtime_path.is_absolute()
+                or ".." in runtime_path.parts or runtime_path.as_posix() in ("", ".")):
+            errors.append("kit.config.json runtime_root must be a private relative path")
+        threshold = config.get("note_threshold", note_threshold)
+        if (not isinstance(threshold, int) or isinstance(threshold, bool)
+                or threshold <= 0):
+            errors.append("kit.config.json note_threshold must be a positive integer")
+        else:
+            note_threshold = threshold
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append(f"kit.config.json is unreadable: {exc}")
+    try:
+        lock = json.loads(DEPENDENCY_LOCK_FILE.read_text(encoding="utf-8"))
+        if lock.get("schema") != 1:
+            errors.append("dependencies.lock.json schema must be 1")
+        value = lock.get("tools", {}).get("gdtoolkit", {}).get("version")
+        if not isinstance(value, str) or not re.fullmatch(r"\d+\.\d+\.\d+", value):
+            errors.append("dependencies.lock.json must pin an exact gdtoolkit version")
+        else:
+            gdtoolkit_version = value
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append(f"dependencies.lock.json is unreadable: {exc}")
+    project_dir = (ROOT / game_layout).resolve()
+    if not project_dir.is_relative_to(ROOT.resolve()):
+        errors.append("configured game root escapes the kit root")
+        project_dir = ROOT / "src"
+    return (
+        project_dir,
+        game_layout,
+        gdtoolkit_version,
+        "; ".join(errors),
+        note_threshold,
+    )
+
+
+(
+    PROJECT_DIR,
+    GAME_LAYOUT,
+    GDTOOLKIT_VERSION,
+    PORTABLE_CONTRACT_ERROR,
+    RETRO_NOTE_THRESHOLD,
+) = _load_portable_contracts()
 LOG_DIR = ROOT / ".checklogs"
-EXPECTED_VERSION = "4.7.1"
+EXPECTED_VERSION = "4.7.2"
 STAGES = ["integrity", "skills", "schema", "shape", "design", "conformance", "format", "lint",
           "sanitise", "import", "typecheck", "grep", "types", "arch", "tests",
           "assets", "resources", "gut", "smoke"]
+ENGINE_STAGES = ("import", "typecheck", "resources", "gut", "smoke")
+STATIC_STAGES = tuple(stage for stage in STAGES if stage not in ENGINE_STAGES)
 GATE_RULES_FILE = ROOT / "gate.rules.json"
 MANIFEST_FILE = ROOT / ".gate.sha256"
 
@@ -74,6 +139,19 @@ GATE_FILES = ["check.py", "arch.py", "sanitise.py", "gate.rules.json"]
 # to edit the file -- pinning it made that change impossible to make honestly.
 # A diff still surfaces it for review, which is the point.
 ADVISORY_FILES = ["project.godot", "arch.rules.json"]
+
+
+def repository_game_relative(path: str) -> Optional[str]:
+    """Map one Git-reported repository path into configured ``res://`` space."""
+    rendered = path.strip().replace("\\", "/")
+    first = rendered.split("/", 1)[0] if rendered else ""
+    if (not rendered or rendered.startswith("/") or ".." in rendered.split("/")
+            or ":" in first):
+        return None
+    if GAME_LAYOUT == ".":
+        return rendered
+    prefix = GAME_LAYOUT + "/"
+    return rendered[len(prefix):] if rendered.startswith(prefix) else None
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -215,6 +293,7 @@ def indent(text: str, limit: int = 40) -> None:
 # uncapped log reached 165 MB in the field. The cap keeps the tail, because the
 # tail is where a timeout notice or a summary line lives.
 LOG_CAP_BYTES = 2 * 1024 * 1024
+ENGINE_LOCK_FILE = ROOT / ".kit" / "runtime" / "godot-process.lock"
 
 
 def _cap(text: str) -> str:
@@ -226,6 +305,160 @@ def _cap(text: str) -> str:
             f"showing the last {LOG_CAP_BYTES} bytes]\n" + keep)
 
 
+def _is_engine_command(cmd: Sequence[str]) -> bool:
+    return bool(cmd) and "godot" in Path(str(cmd[0])).name.lower()
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        # `os.kill(pid, 0)` is a POSIX liveness probe. On Windows Python maps
+        # os.kill to console/termination APIs and signal 0 is not portable, so
+        # it can misclassify a live lock holder as stale. Query the process
+        # object without requesting mutation rights instead.
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        access_denied = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if handle:
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+            finally:
+                kernel32.CloseHandle(handle)
+        # A protected live process may deny even SYNCHRONIZE. Treat that as
+        # alive: refusing a concurrent launch is safer than deleting its lock.
+        return ctypes.get_last_error() == access_denied
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _acquire_engine_lock() -> tuple[str | None, str]:
+    """Serialize native engine launches across agents and check processes."""
+    ENGINE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    for attempt in range(2):
+        try:
+            descriptor = os.open(
+                str(ENGINE_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"pid": os.getpid(), "token": token}, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return token, ""
+        except FileExistsError:
+            try:
+                holder = json.loads(ENGINE_LOCK_FILE.read_text(encoding="utf-8"))
+                pid = int(holder.get("pid", 0))
+                if attempt == 0 and not _pid_is_alive(pid):
+                    ENGINE_LOCK_FILE.unlink()
+                    continue
+                return None, f"another Godot launch is active (pid {pid or 'unknown'})"
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None, "another Godot launch owns an unreadable process lock"
+        except OSError as exc:
+            return None, f"cannot acquire the Godot process lock: {exc}"
+    return None, "another Godot launch is active"
+
+
+def _release_engine_lock(token: str) -> None:
+    try:
+        holder = json.loads(ENGINE_LOCK_FILE.read_text(encoding="utf-8"))
+        if holder.get("token") == token:
+            ENGINE_LOCK_FILE.unlink()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+
+def _start_owned_engine_process(cmd: Sequence[str]) -> subprocess.Popen[bytes]:
+    """Start one headless engine process without Windows error-dialog UI.
+
+    Windows child processes inherit their parent's error mode. Temporarily
+    setting SEM_FAILCRITICALERRORS and SEM_NOGPFAULTERRORBOX prevents a native
+    crash from opening a modal Application Error / WER dialog. The gate is a
+    single-threaded process and restores its original mode immediately after
+    CreateProcess returns.
+    """
+    creation_flags = 0
+    start_new_session = os.name != "nt"
+    kernel32 = None
+    previous_error_mode = None
+    if os.name == "nt":
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetErrorMode.restype = ctypes.c_uint
+            kernel32.SetErrorMode.argtypes = [ctypes.c_uint]
+            kernel32.SetErrorMode.restype = ctypes.c_uint
+            current = kernel32.GetErrorMode()
+            previous_error_mode = kernel32.SetErrorMode(current | 0x0001 | 0x0002)
+        except (AttributeError, OSError):
+            kernel32 = None
+            previous_error_mode = None
+    try:
+        return subprocess.Popen(
+            list(cmd),
+            cwd=str(PROJECT_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags,
+            start_new_session=start_new_session,
+        )
+    finally:
+        if kernel32 is not None and previous_error_mode is not None:
+            kernel32.SetErrorMode(previous_error_mode)
+
+
+def _terminate_owned_process_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate only the native process tree started by this gate."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def run(cmd: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
     """Run a command, capture combined output to `log`, never raise.
 
@@ -233,18 +466,49 @@ def run(cmd: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
     an inherited stdin it reads garbage, resumes, breaks again, and spins until
     the timeout. DEVNULL turns that infinite loop into a clean immediate exit.
     """
+    engine_command = _is_engine_command(cmd)
+    engine_token: str | None = None
+    if engine_command:
+        engine_token, problem = _acquire_engine_lock()
+        if engine_token is None:
+            out = (
+                "ENGINE LAUNCH REFUSED: " + problem
+                + ". Let the existing verification finish; do not retry in parallel.\n"
+            )
+            with log.open("w", encoding="utf-8", errors="replace", newline="") as fh:
+                fh.write(out)
+            return 125, out
     try:
-        proc = subprocess.run(
-            list(cmd),
-            cwd=str(PROJECT_DIR),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
-        out = proc.stdout.decode("utf-8", errors="replace")
-        code = proc.returncode
+        if engine_command:
+            owned = _start_owned_engine_process(cmd)
+            try:
+                raw, _stderr = owned.communicate(timeout=timeout)
+                code = owned.returncode
+            except subprocess.TimeoutExpired as exc:
+                _terminate_owned_process_tree(owned)
+                try:
+                    raw, _stderr = owned.communicate(timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    raw = exc.output or b""
+                if isinstance(raw, str):
+                    raw = raw.encode()
+                out = raw.decode("utf-8", errors="replace")
+                out += f"\nTIMEOUT after {timeout}s; owned process tree terminated\n"
+                code = 124
+            else:
+                out = raw.decode("utf-8", errors="replace")
+        else:
+            proc = subprocess.run(
+                list(cmd),
+                cwd=str(PROJECT_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+            out = proc.stdout.decode("utf-8", errors="replace")
+            code = proc.returncode
     except subprocess.TimeoutExpired as exc:
         partial = exc.stdout or b""
         if isinstance(partial, str):
@@ -255,6 +519,9 @@ def run(cmd: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
     except FileNotFoundError:
         out = f"executable not found: {cmd[0]}\n"
         code = 127
+    finally:
+        if engine_token is not None:
+            _release_engine_lock(engine_token)
     # newline="" prevents Windows translating Godot's \r\n into \r\r\n.
     # ANSI escapes are stripped: the log is read back by an agent, not a TTY.
     clean = _cap(ANSI_RE.sub("", out))
@@ -338,7 +605,16 @@ def find_godot() -> Optional[str]:
         if found:
             return found
         return None
-    for name in ("godot", "godot4", "Godot", "godot.exe", "Godot.exe"):
+    names = (
+        f"Godot_v{EXPECTED_VERSION}-stable_win64_console.exe",
+        f"Godot_v{EXPECTED_VERSION}-stable_win64.exe",
+        "godot",
+        "godot4",
+        "Godot",
+        "godot.exe",
+        "Godot.exe",
+    )
+    for name in names:
         found = shutil.which(name)
         if found:
             return found
@@ -355,30 +631,77 @@ def gd_files() -> List[Path]:
     return out
 
 
+def _private_gdtool(name: str) -> Optional[Path]:
+    """Resolve the exact project-private tool installed by public setup."""
+    if not GDTOOLKIT_VERSION:
+        return None
+    try:
+        config = json.loads(KIT_CONFIG_FILE.read_text(encoding="utf-8"))
+        runtime = Path(config["runtime_root"])
+        if runtime.is_absolute() or ".." in runtime.parts:
+            return None
+        bindir = (ROOT / runtime / "tooling" / f"gdtoolkit-{GDTOOLKIT_VERSION}"
+                  / ("Scripts" if os.name == "nt" else "bin"))
+        candidate = bindir / (name + (".exe" if os.name == "nt" else ""))
+        return candidate if candidate.is_file() else None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def gdtool(name: str) -> Optional[List[str]]:
     """Resolve gdformat/gdlint.
 
     Order of preference:
-      1. the binary on PATH, fastest
-      2. `uvx --from gdtoolkit==4.*`, which needs nothing installed permanently
-         and pins the major version to match Godot 4
-      3. `python -m`, the fallback when the package is pip-installed but
+      1. the exact project-private environment installed by public setup
+      2. an exact-version binary on PATH
+      3. an offline uv tool run of the exact version in dependencies.lock.json
+      4. `python -m`, only when that Python has the exact locked package
          pip's Scripts directory is missing from PATH, which is common on Windows
 
-    Set GDTOOLKIT_OFFLINE=1 to skip the uvx path entirely on a machine with no
-    network access, so the stage degrades to SKIP quickly instead of timing out.
+    Verification never downloads implicitly. Every uv fallback is forced into
+    offline mode; acquisition belongs to a separate, explicitly approved setup
+    operation.
     """
+    private = _private_gdtool(name)
+    if private is not None:
+        try:
+            probe = subprocess.run(
+                [str(private), "--version"], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+            match = re.search(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])",
+                              (probe.stdout or "") + (probe.stderr or ""))
+            if (probe.returncode == 0 and match
+                    and match.group(1) == GDTOOLKIT_VERSION):
+                return [str(private)]
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     found = shutil.which(name)
     if found:
-        return [found]
+        try:
+            probe = subprocess.run(
+                [found, "--version"], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+            match = re.search(
+                r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])",
+                (probe.stdout or "") + (probe.stderr or ""),
+            )
+            if (probe.returncode == 0 and match is not None
+                    and match.group(1) == GDTOOLKIT_VERSION):
+                return [found]
+        except (OSError, subprocess.SubprocessError):
+            pass
 
-    if not os.environ.get("GDTOOLKIT_OFFLINE"):
+    if GDTOOLKIT_VERSION:
         runner = shutil.which("uvx")
         base = [runner] if runner else None
         if base is None and shutil.which("uv"):
             base = [shutil.which("uv"), "tool", "run"]
         if base:
-            cmd = base + ["--from", "gdtoolkit==4.*", name]
+            base.append("--offline")
+            cmd = base + ["--from", f"gdtoolkit=={GDTOOLKIT_VERSION}", name]
             try:
                 probe = subprocess.run(
                     cmd + ["--version"], stdout=subprocess.DEVNULL,
@@ -388,6 +711,12 @@ def gdtool(name: str) -> Optional[List[str]]:
             except (subprocess.TimeoutExpired, OSError):
                 pass
 
+    try:
+        installed = importlib.metadata.version("gdtoolkit")
+    except importlib.metadata.PackageNotFoundError:
+        installed = ""
+    if installed != GDTOOLKIT_VERSION:
+        return None
     module = {"gdformat": "gdtoolkit.formatter", "gdlint": "gdtoolkit.linter"}[name]
     probe = subprocess.run(
         [sys.executable, "-m", module, "--help"],
@@ -427,17 +756,19 @@ def write_manifest() -> None:
             lines.append(f"{digest}  {rel}")
     with MANIFEST_FILE.open("w", encoding="utf-8", newline="\n") as fh:
         fh.write("# Integrity manifest for the verification gate.\n")
-        fh.write("# Regenerate deliberately: python check.py --accept-gate-changes\n")
+        fh.write("# Regenerate deliberately: kit integrity accept\n")
         fh.write("\n".join(lines) + "\n")
 
 
 def stage_integrity() -> None:
     head("gate integrity")
     if not MANIFEST_FILE.is_file():
-        write_manifest()
-        print(f"  no manifest, created {MANIFEST_FILE.name} from current files")
-        print("  commit it: this is the baseline the gate is measured against")
-        RESULTS.passed("integrity (baselined)")
+        print(f"  {RED}MISSING   {MANIFEST_FILE.name}{RST}")
+        print()
+        print("  The shipped trust manifest is absent, so there is no trusted")
+        print("  baseline against which to verify the gate. Restore it from the")
+        print("  distribution or version control; never baseline unknown files.")
+        RESULTS.fail("integrity (manifest missing)")
         return
 
     expected: Dict[str, str] = {}
@@ -448,6 +779,18 @@ def stage_integrity() -> None:
         parts = line.split(None, 1)
         if len(parts) == 2:
             expected[parts[1].strip()] = parts[0]
+
+    required = set(GATE_FILES + ADVISORY_FILES)
+    unlisted = sorted(required - set(expected))
+    if unlisted:
+        for rel in unlisted:
+            print(f"  {RED}UNLISTED  {rel}{RST}")
+        print()
+        print("  The shipped trust manifest is incomplete. Restore it from the")
+        print("  distribution or version control; an incomplete baseline cannot")
+        print("  establish that every gate file is unchanged.")
+        RESULTS.fail("integrity (manifest incomplete)")
+        return
 
     drift, missing = [], []
     for rel, want in expected.items():
@@ -477,7 +820,7 @@ def stage_integrity() -> None:
     print("  The gate has been modified. This is not automatically wrong, but it")
     print("  must be a deliberate human decision, never an agent's route to green.")
     print("  Review with:  git diff -- " + " ".join(sorted(drift + missing)))
-    print("  Then either revert, or accept:  python check.py --accept-gate-changes")
+    print("  Then either revert, or accept:  kit integrity accept")
     RESULTS.fail("integrity (gate modified)")
 
 
@@ -553,7 +896,7 @@ def stage_tests() -> None:
     """Test files the runner would silently ignore, and untested modules.
 
     GUT collects only files matching its configured dirs/prefix/suffix. A file
-    named `deglyph_test.gd` is not collected and produces NO error - the suite
+    named `project_rule_test.gd` is not collected and produces NO error - the suite
     looks healthy while testing nothing. That is a false green, so it blocks.
 
     The pairing check (does each interior/boundary module have a test file) is
@@ -667,7 +1010,7 @@ def stage_assets() -> None:
             assets += 1
             if not path.with_name(path.name + ".import").is_file():
                 problems.append(f"{rel.as_posix()}: no .import sidecar"
-                                f" -- run: python check.py --only import")
+                                f" -- run: kit verify --stage import")
     # .uid sidecars for scripts are advisory: whether headless import generates
     # them is engine-version dependent, and a missing one degrades to
     # path-based resolution rather than breaking anything.
@@ -692,11 +1035,11 @@ def stage_assets() -> None:
 
 def stage_resources(godot: str) -> None:
     head("resources (headless load + instantiate)")
-    # GDScript run by the engine must live inside src/, because res:// resolves
-    # to the Godot project root, not the repo root.
+    # GDScript run by the engine must live inside the configured game root,
+    # because res:// cannot reach a sibling kit directory.
     script = PROJECT_DIR / "tools" / "validate_resources.gd"
     if not script.is_file():
-        print("  src/tools/validate_resources.gd not present, stage disabled")
+        print("  res://tools/validate_resources.gd not present, stage disabled")
         RESULTS.skip("resources")
         return
     _, out = run(
@@ -741,6 +1084,10 @@ def stage_schema() -> None:
     say.
     """
     head("schema (artefact field shapes)")
+    if PORTABLE_CONTRACT_ERROR:
+        print(f"  {RED}error: {PORTABLE_CONTRACT_ERROR}{RST}")
+        RESULTS.fail("schema")
+        return
     tool = ROOT / "tools" / "schema.py"
     if not tool.exists():
         print("  tools/schema.py missing")
@@ -757,7 +1104,7 @@ def stage_schema() -> None:
         elif line:
             print(f"  {line}")
     if code != 0:
-        print(f"  {DIM}field list: python tools/schema.py --describe proposal"
+        print(f"  {DIM}field list: kit schema describe proposal"
               f"{RST}")
         RESULTS.fail("schema")
         return
@@ -999,7 +1346,7 @@ def stage_format() -> None:
     head("format (gdformat --check)")
     tool = gdtool("gdformat")
     if tool is None:
-        print("  gdformat unavailable. Run: python bootstrap.py --fix")
+        print("  gdformat unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         RESULTS.skip("format")
         return
     files = [str(p) for p in gd_files()]
@@ -1015,7 +1362,7 @@ def stage_format() -> None:
         # Deliberately not "gdformat ." -- that is unscoped and reformats
         # addons/, which is third-party code the gate excludes. --fix-format
         # reuses this stage's own filtered file list.
-        print("  fix with: python check.py --fix-format")
+        print("  fix with: kit setup format")
         RESULTS.fail("format")
 
 
@@ -1024,7 +1371,7 @@ def fix_format() -> int:
     head("fix-format (gdformat, project files only)")
     tool = gdtool("gdformat")
     if tool is None:
-        print(f"  {RED}gdformat unavailable{RST}. Run: python bootstrap.py --fix")
+        print(f"  {RED}gdformat unavailable{RST}. Install the locked version shown by: kit doctor")
         return 2
     files = [str(p) for p in gd_files()]
     if not files:
@@ -1045,7 +1392,7 @@ def stage_lint() -> None:
     head("lint (gdlint)")
     tool = gdtool("gdlint")
     if tool is None:
-        print("  gdlint unavailable. Run: python bootstrap.py --fix")
+        print("  gdlint unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         RESULTS.skip("lint")
         return
     # gdlint honours .gdlintrc excluded_directories; gdformat does not, so both
@@ -1391,7 +1738,7 @@ def stage_design() -> None:
     """
     head("design index and bindings")
     tool = ROOT / "tools" / "design.py"
-    design_dir = PROJECT_DIR.parent / "docs" / "design"
+    design_dir = ROOT / "docs" / "design"
     if not tool.is_file():
         print("  tools/design.py not found")
         RESULTS.skip("design")
@@ -1540,10 +1887,10 @@ def stage_conformance() -> None:
 
     # Experience before structure. Every other artefact in this repo describes
     # structure; nothing else captures intended feel. Without it, feel gets
-    # inferred from whatever the renderer happens to do -- a cell-based
-    # renderer reads as cell-stepped movement, which may be the opposite of
-    # what was wanted. Required at every level, including hands-off, because
-    # the inference is just as wrong when nobody is watching.
+    # inferred from the first plausible implementation. Structurally valid work
+    # can still deliver the wrong interaction. Required at every level,
+    # including hands-off, because the inference is just as wrong when nobody
+    # is watching.
     exp = prop.get("experience")
     has_structure = bool(prop_mods or prop_files)
     if has_structure:
@@ -1676,7 +2023,7 @@ def stage_conformance() -> None:
     if not status:
         print(f"  {YEL}note: no status field; treating as approved{RST}")
 
-    # Actual state, from src/ only. Gate scripts and docs are not game code.
+    # Actual state, relative to the configured res:// root.
     all_real = {str(f.relative_to(PROJECT_DIR)).replace("\\", "/")
                 for f in gd_files()}
     all_real = {f for f in all_real
@@ -1689,20 +2036,22 @@ def stage_conformance() -> None:
     baseline = str(prop.get("baseline_sha", "") or "").strip()
     scoped = False
     if baseline and shutil.which("git"):
+        pathspec = GAME_LAYOUT
         code, out = run(["git", "-C", str(ROOT), "diff", "--name-only",
-                         baseline, "--", "src"], 30, LOG_DIR / "conformance.log")
+                         baseline, "--", pathspec], 30,
+                        LOG_DIR / "conformance.log")
         # git diff shows tracked changes only. New work is usually UNTRACKED,
         # so omitting it scopes the diff to nothing and the stage reports a
         # perfect match over files it never looked at.
         _, untracked = run(["git", "-C", str(ROOT), "ls-files", "--others",
-                            "--exclude-standard", "--", "src"], 30,
+                            "--exclude-standard", "--", pathspec], 30,
                            LOG_DIR / "conformance.log")
         if code == 0:
             changed = set()
             for line in (out + "\n" + untracked).splitlines():
-                line = line.strip().replace("\\", "/")
-                if line.startswith("src/"):
-                    changed.add(line[len("src/"):])
+                relative = repository_game_relative(line)
+                if relative is not None:
+                    changed.add(relative)
             real_files = all_real & changed
             scoped = True
             print(f"  {DIM}scoped to {len(real_files)} file(s) changed since"
@@ -1724,14 +2073,14 @@ def stage_conformance() -> None:
     action_wrong: List[str] = []
     if baseline and shutil.which("git"):
         code, listing = run(["git", "-C", str(ROOT), "ls-tree", "-r",
-                             "--name-only", baseline, "--", "src"], 30,
+                             "--name-only", baseline, "--", GAME_LAYOUT], 30,
                             LOG_DIR / "conformance.log")
         if code == 0:
             at_baseline = set()
             for line in listing.splitlines():
-                line = line.strip().replace("\\", "/")
-                if line.startswith("src/"):
-                    at_baseline.add(line[len("src/"):])
+                relative = repository_game_relative(line)
+                if relative is not None:
+                    at_baseline.add(relative)
             for item in (prop.get("files") or []):
                 if not isinstance(item, dict):
                     continue
@@ -1813,7 +2162,7 @@ def stage_conformance() -> None:
 def stage_gut(godot: str) -> None:
     head("unit tests (GUT)")
     if not (PROJECT_DIR / "addons" / "gut" / "gut_cmdln.gd").is_file():
-        print("  GUT not installed. Run: python bootstrap.py --fix")
+        print("  GUT not installed. Run explicitly: kit setup dependency gut")
         RESULTS.skip("gut")
         return
     code, out = run(
@@ -1966,22 +2315,30 @@ def retro_nudge() -> None:
     n = len([q for q in notes.glob("*.md") if q.name.lower() != "readme.md"])
     if not n:
         return
-    threshold = 10
-    try:
-        cfg = json.loads((ROOT / "retro.config.json").read_text(encoding="utf-8"))
-        threshold = int(cfg.get("note_threshold", threshold)) or threshold
-    except (OSError, ValueError, TypeError):
-        pass
+    threshold = RETRO_NOTE_THRESHOLD
     if n >= threshold:
         print(f"{YEL}retrospective due{RST} {DIM}({n} unarchived slice note(s),"
               f" threshold {threshold}){RST}")
-        print(f"{DIM}  copilot --agent retrospective -p \"Run a retrospective"
-              f" over the unarchived notes.\"{RST}")
+        print(f"{DIM}  kit retro run{RST}")
+
+
+def finish() -> int:
+    """Print the one authoritative summary after a bounded verification run."""
+    print(f"\n{DIM}================ summary ================{RST}")
+    for line in RESULTS.lines:
+        print(line)
+    print(f"{DIM}logs: {LOG_DIR}{RST}")
+    if RESULTS.failed:
+        print(f"{RED}GATE FAILED{RST}")
+        return 1
+    print(f"{GRN}GATE PASSED{RST}")
+    retro_nudge()
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verification gate for the Godot co-op project.",
+        description="Verification gate for a portable Godot project.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="stages: " + " ".join(STAGES),
     )
@@ -1989,6 +2346,8 @@ def main() -> int:
                         help="run only this stage (repeatable or comma-separated)")
     parser.add_argument("--fast", action="store_true",
                         help="skip import; use when only .gd files changed")
+    parser.add_argument("--static", action="store_true",
+                        help="run every non-engine stage without discovering or launching Godot")
     parser.add_argument("--list", action="store_true", help="list stages and exit")
     parser.add_argument("--fix-format", action="store_true",
                         help="run gdformat over project .gd files (addons excluded)")
@@ -2013,36 +2372,37 @@ def main() -> int:
     selected = []
     for item in args.only:
         selected.extend(s.strip() for s in item.split(",") if s.strip())
+    if args.static and (selected or args.fast):
+        parser.error("--static cannot be combined with --only or --fast")
     unknown = [s for s in selected if s not in STAGES]
     if unknown:
         print(f"unknown stage(s): {', '.join(unknown)}")
         print(f"valid stages: {' '.join(STAGES)}")
         return 2
-    active = selected or list(STAGES)
+    active = list(STATIC_STAGES) if args.static else (selected or list(STAGES))
 
     LOG_DIR.mkdir(exist_ok=True)
 
     head("prerequisites")
     print(f"python: {sys.version.split()[0]} on {sys.platform}")
-    godot = find_godot()
-    needs_godot = any(s in active for s in
-                      ("import", "typecheck", "gut", "smoke", "resources"))
-    if godot is None:
-        if needs_godot:
-            print(f"{RED}godot not on PATH{RST}")
-            print("Set GODOT_BIN to the executable, or run: python bootstrap.py")
-            return 2
-        print(f"{YEL}godot not found, but no stage needs it{RST}")
-    else:
-        _, ver = run([godot, "--version"], 30, LOG_DIR / "version.log")
-        version_line = ver.strip().splitlines()[-1] if ver.strip() else "unknown"
-        print(f"godot:  {version_line}  ({godot})")
-        if EXPECTED_VERSION not in version_line:
-            print(f"{YEL}warning: expected {EXPECTED_VERSION};"
-                  f" AGENTS.md and CI assume it{RST}")
+    needs_godot = any(stage in active for stage in ENGINE_STAGES)
+    if not needs_godot:
+        print("godot:  not discovered or launched (no selected stage needs it)")
 
+    # Integrity is a trust boundary, not merely another diagnostic. If it
+    # fails, stop before importing tools, scanning the project, or touching the
+    # native engine. The human must first review the protected-file diff.
     if "integrity" in active:
         stage_integrity()
+        if RESULTS.failed:
+            for stage in active:
+                if stage != "integrity":
+                    RESULTS.skip(f"{stage} (skipped: integrity review required)")
+            return finish()
+
+    # Every process-light stage completes before the native-engine boundary.
+    # This both gives useful kit evidence without Godot and ensures a static
+    # failure cannot cascade into one or more native crash dialogs.
     if "skills" in active:
         stage_skills()
     if "schema" in active:
@@ -2059,21 +2419,6 @@ def main() -> int:
         stage_lint()
     if "sanitise" in active:
         stage_sanitise()
-    if "import" in active:
-        if args.fast:
-            RESULTS.skip("import (--fast)")
-        else:
-            stage_import(godot)  # type: ignore[arg-type]
-    if "typecheck" in active:
-        stage_typecheck(godot)  # type: ignore[arg-type]
-    # Fail-fast barrier. Stages after this point load and execute GDScript.
-    # Running them against code that does not parse produces noise at best and
-    # a debugger spin at worst, and tells the agent nothing it does not already
-    # know from typecheck. Cheap text-only stages still run so one gate pass
-    # reports every static problem at once.
-    parse_broken = any(
-        line.startswith("FAIL") and (" typecheck" in line or " import" in line)
-        for line in RESULTS.lines)
     if "grep" in active:
         stage_grep()
     if "types" in active:
@@ -2084,32 +2429,78 @@ def main() -> int:
         stage_tests()
     if "assets" in active:
         stage_assets()
-    if "resources" in active:
-        if parse_broken:
-            RESULTS.skip("resources (skipped: fix parse errors first)")
-        else:
-            stage_resources(godot)  # type: ignore[arg-type]
-    if "gut" in active:
-        if parse_broken:
-            RESULTS.skip("gut (skipped: fix parse errors first)")
-        else:
-            stage_gut(godot)  # type: ignore[arg-type]
-    if "smoke" in active:
-        if parse_broken:
-            RESULTS.skip("smoke (skipped: fix parse errors first)")
-        else:
-            stage_smoke(godot)  # type: ignore[arg-type]
 
-    print(f"\n{DIM}================ summary ================{RST}")
-    for line in RESULTS.lines:
-        print(line)
-    print(f"{DIM}logs: {LOG_DIR}{RST}")
-    if RESULTS.failed:
-        print(f"{RED}GATE FAILED{RST}")
-        return 1
-    print(f"{GRN}GATE PASSED{RST}")
-    retro_nudge()
-    return 0
+    if needs_godot:
+        if RESULTS.failed:
+            head("engine boundary")
+            print("godot:  not discovered or launched because static verification failed")
+            for stage in ENGINE_STAGES:
+                if stage in active:
+                    RESULTS.skip(f"{stage} (skipped: static verification failed)")
+        elif os.environ.get("KIT_ENGINE_DISABLED") == "1":
+            head("engine boundary")
+            print("godot:  not discovered or launched; native engine disabled by caller")
+            RESULTS.fail("engine-boundary (native engine disabled by caller)")
+            for stage in ENGINE_STAGES:
+                if stage in active:
+                    RESULTS.skip(f"{stage} (skipped: native engine disabled by caller)")
+        else:
+            head("engine boundary")
+            godot = find_godot()
+            if godot is None:
+                print(f"{RED}godot not on PATH{RST}")
+                print("Set GODOT_BIN to the executable, or run: kit doctor")
+                return 2
+            print(f"godot:  {godot}")
+            code, version_output = run(
+                [godot, "--headless", "--version"], 30, LOG_DIR / "version.log"
+            )
+            version_errors = scan(version_output)
+            version_line = (
+                version_output.strip().splitlines()[-1]
+                if version_output.strip() else "no version output"
+            )
+            if code != 0 or version_errors:
+                print(f"{RED}engine health check failed{RST}: {version_line}")
+                indent("\n".join(version_errors), 12)
+                RESULTS.fail("engine-health")
+            else:
+                print(f"version: {version_line}")
+                match = re.search(
+                    r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])",
+                    version_line,
+                )
+                reported_version = match.group(1) if match else "unknown"
+                if reported_version != EXPECTED_VERSION:
+                    print(
+                        f"{RED}unsupported engine version {reported_version}; "
+                        f"expected exactly {EXPECTED_VERSION}{RST}"
+                    )
+                    RESULTS.fail("engine-version")
+
+            engine_functions = {
+                "import": stage_import,
+                "typecheck": stage_typecheck,
+                "resources": stage_resources,
+                "gut": stage_gut,
+                "smoke": stage_smoke,
+            }
+            engine_blocked = RESULTS.failed
+            for stage in ENGINE_STAGES:
+                if stage not in active:
+                    continue
+                if stage == "import" and args.fast:
+                    RESULTS.skip("import (--fast)")
+                    continue
+                if engine_blocked:
+                    RESULTS.skip(
+                        f"{stage} (skipped: previous native-engine check failed)"
+                    )
+                    continue
+                engine_functions[stage](godot)
+                engine_blocked = RESULTS.failed
+
+    return finish()
 
 
 if __name__ == "__main__":

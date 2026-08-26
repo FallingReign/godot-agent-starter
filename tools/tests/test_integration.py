@@ -16,8 +16,9 @@ against *each other*, which is where a parallel build actually breaks:
 * **The loop, end to end.** One approval, through a real HTTP request, a real
   `RunManager`, a real spawned process, to the prompt file on disk -- asserting
   the dispatched bytes are the bytes the page displayed. The spawned executable
-  is a stub that sleeps and exits 0: the plumbing is exercised, no quota is
-  spent, and nothing here can reach a model.
+  is an edit-only stub: the host must seal Git metadata, validate and commit its
+  bounded change, run the gate and integrate it. No quota is spent, and nothing
+  here can reach a model.
 
 Every path is redirected into a temp directory, so no test here writes to
 docs/retro/.
@@ -28,6 +29,7 @@ import http.server
 import json
 import os
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -47,8 +49,8 @@ import retro_queue    # noqa: E402
 from test_board_api import SLUG_A, SLUG_B, BoardTestCase  # noqa: E402
 
 
-def _serve(handler_cls) -> tuple[http.server.ThreadingHTTPServer, int]:
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+def _serve(handler_cls) -> tuple[board.BoardHTTPServer, int]:
+    httpd = board.BoardHTTPServer(("127.0.0.1", 0), handler_cls)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, httpd.server_address[1]
 
@@ -110,6 +112,7 @@ class TestMockRealParity(BoardTestCase):
         real, mock = self.both("/api/health")
         self.assertSameKeys(real, mock, "/api/health")
         self.assertEqual(real["schema"], mock["schema"])
+        self.assertEqual(real["version"], mock["version"])
 
     def test_state_top_level_agrees(self) -> None:
         real, mock = self.both("/api/state")
@@ -152,7 +155,13 @@ class TestMockRealParity(BoardTestCase):
             self.assertFalse(mock["ok"])
 
 
-def _stub_copilot(directory: Path) -> str:
+def _git(directory: Path, *args: str) -> str:
+    result = subprocess.run(["git", "-C", str(directory), *args], check=True,
+                            capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def _stub_worker(directory: Path) -> Path:
     """An executable that behaves like a worker and costs nothing.
 
     It sleeps long enough for the board to observe a `working` item and a
@@ -161,20 +170,35 @@ def _stub_copilot(directory: Path) -> str:
     watcher thread, the queue and the state file.
     """
     seconds = 3
-    if os.name == "nt":
-        path = directory / "stub_copilot.cmd"
-        path.write_text(
-            "@echo off\r\n"
-            f'"{sys.executable}" -c "import time; time.sleep({seconds})"\r\n'
-            "exit /b 0\r\n", encoding="utf-8")
-    else:
-        path = directory / "stub_copilot.sh"
-        path.write_text(
-            "#!/bin/sh\n"
-            f'"{sys.executable}" -c "import time; time.sleep({seconds})"\n'
-            "exit 0\n", encoding="utf-8")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
-    return str(path)
+    worker = directory / "stub_worker.py"
+    worker.write_text(
+        "import os, sys, time\n"
+        "from pathlib import Path\n"
+        f"time.sleep({seconds})\n"
+        "mode = sys.argv[1]\n"
+        "if mode == 'missing':\n"
+        "    raise SystemExit(0)\n"
+        "run_id = os.environ['KIT_RUN_ID']\n"
+        "prompt = sys.stdin.read()\n"
+        "name = 'check.py' if 'fix_files: check.py' in prompt else 'tools/thing.py'\n"
+        "Path(name).parent.mkdir(parents=True, exist_ok=True)\n"
+        "existing = Path(name).read_text(encoding='utf-8') if Path(name).exists() else ''\n"
+        "Path(name).write_text(existing + '# host-finalized ' + run_id + '\\n', "
+        "encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    return worker
+
+
+def _stub_command(worker: Path, mode: str) -> list[str]:
+    """Return an argv-only command that never passes through a command shell.
+
+    The provider command builder has its own exact-argv security tests. This
+    seam test needs a stable child process on every platform, especially on
+    Windows where a ``.cmd`` wrapper can reinterpret a multiline prompt before
+    the stub sees it.
+    """
+    return [sys.executable, str(worker), mode]
 
 
 class TestEndToEnd(BoardTestCase):
@@ -184,10 +208,30 @@ class TestEndToEnd(BoardTestCase):
     def setUp(self) -> None:
         super().setUp()
         self._root = board.ROOT
-        self._exe = board._copilot_executable
+        self._launcher = board.providers._copilot_launcher
+        self._worker_command = board.providers.worker_command
         board.ROOT = self.dir                    # runs/ live under the temp repo
-        stub = _stub_copilot(self.dir)
-        board._copilot_executable = lambda: stub
+        (self.dir / "check.py").write_text("print('GATE PASSED')\n", encoding="utf-8")
+        (self.dir / ".gitignore").write_text(".kit/\n", encoding="utf-8")
+        (self.dir / "kit.config.json").write_text(json.dumps({
+            "schema": 1,
+            "dispatch_policy": {
+                "owned": ["tools", "check.py"],
+                "forbidden": [".kit", "docs/retro", "src"],
+            },
+        }), encoding="utf-8")
+        _git(self.dir, "init")
+        _git(self.dir, "config", "user.email", "board-test@example.invalid")
+        _git(self.dir, "config", "user.name", "Board Integration")
+        _git(self.dir, "add", ".")
+        _git(self.dir, "commit", "-m", "fixture baseline")
+        self.stub_dir = self.runtime / "test-stubs"
+        self.stub_dir.mkdir(parents=True, exist_ok=True)
+        self.stub = _stub_worker(self.stub_dir)
+        board.providers._copilot_launcher = lambda: [sys.executable]
+        board.providers.worker_command = (
+            lambda _spec: _stub_command(self.stub, "implemented")
+        )
         board._run_manager = board.RunManager()  # the real one, not the fake
         self.httpd, self.port = _serve(board.Handler)
 
@@ -196,7 +240,8 @@ class TestEndToEnd(BoardTestCase):
         self.httpd.server_close()
         self._drain()
         board.ROOT = self._root
-        board._copilot_executable = self._exe
+        board.providers._copilot_launcher = self._launcher
+        board.providers.worker_command = self._worker_command
         super().tearDown()
 
     def _drain(self, timeout: float = 40.0) -> None:
@@ -209,7 +254,8 @@ class TestEndToEnd(BoardTestCase):
         deadline = time.time() + timeout
         while time.time() < deadline:
             runs = board.load_state().get("runs", [])
-            if not any(r.get("status") == "running" for r in runs):
+            if not any(r.get("status") in ("starting", "running", "verifying")
+                       for r in runs):
                 time.sleep(0.3)   # let the watcher thread close its handles
                 return
             time.sleep(0.25)
@@ -218,7 +264,9 @@ class TestEndToEnd(BoardTestCase):
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}", method="POST",
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "Origin": f"http://127.0.0.1:{self.port}",
+                     "X-Kit-Board-Token": self.httpd.capability_token})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.loads(r.read().decode("utf-8"))
@@ -239,6 +287,19 @@ class TestEndToEnd(BoardTestCase):
             time.sleep(0.25)
         self.fail(f"{slug} never reached {states}; last was {last.get('state')!r}")
 
+    def wait_run_started(self, run_id: str, timeout: float = 10.0) -> dict:
+        deadline = time.time() + timeout
+        run: dict = {}
+        while time.time() < deadline:
+            run = next(r for r in board.load_state()["runs"] if r["run_id"] == run_id)
+            if run.get("status") == "running" and run.get("pid"):
+                return run
+            time.sleep(0.05)
+        self.fail(
+            f"{run_id} did not start; status={run.get('status')!r}; "
+            f"errors={run.get('result_errors')!r}"
+        )
+
     def test_approve_dispatches_the_prompt_the_page_displayed(self) -> None:
         comment = "Do the smallest version, and keep the CLI."
 
@@ -257,7 +318,7 @@ class TestEndToEnd(BoardTestCase):
         self.assertEqual(entry["comment"], comment)
 
         # (b) a worker really was spawned -- a live pid, not a bookkeeping entry
-        run = next(r for r in board.load_state()["runs"] if r["run_id"] == run_id)
+        run = self.wait_run_started(run_id)
         self.assertTrue(board._pid_alive(run["pid"]), "no live worker process")
 
         # (c) the dispatched bytes are the displayed bytes plus the comment
@@ -276,7 +337,7 @@ class TestEndToEnd(BoardTestCase):
         self.assertEqual(self.state_of(SLUG_B)["state"], "queued",
                          "a second approval ran concurrently instead of queueing")
 
-        done = self.wait_for(SLUG_A, ("done", "failed"))
+        done = self.wait_for(SLUG_A, ("done", "blocked", "unverified", "failed"))
         self.assertEqual(done["state"], "done", done["status_detail"])
         self.assertEqual(
             next(r for r in board.load_state()["runs"] if r["run_id"] == run_id)["exit_code"], 0)
@@ -293,7 +354,26 @@ class TestEndToEnd(BoardTestCase):
         written = (board.RUNS_DIR / f"{payload['run']['run_id']}.prompt.md").read_text(
             encoding="utf-8")
         self.assertEqual(written, preview)
-        self.wait_for(SLUG_A, ("done", "failed"))
+        self.wait_for(SLUG_A, ("done", "blocked", "unverified", "failed"))
+
+    def test_exit_zero_without_edits_is_blocked_and_halts_queue(self) -> None:
+        board.providers.worker_command = (
+            lambda _spec: _stub_command(self.stub, "missing")
+        )
+        code, first = self.post("/api/finding/approve",
+                                {"slug": SLUG_A, "comment": "plain exit"})
+        self.assertEqual(code, 200, first)
+        code, second = self.post("/api/finding/approve",
+                                 {"slug": SLUG_B, "comment": "must wait"})
+        self.assertEqual(code, 200, second)
+        outcome = self.wait_for(SLUG_A, ("blocked", "unverified", "failed"))
+        self.assertEqual(outcome["state"], "blocked", outcome["status_detail"])
+        self.assertIn("without proposed file changes", outcome["status_detail"],
+                      board.load_state())
+        queued = self.state_of(SLUG_B)
+        self.assertEqual(queued["state"], "queued")
+        _code, state = _fetch(self.port, "/api/state")
+        self.assertTrue(state["queue_halted"])
 
 
 class TestAcceptedMigration(BoardTestCase):
