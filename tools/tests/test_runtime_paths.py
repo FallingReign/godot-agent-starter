@@ -9,6 +9,7 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Iterator
+from unittest import mock
 
 from tools import runtime_paths
 
@@ -60,16 +61,25 @@ class RuntimePathsTests(unittest.TestCase):
 
     def test_create_only_makes_runtime_directories(self) -> None:
         with _scratch() as root:
-            _configure(root, "state/private")
+            _configure(root, ".kit/private")
             paths = runtime_paths.resolve(root, create=True)
             self.assertTrue(paths.session_evidence.is_dir())
             self.assertTrue(paths.board_runs.is_dir())
+            self.assertTrue(paths.verification_runs.is_dir())
+            self.assertTrue(paths.plan_decisions.is_dir())
+            self.assertEqual(
+                paths.verification_latest,
+                root / ".kit" / "private" / "verification" / "latest.json",
+            )
             self.assertTrue(paths.dispatch_workspaces.is_dir())
             self.assertFalse((root / "docs").exists())
 
     def test_rejects_absolute_traversal_and_project_root(self) -> None:
         with _scratch() as root:
-            for bad in ("../elsewhere", str(root.resolve()), "."):
+            for bad in (
+                "../elsewhere", str(root.resolve()), ".", ".kit",
+                "state/private", "src/runtime", "docs/private",
+            ):
                 with self.subTest(bad=bad):
                     _configure(root, bad)
                     with self.assertRaises(runtime_paths.RuntimeConfigError):
@@ -82,6 +92,24 @@ class RuntimePathsTests(unittest.TestCase):
             _configure(root, schema=99)
             with self.assertRaises(runtime_paths.RuntimeConfigError):
                 runtime_paths.resolve(root)
+
+    def test_existing_runtime_components_cannot_redirect_or_be_files(self) -> None:
+        with _scratch() as root:
+            _configure(root)
+            (root / ".kit").write_text("not a directory", encoding="utf-8")
+            with self.assertRaisesRegex(
+                runtime_paths.RuntimeConfigError, "unredirected directory"
+            ):
+                runtime_paths.resolve(root)
+
+        with _scratch() as root:
+            _configure(root)
+            (root / ".kit").mkdir()
+            with mock.patch.object(runtime_paths, "_is_reparse", return_value=True):
+                with self.assertRaisesRegex(
+                    runtime_paths.RuntimeConfigError, "unredirected directory"
+                ):
+                    runtime_paths.resolve(root)
 
 
 if __name__ == "__main__":

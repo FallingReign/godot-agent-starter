@@ -10,7 +10,7 @@ repository root or under `src/`. It does not assume a genre, multiplayer, 2D or
 
 ## Safe start
 
-Use `\.\kit.cmd` on Windows or `./kit` on macOS/Linux. The examples use `kit`
+Use `.\kit.cmd` on Windows or `./kit` on macOS/Linux. The examples use `kit`
 as the platform-neutral name.
 
 ```text
@@ -24,15 +24,19 @@ code, changes Git, calls a model, or starts a server.
 Engine selection is exact-version aware without executing the binary. A stale
 versioned `GODOT_BIN` may fall forward to the supported console binary beside it
 or beside the project; otherwise the known mismatch is reported and no native
-process starts. Full verification still confirms the engine's own version output.
+process starts. Full verification and each explicit non-gate native operation
+then authenticate the selected executable's own version output. Import, API-doc
+generation and the language server never treat an unversioned PATH entry as
+execution authority.
 
-If readiness is complete:
+If readiness is complete and the native boundary is known safe, with no
+unresolved native failure:
 
 ```text
 kit verify
 ```
 
-If the native engine is unsafe or unavailable:
+If the native engine is unsafe, unavailable, or has an unresolved crash:
 
 ```text
 kit verify --static
@@ -41,7 +45,9 @@ kit self-test
 
 `verify --static` runs the project gate's non-engine stages. `self-test` runs the
 kit control-plane regression suite with native-engine execution explicitly
-disabled. Neither is a substitute for full release evidence.
+disabled. Neither resolves an existing crash warning or substitutes for full
+release evidence. Resume full verification only after explicit approval for one
+bounded native retry.
 
 ## Public commands
 
@@ -54,12 +60,12 @@ disabled. Neither is a substitute for full release evidence.
 | `kit verify --static` | Run every non-engine gate stage | Never discovers or starts Godot |
 | `kit verify --strict` | Produce production/release evidence | Rejects unsupported skips |
 | `kit self-test` | Test the kit control plane | Native engine is forcibly disabled |
-| `kit plan` | Regenerate `plan.html` and `retro.html` | Deterministic local file generation |
-| `kit serve` | Start or reuse the authenticated loopback board | Local server on `127.0.0.1` only |
+| `kit plan [--snapshot [NAME]]` | Regenerate the living views and optionally retain an immutable review snapshot | Deterministic local file generation; no server |
+| `kit serve [start\|status\|open\|stop]` | Manage the capability-protected local review cockpit | Explicit local server lifecycle on `127.0.0.1` only |
 | `kit retro status` | Report whether retrospective work is due | Deterministic; no model call |
-| `kit retro run` | Prepare evidence with the configured analyzer | Manual by default |
+| `kit retro run [--since ISO] [--limit N]` | Prepare complete bounded evidence or an explicit snapshot-bound window | Manual by default |
 | `kit retro run --confirm-spend` | Invoke an automatic analyzer | Explicit external-provider action |
-| `kit retro publish` | Validate findings and refresh decision views | No worker dispatch |
+| `kit retro publish` | Validate findings, refresh both views and transactionally close the exact evidence snapshot | No worker dispatch |
 | `kit release build PATH` | Build and verify a sanitized archive | Local archive only; never publishes |
 
 All commands accept `--project PATH` and `--json`. A kit root is the nearest
@@ -100,19 +106,74 @@ reviews the exact diff and separately runs `kit integrity accept`.
 
 `kit plan` produces two generated views:
 
-- `plan.html` opens with the current outcome, what is actually true, the latest
-  evidence and the next decision. Approved structure, open questions, direction,
-  recent changes, architecture and source documents remain available under
-  progressive disclosure.
+- `plan.html` opens with a Quick Read of what the player does, experiences and
+  should achieve. It shows the exact design authority and digest, whether the
+  current work is reversible, the next go/no-go point, verification freshness,
+  and the one decision currently needed. Approved structure, open questions,
+  direction, recent changes, architecture and source documents remain available
+  under progressive disclosure.
 - `retro.html` opens each finding as problem, recommended change, success measure
   and decision. Evidence, scoring, hashes and worker detail are secondary.
 
 The pages are views, not state. Edit the durable JSON or Markdown source and
-regenerate them; never hand-edit generated HTML. They work as local files. Run
-`kit serve` only when authenticated decision controls are needed.
+regenerate them; never hand-edit generated HTML. A direct `file://` page is an
+explicit read-only view and says whether the cockpit is live, down, or not
+applicable. It never pretends its controls are interactive. Use `kit serve` to
+start the cockpit, review the printed `http://127.0.0.1:.../plan.html` URL, and
+make a decision-bound approval, veto, or change request. The cockpit protects
+the local mutation channel and records portable policy evidence; it does not
+authenticate a person's identity. Use `kit serve stop`
+when that review session is finished. Rendering or opening a local file never
+starts the server.
 
 The board binds only to `127.0.0.1` and checks the request Host, mutation Origin
 and an in-memory capability token. Rendering a page never starts the server.
+
+## Design authority before implementation
+
+Every implementation proposal cites exact `docs/design/` content and its
+canonical SHA-256 digest. Design records player experience, intended outcomes
+and gameplay rules; it does not prescribe architecture. If the needed design is
+missing, implementation stops for discovery instead of guessing intent.
+An absent `proposal.json` is only a clean planning state: conformance compares
+the game root to Git and blocks any authored addition, modification or deletion
+that has no recorded design-backed envelope.
+
+An agent may write provisional design only when its confidence is exactly
+`very-high`. The section must disclose agent authorship, why the inference was
+made, its assumptions, an ADHD-friendly Quick Read, the part that can still be
+vetoed, and the next go/no-go point. Hands-off work may continue only inside
+recorded coarse file or directory boundaries while the proposal is explicitly
+reversible. The cockpit binds an operator policy event to the exact design and
+proposal digest; silence, an old approval, or approval of a different plan never
+counts. Its portable receipt is tamper-evident policy evidence, not proof that a
+particular person's identity was authenticated.
+
+Approval depth is literal. Module review binds complete allowed outgoing
+dependencies and boundary data; file review includes new, modified and deleted
+authored inputs; function review additionally binds canonical typed GDScript
+signatures and normalized body changes at the exact Git baseline. Authored scope
+is inverse, so custom/extensionless content and project tests remain visible
+unless they are a known generated, private, engine-owned or third-party surface.
+
+## Copilot and Codex
+
+Repository-wide governance lives in `AGENTS.md`. GitHub Copilot receives a
+provider bridge in `.github/copilot-instructions.md`; Codex reads `AGENTS.md`
+directly. Both surfaces point to the same schemas, design authority, reversible
+envelope, gate and retrospective rules rather than maintaining separate policy.
+
+Interactive Copilot and Codex development are supported. Repository-scoped
+history evidence is collected for both without retaining assistant responses,
+tool bodies, reasoning, environment values or raw command output. Copilot AIU
+usage and Codex token categories remain separate, and the kit reports monetary
+cost as unknown unless a provider supplies an authoritative value.
+
+Automatic Copilot and Codex analysis or worker dispatch both fail closed for
+now: neither available host can prove that unrelated files are unreadable at the
+OS boundary. Interactive use and the manual evidence handoff remain supported.
+Authentication and spend confirmation are still required, but neither is a
+substitute for isolation; the kit will not claim a boundary it cannot enforce.
 
 ## Retrospective evidence and dispatch
 
@@ -122,21 +183,54 @@ The public loop is deliberately short:
 kit retro status
 kit retro run
 kit retro publish
-kit plan
 ```
+
+With no window flags, `retro run` captures every matching repository session up
+to the declared hard session, byte and record limits. `--since` and `--limit`
+are explicit operator cuts and are stored in the immutable session snapshot;
+there is no implicit newest-three window.
 
 Evidence capture is repository-scoped. Published findings cite immutable
 snapshots, while live histories remain replaceable inputs. Injected platform
 instructions are filtered from testimony; genuine in-scope human messages,
-including an opening task, remain evidence.
+including an opening task, remain evidence. Matching session count, event bytes
+and parsed records have explicit completeness limits. Exceeding one blocks that
+capture with the observed and allowed values; it never silently presents a
+newest-only subset as the complete history.
+If any selected Copilot or Codex source cannot be re-authenticated or completely
+captured, the private pack names the failed session and reason, but no analyzer
+handoff is prepared and `retro publish` refuses findings bound to that pack.
 
-Machine-local snapshots, prompts, queues, logs and run state live under the
-configured `.kit/runtime/` and never ship. Human decisions remain in the tracked
+The stored field set is privacy-minimised, not a secret-scanner guarantee.
+Assistant/tool/reasoning/raw-output bodies are omitted, and high-confidence
+credentials and machine-local paths in retained human testimony are redacted on
+a best-effort basis. Human messages can still contain sensitive material, so
+`.kit/runtime/` must be protected accordingly and never published.
+
+`retro publish` is the single manual publication boundary: it ranks one resolved
+report, refreshes both decision views, then archives exactly the captured note
+bytes and exposes the completion marker. Any validation, rendering, report-drift
+or marker failure leaves no false completion and restores moved notes.
+
+Retrospective urgency is consequence-based, not merely note-count based. A
+native crash, false green, unauthorized provider use, irreversible unapproved
+change or destroyed work becomes an immediate warning. Repeated correction,
+wrong output and repeated verification failure become prompt-level warnings.
+Exact trigger codes come from slice testimony or the verification ledger, so a
+static follow-up cannot silently erase an unresolved native crash.
+
+Machine-local snapshots, prompts, queues, logs and run state live below the
+configured `.kit/` private container (normally `.kit/runtime/`) and never ship.
+Human decisions remain in the tracked
 retrospective ledger.
 
 Analyzer and worker providers default to `manual`. Provider configuration is a
-closed typed registry, not a command string. Automatic dispatch is authenticated,
-idempotent, sequential and stops at the first failure.
+closed typed registry, not a command string. Automatic dispatch is
+capability-protected, sequential and stops at the first failure. Replay of the
+same exact reviewed artifact, amendment and retry target returns the original
+durable decision/run;
+a different approval identity is a conflict or an explicit retry, not a blanket
+exactly-once guarantee.
 
 Automatic workers are limited to an approved non-executable documentation scope.
 The exact approved prompt is sealed and sent over standard input, never a shell
@@ -155,14 +249,23 @@ The verification order is intentional:
 4. A failed health check or native stage suppresses every later native stage.
 
 This prevents one native fault from generating a cascade of crash dialogs.
-`doctor`, `verify --static`, and `self-test` do not launch Godot.
+Windows verification prefers the console binary, suppresses modal Application
+Error UI, owns a single process tree and terminates that tree on timeout. Native
+access violations, bounded timeouts and refused concurrent launches are written
+to the private verification ledger and surfaced in the cockpit and
+retrospective status. An unresolved native crash remains visible across static
+checks until a later complete native verification succeeds. `doctor`,
+`verify --static`, and `self-test` do not launch Godot.
 
 ## Private runtime
 
 `.kit/runtime/` may contain sensitive session evidence, sealed prompts, logs,
 detached Git metadata and queue state. It is machine-local, untracked and excluded
 from releases. Do not cite it as durable product intent, copy it into docs, or
-publish it.
+publish it. A configured `runtime_root` must remain a proper descendant of
+`.kit/`; repository-local paths elsewhere are rejected rather than treated as
+private. Existing path components must be ordinary unredirected directories;
+links, junctions and a `.kit` file fail closed.
 
 ## Distributing the kit
 
@@ -175,10 +278,21 @@ kit release verify ../godot-agent-kit.zip
 Release construction uses a closed reviewed allowlist and requires every fixed
 kit surface, all canonical agent personas, every shipped skill, `VERSION`, and
 non-empty top-level legal metadata (`LICENSE*` or `COPYING*`). It fails if a
-required file disappears.
+required file disappears or if the source repository is dirty. `release inspect`
+can expose the provenance of an older dirty-marked archive for
+diagnosis, but production verification rejects it.
 
 ZIP and TAR output is deterministic: UTF-8/LF text, fixed timestamps, normalized
 modes and a canonical manifest containing size and SHA-256 for every member.
+ZIP entries and gzip streams use canonical stored blocks rather than a host's
+compressor heuristics, so zlib/library versions cannot change archive bytes.
+The manifest labels archive authority evidence as `receipt_trust:
+portable-policy` with the `portable-policy-audit` identity model. That label
+means the archive satisfies the reviewable policy carried inside it; it never
+claims a person's identity was authenticated. If proposal and shape state are
+present in the source checkout, build records their exact pre-exclusion receipt
+trust and refuses a contradictory local receipt. Clean kits with no project
+state record `not-applicable-no-project-state`.
 Source paths and archive members reject traversal, links and Windows reparse
 points. Verification reads without extracting; strict smoke testing extracts only
 after verification into new private scratch and starts the public launcher.
@@ -186,6 +300,10 @@ after verification into new private scratch and starts the public launcher.
 The archive contains the kit, not this repository's game or private history.
 `src/`, `docs/design/`, `project.shape.json`, `proposal.json`, generated pages,
 current retrospective decisions/evidence and `.kit/runtime/` are excluded.
+The required `ARCHITECTURE.md` member is replaced with a canonical empty graph,
+and `arch.rules.json` is replaced with a fixed genre-neutral starting policy.
+Running `kit architecture update` in the destination derives the graph from that
+project, so source-project module names, descriptions and edges never ship.
 Building an archive never publishes it.
 
 CI repeats control-plane, strict engine and release evidence on Windows, macOS
@@ -214,14 +332,14 @@ lives in `docs/design/`. Neither becomes kit policy.
 | `dependencies.lock.json` | Exact canonical-upstream third-party provenance |
 | `bootstrap.py` | Readiness detector and explicit setup implementation |
 | `check.py` | Ordered static/native verification gate |
-| `tools/engine_discovery.py` | Read-only exact-version engine selection shared by diagnosis and verification |
+| `tools/engine_discovery.py` | Read-only selection plus bounded engine-reported version authentication for explicit native operations |
 | `.gate.sha256` | Human-controlled gate trust baseline |
-| `tools/plan_html.py`, `tools/retro_html.py` | Decision-view generators |
+| `tools/cockpit.py`, `tools/plan_html.py`, `tools/retro_html.py` | Durable decision/verification state and generated views |
 | `tools/session_evidence.py`, `tools/session_digest.py` | Scoped evidence capture |
 | `tools/board.py`, `tools/run_result.py`, `tools/providers.py` | Authenticated dispatch control plane |
 | `tools/release.py` | Deterministic sanitized release builder/verifier |
 | `.agents/skills/` | On-demand agent guidance |
-| `.github/agents/`, `.claude/settings.json` | Provider personas and default safety policy |
+| `.github/copilot-instructions.md`, `.github/agents/`, `AGENTS.md` | Copilot/Codex bridge, personas and shared governance |
 | `.github/workflows/ci.yml` | Cross-platform production evidence |
 | `.kit/runtime/` | Private machine-local state; never released |
 

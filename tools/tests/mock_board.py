@@ -128,19 +128,46 @@ def state_payload() -> dict:
          "result_errors": [], "changed_files": ["tools/example.py"],
          "verification": {"passed": True, "exit_code": 0, "tail": "GATE PASSED"},
          "integration": {"integrated": True}, "workspace": ".kit/runtime/dispatch/workspaces/run-3",
-         "timeout_seconds": 1800, "timed_out": False},
+        "timeout_seconds": 1800, "timed_out": False},
     ]
+    public_run_fields = (
+        "run_id", "kind", "finding", "slug", "status", "status_label",
+        "provider", "model", "persona", "elapsed_s", "silence_minutes",
+        "exit_code", "resume_cmd", "outcome", "timeout_seconds", "timed_out",
+    )
+    runs = [
+        {key: run.get(key) for key in public_run_fields}
+        for run in runs
+    ]
+    try:
+        plan = board.cockpit.plan_view(board.ROOT)
+    except Exception:
+        plan = {"status": "unavailable", "fingerprint": None,
+                "verification": {"status": "not-run"}}
+    retro_state = board.retro_due.state()
+    retro_state.update({
+        "unarchived": 11,
+        "threshold": 10,
+        "due": True,
+        "archived": 3,
+        "notes": ["slice-1.md", "slice-2.md"],
+        "trigger_level": "routine",
+        "immediate_consequences": [],
+        "prompt_triggers": [],
+        "warnings": [],
+    })
     return {
         "ok": True,
         "schema": board.SCHEMA,
         "board": {"port": 0, "pid": 0, "started": "2026-08-19T00:00:00Z",
                   "schema": board.SCHEMA, "version": board.BOARD_VERSION},
-        "retro_due": {"unarchived": 11, "threshold": 10, "due": True,
-                      "archived": 3, "notes": ["slice-1.md", "slice-2.md"]},
+        "retro_due": retro_state,
         "providers": {
             "analyzer": board._provider_view("analyzer"),
             "worker": board._provider_view("worker"),
         },
+        "plan": plan,
+        "verification": plan.get("verification", {}),
         "findings": findings,
         "queue_halted": False,
         "silence_minutes": 3.0,
@@ -168,6 +195,8 @@ class Handler(board.Handler):
                 return board._error(500, "board is shutting down", "server_error")
             return 200, {"ok": True, "port": self.server.server_address[1],
                          "pid": 0, "started": "2026-08-19T00:00:00Z",
+                         "instance_id": self.server.instance_id,
+                         "repository_scope_id": self.server.repository_scope_id,
                          "schema": board.SCHEMA, "version": board.BOARD_VERSION}
         if method == "GET" and path == "/api/state":
             return 200, state_payload()
@@ -188,6 +217,7 @@ class Handler(board.Handler):
                 "evidence_snapshot": item.get("evidence_snapshot", ""),
                 "comment": "",
                 "prompt_preview": retro_queue.render_prompt(item, ""),
+                "review": retro_queue.review_identity(item),
             }
         if method == "POST":
             if SCENARIO == "broken":

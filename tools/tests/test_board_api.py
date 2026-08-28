@@ -20,10 +20,12 @@ quota or write to docs/retro/.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -208,6 +210,7 @@ class BoardTestCase(unittest.TestCase):
         self.findings = self.retro / "2026-01-01-findings.md"
         self.findings.write_text(self.findings_text, encoding="utf-8")
         self.queue_dir = self.runtime / "retro" / "queue"
+        shutil.copyfile(TOOLS.parent / "kit.config.json", self.dir / "kit.config.json")
 
         self._saved = {
             "discover": session_digest.discover,
@@ -303,10 +306,32 @@ class BoardTestCase(unittest.TestCase):
     def accepted(self) -> list[dict]:
         return json.loads(board.ACCEPTED_FILE.read_text(encoding="utf-8"))
 
+    def review(self, slug: str) -> dict:
+        item = retro_queue.load_item(slug, self.queue_dir)
+        return retro_queue.review_identity(item) if item is not None else {}
+
+    def approve(self, slug: str, comment: str, by: str = "", request_id: str = "",
+                retry_of: str = "") -> tuple[int, dict]:
+        return board.api_approve(
+            slug, comment, by=by, request_id=request_id, retry_of=retry_of,
+            review=self.review(slug),
+        )
+
+    def probe_identity(self, port: int, pid: int | None = None,
+                       instance_id: str = "expected-instance") -> dict:
+        return {
+            "port": port,
+            "pid": os.getpid() if pid is None else pid,
+            "instance_id": instance_id,
+            "repository_scope_id": board._repository_scope_id(),
+            "schema": board.SCHEMA,
+            "version": board.BOARD_VERSION,
+        }
+
 
 class TestApprove(BoardTestCase):
     def test_comment_persists_and_is_dispatched(self) -> None:
-        code, payload = board.api_approve(SLUG_A, "Keep the CLI, drop the flag.", by="jf")
+        code, payload = self.approve(SLUG_A, "Keep the CLI, drop the flag.", by="jf")
         self.assertEqual(code, 200)
         self.assertTrue(payload["ok"])
 
@@ -328,13 +353,13 @@ class TestApprove(BoardTestCase):
         self.assertFalse((self.retro / "runs").exists())
 
     def test_comment_survives_a_reload_of_the_decision_file(self) -> None:
-        board.api_approve(SLUG_A, "the comment is the amendment")
+        self.approve(SLUG_A, "the comment is the amendment")
         reloaded = board.load_accepted()
         self.assertEqual(reloaded[0]["comment"], "the comment is the amendment")
 
     def test_repeated_automatic_approval_returns_the_complete_dispatch_contract(self) -> None:
-        _code, first = board.api_approve(SLUG_A, "same amendment")
-        code, repeated = board.api_approve(SLUG_A, "same amendment")
+        _code, first = self.approve(SLUG_A, "same amendment")
+        code, repeated = self.approve(SLUG_A, "same amendment")
 
         self.assertEqual(200, code)
         self.assertEqual(first["run"]["run_id"], repeated["run"]["run_id"])
@@ -343,10 +368,74 @@ class TestApprove(BoardTestCase):
         self.assertTrue(repeated["dispatch"]["idempotent"])
         self.assertEqual(1, len(self.rm.spawned))
 
+    def test_approval_requires_the_exact_artifact_review_identity(self) -> None:
+        original_review = self.review(SLUG_A)
+        path = self.queue_dir / f"{SLUG_A}.json"
+        item = json.loads(path.read_text(encoding="utf-8"))
+        item["generated_at"] = "2099-01-01T00:00:00Z"
+        item["artifact_sha256"] = retro_queue.artifact_sha256(item)
+        path.write_text(json.dumps(item), encoding="utf-8")
+
+        code, payload = board.api_approve(
+            SLUG_A, "go", review=original_review
+        )
+
+        self.assertEqual(409, code)
+        self.assertEqual("stale_review", payload["code"])
+        self.assertEqual([], self.rm.spawned)
+        self.assertFalse(board.ACCEPTED_FILE.exists())
+
+    def test_orphan_reservation_recovers_same_run_and_prompt(self) -> None:
+        def crash_after_decision(*_args, **_kwargs):
+            raise RuntimeError("simulated process loss before enqueue")
+
+        self.rm.enqueue = crash_after_decision
+        with self.assertRaisesRegex(RuntimeError, "simulated process loss"):
+            self.approve(SLUG_A, "exact amendment")
+        accepted = self.accepted()[0]
+        self.assertEqual("reserved", accepted["state"])
+        reserved_run_id = accepted["run_id"]
+
+        replacement = FakeRunManager()
+        board._run_manager = replacement
+        recovered = board.recover_orphan_reservations()
+
+        self.assertEqual(1, len(recovered))
+        self.assertNotIn("error", recovered[0])
+        self.assertEqual(reserved_run_id, replacement.spawned[0]["run_id"])
+        item = retro_queue.load_item(SLUG_A, self.queue_dir)
+        expected_prompt = retro_queue.render_prompt(item, "exact amendment")
+        self.assertEqual(expected_prompt, replacement.spawned[0]["prompt"])
+        self.assertEqual(
+            accepted["dispatch_prompt_sha256"],
+            hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest(),
+        )
+
+    def test_orphan_recovery_fails_closed_if_artifact_changed(self) -> None:
+        self.rm.enqueue = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated process loss")
+        )
+        with self.assertRaises(RuntimeError):
+            self.approve(SLUG_A, "exact amendment")
+        path = self.queue_dir / f"{SLUG_A}.json"
+        item = json.loads(path.read_text(encoding="utf-8"))
+        item["generated_at"] = "2099-01-02T00:00:00Z"
+        item["artifact_sha256"] = retro_queue.artifact_sha256(item)
+        path.write_text(json.dumps(item), encoding="utf-8")
+        replacement = FakeRunManager()
+        board._run_manager = replacement
+
+        recovered = board.recover_orphan_reservations()
+
+        self.assertEqual(1, len(recovered))
+        self.assertIn("error", recovered[0])
+        self.assertEqual([], replacement.spawned)
+        self.assertEqual("unverified", self.accepted()[0]["state"])
+
     def test_approving_a_stale_artifact_is_refused(self) -> None:
         self.findings.write_text(
             self.findings_text + "\nan edit landed under it.\n", encoding="utf-8")
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
         self.assertEqual(code, 409)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["code"], "stale")
@@ -357,20 +446,20 @@ class TestApprove(BoardTestCase):
         self.assertFalse(board.ACCEPTED_FILE.exists())
 
     def test_unknown_slug_is_a_structured_404(self) -> None:
-        code, payload = board.api_approve("no-such-finding", "go")
+        code, payload = self.approve("no-such-finding", "go")
         self.assertEqual(code, 404)
         self.assertEqual(payload["code"], "missing_artifact")
         self.assertEqual(self.rm.spawned, [])
 
     def test_missing_slug_is_a_structured_400(self) -> None:
-        code, payload = board.api_approve("", "go")
+        code, payload = self.approve("", "go")
         self.assertEqual(code, 400)
         self.assertEqual(payload["code"], "bad_request")
 
     def test_unavailable_provider_preserves_the_decision_without_dispatch(self) -> None:
         board.providers.preflight = lambda _spec: ["adapter unavailable"]
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 200)
         self.assertTrue(payload["ok"])
@@ -384,7 +473,7 @@ class TestApprove(BoardTestCase):
             "repository has uncommitted changes: tools/thing.py"
         ]
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 200)
         self.assertTrue(payload["ok"])
@@ -403,7 +492,7 @@ class TestApprove(BoardTestCase):
 
         board.run_result.dispatch_blockers = blockers
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 200)
         self.assertEqual(requested, ["tools/thing.py"])
@@ -418,7 +507,7 @@ class TestApprove(BoardTestCase):
         board.providers.selection = lambda _root, _role: manual
         board.providers.preflight = lambda _spec: ["worker provider is manual"]
 
-        code, payload = board.api_approve(SLUG_A, "approved for later")
+        code, payload = self.approve(SLUG_A, "approved for later")
 
         self.assertEqual(200, code)
         self.assertIsNone(payload["run"])
@@ -426,7 +515,7 @@ class TestApprove(BoardTestCase):
         self.assertEqual([], self.rm.spawned)
         self.assertEqual("approved", self.accepted()[0]["state"])
 
-        repeated_code, repeated = board.api_approve(SLUG_A, "approved for later")
+        repeated_code, repeated = self.approve(SLUG_A, "approved for later")
         self.assertEqual(200, repeated_code)
         self.assertIsNone(repeated["run"])
         self.assertFalse(repeated["dispatch"]["started"])
@@ -436,7 +525,7 @@ class TestApprove(BoardTestCase):
         self.rm.enqueue = lambda item, retry_of="": {
             "error": "could not spawn copilot: not on PATH"
         }
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
         self.assertEqual(code, 500)
         self.assertEqual(payload["code"], "spawn_failed")
         self.assertIn("copilot", payload["error"])
@@ -452,7 +541,7 @@ class TestApprove(BoardTestCase):
         item.pop("evidence_snapshot", None)
         path.write_text(json.dumps(item), encoding="utf-8")
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 409)
         self.assertEqual(payload["code"], "not_dispatchable")
@@ -470,7 +559,7 @@ class TestApprove(BoardTestCase):
         items = retro_queue.build(findings_dir=self.retro, queue_dir=self.queue_dir)
         self.assertFalse(items[0]["dispatchable"])
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 409)
         self.assertEqual(payload["code"], "not_dispatchable")
@@ -485,16 +574,16 @@ class TestApprove(BoardTestCase):
         item["prompt"] += "\nUnreviewed extra instruction.\n"
         path.write_text(json.dumps(item), encoding="utf-8")
 
-        code, payload = board.api_approve(SLUG_A, "go")
+        code, payload = self.approve(SLUG_A, "go")
 
         self.assertEqual(code, 409)
         self.assertEqual(payload["code"], "not_dispatchable")
-        self.assertIn("prompt does not match", " ".join(payload["dispatch_blockers"]))
+        self.assertIn("prompt digest", " ".join(payload["dispatch_blockers"]))
         self.assertEqual(self.rm.spawned, [])
         self.assertFalse(board.ACCEPTED_FILE.exists())
 
     def test_tampered_snapshot_refuses_retry_without_rewriting_decision(self) -> None:
-        code, first = board.api_approve(SLUG_A, "first")
+        code, first = self.approve(SLUG_A, "first")
         self.assertEqual(code, 200)
         run_id = first["run"]["run_id"]
         state = board.load_state()
@@ -506,7 +595,7 @@ class TestApprove(BoardTestCase):
         snapshot.write_bytes(snapshot.read_bytes().replace(
             b"human message 1", b"tampered message"))
 
-        code, payload = board.api_approve(
+        code, payload = self.approve(
             SLUG_A, "retry amendment", retry_of=run_id)
 
         self.assertEqual(code, 409)
@@ -519,8 +608,8 @@ class TestApprove(BoardTestCase):
 
 class TestSequentialQueue(BoardTestCase):
     def test_second_approval_queues_behind_the_first(self) -> None:
-        board.api_approve(SLUG_A, "first")
-        board.api_approve(SLUG_B, "second")
+        self.approve(SLUG_A, "first")
+        self.approve(SLUG_B, "second")
         self.assertEqual(len(self.rm.spawned), 1, "two workers ran concurrently")
         self.assertEqual(self.rm.spawned[0]["slug"], SLUG_A)
 
@@ -530,14 +619,14 @@ class TestSequentialQueue(BoardTestCase):
         self.assertIn("queued", states[SLUG_B]["status_detail"])
 
     def test_the_queued_item_starts_when_the_first_finishes(self) -> None:
-        board.api_approve(SLUG_A, "first")
-        board.api_approve(SLUG_B, "second")
+        self.approve(SLUG_A, "first")
+        self.approve(SLUG_B, "second")
         self.rm.finish(ok=True)
         self.assertEqual([s["slug"] for s in self.rm.spawned], [SLUG_A, SLUG_B])
 
     def test_a_failed_run_halts_the_queue_visibly(self) -> None:
-        board.api_approve(SLUG_A, "first")
-        board.api_approve(SLUG_B, "second")
+        self.approve(SLUG_A, "first")
+        self.approve(SLUG_B, "second")
         self.rm.finish(ok=False)
         self.assertEqual(len(self.rm.spawned), 1)
         states = {f["slug"]: f for f in board.finding_states()}
@@ -646,7 +735,7 @@ class TestDurableDispatch(BoardTestCase):
 
         def approve() -> None:
             barrier.wait()
-            results.append(board.api_approve(
+            results.append(self.approve(
                 SLUG_A, "one exact amendment", request_id="browser-request-1"
             ))
 
@@ -671,9 +760,9 @@ class TestDurableDispatch(BoardTestCase):
         self.assertEqual(len(list(board.RUNS_DIR.glob("*.prompt.md"))), 1)
 
     def test_different_second_decision_requires_an_explicit_terminal_retry(self) -> None:
-        code, _ = board.api_approve(SLUG_A, "first amendment")
+        code, _ = self.approve(SLUG_A, "first amendment")
         self.assertEqual(code, 200)
-        code, payload = board.api_approve(SLUG_A, "different amendment")
+        code, payload = self.approve(SLUG_A, "different amendment")
         self.assertEqual(code, 409)
         self.assertEqual(payload["code"], "decision_conflict")
         self.assertEqual(len(self.rm.spawned), 1)
@@ -772,17 +861,19 @@ class TestState(BoardTestCase):
         self.assertIn("threshold", payload["retro_due"])
 
     def test_a_silent_worker_is_legible(self) -> None:
-        board.api_approve(SLUG_A, "go")
+        self.approve(SLUG_A, "go")
         run_id = self.rm.spawned[0]["run_id"]
-        log = self.dir / "worker.log"
+        board.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        log = board.RUNS_DIR / f"{run_id}.log"
         log.write_text("started\n", encoding="utf-8")
         old = os.path.getmtime(log) - 3600
         os.utime(log, (old, old))
         state = board.load_state()
         state["runs"] = [{"run_id": run_id, "kind": "finding", "finding": "x",
                           "slug": SLUG_A, "status": "running", "pid": os.getpid(),
-                          "log": "worker.log", "t0": 0,
-                          "resume_cmd": "copilot --resume=abc", "exit_code": None}]
+                          "log": log.relative_to(self.dir).as_posix(), "t0": 0,
+                          "resume_cmd": "copilot --agent kit-builder --resume=abc",
+                          "exit_code": None}]
         board.save_state(state)
         saved_root = board.ROOT
         board.ROOT = self.dir
@@ -794,7 +885,9 @@ class TestState(BoardTestCase):
         self.assertEqual(entry["state"], "working")
         self.assertIn("no output for", entry["status_detail"])
         self.assertIn("60m", entry["status_detail"])
-        self.assertEqual(entry["resume_cmd"], "copilot --resume=abc")
+        self.assertEqual(
+            entry["resume_cmd"], "copilot --agent kit-builder --resume=abc"
+        )
 
     def test_stale_is_orthogonal_to_state(self) -> None:
         self.findings.write_text(self.findings_text + "\nedit\n", encoding="utf-8")
@@ -814,6 +907,23 @@ class TestFindingAndDefer(BoardTestCase):
         self.assertTrue(payload["dispatchable"])
         self.assertEqual(payload["dispatch_blockers"], [])
         self.assertEqual(payload["evidence_snapshot"], self.snapshot)
+        self.assertEqual(payload["review"], retro_queue.review_identity(item))
+
+    def test_browser_control_carries_the_rendered_review_identity(self) -> None:
+        item = retro_queue.load_item(SLUG_A, self.queue_dir)
+        review = retro_queue.review_identity(item)
+        rendered = board.retro_html.render_decision(
+            item["title"], item, accepted={}, deferred={}
+        )
+        for field in (
+            "artifact_sha256", "prompt_sha256", "template_sha256", "review_sha256"
+        ):
+            attribute = field.replace("_", "-")
+            self.assertIn(f'data-{attribute}="{review[field]}"', rendered)
+        self.assertIn(
+            f'data-artifact-schema="{retro_queue.SCHEMA}"', rendered
+        )
+        self.assertIn("review:review", board.retro_html.DISPATCH_JS)
 
     def test_finding_get_exposes_tampered_snapshot_as_ineligible(self) -> None:
         snapshot = self.dir / self.snapshot
@@ -828,6 +938,16 @@ class TestFindingAndDefer(BoardTestCase):
         code, payload = board.api_finding("nope")
         self.assertEqual(code, 404)
         self.assertEqual(payload["code"], "missing_artifact")
+
+    def test_traversal_and_alternate_slug_spellings_are_rejected(self) -> None:
+        for slug in ("../accepted", "..\\accepted", "Two-Words", "two--words"):
+            with self.subTest(slug=slug):
+                code, payload = board.api_finding(slug)
+                self.assertEqual(400, code)
+                self.assertEqual("invalid_slug", payload["code"])
+                code, payload = board.api_defer(slug, "later")
+                self.assertEqual(400, code)
+                self.assertEqual("invalid_slug", payload["code"])
 
     def test_defer_records_and_never_dispatches(self) -> None:
         code, payload = board.api_defer(SLUG_A, "not worth it yet")
@@ -844,6 +964,22 @@ class TestFindingAndDefer(BoardTestCase):
 
 
 class TestRetroRun(BoardTestCase):
+    def test_read_boundary_blocker_never_launches_process(self) -> None:
+        manager = board.RunManager()
+        analyzer = board.providers.ProviderSpec("analyzer", "copilot-sdk")
+        blocker = board.providers.COPILOT_READ_BOUNDARY_BLOCKER
+
+        with mock.patch.object(
+            board.providers, "preflight", return_value=[blocker]
+        ), mock.patch.object(board.subprocess, "Popen") as launch:
+            result = manager.spawn_retro(analyzer)
+
+        self.assertEqual(
+            f"analyzer provider is unavailable: {blocker}", result["error"]
+        )
+        launch.assert_not_called()
+        self.assertEqual([], board.load_state().get("runs", []))
+
     def test_run_returns_a_run_id(self) -> None:
         code, payload = board.api_retro_run()
         self.assertEqual(code, 200)
@@ -870,23 +1006,151 @@ class TestRunStatus(BoardTestCase):
         self.assertEqual(payload["code"], "missing_run")
 
     def test_known_run_carries_tail_and_resume(self) -> None:
-        log = self.dir / "r.log"
+        run_id = "run-r1"
+        board.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        log = board.RUNS_DIR / f"{run_id}.log"
         log.write_text("line one\nline two\n", encoding="utf-8")
         board.save_state({"port": 1, "pid": os.getpid(), "started": "now", "runs": [
-            {"run_id": "r1", "kind": "finding", "finding": "x", "slug": SLUG_A,
+            {"run_id": run_id, "kind": "finding", "finding": "x", "slug": SLUG_A,
              "status": "finished", "exit_code": 0, "pid": os.getpid(),
-             "log": "r.log", "t0": 0, "resume_cmd": "copilot --resume=abc"},
+             "log": log.relative_to(self.dir).as_posix(), "t0": 0,
+             "resume_cmd": "copilot --agent kit-builder --resume=abc"},
         ]})
         saved_root = board.ROOT
         board.ROOT = self.dir
         try:
-            code, payload = board.api_run("r1")
+            code, payload = board.api_run(run_id)
         finally:
             board.ROOT = saved_root
         self.assertEqual(code, 200)
         self.assertIn("line two", payload["tail"])
-        self.assertEqual(payload["resume_cmd"], "copilot --resume=abc")
+        self.assertEqual(
+            payload["resume_cmd"], "copilot --agent kit-builder --resume=abc"
+        )
         self.assertEqual(payload["exit_code"], 0)
+
+    def test_run_log_is_bounded_and_public_tail_is_redacted(self) -> None:
+        run_id = "run-redaction"
+        board.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        log = board.RUNS_DIR / f"{run_id}.log"
+        log.write_text(
+            "api_key=super-secret C:\\Users\\person\\private.txt\n"
+            "Authorization: Bearer ultra-secret /home/person/private.txt\n",
+            encoding="utf-8",
+        )
+        board.save_state({"runs": [{
+            "run_id": run_id, "kind": "finding", "finding": "x", "slug": SLUG_A,
+            "status": "running", "pid": os.getpid(),
+            "log": log.relative_to(self.dir).as_posix(),
+            "resume_cmd": "copilot --resume=abc; calc.exe",
+            "provider": {"kind": "copilot-cli", "secret": "provider-private"},
+            "unexpected_private_field": "state-private",
+        }]})
+
+        code, payload = board.api_run(run_id)
+
+        self.assertEqual(200, code)
+        self.assertNotIn("super-secret", payload["tail"])
+        self.assertNotIn("ultra-secret", payload["tail"])
+        self.assertNotIn("C:\\Users", payload["tail"])
+        self.assertNotIn("/home/person", payload["tail"])
+        self.assertIn("<redacted>", payload["tail"])
+        self.assertIsNone(payload["resume_cmd"])
+        self.assertNotIn("log", payload)
+        self.assertNotIn("provider-private", json.dumps(payload))
+        self.assertNotIn("state-private", json.dumps(payload))
+
+    def test_resume_hint_requires_the_exact_provider_grammar(self) -> None:
+        self.assertEqual(
+            board._safe_resume_command(
+                "copilot --agent kit-builder --resume=good-session_123"
+            ),
+            "copilot --agent kit-builder --resume=good-session_123",
+        )
+        self.assertIsNone(board._safe_resume_command("Remove-Item C:/important"))
+        self.assertIsNone(board._safe_resume_command("copilot --resume=legacy"))
+
+    def test_run_log_path_cannot_escape_private_run_root(self) -> None:
+        run_id = "run-escape"
+        outside = self.dir / f"{run_id}.log"
+        outside.write_text("outside-private-text\n", encoding="utf-8")
+        board.save_state({"runs": [{
+            "run_id": run_id, "kind": "finding", "finding": "x", "slug": SLUG_A,
+            "status": "running", "pid": os.getpid(),
+            "log": outside.relative_to(self.dir).as_posix(),
+        }]})
+
+        code, payload = board.api_run(run_id)
+
+        self.assertEqual(200, code)
+        self.assertEqual("", payload["tail"])
+
+
+class TestCodexPublicBoundary(BoardTestCase):
+    def test_manual_provider_is_a_neutral_handoff_not_an_unavailable_adapter(self) -> None:
+        spec = board.providers.ProviderSpec("analyzer", "manual")
+        board.providers.selection = lambda _root, _role: spec
+
+        view = board._provider_view("analyzer")
+
+        self.assertFalse(view["automatic"])
+        self.assertTrue(view["ready"])
+        self.assertEqual(view["preflight"], "manual-handoff")
+        self.assertEqual(view["blockers"], [])
+
+    def test_codex_run_never_exposes_log_events_paths_or_result_text(self) -> None:
+        log = self.runtime / "board" / "runs" / "codex-events.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('{"hidden":"do not expose"}\n', encoding="utf-8")
+        entry = {
+            "run_id": "codex-1",
+            "kind": "finding",
+            "finding": "Safe progress",
+            "slug": "safe-progress",
+            "status": "blocked",
+            "provider": {
+                "role": "worker",
+                "kind": "codex-cli",
+                "model": "gpt-safe",
+                "secret": "provider-private",
+            },
+            "log": log.relative_to(self.dir).as_posix(),
+            "resume_cmd": "codex resume private-token",
+            "result_summary": "private result detail",
+            "result_errors": ["private error detail"],
+            "prompt": "private prompt",
+        }
+        described = board.describe_run(entry, 3)
+        self.assertEqual(described["last_line"], "")
+        self.assertNotIn("private result", described["status_label"])
+        board.save_state({"schema": board.SCHEMA, "runs": [entry]})
+
+        code, payload = board.api_run("codex-1")
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+        for forbidden in (
+            "log", "tail", "resume_cmd", "prompt", "result_summary", "result_errors"
+        ):
+            self.assertNotIn(forbidden, payload)
+        self.assertNotIn("secret", payload["provider"])
+        rendered = json.dumps(board._sanitize_public_payload({"runs": [entry]}))
+        for private in (
+            "do not expose", "private-token", "private result", "private error",
+            "private prompt", "provider-private",
+        ):
+            self.assertNotIn(private, rendered)
+
+    def test_codex_analyzer_preflight_explains_repository_read_boundary(self) -> None:
+        spec = board.providers.ProviderSpec("analyzer", "codex-cli")
+        blocker = board.providers.CODEX_READ_BOUNDARY_BLOCKER
+        board.providers.selection = lambda _root, _role: spec
+        board.providers.preflight = lambda _spec: [blocker]
+
+        view = board._provider_view("analyzer")
+
+        self.assertFalse(view["ready"])
+        self.assertEqual(view["preflight"], "blocked")
+        self.assertEqual(view["blockers"], [blocker])
 
 
 class TestLiveness(BoardTestCase):
@@ -904,7 +1168,7 @@ class TestLiveness(BoardTestCase):
     def test_dead_pid_and_dead_port(self) -> None:
         board.save_state({"port": 9, "pid": 999999, "started": "now", "runs": []})
         saved = board._probe
-        board._probe = lambda port, timeout=1.0: False
+        board._probe = lambda port, expected, timeout=1.0, **kwargs: False
         try:
             health = board.board_health()
         finally:
@@ -914,10 +1178,21 @@ class TestLiveness(BoardTestCase):
         self.assertFalse(health["port_alive"])
         self.assertIn("999999", health["detail"])
 
+    def test_corrupt_lifecycle_identity_fails_closed_without_exception(self) -> None:
+        board.save_state({
+            "port": "not-a-port", "pid": "not-a-pid", "started": "now", "runs": [],
+            "instance_id": [], "repository_scope_id": {},
+            "schema": board.SCHEMA, "version": board.BOARD_VERSION,
+        })
+        health = board.board_health()
+        self.assertFalse(health["alive"])
+        self.assertFalse(health["pid_alive"])
+        self.assertFalse(health["port_alive"])
+
     def test_live_pid_but_dead_port_is_not_alive(self) -> None:
         board.save_state({"port": 9, "pid": os.getpid(), "started": "now", "runs": []})
         saved = board._probe
-        board._probe = lambda port, timeout=1.0: False
+        board._probe = lambda port, expected, timeout=1.0, **kwargs: False
         try:
             health = board.board_health()
         finally:
@@ -929,7 +1204,7 @@ class TestLiveness(BoardTestCase):
     def test_live_port_but_dead_pid_is_not_alive(self) -> None:
         board.save_state({"port": 9, "pid": 999999, "started": "now", "runs": []})
         saved = board._probe
-        board._probe = lambda port, timeout=1.0: True
+        board._probe = lambda port, expected, timeout=1.0, **kwargs: True
         try:
             health = board.board_health()
         finally:
@@ -940,13 +1215,62 @@ class TestLiveness(BoardTestCase):
     def test_both_alive(self) -> None:
         board.save_state({"port": 9, "pid": os.getpid(), "started": "now", "runs": []})
         saved = board._probe
-        board._probe = lambda port, timeout=1.0: True
+        board._probe = lambda port, expected, timeout=1.0, **kwargs: True
         try:
             health = board.board_health()
         finally:
             board._probe = saved
         self.assertTrue(health["alive"])
         self.assertEqual(health["detail"], "")
+
+    def test_exact_prior_build_is_reported_as_stale_not_dead(self) -> None:
+        board.save_state({
+            "port": 9123,
+            "pid": os.getpid(),
+            "started": "now",
+            "instance_id": "old-instance",
+            "repository_scope_id": board._repository_scope_id(),
+            "schema": board.SCHEMA,
+            "version": "old-build",
+            "runs": [],
+        })
+
+        def probe(_port, _expected, timeout=1.0, *, require_current=True):
+            return not require_current
+
+        with mock.patch.object(board, "_probe", side_effect=probe):
+            health = board.board_health()
+
+        self.assertFalse(health["alive"])
+        self.assertTrue(health["identity_alive"])
+        self.assertIn("build is stale", health["detail"])
+
+    def test_start_stops_exact_stale_instance_before_replacement(self) -> None:
+        state = {
+            "port": 9123,
+            "pid": os.getpid(),
+            "instance_id": "old-instance",
+            "repository_scope_id": board._repository_scope_id(),
+            "schema": board.SCHEMA,
+            "version": "old-build",
+            "runs": [],
+        }
+        board.save_state(state)
+        with mock.patch.object(board, "board_health", return_value={
+            "alive": False,
+            "identity_alive": True,
+            "detail": "stale",
+            "url": None,
+        }), mock.patch.object(
+            board, "_stop_stale_recorded_instance", return_value=False
+        ) as stop, mock.patch.object(board.subprocess, "Popen") as launch:
+            self.assertIsNone(board.ensure_running())
+
+        stop.assert_called_once()
+        stopped_state = stop.call_args.args[0]
+        for key, value in state.items():
+            self.assertEqual(value, stopped_state[key])
+        launch.assert_not_called()
 
     def test_probe_rejects_a_port_answering_something_else(self) -> None:
         import http.server
@@ -965,7 +1289,7 @@ class TestLiveness(BoardTestCase):
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Other)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
-            self.assertFalse(board._probe(httpd.server_address[1]))
+            self.assertFalse(board._probe(httpd.server_address[1], self.probe_identity(httpd.server_address[1])))
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -989,7 +1313,33 @@ class TestLiveness(BoardTestCase):
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stale)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
-            self.assertFalse(board._probe(httpd.server_address[1]))
+            self.assertFalse(board._probe(httpd.server_address[1], self.probe_identity(httpd.server_address[1])))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_probe_binds_pid_instance_repository_and_port(self) -> None:
+        httpd = board.BoardHTTPServer(
+            ("127.0.0.1", 0), board.Handler,
+            instance_id="instance-one",
+            repository_scope_id=board._repository_scope_id(),
+        )
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        expected = self.probe_identity(port, instance_id="instance-one")
+        try:
+            self.assertTrue(board._probe(port, expected))
+            for field, wrong in (
+                ("pid", os.getpid() + 1),
+                ("instance_id", "instance-two"),
+                ("repository_scope_id", "0" * 64),
+                ("port", port + 1),
+                ("schema", board.SCHEMA + 1),
+                ("version", "other-version"),
+            ):
+                with self.subTest(field=field):
+                    altered = {**expected, field: wrong}
+                    self.assertFalse(board._probe(port, altered))
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -1004,23 +1354,55 @@ class TestLiveness(BoardTestCase):
                 mock.patch.object(board, "_probe", return_value=False), \
                 mock.patch.object(board.time, "sleep", return_value=None), \
                 mock.patch.object(board.subprocess, "Popen", return_value=process), \
-                mock.patch.object(board, "_terminate_process_tree") as terminate:
+                mock.patch.object(
+                    board, "_terminate_process_tree", return_value=True
+                ) as terminate:
             url = board.ensure_running()
 
         self.assertIsNone(url)
         terminate.assert_called_once_with(process)
-        process.wait.assert_called_once_with(timeout=15)
         self.assertEqual(before, board.load_state())
 
     def test_owned_provider_tree_is_terminated_at_its_bound_timeout(self) -> None:
         process = mock.Mock(pid=12345)
         process.wait.side_effect = [subprocess.TimeoutExpired("provider", 60), 143]
-        with mock.patch.object(board, "_terminate_process_tree") as terminate:
+        process.poll.return_value = 143
+        with mock.patch.object(
+                board, "_terminate_process_tree", return_value=True) as terminate:
             exit_code, timed_out = board._wait_bounded(process, 60)
 
         self.assertTrue(timed_out)
         self.assertEqual(143, exit_code)
         terminate.assert_called_once_with(process)
+
+    def test_windows_tree_kill_failure_is_checked_and_falls_back(self) -> None:
+        process = mock.Mock(pid=12345)
+        process.poll.side_effect = [None, None, 0]
+        process.wait.return_value = 0
+        failed = subprocess.CompletedProcess(["taskkill"], 1)
+        with mock.patch.object(board.os, "name", "nt"), \
+                mock.patch.object(board.subprocess, "run", return_value=failed):
+            terminated = board._terminate_process_tree(process)
+        self.assertTrue(terminated)
+        process.kill.assert_called_once_with()
+
+    def test_posix_tree_kill_escalates_from_term_to_kill(self) -> None:
+        process = mock.Mock(pid=12345)
+        process.poll.side_effect = [None, -9]
+        process.wait.side_effect = [subprocess.TimeoutExpired("provider", 5), -9]
+        with mock.patch.object(board.os, "name", "posix"), \
+                mock.patch.object(board.os, "killpg", create=True) as kill_group, \
+                mock.patch.object(board.signal, "SIGKILL", 9, create=True):
+            kill_group.side_effect = [None, None, None, ProcessLookupError()]
+            terminated = board._terminate_process_tree(process)
+        self.assertTrue(terminated)
+        self.assertEqual(
+            [
+                mock.call(12345, signal.SIGTERM), mock.call(12345, 0),
+                mock.call(12345, 9), mock.call(12345, 0),
+            ],
+            kill_group.call_args_list,
+        )
 
     def test_worker_environment_cannot_inherit_broad_or_parent_git_access(self) -> None:
         workspace = self.runtime / "dispatch" / "workspaces" / "run-safe"
@@ -1070,6 +1452,9 @@ class TestOverHTTP(BoardTestCase):
         return self._call(urllib.request.Request(f"http://127.0.0.1:{self.port}{path}"))
 
     def post(self, path: str, body: dict) -> tuple[int, dict]:
+        body = dict(body)
+        if path == "/api/finding/approve" and "review" not in body:
+            body["review"] = self.review(str(body.get("slug") or ""))
         return self.post_raw(path, json.dumps(body).encode("utf-8"), {
             "Content-Type": "application/json",
             "Origin": f"http://127.0.0.1:{self.port}",
@@ -1098,6 +1483,12 @@ class TestOverHTTP(BoardTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["schema"], board.SCHEMA)
         self.assertEqual(payload["version"], board.BOARD_VERSION)
+        self.assertEqual(payload["pid"], os.getpid())
+        self.assertEqual(payload["port"], self.port)
+        self.assertEqual(payload["instance_id"], self.httpd.instance_id)
+        self.assertEqual(
+            payload["repository_scope_id"], board._repository_scope_id()
+        )
 
     def test_served_html_receives_an_ephemeral_capability_and_security_headers(self) -> None:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/plan.html", timeout=10) as r:
@@ -1141,6 +1532,15 @@ class TestOverHTTP(BoardTestCase):
         self.assertTrue(sent.startswith(preview.rstrip("\n")))
         self.assertIn("amend it like this", sent)
 
+    def test_wire_approval_without_rendered_review_digest_is_refused(self) -> None:
+        code, payload = self.post(
+            "/api/finding/approve",
+            {"slug": SLUG_A, "comment": "go", "review": {}},
+        )
+        self.assertEqual(409, code)
+        self.assertEqual("stale_review", payload["code"])
+        self.assertEqual([], self.rm.spawned)
+
     def test_defer_over_the_wire(self) -> None:
         code, payload = self.post("/api/finding/defer", {"slug": SLUG_B, "reason": "later"})
         self.assertEqual(code, 200)
@@ -1150,6 +1550,71 @@ class TestOverHTTP(BoardTestCase):
         code, payload = self.post("/api/retro/run", {})
         self.assertEqual(code, 200)
         self.assertTrue(payload["run_id"])
+
+    def test_retro_read_boundary_blocker_over_the_wire_never_dispatches(self) -> None:
+        blocker = board.providers.COPILOT_READ_BOUNDARY_BLOCKER
+
+        with mock.patch.object(
+            board.providers, "preflight", return_value=[blocker]
+        ):
+            code, payload = self.post("/api/retro/run", {})
+
+        self.assertEqual(409, code)
+        self.assertEqual("provider_unavailable", payload["code"])
+        self.assertEqual([blocker], payload["provider_blockers"])
+        self.assertEqual(0, self.rm.retro_started)
+        self.assertEqual([], self.rm.spawned)
+
+    def test_recorded_plan_veto_requires_capability_and_never_dispatches(self) -> None:
+        decision = {
+            "ok": True,
+            "decision": "veto",
+            "status": "draft",
+            "fingerprint": "e" * 64,
+            "record": "<runtime>/plan-decisions/decision.json",
+            "dispatched": False,
+        }
+        origin = f"http://127.0.0.1:{self.port}"
+        with mock.patch.object(
+            board.cockpit, "record_plan_decision", return_value=decision
+        ) as record, mock.patch.object(
+            board, "_regenerate_views", return_value={"ok": True}
+        ):
+            code, payload = self.post_raw(
+                "/api/plan/decision",
+                json.dumps(
+                    {
+                        "action": "veto",
+                        "fingerprint": "f" * 64,
+                        "comment": "The recorded outcome needs review.",
+                    }
+                ).encode("utf-8"),
+                {"Content-Type": "application/json", "Origin": origin},
+            )
+            self.assertEqual(403, code)
+            self.assertEqual("invalid_capability", payload["code"])
+            record.assert_not_called()
+
+            code, payload = self.post(
+                "/api/plan/decision",
+                {
+                    "action": "veto",
+                    "fingerprint": "f" * 64,
+                    "comment": "The recorded outcome needs review.",
+                },
+            )
+
+        self.assertEqual(200, code)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["regenerated"])
+        self.assertFalse(payload["dispatched"])
+        record.assert_called_once_with(
+            self.dir,
+            action="veto",
+            fingerprint="f" * 64,
+            comment="The recorded outcome needs review.",
+        )
+        self.assertEqual([], self.rm.spawned)
 
     def test_deleted_endpoints_are_gone_and_say_so(self) -> None:
         for path in ("/api/dispatch/prepare", "/api/dispatch/run", "/api/decision"):
@@ -1185,7 +1650,9 @@ class TestOverHTTP(BoardTestCase):
             board.finding_states = saved
         self.assertEqual(code, 500)
         self.assertEqual(payload["code"], "server_error")
-        self.assertIn("boom", payload["error"])
+        self.assertEqual("The board could not complete this request.", payload["error"])
+        self.assertRegex(payload["error_id"], r"^[0-9a-f]{16}$")
+        self.assertNotIn("boom", json.dumps(payload))
 
     def test_a_stale_approval_is_refused_over_the_wire(self) -> None:
         self.findings.write_text(self.findings_text + "\nedited\n", encoding="utf-8")

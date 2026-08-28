@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import importlib.metadata
 import json
 import os
@@ -106,12 +107,28 @@ def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
     RETRO_NOTE_THRESHOLD,
 ) = _load_portable_contracts()
 LOG_DIR = ROOT / ".checklogs"
+VERIFY_RUN_ID = os.environ.get("KIT_VERIFY_NONCE", "").strip()
+VERIFY_RUN_ID_VALID = bool(
+    not VERIFY_RUN_ID or re.fullmatch(r"[0-9a-f]{32}", VERIFY_RUN_ID)
+)
+VERIFY_AUTH_KEY = os.environ.get("KIT_VERIFY_AUTH_KEY", "").strip()
+VERIFY_AUTH_KEY_VALID = bool(
+    not VERIFY_RUN_ID or re.fullmatch(r"[0-9a-f]{64}", VERIFY_AUTH_KEY)
+)
+VERIFY_REPOSITORY_SHA256 = os.environ.get(
+    "KIT_VERIFY_REPOSITORY_SHA256", ""
+).strip()
+VERIFY_REPOSITORY_SHA256_VALID = bool(
+    not VERIFY_RUN_ID
+    or re.fullmatch(r"[0-9a-f]{64}", VERIFY_REPOSITORY_SHA256)
+)
 EXPECTED_VERSION = "4.7.2"
 STAGES = ["integrity", "skills", "schema", "shape", "design", "conformance", "format", "lint",
           "sanitise", "import", "typecheck", "grep", "types", "arch", "tests",
           "assets", "resources", "gut", "smoke"]
 ENGINE_STAGES = ("import", "typecheck", "resources", "gut", "smoke")
 STATIC_STAGES = tuple(stage for stage in STAGES if stage not in ENGINE_STAGES)
+CONFORMANCE_COMPLETION_REQUIRED = True
 GATE_RULES_FILE = ROOT / "gate.rules.json"
 MANIFEST_FILE = ROOT / ".gate.sha256"
 
@@ -167,7 +184,8 @@ EXCLUDED_DIRS = {".godot", "addons", "build", "export", ".git", ".checklogs"}
 # error costs a wrong "done" claim from the agent.
 ERROR_RE = re.compile(
     r"SCRIPT ERROR|Parse Error|ERROR:|Failed to load|Cannot open file"
-    r"|CRITICAL|Condition \".*\" is true|USER ERROR"
+    r"|CRITICAL|Condition \".*\" is true|USER ERROR|NATIVE ENGINE CRASH"
+    r"|ENGINE LAUNCH REFUSED|TIMEOUT after"
 )
 # Lines that match the above but are harmless noise on a clean run.
 IGNORE_RE = re.compile(
@@ -293,7 +311,12 @@ def indent(text: str, limit: int = 40) -> None:
 # uncapped log reached 165 MB in the field. The cap keeps the tail, because the
 # tail is where a timeout notice or a summary line lives.
 LOG_CAP_BYTES = 2 * 1024 * 1024
-ENGINE_LOCK_FILE = ROOT / ".kit" / "runtime" / "godot-process.lock"
+RUN_DIAGNOSTICS: Dict[str, List[dict]] = {
+    "native_crashes": [],
+    "engine_refusals": [],
+    "engine_start_failures": [],
+    "timeouts": [],
+}
 
 
 def _cap(text: str) -> str:
@@ -305,198 +328,45 @@ def _cap(text: str) -> str:
             f"showing the last {LOG_CAP_BYTES} bytes]\n" + keep)
 
 
-def _is_engine_command(cmd: Sequence[str]) -> bool:
-    return bool(cmd) and "godot" in Path(str(cmd[0])).name.lower()
-
-
-def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    if os.name == "nt":
-        # `os.kill(pid, 0)` is a POSIX liveness probe. On Windows Python maps
-        # os.kill to console/termination APIs and signal 0 is not portable, so
-        # it can misclassify a live lock holder as stale. Query the process
-        # object without requesting mutation rights instead.
-        import ctypes
-
-        synchronize = 0x00100000
-        wait_timeout = 0x00000102
-        access_denied = 5
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(synchronize, False, pid)
-        if handle:
-            try:
-                return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
-            finally:
-                kernel32.CloseHandle(handle)
-        # A protected live process may deny even SYNCHRONIZE. Treat that as
-        # alive: refusing a concurrent launch is safer than deleting its lock.
-        return ctypes.get_last_error() == access_denied
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def _acquire_engine_lock() -> tuple[str | None, str]:
-    """Serialize native engine launches across agents and check processes."""
-    ENGINE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    token = f"{os.getpid()}-{time.time_ns()}"
-    for attempt in range(2):
-        try:
-            descriptor = os.open(
-                str(ENGINE_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump({"pid": os.getpid(), "token": token}, handle, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            return token, ""
-        except FileExistsError:
-            try:
-                holder = json.loads(ENGINE_LOCK_FILE.read_text(encoding="utf-8"))
-                pid = int(holder.get("pid", 0))
-                if attempt == 0 and not _pid_is_alive(pid):
-                    ENGINE_LOCK_FILE.unlink()
-                    continue
-                return None, f"another Godot launch is active (pid {pid or 'unknown'})"
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                return None, "another Godot launch owns an unreadable process lock"
-        except OSError as exc:
-            return None, f"cannot acquire the Godot process lock: {exc}"
-    return None, "another Godot launch is active"
-
-
-def _release_engine_lock(token: str) -> None:
-    try:
-        holder = json.loads(ENGINE_LOCK_FILE.read_text(encoding="utf-8"))
-        if holder.get("token") == token:
-            ENGINE_LOCK_FILE.unlink()
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
-
-
-def _start_owned_engine_process(cmd: Sequence[str]) -> subprocess.Popen[bytes]:
-    """Start one headless engine process without Windows error-dialog UI.
-
-    Windows child processes inherit their parent's error mode. Temporarily
-    setting SEM_FAILCRITICALERRORS and SEM_NOGPFAULTERRORBOX prevents a native
-    crash from opening a modal Application Error / WER dialog. The gate is a
-    single-threaded process and restores its original mode immediately after
-    CreateProcess returns.
-    """
-    creation_flags = 0
-    start_new_session = os.name != "nt"
-    kernel32 = None
-    previous_error_mode = None
-    if os.name == "nt":
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            import ctypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetErrorMode.restype = ctypes.c_uint
-            kernel32.SetErrorMode.argtypes = [ctypes.c_uint]
-            kernel32.SetErrorMode.restype = ctypes.c_uint
-            current = kernel32.GetErrorMode()
-            previous_error_mode = kernel32.SetErrorMode(current | 0x0001 | 0x0002)
-        except (AttributeError, OSError):
-            kernel32 = None
-            previous_error_mode = None
-    try:
-        return subprocess.Popen(
-            list(cmd),
-            cwd=str(PROJECT_DIR),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=creation_flags,
-            start_new_session=start_new_session,
-        )
-    finally:
-        if kernel32 is not None and previous_error_mode is not None:
-            kernel32.SetErrorMode(previous_error_mode)
-
-
-def _terminate_owned_process_tree(proc: subprocess.Popen[bytes]) -> None:
-    """Terminate only the native process tree started by this gate."""
-    if proc.poll() is not None:
-        return
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
-    else:
-        try:
-            import signal
-
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (OSError, ValueError):
-            pass
-    if proc.poll() is None:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
-def run(cmd: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
+def run(
+    cmd: Sequence[str], timeout: int, log: Path, *, native: bool = False
+) -> Tuple[int, str]:
     """Run a command, capture combined output to `log`, never raise.
 
     stdin is closed. Godot's debugger prompts for input on a parse error; with
     an inherited stdin it reads garbage, resumes, breaks again, and spins until
     the timeout. DEVNULL turns that infinite loop into a clean immediate exit.
     """
-    engine_command = _is_engine_command(cmd)
-    engine_token: str | None = None
-    if engine_command:
-        engine_token, problem = _acquire_engine_lock()
-        if engine_token is None:
-            out = (
-                "ENGINE LAUNCH REFUSED: " + problem
-                + ". Let the existing verification finish; do not retry in parallel.\n"
-            )
-            with log.open("w", encoding="utf-8", errors="replace", newline="") as fh:
-                fh.write(out)
-            return 125, out
     try:
-        if engine_command:
-            owned = _start_owned_engine_process(cmd)
-            try:
-                raw, _stderr = owned.communicate(timeout=timeout)
-                code = owned.returncode
-            except subprocess.TimeoutExpired as exc:
-                _terminate_owned_process_tree(owned)
-                try:
-                    raw, _stderr = owned.communicate(timeout=10)
-                except (OSError, subprocess.SubprocessError):
-                    raw = exc.output or b""
-                if isinstance(raw, str):
-                    raw = raw.encode()
-                out = raw.decode("utf-8", errors="replace")
-                out += f"\nTIMEOUT after {timeout}s; owned process tree terminated\n"
-                code = 124
-            else:
-                out = raw.decode("utf-8", errors="replace")
+        if native:
+            if not cmd:
+                raise OSError("native engine command is empty")
+            from tools import native_engine
+
+            result = native_engine.run_godot(
+                str(cmd[0]),
+                [str(value) for value in cmd[1:]],
+                root=ROOT,
+                cwd=PROJECT_DIR,
+                timeout=timeout,
+            )
+            native_engine.persist_native_failure(
+                ROOT,
+                result,
+                operation="verification",
+                verification_run_id=VERIFY_RUN_ID or None,
+            )
+            out = result.output
+            code = result.exit_code
+            diagnostic = result.diagnostic()
+            if result.failure_class == "native-crash":
+                RUN_DIAGNOSTICS["native_crashes"].append(diagnostic)
+            elif result.failure_class == "engine-timeout":
+                RUN_DIAGNOSTICS["timeouts"].append(diagnostic)
+            elif result.failure_class == "concurrent-engine-launch":
+                RUN_DIAGNOSTICS["engine_refusals"].append(diagnostic)
+            elif result.failure_class == "engine-start-failed":
+                RUN_DIAGNOSTICS["engine_start_failures"].append(diagnostic)
         else:
             proc = subprocess.run(
                 list(cmd),
@@ -516,12 +386,11 @@ def run(cmd: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
         out = partial.decode("utf-8", errors="replace")
         out += f"\nTIMEOUT after {timeout}s\n"
         code = 124
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError) as exc:
         out = f"executable not found: {cmd[0]}\n"
+        if not isinstance(exc, FileNotFoundError):
+            out = f"executable could not start: {Path(str(cmd[0])).name}: {type(exc).__name__}\n"
         code = 127
-    finally:
-        if engine_token is not None:
-            _release_engine_lock(engine_token)
     # newline="" prevents Windows translating Godot's \r\n into \r\r\n.
     # ANSI escapes are stripped: the log is read back by an agent, not a TTY.
     clean = _cap(ANSI_RE.sub("", out))
@@ -628,6 +497,34 @@ def gd_files() -> List[Path]:
         if EXCLUDED_DIRS.intersection(rel.parts):
             continue
         out.append(path)
+    return out
+
+
+def is_authored_game_relative(relative: str) -> bool:
+    """Use the same inverse authored-input policy as the living plan."""
+    from tools import authored_scope
+
+    is_kit_file = None
+    if GAME_LAYOUT == ".":
+        from tools import release as kit_release
+
+        is_kit_file = kit_release.is_allowlisted
+    return authored_scope.is_authored_game_file(
+        relative,
+        game_layout=GAME_LAYOUT,
+        is_kit_file=is_kit_file,
+    )
+
+
+def authored_game_files() -> List[Path]:
+    """Return every current authored game input, independent of file suffix."""
+    out: List[Path] = []
+    for path in sorted(PROJECT_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(PROJECT_DIR).as_posix()
+        if is_authored_game_relative(relative):
+            out.append(path)
     return out
 
 
@@ -1045,7 +942,7 @@ def stage_resources(godot: str) -> None:
     _, out = run(
         [godot, "--headless", "--path", str(PROJECT_DIR),
          "-s", "res://tools/validate_resources.gd"],
-        120, LOG_DIR / "resources.log",
+        120, LOG_DIR / "resources.log", native=True,
     )
     fails = [ln for ln in out.splitlines() if ln.startswith("RESVAL: FAIL")]
     summary = [ln for ln in out.splitlines() if ln.startswith("RESVAL: SUMMARY")]
@@ -1416,7 +1313,7 @@ def stage_import(godot: str) -> None:
     # Exit code deliberately ignored: known to return 1 on a clean import.
     _, out = run(
         [godot, "--headless", "--path", str(PROJECT_DIR), "--import", "--quit"],
-        180, LOG_DIR / "import.log",
+        180, LOG_DIR / "import.log", native=True,
     )
     errs = scan(out)
     if errs:
@@ -1443,7 +1340,7 @@ def stage_typecheck(godot: str) -> None:
         _, out = run(
             [godot, "--headless", "--path", str(PROJECT_DIR),
              "--check-only", "--script", f"res://{rel}", "--quit"],
-            60, LOG_DIR / "_tc_one.log",
+            60, LOG_DIR / "_tc_one.log", native=True,
         )
         if ERROR_RE.search(out):
             combined.append(out)
@@ -1744,15 +1641,25 @@ def stage_design() -> None:
         RESULTS.skip("design")
         return
     code, out = run([sys.executable, str(tool), "--json"], 60, LOG_DIR / "design.log")
-    if code != 0:
-        print(indent(out or "(no output)"))
-        RESULTS.fail("design (generator failed)")
-        return
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
+        if code != 0:
+            print(indent(out or "(no output)"))
         print(f"  {RED}design.py produced unparseable output{RST}")
         RESULTS.fail("design (bad generator output)")
+        return
+    if code != 0:
+        problems = data.get("metadata_errors") or []
+        if problems:
+            print(f"  {RED}design authority metadata is invalid:{RST}")
+            for problem in problems:
+                print(f"    {problem}")
+        else:
+            print(indent(out or "(no output)"))
+        skill("godot-design-sections",
+              "design authorship and authority must be explicit")
+        RESULTS.fail("design (authority metadata)")
         return
 
     sections = data.get("sections") or []
@@ -1781,6 +1688,10 @@ def stage_design() -> None:
     for p in data.get("unstated_resolution") or []:
         print(f"  {YEL}note: {p} states no resolution line{RST}")
         print("        a reader cannot tell a leaning from a commitment")
+    for warning in data.get("metadata_warnings") or []:
+        print(f"  {YEL}note: {warning}{RST}")
+        print("        legacy design may be read, but it cannot silently grant"
+              " implementation authority")
 
     ready = data.get("ready") or []
     if ready:
@@ -1829,10 +1740,98 @@ def _ack_line(a: dict) -> None:
     why = str(a.get("why", "") or "").strip()
     who = str(a.get("by", "") or "").strip()
     when = str(a.get("on", "") or "").strip()
-    tail = " · ".join(x for x in (who, when) if x)
+    tail = " | ".join(x for x in (who, when) if x)
     print(f"  {DIM}accepted by human: {why}{RST}")
     if tail:
         print(f"  {DIM}  ({tail}){RST}")
+
+
+def proposal_approval_sha256(proposal: dict) -> str:
+    """Bind every final proposal field except the digest's own slot."""
+    material = dict(proposal)
+    material.pop("approval_sha256", None)
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _unbound_authored_changes() -> Tuple[Optional[List[str]], str]:
+    """Return authored game changes at ``HEAD`` when no proposal exists.
+
+    An absent proposal is a valid planning state only while there is no
+    implementation to authorize.  Current files alone cannot answer that
+    question: an adopted project may already contain a committed game, and a
+    deletion is visible only through Git.  Compare the configured game root to
+    the current commit and include untracked inputs using the same inverse
+    authored-file policy as ordinary conformance.
+
+    ``None`` means the comparison could not be proven.  A repository-free,
+    empty game root is the one safe exception because there is no authored
+    input on either side of a possible comparison.
+    """
+    current = {
+        path.relative_to(PROJECT_DIR).as_posix()
+        for path in authored_game_files()
+    }
+    if not shutil.which("git"):
+        if not current and not (ROOT / ".git").exists():
+            return [], ""
+        return None, "Git is unavailable; authored changes cannot be compared to a baseline"
+
+    verify_code, verified_head = run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD^{commit}"],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    verified_head = verified_head.strip().lower()
+    if verify_code != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", verified_head):
+        if not current and not (ROOT / ".git").exists():
+            return [], ""
+        return None, "the current Git baseline is unavailable"
+
+    tracked_code, tracked = run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "diff",
+            "--name-only",
+            verified_head,
+            "--",
+            GAME_LAYOUT,
+        ],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    if tracked_code != 0:
+        return None, "Git could not derive tracked authored changes"
+    untracked_code, untracked = run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            GAME_LAYOUT,
+        ],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    if untracked_code != 0:
+        return None, "Git could not derive untracked authored changes"
+
+    changed: set[str] = set()
+    for line in (tracked + "\n" + untracked).splitlines():
+        relative = repository_game_relative(line)
+        if relative is not None and is_authored_game_relative(relative):
+            changed.add(relative)
+    return sorted(changed), ""
 
 
 def stage_conformance() -> None:
@@ -1842,21 +1841,41 @@ def stage_conformance() -> None:
     ends: the human approves one structure, gets another, and nothing notices.
     proposal.json makes the approved shape durable so the diff is mechanical.
 
-    Reports rather than fails. Deviation while building is legitimate -- what
-    is not legitimate is silent deviation, and a report the agent must address
-    is the mechanism for that. Depth follows involvement: a module-level human
-    is not shown unproposed function signatures they never approved.
+    Structural deviation reports rather than fails. Deviation while building
+    is legitimate; missing design authority, a stale design digest, or crossing
+    a go/no-go without approval is not. Depth follows involvement: a module-
+    level human is not shown unproposed function signatures they never
+    approved.
     """
     head("proposal conformance")
     path = ROOT / "proposal.json"
     level = involvement()
     if not path.is_file():
-        print("  no proposal.json")
+        changed, problem = _unbound_authored_changes()
+        if changed is None:
+            print(f"  {RED}{problem}{RST}")
+            print("  Without proposal.json the gate must prove that no authored"
+                  " game input changed; it cannot infer design authority.")
+            RESULTS.fail("conformance (unbound scope unavailable)")
+            return
+        if changed:
+            print(f"  {RED}authored game changes exist without proposal.json:{RST}")
+            for relative in changed[:16]:
+                print(f"    {relative}")
+            if len(changed) > 16:
+                print(f"    ... and {len(changed) - 16} more")
+            print("  No proposal means no implementation authority. Retrieve or"
+                  " write the relevant design, then record the reversible plan.")
+            skill("godot-design-retrieval",
+                  "authored work has no proposal or exact design ancestry")
+            RESULTS.fail("conformance (implementation without design authority)")
+            return
+        print("  no proposal.json; no authored game changes")
         RESULTS.skip("conformance")
         return
     try:
         prop = json.loads(path.read_text(encoding="utf-8"))
-        for key in ("modules", "files", "functions", "design_refs",
+        for key in ("scope", "modules", "files", "functions", "design_refs",
                     "considered_existing", "revisions"):
             if isinstance(prop.get(key), list):
                 prop[key] = [i for i in prop[key] if not _is_example(i)]
@@ -1873,15 +1892,103 @@ def stage_conformance() -> None:
         items = prop.get(key)
         if not isinstance(items, list):
             return set()
-        return {str(i[field]).strip().replace("\\", "/")
+        return {str(i[field]).strip()
                 for i in items if isinstance(i, dict) and i.get(field)}
 
     prop_mods = listed("modules", "path")
     prop_files = listed("files", "path")
     status = str(prop.get("status", "") or "").strip().lower()
 
-    if status and status not in ("draft", "approved"):
-        print(f"  {RED}status '{status}' is not 'draft' or 'approved'{RST}")
+    from tools import authored_scope, proposal_authority
+
+    path_errors: List[str] = []
+    seen_scope: set[Tuple[str, str]] = set()
+    for item in (prop.get("scope") or []):
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("path", "") or "").strip()
+        kind = str(item.get("kind", "") or "").strip()
+        action = str(item.get("action", "") or "").strip().lower()
+        normal = (
+            authored_scope.normalize_directory(raw)
+            if kind == "directory"
+            else authored_scope.normalize_relative(raw)
+            if kind == "file"
+            else None
+        )
+        if normal != raw:
+            path_errors.append(
+                f"hands-off scope {raw!r}: expected one canonical {kind or 'file/directory'} path"
+            )
+        if kind not in ("file", "directory"):
+            path_errors.append(
+                f"hands-off scope {raw!r}: kind must be 'file' or 'directory'"
+            )
+        if action not in ("new", "modify", "delete"):
+            path_errors.append(
+                f"hands-off scope {raw!r}: action must be 'new', 'modify' or 'delete'"
+            )
+        identity = (kind, raw)
+        if identity in seen_scope:
+            path_errors.append(f"hands-off scope {raw!r}: duplicate boundary")
+        seen_scope.add(identity)
+    for item in (prop.get("modules") or []):
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("path", "") or "").strip()
+        if authored_scope.normalize_directory(raw) != raw:
+            path_errors.append(
+                f"module {raw!r}: expected one canonical game-root-relative directory"
+            )
+        dependencies = item.get("may_depend_on")
+        if not isinstance(dependencies, list):
+            path_errors.append(f"module {raw!r}: may_depend_on must be a list")
+        else:
+            for dependency in dependencies:
+                if (
+                    not isinstance(dependency, str)
+                    or authored_scope.normalize_directory(dependency) != dependency
+                ):
+                    path_errors.append(
+                        f"module {raw!r}: invalid dependency path {dependency!r}"
+                    )
+        if not str(item.get("boundary_data", "") or "").strip():
+            path_errors.append(
+                f"module {raw!r}: boundary_data must name typed crossing data or say none"
+            )
+    for item in (prop.get("files") or []):
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("path", "") or "").strip()
+        if (
+            authored_scope.normalize_relative(raw) != raw
+            or not is_authored_game_relative(raw)
+        ):
+            path_errors.append(
+                f"file {raw!r}: expected one canonical authored game-root-relative path"
+            )
+    for item in (prop.get("functions") or []):
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("file", "") or "").strip()
+        if (
+            authored_scope.normalize_relative(raw) != raw
+            or not raw.endswith(".gd")
+            or not is_authored_game_relative(raw)
+        ):
+            path_errors.append(
+                f"function file {raw!r}: expected one canonical authored .gd path"
+            )
+    if path_errors:
+        print(f"  {RED}proposal paths or module boundaries are invalid:{RST}")
+        for error in path_errors[:16]:
+            print(f"    {error}")
+        RESULTS.fail("conformance (invalid proposal scope)")
+        return
+
+    if status not in ("draft", "recorded", "approved"):
+        print(f"  {RED}status '{status or '(missing)'}' is not 'draft',"
+              f" 'recorded' or 'approved'{RST}")
         RESULTS.fail("conformance (bad status)")
         return
 
@@ -1892,8 +1999,12 @@ def stage_conformance() -> None:
     # including hands-off, because the inference is just as wrong when nobody
     # is watching.
     exp = prop.get("experience")
-    has_structure = bool(prop_mods or prop_files)
-    if has_structure:
+    prop_scope = [
+        item for item in (prop.get("scope") or []) if isinstance(item, dict)
+    ]
+    has_structure = bool(prop_scope or prop_mods or prop_files or prop.get("functions"))
+    requires_authority = has_structure or status in ("recorded", "approved")
+    if requires_authority:
         if not isinstance(exp, dict):
             print(f"  {RED}proposal has structure but no 'experience' object{RST}")
             print("  Describe what the player does and how it should feel BEFORE"
@@ -1931,32 +2042,83 @@ def stage_conformance() -> None:
                   " If it cannot be")
             print("  drawn, say why in mockup.not_possible.")
 
-    # Design ancestry. Every slice is either descended from a design choice or
-    # is a throwaway prototype informing one. It does not have to WRITE design;
-    # it has to point at the design it serves. A slice with no such pointer is
-    # work whose purpose lives only in a chat message.
+    # Design ancestry. Every slice descends from design; a throwaway probe
+    # descends from the written design question it exists to answer. A slice
+    # with no pointer is work whose purpose lives only in a chat message.
     #
     # A dangling pointer is a hard failure -- a reference to a file that does
     # not exist is worse than no reference, because it reads as though the
-    # rationale was written down. Absence is only a warning, because a design
-    # body that is genuinely thin is a real state and failing here would only
-    # produce fabricated ancestry.
-    if has_structure:
+    # rationale was written down. An unbound or out-of-date pointer is equally
+    # unsafe: approval of one design must not survive a later design edit.
+    # Missing ancestry is now blocking. The old acknowledgement escape hatch
+    # remains parseable for migration, but it can never turn silence into
+    # product authority.
+    if requires_authority:
         refs = prop.get("design_refs")
         refs = refs if isinstance(refs, list) else []
         dangling: List[str] = []
         resolved: List[str] = []
+        resolved_digests: Dict[str, str] = {}
+        invalid_refs: List[str] = []
+        parsed_designs: List[dict] = []
+        design_root = (ROOT / "docs" / "design").resolve()
+        from tools import design as design_contract
+
         for r in refs:
             if not isinstance(r, dict):
                 continue
-            sec = str(r.get("section", "") or "").strip().replace("\\", "/")
-            if not sec:
+            try:
+                sec, cand = proposal_authority.canonical_design_reference(
+                    ROOT, r.get("section")
+                )
+            except proposal_authority.AuthorityError as exc:
+                invalid_refs.append(str(exc))
                 continue
-            cand = ROOT / sec
-            if cand.is_file():
-                resolved.append(sec)
-            else:
-                dangling.append(sec)
+            expected = str(r.get("sha256", "") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                invalid_refs.append(
+                    f"{sec}: sha256 must be a canonical lowercase 64-hex digest")
+                continue
+            try:
+                actual = design_contract.design_sha256(
+                    cand.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError) as exc:
+                invalid_refs.append(f"{sec}: cannot read canonical design: {exc}")
+                continue
+            if actual != expected:
+                invalid_refs.append(
+                    f"{sec}: design changed after binding "
+                    f"(proposal {expected[:12]}, current {actual[:12]})")
+                continue
+            try:
+                parsed = design_contract.parse_design(cand)
+            except (OSError, UnicodeError, ValueError) as exc:
+                invalid_refs.append(f"{sec}: cannot parse design authority: {exc}")
+                continue
+            for problem in parsed.get("metadata_errors") or []:
+                invalid_refs.append(f"{sec}: {problem}")
+            if not parsed.get("implementation_eligible"):
+                warnings = parsed.get("metadata_warnings") or []
+                reason = "; ".join(str(item) for item in warnings)
+                invalid_refs.append(
+                    f"{sec}: design is not implementation-eligible"
+                    + (f" ({reason})" if reason else "")
+                )
+                continue
+            parsed_designs.append(parsed)
+            resolved.append(sec)
+            resolved_digests[sec] = expected
+        if invalid_refs:
+            print(f"  {RED}design_refs are not bound to the reviewed design:{RST}")
+            for problem in invalid_refs:
+                print(f"    {problem}")
+            print("  Re-read the design, update its digest deliberately, and"
+                  " re-evaluate the reversible envelope.")
+            skill("godot-design-retrieval",
+                  "implementation authority is bound to exact design content")
+            RESULTS.fail("conformance (stale design_refs)")
+            return
         if dangling:
             print(f"  {RED}design_refs point at files that do not exist:{RST}")
             for s in dangling:
@@ -1968,102 +2130,308 @@ def stage_conformance() -> None:
                   "ancestry must point at something a reader can open")
             RESULTS.fail("conformance (dangling design_refs)")
             return
-        acks = _acks(prop)
         if resolved:
             print(f"  design_refs: {len(resolved)} resolved")
-        elif "no-design-refs" in acks:
-            print(f"  {YEL}note: no design_refs — building without design,"
-                  f" accepted{RST}")
-            _ack_line(acks["no-design-refs"])
         else:
-            print(f"  {YEL}note: no design_refs — why does this work exist?{RST}")
-            print("  Point at the design section establishing the end state this"
-                  " serves. If nothing")
-            print("  in docs/design/ does, that is a signal the design body is"
-                  " thin here: enter")
-            print("  discovery rather than writing a rationale from the feature"
-                  " above it.")
-            print("  If building without it is genuinely the right call, ask the"
-                  " human, then record")
-            print("  it in acknowledged[] with their reason. Do not accept it on"
-                  " their behalf.")
+            print(f"  {RED}no design_refs - implementation has no authority{RST}")
+            old_ack = _acks(prop).get("no-design-refs")
+            if old_ack:
+                print(f"  {YEL}legacy acknowledgement found; it no longer authorizes"
+                      f" implementation{RST}")
+                _ack_line(old_ack)
+            print("  Enter design discovery. Do not build from a plausible guess"
+                  " about intent.")
             skill("godot-design-discovery",
-                  "work with no stated end state gets built on an inference")
+                  "work with no stated end state cannot be implemented")
+            RESULTS.fail("conformance (no design authority)")
+            return
 
-    # A draft is a proposal awaiting review, not a contract. Diffing it would
-    # report deviation from something nobody agreed to, which trains the human
-    # to ignore the report.
-    if status == "draft" and level not in ("", "hands-off"):
-        n = len(prop_mods) + len(prop_files)
-        print(f"  {YEL}proposal is a DRAFT awaiting review"
+        authority = prop.get("design_authority")
+        if not isinstance(authority, dict):
+            print(f"  {RED}proposal has no design_authority object{RST}")
+            print("  State whether the cited design is human-confirmed or an"
+                  " agent-authored provisional inference.")
+            RESULTS.fail("conformance (missing design authority)")
+            return
+        authority_kind = str(authority.get("authority", "") or "").strip()
+        authored_by = str(authority.get("authored_by", "") or "").strip()
+        confidence = str(authority.get("confidence", "") or "").strip()
+        if authority_kind not in ("human-confirmed", "agent-provisional"):
+            print(f"  {RED}design_authority.authority must be human-confirmed or"
+                  f" agent-provisional{RST}")
+            RESULTS.fail("conformance (bad design authority)")
+            return
+        if authored_by not in ("human", "agent"):
+            print(f"  {RED}design_authority.authored_by must be human or agent{RST}")
+            RESULTS.fail("conformance (bad design authorship)")
+            return
+        if confidence not in ("very-high", "high", "medium", "low"):
+            print(f"  {RED}design_authority.confidence must be very-high, high,"
+                  f" medium or low{RST}")
+            RESULTS.fail("conformance (bad design confidence)")
+            return
+        if authority_kind == "agent-provisional" and (
+                authored_by != "agent" or confidence != "very-high"):
+            print(f"  {RED}agent-provisional implementation requires agent"
+                  f" authorship and exact very-high confidence{RST}")
+            print("  Lower confidence may be recorded as design evidence, but it"
+                  " cannot authorize delivery.")
+            RESULTS.fail("conformance (provisional design not eligible)")
+            return
+
+        actual_authorities = {
+            str(item.get("authority", "")) for item in parsed_designs
+        }
+        expected_authority = (
+            "agent-provisional"
+            if "agent-provisional" in actual_authorities
+            else "human-confirmed"
+        )
+        expected_author = (
+            "agent"
+            if any(item.get("authored_by") == "agent" for item in parsed_designs)
+            else "human"
+        )
+        confidence_rank = {"low": 0, "medium": 1, "high": 2, "very-high": 3}
+        relevant_confidence = [
+            str(item.get("confidence", ""))
+            for item in parsed_designs
+            if expected_authority == "human-confirmed"
+            or item.get("authority") == "agent-provisional"
+        ]
+        expected_confidence = min(
+            relevant_confidence,
+            key=lambda item: confidence_rank.get(item, -1),
+            default="",
+        )
+        mismatches: List[str] = []
+        if authority_kind != expected_authority:
+            mismatches.append(
+                f"authority says {authority_kind!r}, cited design requires"
+                f" {expected_authority!r}"
+            )
+        if authored_by != expected_author:
+            mismatches.append(
+                f"authored_by says {authored_by!r}, cited design requires"
+                f" {expected_author!r}"
+            )
+        if confidence != expected_confidence:
+            mismatches.append(
+                f"confidence says {confidence!r}, cited design requires"
+                f" {expected_confidence!r}"
+            )
+        if mismatches:
+            print(f"  {RED}proposal design_authority contradicts its cited"
+                  f" design:{RST}")
+            for mismatch in mismatches:
+                print(f"    {mismatch}")
+            RESULTS.fail("conformance (design authority mismatch)")
+            return
+
+        reversibility = prop.get("reversibility")
+        if not isinstance(reversibility, dict):
+            print(f"  {RED}proposal has no reversibility object{RST}")
+            RESULTS.fail("conformance (missing reversible envelope)")
+            return
+        reversible_state = str(reversibility.get("state", "") or "").strip()
+        if reversible_state not in ("reversible", "go-no-go"):
+            print(f"  {RED}reversibility.state must be reversible or go-no-go{RST}")
+            RESULTS.fail("conformance (bad reversible envelope)")
+            return
+        missing_boundary = [key for key in (
+            "veto_scope", "hard_to_undo", "next_go_no_go"
+        ) if not str(reversibility.get(key, "") or "").strip()]
+        if missing_boundary:
+            print(f"  {RED}reversibility is missing:"
+                  f" {', '.join(missing_boundary)}{RST}")
+            RESULTS.fail("conformance (incomplete reversible envelope)")
+            return
+
+        shape_path = ROOT / "project.shape.json"
+        try:
+            shape = json.loads(shape_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"  {RED}cannot read the durable decision ledger: {exc}{RST}")
+            RESULTS.fail("conformance (approval ledger unreadable)")
+            return
+        if not isinstance(shape, dict):
+            print(f"  {RED}project.shape.json must contain an object{RST}")
+            RESULTS.fail("conformance (approval ledger unreadable)")
+            return
+        try:
+            rejection = proposal_authority.proposal_authority_rejection(
+                ROOT, prop, shape
+            )
+        except proposal_authority.AuthorityError as exc:
+            print(f"  {RED}cannot project current human authority: {exc}{RST}")
+            RESULTS.fail("conformance (authority projection unavailable)")
+            return
+        if status in ("recorded", "approved") and rejection is not None:
+            scope = str(rejection.get("authority_scope") or "design-and-plan")
+            print(
+                f"  {RED}human rejection is active for the current design intent "
+                f"or exact plan{RST}"
+            )
+            print(f"    scope: {scope}; decision: {rejection.get('id', '(unidentified)')}")
+            print("  Changing only status or approval metadata cannot resume rejected intent."
+                  " Change the substantive design/plan or obtain a new exact cockpit confirmation.")
+            RESULTS.fail("conformance (human rejection active)")
+            return
+
+        approved_by = str(prop.get("approved_by", "") or "").strip()
+        approved_on = str(prop.get("approved_on", "") or "").strip()
+        if status == "recorded":
+            if level != "hands-off":
+                print(f"  {RED}recorded status is only valid at hands-off"
+                      f" involvement{RST}")
+                RESULTS.fail("conformance (record used as approval)")
+                return
+            if reversible_state != "reversible":
+                print(f"  {RED}hands-off work reached a go/no-go boundary{RST}")
+                print("  Stop. A human must approve the exact bound design before"
+                      " work can continue.")
+                RESULTS.fail("conformance (go-no-go approval required)")
+                return
+            if approved_by or approved_on:
+                print(f"  {RED}recorded work must not carry approval metadata{RST}")
+                RESULTS.fail("conformance (record conflates approval)")
+                return
+        elif status == "approved":
+            if not approved_by or not approved_on:
+                print(f"  {RED}approved proposal must name who approved it and"
+                      f" when{RST}")
+                RESULTS.fail("conformance (approval attribution missing)")
+                return
+            if authority_kind != "human-confirmed":
+                print(f"  {RED}approved work must bind human-confirmed design{RST}")
+                RESULTS.fail("conformance (approval did not confirm design)")
+                return
+            try:
+                exact_approval = proposal_authority.exact_approval_state(
+                    ROOT, prop, shape
+                )
+            except proposal_authority.AuthorityError as exc:
+                print(f"  {RED}cannot project exact approval: {exc}{RST}")
+                RESULTS.fail("conformance (approval contract unbound)")
+                return
+            if not exact_approval["approved"]:
+                print(f"  {RED}stored approved status is not exact authority evidence:{RST}")
+                for reason in exact_approval["reasons"][:12]:
+                    print(f"    {reason}")
+                RESULTS.fail("conformance (stale plan approval)")
+                return
+
+    # A draft is a proposal awaiting review, never implementation authority.
+    # It blocks completion at every involvement level. Hands-off autonomy uses
+    # `recorded` only while the declared envelope remains reversible.
+    if status == "draft":
+        n = len(prop_scope) + len(prop_mods) + len(prop_files) + len(prop.get("functions") or [])
+        print(f"  {RED}proposal is a DRAFT awaiting review"
               f" ({n} item(s)){RST}")
-        print("  open plan.html; approval sets status to 'approved'")
+        print("  Open the cockpit. Confirm, veto or request changes before any"
+              " work crosses this boundary.")
         write_plan()
-        RESULTS.skip("conformance")
+        RESULTS.fail("conformance (decision required)")
         return
 
-    if level in ("", "hands-off"):
-        print(f"  involvement '{level or 'unset'}': proposal is a record, not a"
-              " contract")
-        if prop_mods or prop_files:
-            print(f"  recorded: {len(prop_mods)} module(s),"
-                  f" {len(prop_files)} file(s)")
-        write_plan()
-        RESULTS.skip("conformance")
+    if level == "":
+        print(f"  {RED}project involvement is unset{RST}")
+        RESULTS.fail("conformance (involvement unset)")
         return
 
-    if not (prop_mods or prop_files):
-        print(f"  {YEL}proposal.json is empty at involvement '{level}'{RST}")
-        print("  Write it as a draft, render plan.html, then wait for approval.")
-        skill("godot-human-involvement", "an unapproved structure is unreviewable")
+    if not has_structure:
+        print(f"  {RED}proposal.json grants implementation status but declares"
+              f" no structure{RST}")
+        print("  Record at least the modules, files or functions this slice"
+              " changes. Empty authority cannot be conformed to real work.")
+        skill("godot-human-involvement", "implementation scope must be reviewable")
         write_plan()
-        RESULTS.skip("conformance")
+        RESULTS.fail("conformance (empty implementation scope)")
         return
 
-    if not status:
-        print(f"  {YEL}note: no status field; treating as approved{RST}")
+    depth_missing = (
+        "at least one coarse scope boundary" if level == "hands-off" and not prop_scope
+        else "module declarations" if level == "module" and not prop_mods
+        else "module and file declarations" if level == "file" and (not prop_mods or not prop_files)
+        else "module, file and function declarations"
+        if level == "function" and (
+            not prop_mods or not prop_files or not (prop.get("functions") or [])
+        )
+        else ""
+    )
+    if depth_missing:
+        print(f"  {RED}{level} involvement requires {depth_missing}{RST}")
+        print("  Record the contract at exactly the configured involvement depth;")
+        print("  a coarser proposal cannot prove that the work stayed inside it.")
+        RESULTS.fail("conformance (involvement scope incomplete)")
+        return
 
     # Actual state, relative to the configured res:// root.
-    all_real = {str(f.relative_to(PROJECT_DIR)).replace("\\", "/")
-                for f in gd_files()}
-    all_real = {f for f in all_real
-                if not f.startswith("tests/") and not f.startswith("addons/")}
+    current_files = {
+        str(path.relative_to(PROJECT_DIR)).replace("\\", "/")
+        for path in authored_game_files()
+    }
 
     # A per-slice proposal cannot claim files that predate it. Scope the diff to
     # what changed since approval, using the git sha recorded at approval time.
     # Without a baseline the diff covers the whole tree and says so, because a
     # silently over-broad diff trains the agent to ignore this stage.
     baseline = str(prop.get("baseline_sha", "") or "").strip()
-    scoped = False
-    if baseline and shutil.which("git"):
-        pathspec = GAME_LAYOUT
-        code, out = run(["git", "-C", str(ROOT), "diff", "--name-only",
-                         baseline, "--", pathspec], 30,
-                        LOG_DIR / "conformance.log")
-        # git diff shows tracked changes only. New work is usually UNTRACKED,
-        # so omitting it scopes the diff to nothing and the stage reports a
-        # perfect match over files it never looked at.
-        _, untracked = run(["git", "-C", str(ROOT), "ls-files", "--others",
-                            "--exclude-standard", "--", pathspec], 30,
-                           LOG_DIR / "conformance.log")
-        if code == 0:
-            changed = set()
-            for line in (out + "\n" + untracked).splitlines():
-                relative = repository_game_relative(line)
-                if relative is not None:
-                    changed.add(relative)
-            real_files = all_real & changed
-            scoped = True
-            print(f"  {DIM}scoped to {len(real_files)} file(s) changed since"
-                  f" {baseline[:8]}{RST}")
-        else:
-            print(f"  {YEL}baseline_sha {baseline[:8]!r} not found in git;"
-                  f" comparing whole tree{RST}")
-            real_files = all_real
-    else:
-        real_files = all_real
-        if not baseline:
-            print(f"  {DIM}no baseline_sha in proposal; comparing whole tree{RST}")
+    if not baseline:
+        print(f"  {RED}proposal has no baseline_sha{RST}")
+        print("  Bind the slice to the repository state it started from; an"
+              " unscoped comparison cannot support approval.")
+        RESULTS.fail("conformance (missing baseline)")
+        return
+    if not re.fullmatch(r"[0-9a-f]{40,64}", baseline):
+        print(f"  {RED}baseline_sha is not an exact lowercase commit id{RST}")
+        RESULTS.fail("conformance (invalid baseline)")
+        return
+    if not shutil.which("git"):
+        print(f"  {RED}Git is unavailable; changed-file scope cannot be proven{RST}")
+        RESULTS.fail("conformance (git unavailable)")
+        return
+    verify_code, verified_baseline = run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{baseline}^{{commit}}"],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    verified_baseline = verified_baseline.strip().lower()
+    if verify_code != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", verified_baseline):
+        print(f"  {RED}baseline_sha {baseline[:12]!r} is not a commit in this"
+              f" repository{RST}")
+        RESULTS.fail("conformance (baseline unavailable)")
+        return
+    pathspec = GAME_LAYOUT
+    code, out = run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", verified_baseline,
+         "--", pathspec],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    if code != 0:
+        print(f"  {RED}Git could not derive tracked changes from the baseline{RST}")
+        RESULTS.fail("conformance (tracked scope unavailable)")
+        return
+    untracked_code, untracked = run(
+        ["git", "-C", str(ROOT), "ls-files", "--others", "--exclude-standard",
+         "--", pathspec],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    if untracked_code != 0:
+        print(f"  {RED}Git could not derive untracked changes; scope would be"
+              f" incomplete{RST}")
+        RESULTS.fail("conformance (untracked scope unavailable)")
+        return
+    changed: set[str] = set()
+    for line in (out + "\n" + untracked).splitlines():
+        relative = repository_game_relative(line)
+        if relative is not None and is_authored_game_relative(relative):
+            changed.add(relative)
+    real_files = changed
+    print(f"  {DIM}scoped to {len(real_files)} file(s) changed since"
+          f" {verified_baseline[:8]}{RST}")
 
     # Each file declares create or modify. Nothing checked it, so `create` on a
     # file that already existed slipped through twice and a human caught it both
@@ -2071,66 +2439,455 @@ def stage_conformance() -> None:
     # wrong action means the agent has not looked at what is already there --
     # which is exactly when extend-before-create gets skipped.
     action_wrong: List[str] = []
-    if baseline and shutil.which("git"):
-        code, listing = run(["git", "-C", str(ROOT), "ls-tree", "-r",
-                             "--name-only", baseline, "--", GAME_LAYOUT], 30,
-                            LOG_DIR / "conformance.log")
-        if code == 0:
-            at_baseline = set()
-            for line in listing.splitlines():
-                relative = repository_game_relative(line)
-                if relative is not None:
-                    at_baseline.add(relative)
-            for item in (prop.get("files") or []):
-                if not isinstance(item, dict):
-                    continue
-                rel = str(item.get("path", "") or "").strip().replace("\\", "/")
-                act = str(item.get("action", "") or "").strip().lower()
-                if not rel:
-                    continue
-                # Skipping a missing action meant this whole check never ran:
-                # two real proposals omitted the field entirely, so "modify"
-                # vanished from the plan and nothing compared anything.
-                if not act:
-                    action_wrong.append(
-                        f"{rel}: no action declared (expected 'new' or 'modify')")
-                    continue
-                if act not in ("new", "create", "modify"):
-                    action_wrong.append(
-                        f"{rel}: action {act!r} is not 'new' or 'modify'")
-                    continue
-                existed = rel in at_baseline
-                if act in ("new", "create") and existed:
-                    action_wrong.append(f"{rel}: marked '{act}' but it already existed")
-                elif act == "modify" and not existed:
-                    action_wrong.append(f"{rel}: marked 'modify' but it did not exist")
+    code, listing = run(
+        ["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only",
+         verified_baseline, "--", GAME_LAYOUT],
+        30,
+        LOG_DIR / "conformance.log",
+    )
+    if code != 0:
+        print(f"  {RED}Git could not read the baseline tree; create/modify"
+              f" declarations cannot be proven{RST}")
+        RESULTS.fail("conformance (baseline tree unavailable)")
+        return
+    at_baseline: set[str] = set()
+    for line in listing.splitlines():
+        relative = repository_game_relative(line)
+        if relative is not None and is_authored_game_relative(relative):
+            at_baseline.add(relative)
+
+    def scope_contains(boundary: dict, relative: str) -> bool:
+        raw = str(boundary.get("path") or "")
+        if boundary.get("kind") == "file":
+            return relative == raw
+        if raw == "(root)":
+            return True
+        return relative == raw or relative.startswith(raw.rstrip("/") + "/")
+
+    def scope_specificity(boundary: dict) -> Tuple[int, int]:
+        raw = str(boundary.get("path") or "")
+        if boundary.get("kind") == "file":
+            return (2, len(raw.split("/")))
+        if raw == "(root)":
+            return (0, 0)
+        return (1, len(raw.split("/")))
+
+    def changed_action(relative: str) -> str:
+        existed = relative in at_baseline
+        exists_now = relative in current_files
+        if not existed and exists_now:
+            return "new"
+        if existed and not exists_now:
+            return "delete"
+        return "modify"
+
+    scope_unbuilt: List[str] = []
+    unscoped_hands_off: List[str] = []
+    if level == "hands-off":
+        claimed: Dict[int, List[str]] = {
+            index: [] for index, _boundary in enumerate(prop_scope)
+        }
+        for relative in sorted(real_files):
+            matching = [
+                (index, boundary)
+                for index, boundary in enumerate(prop_scope)
+                if scope_contains(boundary, relative)
+            ]
+            if not matching:
+                unscoped_hands_off.append(relative)
+                continue
+            owner_index, owner = max(
+                matching, key=lambda item: scope_specificity(item[1])
+            )
+            actual = changed_action(relative)
+            declared = str(owner.get("action") or "").strip().lower()
+            if declared != actual:
+                action_wrong.append(
+                    f"{relative}: hands-off scope declares {declared!r} but the "
+                    f"observed action is {actual!r}"
+                )
+                continue
+            claimed[owner_index].append(relative)
+        for index, boundary in enumerate(prop_scope):
+            if not claimed.get(index):
+                scope_unbuilt.append(
+                    f"{boundary.get('kind')} {boundary.get('path')} "
+                    f"({boundary.get('action')})"
+                )
+    for item in (prop.get("files") or []):
+        if not isinstance(item, dict):
+            continue
+        rel = str(item.get("path", "") or "").strip()
+        act = str(item.get("action", "") or "").strip().lower()
+        if not rel:
+            continue
+        # Skipping a missing action meant this whole check never ran: two real
+        # proposals omitted it, so "modify" vanished and nothing was compared.
+        if not act:
+            action_wrong.append(
+                f"{rel}: no action declared (expected 'new', 'modify' or 'delete')")
+            continue
+        if act not in ("new", "modify", "delete"):
+            action_wrong.append(
+                f"{rel}: action {act!r} is not 'new', 'modify' or 'delete'"
+            )
+            continue
+        existed = rel in at_baseline
+        exists_now = rel in current_files
+        changed_now = rel in changed
+        if act == "new" and existed:
+            action_wrong.append(f"{rel}: marked 'new' but it already existed")
+        elif act in ("modify", "delete") and not existed:
+            action_wrong.append(
+                f"{rel}: marked '{act}' but it did not exist at the baseline"
+            )
+        elif changed_now and act == "new" and not exists_now:
+            action_wrong.append(f"{rel}: marked 'new' but no current file exists")
+        elif changed_now and act == "modify" and not exists_now:
+            action_wrong.append(
+                f"{rel}: was deleted but is marked 'modify' instead of 'delete'"
+            )
+        elif changed_now and act == "delete" and exists_now:
+            action_wrong.append(
+                f"{rel}: still exists but is marked 'delete'"
+            )
 
     depth = arch_depth()
+    def module_for(relative: str) -> str:
+        parent = str(Path(relative).parent).replace("\\", "/")
+        if parent in ("", "."):
+            return "(root)"
+        return "/".join(parent.split("/")[:depth])
+
+    for key, field in (("files", "path"), ("functions", "file")):
+        for item in (prop.get(key) or []):
+            if not isinstance(item, dict) or not item.get(field):
+                continue
+            declared_module = str(item.get("module", "") or "").strip()
+            if not declared_module:
+                continue
+            expected_module = module_for(str(item[field]).strip())
+            if declared_module != expected_module:
+                action_wrong.append(
+                    f"{item[field]}: module {declared_module!r} does not match"
+                    f" path-derived {expected_module!r}"
+                )
+
     # A module is a DIRECTORY. Truncating a file path to `depth` segments turns
     # scripts/main.gd into a phantom module, so derive from the parent.
-    real_mods = set()
-    for rel in real_files:
-        parent = str(Path(rel).parent).replace("\\", "/")
-        if parent in ("", "."):
+    def modules_for(files: set[str]) -> set[str]:
+        modules: set[str] = set()
+        for rel in files:
+            modules.add(module_for(rel))
+        return modules
+
+    real_mods = modules_for(real_files)
+    current_mods = modules_for(current_files)
+    baseline_mods = modules_for(at_baseline)
+    for item in (prop.get("modules") or []):
+        if not isinstance(item, dict):
             continue
-        real_mods.add("/".join(parent.split("/")[:depth]))
+        rel = str(item.get("path", "") or "").strip()
+        act = str(item.get("action", "") or "").strip().lower()
+        if not rel:
+            continue
+        if act not in ("new", "modify", "delete"):
+            action_wrong.append(
+                f"{rel}/: action {act!r} is not 'new', 'modify' or 'delete'"
+            )
+            continue
+        existed = rel in baseline_mods
+        exists_now = rel in current_mods
+        changed_now = rel in real_mods
+        if act == "new" and existed:
+            action_wrong.append(f"{rel}/: marked 'new' but the module already existed")
+        elif act in ("modify", "delete") and not existed:
+            action_wrong.append(
+                f"{rel}/: marked '{act}' but the module did not exist at the baseline"
+            )
+        elif changed_now and act == "new" and not exists_now:
+            action_wrong.append(f"{rel}/: marked 'new' but no current module exists")
+        elif changed_now and act == "modify" and not exists_now:
+            action_wrong.append(
+                f"{rel}/: was deleted but is marked 'modify' instead of 'delete'"
+            )
+        elif changed_now and act == "delete" and exists_now:
+            action_wrong.append(f"{rel}/: still exists but is marked 'delete'")
+
+    graph_code, graph_output = run(
+        [sys.executable, str(ROOT / "arch.py"), "--json"],
+        60,
+        LOG_DIR / "conformance-architecture.log",
+    )
+    try:
+        graph = json.loads(graph_output)
+    except json.JSONDecodeError:
+        graph = None
+    graph_modules = graph.get("modules") if isinstance(graph, dict) else None
+    if graph_code not in (0, 1) or not isinstance(graph_modules, dict):
+        print(f"  {RED}the current module dependency graph is unavailable{RST}")
+        print("  Proposal boundaries cannot be compared without arch.py --json.")
+        RESULTS.fail("conformance (module graph unavailable)")
+        return
+    dependency_wrong: List[str] = []
+    for item in (prop.get("modules") or []):
+        if not isinstance(item, dict):
+            continue
+        module = str(item.get("path", "") or "").strip()
+        allowed_raw = item.get("may_depend_on")
+        allowed = {
+            str(value).strip()
+            for value in allowed_raw
+            if isinstance(value, str) and value.strip()
+        } if isinstance(allowed_raw, list) else set()
+        actual_raw = graph_modules.get(module, [])
+        if not isinstance(actual_raw, list):
+            dependency_wrong.append(
+                f"{module}/: architecture graph returned a malformed dependency list"
+            )
+            continue
+        actual = {str(value) for value in actual_raw}
+        for dependency in sorted(actual - allowed):
+            dependency_wrong.append(
+                f"{module}/: depends on unapproved module {dependency!r}"
+            )
+    action_wrong.extend(dependency_wrong)
+
+    function_entries = [
+        item for item in (prop.get("functions") or [])
+        if isinstance(item, dict)
+    ]
+    function_unbuilt: List[str] = []
+    if level == "function" or function_entries:
+        from tools import gd_signature
+
+        proposed_functions: Dict[Tuple[str, str], dict] = {}
+        for item in function_entries:
+            relative = str(item.get("file", "") or "").strip()
+            signature = str(item.get("signature", "") or "").strip()
+            class_scope = str(item.get("class_scope", "") or "").strip()
+            action = str(item.get("action", "") or "").strip().lower()
+            try:
+                parsed_signature = gd_signature.parse_proposal_signature(signature)
+            except gd_signature.SignatureError as exc:
+                action_wrong.append(
+                    f"{relative or '(missing file)'}: invalid function signature: {exc}"
+                )
+                continue
+            if signature != parsed_signature.canonical:
+                action_wrong.append(
+                    f"{relative}::{parsed_signature.name}: signature is not canonical; "
+                    f"use {parsed_signature.canonical!r}"
+                )
+            if action not in ("new", "modify", "delete"):
+                action_wrong.append(
+                    f"{relative}::{parsed_signature.name}: action {action!r} is not "
+                    "'new', 'modify' or 'delete'"
+                )
+            source_identity = (
+                f"{class_scope}.{parsed_signature.name}"
+                if class_scope else parsed_signature.name
+            )
+            identity = (relative, source_identity)
+            if identity in proposed_functions:
+                action_wrong.append(
+                    f"{relative}::{source_identity}: duplicate function proposal"
+                )
+            proposed_functions[identity] = {
+                "action": action,
+                "signature": parsed_signature.canonical,
+            }
+
+        function_files = {relative for relative, _name in proposed_functions}
+        if level == "function":
+            function_files.update(
+                relative for relative in changed if relative.endswith(".gd")
+            )
+        source_maps: Dict[
+            str,
+            Tuple[
+                Dict[str, gd_signature.SourceFunction],
+                Dict[str, gd_signature.SourceFunction],
+            ],
+        ] = {}
+        function_source_error = ""
+        for relative in sorted(function_files):
+            before_functions: Dict[str, gd_signature.SourceFunction] = {}
+            current_functions: Dict[str, gd_signature.SourceFunction] = {}
+            if relative in at_baseline:
+                repository_path = (
+                    relative if GAME_LAYOUT == "." else f"{GAME_LAYOUT}/{relative}"
+                )
+                show_code, baseline_source = run(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "show",
+                        f"{verified_baseline}:{repository_path}",
+                    ],
+                    30,
+                    LOG_DIR / "conformance-functions.log",
+                )
+                if show_code != 0:
+                    function_source_error = (
+                        f"Git could not read baseline function source for {relative}"
+                    )
+                    break
+                try:
+                    before_functions = gd_signature.parse_source_functions(
+                        baseline_source
+                    )
+                except gd_signature.SignatureError as exc:
+                    function_source_error = (
+                        f"baseline {relative} has an unrepresentable function: {exc}"
+                    )
+                    break
+            if relative in current_files:
+                try:
+                    current_source = (PROJECT_DIR / relative).read_text(
+                        encoding="utf-8"
+                    )
+                    current_functions = gd_signature.parse_source_functions(
+                        current_source
+                    )
+                except (OSError, UnicodeError, gd_signature.SignatureError) as exc:
+                    function_source_error = (
+                        f"current {relative} has an unrepresentable function: {exc}"
+                    )
+                    break
+            source_maps[relative] = (before_functions, current_functions)
+        if function_source_error:
+            print(f"  {RED}{function_source_error}{RST}")
+            print("  Function-level conformance fails closed rather than omitting it.")
+            RESULTS.fail("conformance (function source unavailable)")
+            return
+
+        actual_function_changes: Dict[Tuple[str, str], dict] = {}
+        for relative, (before_functions, current_functions) in source_maps.items():
+            for name in sorted(set(before_functions) | set(current_functions)):
+                before_function = before_functions.get(name)
+                current_function = current_functions.get(name)
+                if before_function is None and current_function is not None:
+                    actual_function_changes[(relative, name)] = {
+                        "action": "new",
+                        "signature": current_function.signature,
+                    }
+                elif before_function is not None and current_function is None:
+                    actual_function_changes[(relative, name)] = {
+                        "action": "delete",
+                        "signature": before_function.signature,
+                    }
+                elif (
+                    before_function is not None
+                    and current_function is not None
+                    and (
+                        before_function.signature != current_function.signature
+                        or before_function.body_sha256 != current_function.body_sha256
+                    )
+                ):
+                    actual_function_changes[(relative, name)] = {
+                        "action": "modify",
+                        "signature": current_function.signature,
+                    }
+
+        for identity, declared in proposed_functions.items():
+            relative, name = identity
+            before_functions, current_functions = source_maps.get(
+                relative, ({}, {})
+            )
+            before_function = before_functions.get(name)
+            current_function = current_functions.get(name)
+            action = str(declared["action"])
+            signature = str(declared["signature"])
+            if action == "new":
+                if before_function is not None:
+                    action_wrong.append(
+                        f"{relative}::{name}: marked 'new' but existed at baseline"
+                    )
+                elif current_function is None:
+                    function_unbuilt.append(f"{relative}::{name}")
+                elif current_function.signature != signature:
+                    action_wrong.append(
+                        f"{relative}::{name}: implemented signature "
+                        f"{current_function.signature!r}, proposed {signature!r}"
+                    )
+            elif action == "modify":
+                if before_function is None:
+                    action_wrong.append(
+                        f"{relative}::{name}: marked 'modify' but did not exist at baseline"
+                    )
+                elif current_function is None:
+                    action_wrong.append(
+                        f"{relative}::{name}: was deleted but is marked 'modify'"
+                    )
+                elif current_function.signature != signature:
+                    action_wrong.append(
+                        f"{relative}::{name}: implemented signature "
+                        f"{current_function.signature!r}, proposed {signature!r}"
+                    )
+                elif identity not in actual_function_changes:
+                    function_unbuilt.append(f"{relative}::{name}")
+            elif action == "delete":
+                if before_function is None:
+                    action_wrong.append(
+                        f"{relative}::{name}: marked 'delete' but did not exist at baseline"
+                    )
+                elif before_function.signature != signature:
+                    action_wrong.append(
+                        f"{relative}::{name}: deletion must cite baseline signature "
+                        f"{before_function.signature!r}"
+                    )
+                elif current_function is not None:
+                    function_unbuilt.append(f"{relative}::{name}")
+
+        if level == "function":
+            for identity, actual in actual_function_changes.items():
+                declared = proposed_functions.get(identity)
+                if declared is None:
+                    action_wrong.append(
+                        f"{identity[0]}::{identity[1]}: changed as "
+                        f"{actual['action']} with unproposed signature "
+                        f"{actual['signature']!r}"
+                    )
+                elif (
+                    declared.get("action") != actual.get("action")
+                    or declared.get("signature") != actual.get("signature")
+                ):
+                    action_wrong.append(
+                        f"{identity[0]}::{identity[1]}: actual "
+                        f"{actual['action']} {actual['signature']!r} does not match "
+                        f"proposal {declared.get('action')} "
+                        f"{declared.get('signature')!r}"
+                    )
 
     notes = 0
     if action_wrong:
         notes += 1
-        print(f"  {YEL}wrong action on {len(action_wrong)} file(s):{RST}")
+        print(f"  {YEL}wrong action on {len(action_wrong)} scope item(s):{RST}")
         for line in action_wrong[:8]:
             print(f"    {line}")
         print("  Check what exists before proposing. Extending beats creating a"
               " second copy beside it.")
 
-    unproposed_mods = sorted(real_mods - prop_mods)
+    if unscoped_hands_off:
+        notes += 1
+        print(f"  {YEL}authored changes outside the recorded hands-off scope:{RST}")
+        for relative in unscoped_hands_off[:12]:
+            print(f"    {relative}")
+    unproposed_mods = (
+        sorted(real_mods - prop_mods)
+        if level in ("module", "file", "function") else []
+    )
     if unproposed_mods:
         notes += 1
         print(f"  {YEL}module(s) in code but not in the proposal:{RST}")
         for m in unproposed_mods[:8]:
             print(f"    {m}")
-    unbuilt_mods = sorted(prop_mods - real_mods)
+    unbuilt_mods = (
+        sorted(prop_mods - real_mods)
+        if level in ("module", "file", "function") else []
+    )
     if unbuilt_mods:
         print(f"  {DIM}proposed, not yet built: {', '.join(unbuilt_mods[:6])}{RST}")
 
@@ -2146,14 +2903,56 @@ def stage_conformance() -> None:
         unbuilt = sorted(prop_files - real_files)
         if unbuilt:
             print(f"  {DIM}proposed, not yet built: {len(unbuilt)} file(s){RST}")
+    if function_unbuilt:
+        print(
+            f"  {DIM}proposed, not yet built: {len(function_unbuilt)} "
+            f"function(s){RST}"
+        )
+
+    incomplete = [
+        *(f"scope {item}" for item in scope_unbuilt),
+        *(f"module {item}" for item in unbuilt_mods),
+        *(f"function {item}" for item in function_unbuilt),
+    ]
+    if level in ("file", "function"):
+        incomplete.extend(f"file {item}" for item in sorted(prop_files - real_files))
+    if incomplete and CONFORMANCE_COMPLETION_REQUIRED:
+        print(f"  {RED}declared implementation is not fully observed:{RST}")
+        for item in incomplete[:16]:
+            print(f"    {item}")
+        print("  Full and strict verification are completion proof; they cannot pass"
+              " while approved or recorded work is still only planned.")
+        write_plan()
+        RESULTS.fail("conformance (implementation incomplete)")
+        return
+    if incomplete:
+        print(f"  {DIM}static planning proof: {len(incomplete)} declared item(s)"
+              f" remain unbuilt{RST}")
 
     if notes:
-        print(f"  Deviation is fine; SILENT deviation is not. Report what"
-              f" differs, revise proposal.json, re-approve at '{level}'.")
-        skill("godot-human-involvement", "the approved structure changed")
+        if status == "recorded":
+            print("  A deviation may be legitimate, but it is not inside the"
+                  " recorded envelope yet. Revise proposal.json and re-evaluate"
+                  " whether the work remains reversible.")
+        else:
+            print(f"  A deviation may be legitimate, but the human did not"
+                  f" approve it. Revise proposal.json and re-approve at"
+                  f" '{level}'.")
+        skill(
+            "godot-human-involvement",
+            "the approved or recorded structure changed",
+        )
+        write_plan()
+        RESULTS.fail("conformance (unrecorded deviation)")
+        return
     else:
-        print(f"  matches the approved proposal ({len(prop_mods)} module(s)"
+        contract_label = (
+            "recorded reversible plan" if status == "recorded"
+            else "approved proposal"
+        )
+        print(f"  matches the {contract_label} ({len(prop_mods)} module(s)"
               + (f", {len(prop_files)} file(s)" if level in ("file", "function") else "")
+              + (f", {len(function_entries)} function(s)" if level == "function" else "")
               + ")")
     write_plan()
     RESULTS.passed("conformance")
@@ -2169,7 +2968,7 @@ def stage_gut(godot: str) -> None:
         [godot, "--headless", "--path", str(PROJECT_DIR), "-d",
          "-s", "res://addons/gut/gut_cmdln.gd",
          "-gconfig=res://.gutconfig.json", "-gexit"],
-        60, LOG_DIR / "gut.log",
+        60, LOG_DIR / "gut.log", native=True,
     )
     # GUT needs -d for asserts, which also puts Godot in the interactive
     # debugger. An ordinary assertion failure therefore prints a debugger break
@@ -2286,7 +3085,7 @@ def stage_smoke(godot: str) -> None:
     head("smoke test (headless boot)")
     _, out = run(
         [godot, "--headless", "--path", str(PROJECT_DIR), "res://tests/smoke_test.tscn"],
-        120, LOG_DIR / "smoke.log",
+        120, LOG_DIR / "smoke.log", native=True,
     )
     indent("\n".join(out.splitlines()[-15:]), 15)
     if "SMOKE: PASS" in out and "SMOKE: FAIL" not in out:
@@ -2324,11 +3123,51 @@ def retro_nudge() -> None:
 
 def finish() -> int:
     """Print the one authoritative summary after a bounded verification run."""
+    summary = {
+        "schema": 2,
+        "run_id": VERIFY_RUN_ID or None,
+        "repository_sha256": VERIFY_REPOSITORY_SHA256 or None,
+        "failed": RESULTS.failed,
+        "results": [ANSI_RE.sub("", line) for line in RESULTS.lines],
+        "diagnostics": RUN_DIAGNOSTICS,
+    }
+    diagnostics_persisted = False
+    try:
+        if not VERIFY_RUN_ID_VALID:
+            raise OSError("KIT_VERIFY_NONCE is malformed")
+        if not VERIFY_AUTH_KEY_VALID:
+            raise OSError("KIT_VERIFY_AUTH_KEY is missing or malformed")
+        if not VERIFY_REPOSITORY_SHA256_VALID:
+            raise OSError("KIT_VERIFY_REPOSITORY_SHA256 is missing or malformed")
+        if VERIFY_RUN_ID:
+            canonical = json.dumps(
+                summary,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            summary["auth_sha256"] = hmac.new(
+                bytes.fromhex(VERIFY_AUTH_KEY), canonical, hashlib.sha256
+            ).hexdigest()
+        else:
+            summary["auth_sha256"] = None
+        suffix = f"-{VERIFY_RUN_ID}" if VERIFY_RUN_ID else ""
+        summary_path = LOG_DIR / f"run-summary{suffix}.json"
+        temporary = summary_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(summary, indent=2) + "\n",
+            encoding="utf-8",
+            newline="",
+        )
+        os.replace(temporary, summary_path)
+        diagnostics_persisted = True
+    except OSError as exc:
+        print(f"{RED}error: could not persist gate run diagnostics: {exc}{RST}")
     print(f"\n{DIM}================ summary ================{RST}")
     for line in RESULTS.lines:
         print(line)
     print(f"{DIM}logs: {LOG_DIR}{RST}")
-    if RESULTS.failed:
+    if RESULTS.failed or not diagnostics_persisted:
         print(f"{RED}GATE FAILED{RST}")
         return 1
     print(f"{GRN}GATE PASSED{RST}")
@@ -2337,6 +3176,7 @@ def finish() -> int:
 
 
 def main() -> int:
+    global CONFORMANCE_COMPLETION_REQUIRED
     parser = argparse.ArgumentParser(
         description="Verification gate for a portable Godot project.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2354,6 +3194,10 @@ def main() -> int:
     parser.add_argument("--accept-gate-changes", action="store_true",
                         help="re-baseline the integrity manifest (HUMAN ONLY)")
     args = parser.parse_args()
+    CONFORMANCE_COMPLETION_REQUIRED = not args.static
+
+    for diagnostic_items in RUN_DIAGNOSTICS.values():
+        diagnostic_items.clear()
 
     if args.list:
         print("\n".join(STAGES))
@@ -2453,7 +3297,8 @@ def main() -> int:
                 return 2
             print(f"godot:  {godot}")
             code, version_output = run(
-                [godot, "--headless", "--version"], 30, LOG_DIR / "version.log"
+                [godot, "--headless", "--version"], 30,
+                LOG_DIR / "version.log", native=True
             )
             version_errors = scan(version_output)
             version_line = (

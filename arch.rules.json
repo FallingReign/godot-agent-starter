@@ -37,6 +37,10 @@
         "scripts/data"
       ]
     },
+    "tests/fixtures": {
+      "description": "kit verification scenes used only by the canonical source repository",
+      "may_depend_on": []
+    },
     "tests": {
       "description": "harnesses",
       "may_depend_on": [

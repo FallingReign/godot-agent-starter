@@ -271,6 +271,27 @@ class RunResultTest(unittest.TestCase):
             for error in protected
         ))
 
+    def test_runtime_root_is_derived_as_forbidden_from_immutable_config(self) -> None:
+        config = json.loads((self.root / "kit.config.json").read_text(encoding="utf-8"))
+        config["dispatch_policy"]["owned"].append(".kit/private-runtime")
+        config["dispatch_policy"]["forbidden"] = []
+        config["runtime_root"] = ".kit/private-runtime"
+        (self.root / "kit.config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        _git(self.root, "add", "kit.config.json")
+        _git(self.root, "commit", "-m", "runtime policy fixture")
+        baseline = _git(self.root, "rev-parse", "HEAD")
+
+        blockers = run_result.dispatch_scope_blockers(
+            self.root, baseline, [".kit/private-runtime/secret.json"]
+        )
+
+        self.assertTrue(any(
+            ".kit/private-runtime/secret.json: forbidden" in error
+            for error in blockers
+        ))
+
     def test_protected_declared_scope_blocks_a_clean_dispatch(self) -> None:
         blockers = run_result.dispatch_blockers(
             self.root, requested_files=["tools/control.py"]

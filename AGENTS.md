@@ -24,9 +24,16 @@ name the specific missing prerequisite or decision, estimate the work, and state
 which explicit side effect (if any) needs their approval. A cold question as the
 opening line reads as an interrogation, and an unexplained setup command hides risk.
 
-Then `kit verify` before any code. Nothing is complete until it passes
-and you have pasted the result. Use `kit verify --strict` for release
-or production evidence; a missing dependency is not proof.
+Then run `kit verify --static` before any code. Use full `kit verify` when the
+native boundary is known safe. After a native crash, timeout or unresolved
+engine failure, static verification and `kit self-test` are the only automatic
+proofs allowed; ask for explicit human approval before one bounded full retry.
+Bind that retry to the exact warning digest shown by doctor/cockpit with
+`kit verify --confirm-native-retry <warning_sha256>` (or add `--strict`). Never
+reuse, shorten or guess the digest; the private authorization is run-bound.
+Nothing is complete until full verification passes and you have pasted the
+result. Use `kit verify --strict` for release or production evidence; a missing
+dependency is not proof.
 
 ## Layout
 
@@ -65,26 +72,47 @@ Leave the room, implement only today's fields. If `direction[]` is empty, ask wh
 eventually hold. Skill: `godot-content-pipeline`.
 
 **`plan.html` is the living view** of all of this: what is approved, what is built against
-it, open questions, direction, recent changes, the real module graph, and every document
-in `docs/` and `docs/design/` rendered inline. `kit plan` regenerates
+it, open questions, direction, recent changes, the real module graph, and the bounded
+kit/design documents relevant to the active decision rendered inline. `kit plan` regenerates
 it and `retro.html` coherently. Point the
 human at it rather than describing state in prose. It is generated — never edit it, edit
 the JSON.
 
 **Two kinds of documentation, and they do not mix.** `docs/` documents the kit: the gate,
-the rules, the workflow. `docs/design/` documents the game: intended experience and the
-rules code must preserve. **How design works — resolution levels, why it precedes code,
+the rules, the workflow. `docs/design/` documents the game: intended player experience,
+outcomes and gameplay rules code must preserve. It never prescribes architecture or other
+technical implementation unless that implementation is itself a gameplay rule. **How
+design works — resolution, authority, why it precedes code,
 where sections come from — is `docs/DESIGN.md`. Read it before writing or citing any
 design section.**
 
-When a `direction[]` entry or a decision is settled enough to be written for a reader, draft
-the section, get it approved, and add a `docs_at` pointer on the decision entry. Nothing is
-deleted from `decisions[]` — the plan view stops showing it, the ledger keeps it.
+Resolution and authority are separate. Every new or changed design section declares
+`Resolution`, `Authority`, `Authored by` and `Confidence`. Human-confirmed design can have
+been written by either a human or an agent. Agent-written design remains
+`agent-provisional` until the human confirms its exact digest. It must show a Quick read,
+the inference rationale, assumptions, veto scope and next go/no-go. Nothing silently
+inherits authority from prose, chat, age or a previous slice.
+
+When a `direction[]` entry or decision becomes readable design, draft the section. An
+explicit cockpit confirmation appends a capability-protected local operator policy event
+with `docs_at`, the section's canonical `design_sha256`, the exact `proposal_sha256`, and
+`authority_action: confirm`. Its portable receipt is tamper-evident policy/audit evidence,
+not proof that a person's identity was authenticated; only a matching private receipt may
+be labelled `local-audit-matched`. A veto appends a superseding
+`authority_action: veto` event.
+Nothing is deleted from `decisions[]` — the plan view may stop showing it, the ledger keeps
+the exact approval and withdrawal events.
 
 **`involvement` sets what you must propose before writing code.** The gate prints it every
-run. `hands-off` — build and report. `module` — propose modules, boundaries and the data
+run. `hands-off` — record the plan with coarse game-root-relative file or directory
+`scope[]` boundaries and the exact `new`, `modify` or `delete` action each boundary
+owns, then build only inside them while it remains reversibly vetoable. A directory
+boundary owns only matching actions; use a more-specific boundary for a different
+action. `(root)` means the configured game root and is the least-specific boundary.
+`module` — propose modules, boundaries and the data
 crossing them, then wait. `file` — that plus every file you create or modify. `function` —
-that plus signatures and how they connect. It never relaxes a gate check.
+that plus every changed function's typed canonical signature and purpose. Module
+dependencies record how components connect. It never relaxes a gate check.
 
 **Before you write a proposal, read `docs/design/INDEX.md` and ask one question: what end
 state does this work serve?** Not the feature above it — the end state. "The interface must
@@ -92,16 +120,16 @@ respond" is true and constrains nothing; "every accepted action acknowledges imm
 and preserves enough context for the player to understand its result" tells you what to
 build. Start at the index and open only the two or three sections
 that matter; never load the whole design body. Put the section you land on in `design_refs`
-with one line on why. If nothing answers it, that is the signal: enter discovery and write
-the section, rather than reasoning up from the feature. Skills:
+with one line on why and its canonical `sha256`. If nothing answers it, that is the signal:
+enter discovery. Do not build without first writing the missing design. Skills:
 `godot-design-retrieval`, `godot-design-discovery`.
 
-**When the plan is ready, say what is missing from it before asking for approval.**
-If there are no `design_refs`, say so plainly and offer the choice: design the
-section together first, or accept building on an inference. Recommend the first.
-If the human accepts the second, record it in `acknowledged[]` with their words as
-the reason — **never tick that box on their behalf.** An acknowledgement applies to
-one slice; it does not carry forward.
+**No design reference means no implementation authority.** A legacy
+`no-design-refs` acknowledgement is history, not consent to guess intent. Work with the
+human on the missing design unless you can explain why one inferred design is correct with
+exactly `very-high` confidence. In that exceptional case, write it as
+`agent-provisional`, disclose that you wrote it, and record the inference, assumptions,
+veto scope and next go/no-go. Lower confidence stops for the human.
 
 **When nobody has asked for anything specific, the next work is derivable.** The index has a
 "Ready to work on" list, derived from section resolution and which declared tunables no code
@@ -114,21 +142,34 @@ At `module` and above, **propose in the file, not in the chat.** Order matters: 
 `experience` first — what the player does, how it should feel, camera, controls, and in
 `not_this` the nearest thing it deliberately is not. Then a `mockup` as inline SVG **if the
 outcome is vector-approximable** (grids, shapes, layout, UI arrangement); if it is not, say
-why in `mockup.not_possible`. Then the structure. Then `"status": "draft"` and
-`baseline_sha` from `git rev-parse HEAD`, run `kit plan`, and give the
-human a **clickable link** using the absolute file URI, e.g.
-`[Open plan.html](file:///C:/path/to/repo/plan.html)` — do not only name the file. Two or
-three lines of summary at most. Wait. On approval set `"status": "approved"`, then build.
+why in `mockup.not_possible`. Then `design_authority`, the `reversibility` envelope, and
+the structure. Start with `"status": "draft"` and `baseline_sha` from
+`git rev-parse HEAD`, run `kit serve start`, and give the human a **clickable link** using
+the exact loopback `plan.html` URL printed by that command. A `file://` page is deliberately
+read-only and cannot approve anything. Two or three lines of summary at most.
+
+At `hands-off`, declare coarse game-root-relative file or directory `scope[]` with the
+exact action each boundary owns, change the status to `recorded`, and continue only while
+all authored changes remain inside that scope and reversible. `recorded` is an audit
+state, never approval. Agent-provisional design is eligible only at exactly `very-high`
+confidence. At `module`, `file` or `function`, wait;
+only an explicit human cockpit action may set `approved_by`, `approved_on`,
+`approval_sha256` and `status: approved`, and append the exact confirmation event. Never
+hand-fill approval fields or infer consent from silence. At any involvement level, stop at
+`reversibility.state: go-no-go`; the human must confirm the exact design and proposal
+digests before a hard-to-undo commitment.
 
 **Experience before structure is not optional.** Every other artefact here describes
 structure; nothing else records intended feel, so without it feel gets inferred from
 whatever the renderer happens to do. `conformance` fails on a proposal that has structure
 and no `experience`.
 
-`conformance` only diffs an **approved** proposal, so writing the draft early enforces
-nothing and risks nothing. Deviating mid-build is expected and legitimate; deviating
-*silently* is not — append to `revisions`, set `status` back to `draft`, regenerate, ask
-again. Never set `approved` yourself. Skill: `godot-human-involvement`.
+`conformance` diffs every authored game input in `recorded` and `approved` proposals. A
+draft authorizes no implementation file.
+Deviating mid-build is expected and legitimate; deviating *silently* is not — append to
+`revisions`, set `status` back to `draft`, regenerate, and either re-record a still
+reversible hands-off plan or ask again. Never set `approved` yourself. Skill:
+`godot-human-involvement`.
 
 Everything else is recorded **when it is decided**, not predicted. Three rules govern how
 work is scoped and captured:
@@ -152,14 +193,16 @@ work is scoped and captured:
 3. **Append what gets settled in passing.** Most direction arrives as an aside, not as an
    answer to a question you asked. A constraint, a scope cut, a preference, a reason. If
    it would change later work, record it in the human's own words before moving on.
-4. **Never write past the resolution the human has reached.** A design section may exist
-   as a question with no answer. It may not be filled with a plausible answer you inferred
-   — that reads as intent to the next agent and gets built on. An empty section is honest;
-   a fabricated one is not recoverable. If you are inventing the answer, ask instead.
+4. **Never present an inference as human intent.** A section may exist as a question with no
+   answer. Ordinarily, if you are inventing the answer, ask. Only an exact `very-high`
+   confidence inference may be written as agent-authored, agent-provisional design, with
+   the required disclosure and veto boundary. It never becomes human-confirmed by age,
+   implementation or silence.
 5. **Design is a separate pipeline from delivery.** When the human describes an idea or
-   vision, that is a discovery session: it produces design sections and decisions, no code.
-   Say you are switching. The other entry point is a proposal you cannot ground in an end
-   state, above. Skill: `godot-design-discovery`.
+   vision, switch explicitly to discovery and write design, not code. Delivery may resume
+   only after that design is human-confirmed, or while an exact `very-high`
+   agent-provisional design remains inside a recorded reversible envelope. Skill:
+   `godot-design-discovery`.
 
 A decision is anything that would make a later agent act differently — art direction,
 audience, scope, monetisation, moderation, accessibility, team shape, as much as entity
@@ -234,7 +277,10 @@ agent with three moods.
 At the end of a slice the game builder writes a note to `docs/retro/notes/`.
 Testimony, not assessment: what was proposed, what changed, what the human
 corrected, what it got wrong, where it hit friction. No conclusions and no kit
-proposals - a single slice cannot show a pattern.
+proposals - a single slice cannot show a pattern. If a closed consequence or
+prompt trigger in `docs/retro/notes/README.md` was directly observed, include
+its exact `consequence:` or `retro_trigger:` declaration. Never classify prose
+or invent severity.
 
 ## Non-negotiables
 
@@ -275,7 +321,8 @@ work, and never claim "the repo is in a bad state" without naming the error.
 
 ## Ownership
 
-**Yours:** everything under the configured game root, plus `docs/**` and `*.md`.
+**Yours:** everything under the configured game root, plus `docs/**` and `*.md`,
+except the provider bridge `.github/copilot-instructions.md`.
 `*.tscn`/`*.tres` too, but
 read `docs/SCENES.md` first. Assets: drop in, then `kit verify --stage import`.
 
@@ -284,7 +331,8 @@ hash-checked) · `.gate.sha256` (human-only) · the game root's `project.godot`
 (engine-owned; the gate
 reports changes but does not fail) · `*.import`, `*.uid` (machine-generated — commit,
 never edit) · `plan.html`, `plan/*.html` (generated — edit the JSON) ·
-`export_presets.cfg` · the configured game root's `addons/**`.
+`export_presets.cfg` · the configured game root's `addons/**` ·
+`.github/copilot-instructions.md` (provider governance bridge).
 
 Full table and permanent human-only work: **`docs/RULES.md`**.
 ## The core architecture rule
@@ -347,12 +395,13 @@ Stages, remediation and engine quirks: **`docs/GATE.md`**.
 5. **Anything you cannot verify called out explicitly** — anything visual, feel, timing,
    composition, animation graphs, tilesets, shaders by eye, bakes, export presets,
    real-latency networking, device testing
-6. **Launch the game when you stop for visual judgement.** If the increment changed
-   anything the human has to look at, run it before handing back — do not ask them to
-   launch it themselves. The gate proves it loads; only they can say whether it is right,
-   and asking them to do the launching adds a step to every review. A passing `resources`
-   stage proves a scene loads, not that it looks right. Never claim a game "is running"
-   from a headless run.
+6. **Launch the game when you stop for visual judgement, only when the native boundary is
+   safe.** If an unresolved crash, timeout or another engine verification is running, do not
+   launch; report the named blocker and obtain approval for one bounded retry. Otherwise,
+   if the increment changed anything the human has to look at, run it before handing back
+   — do not ask them to launch it themselves. The gate proves it loads; only they can say
+   whether it is right. A passing `resources` stage proves a scene loads, not that it looks
+   right. Never claim a game "is running" from a headless run.
 7. **At a slice boundary, run `kit friction`.** If a file was rewritten many
    times, or the proposal needed several revisions, say so and ask whether a tool should
    exist. It only sees committed history, so anything you retried inside one turn is
@@ -364,8 +413,9 @@ Stages, remediation and engine quirks: **`docs/GATE.md`**.
    `--confirm-spend`. `kit retro publish` validates a completed findings report,
    builds dispatch artifacts and refreshes the decision views. Findings must cite the immutable,
    repository-scoped snapshot used to produce them. A human reviews the proposed
-   change and success measure before approval; dispatch is authenticated,
-   idempotent, sequential and verified against the configured ownership policy.
+   change and success measure before approval; dispatch is capability-protected,
+   sequential, replay-safe for the exact decision identity and verified against
+   the configured ownership policy. It does not authenticate a person's identity.
    Write findings to `docs/retro/`; never change a rule, skill or gate file
    because of your own retro. The whole loop is `docs/retro/README.md`. Skill:
    `godot-retrospective`.

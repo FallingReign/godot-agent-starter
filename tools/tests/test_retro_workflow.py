@@ -66,7 +66,9 @@ class RetroWorkflowTest(unittest.TestCase):
         retro_rank.ROOT = self.root
         retro_rank.SESSION_EVIDENCE_DIR = self.runtime_dir / "evidence" / "sessions"
         sessions = [{"id": "session-abc", "log": self.root / "events.jsonl"}]
-        retro.session_digest.discover = lambda root, roots=None: list(sessions)
+        retro.session_digest.discover = (
+            lambda root, roots=None, **_window: list(sessions)
+        )
         retro.session_digest.digest_one = lambda session, index: {
             "index": index,
             "id": session["id"],
@@ -74,12 +76,17 @@ class RetroWorkflowTest(unittest.TestCase):
             "started": "2026-01-01T00:00:00Z",
             "updated": "2026-01-01T01:00:00Z",
             "turns": 2,
-            "cost": 0.5,
+            "provider": "copilot",
+            "usage": {
+                "source": "provider_reported",
+                "metrics": [{"name": "aiu", "value": 0.5}],
+                "monetary_cost": None,
+            },
             "model": "fixture-model",
             "persona": "game-builder",
             "gate_fails": {"schema": 2},
             "gate_passes": 1,
-            "loops": {"python check.py": 4},
+            "loops": {"kit verify": 4},
             "rewrites": {"plan.py": 3},
             "human": ["Please make the decision visible."],
             "sources": {"events": {"path": "events.jsonl", "sha256": "a" * 64,
@@ -101,7 +108,9 @@ class RetroWorkflowTest(unittest.TestCase):
         self.scratch.__exit__(None, None, None)
 
     def args(self) -> SimpleNamespace:
-        return SimpleNamespace(sessions=None, max_sessions=3, baseline=None)
+        return SimpleNamespace(
+            sessions=None, since=None, limit=None, baseline=None
+        )
 
     def valid_result(self) -> dict:
         return {
@@ -110,7 +119,7 @@ class RetroWorkflowTest(unittest.TestCase):
                 "title": "Decision state is invisible",
                 "sessions": ["S1"],
                 "human_turns": ["S1:H1"],
-                "mechanical": ["LOOP python check.py x4 (S1)"],
+                "mechanical": ["LOOP kit verify x4 (S1)"],
                 "recurs": True,
                 "severity": "wrong-built",
                 "fix_files": ["tools/plan_html.py", "src/forbidden.gd", "../escape"],
@@ -122,6 +131,29 @@ class RetroWorkflowTest(unittest.TestCase):
             "observations": [],
         }
 
+    def report_for(self, pack_path: Path) -> Path:
+        report = self.retro_dir / f"2026-01-01-{pack_path.stem[:10]}-findings.md"
+        report.write_text("# Retrospective findings\n", encoding="utf-8")
+        return report
+
+    def bound_report_for(self, pack_path: Path) -> Path:
+        return retro_sdk.write_rankable_report(
+            self.retro_dir, "slice", self.valid_result(), "", False,
+            pack_path, self.root,
+        )
+
+    def published_report_for(self, pack_path: Path) -> Path:
+        report = self.bound_report_for(pack_path)
+        text = report.read_text(encoding="utf-8")
+        header, findings = retro_rank.parse_findings(text)
+        digests, warnings, personas = retro_rank.citation_report(findings)
+        self.assertEqual(warnings, [])
+        ranked, _scores, _notes = retro_rank.rewrite(
+            report, header, findings, digests, personas
+        )
+        report.write_text(ranked, encoding="utf-8", newline="\n")
+        return report
+
     def test_pack_is_content_addressed_and_contains_notes_and_stable_citations(self) -> None:
         first = retro.build_pack(self.args())
         first_path = retro.write_pack(first)
@@ -130,6 +162,7 @@ class RetroWorkflowTest(unittest.TestCase):
         self.assertEqual(first_path, second_path)
         self.assertEqual(first["notes"][0]["text"],
                          self.note.read_bytes().decode("utf-8"))
+        self.assertEqual(first["completion_key"], "no-proposal")
         self.assertEqual(first["sessions"][0]["human_messages"][0]["citation"], "S1:H1")
         self.assertEqual(first["sessions"][0]["persona"], "game-builder")
         pointer = json.loads(
@@ -142,16 +175,125 @@ class RetroWorkflowTest(unittest.TestCase):
         self.assertFalse((self.retro_dir / "evidence").exists())
         self.assertFalse((self.retro_dir / "evidence.json").exists())
 
+    def test_default_capture_keeps_every_bounded_matching_session(self) -> None:
+        sessions = [
+            {"id": f"session-{number}", "log": self.root / f"events-{number}.jsonl"}
+            for number in range(1, 6)
+        ]
+
+        def discover(_root, _roots=None, *, since=None, limit=None):
+            self.assertIsNone(since)
+            self.assertIsNone(limit)
+            return list(sessions)
+
+        with mock.patch.object(retro.session_digest, "discover", side_effect=discover):
+            pack = retro.build_pack(self.args())
+
+        self.assertEqual(len(pack["sessions"]), 5)
+        self.assertEqual(pack["sessions_found"], 5)
+        self.assertEqual(pack["session_capture"], {
+            "complete": True,
+            "window": {
+                "mode": "complete-bounded",
+                "since": None,
+                "limit": None,
+                "captured_sessions": 5,
+            },
+            "failures": [],
+        })
+
+    def test_explicit_session_window_is_bound_into_snapshot_and_pack(self) -> None:
+        args = self.args()
+        args.since = "2026-01-01T00:00:00Z"
+        args.limit = 2
+        selected = [
+            {"id": f"window-{number}", "log": self.root / f"window-{number}.jsonl"}
+            for number in range(1, 3)
+        ]
+
+        def discover(_root, _roots=None, *, since=None, limit=None):
+            self.assertEqual(since, args.since)
+            self.assertEqual(limit, args.limit)
+            return list(selected)
+
+        with mock.patch.object(retro.session_digest, "discover", side_effect=discover):
+            pack = retro.build_pack(args)
+
+        snapshot_path = self.root / pack["session_snapshot"]["path"]
+        manifest = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            pack["session_capture"]["window"], manifest["capture_window"]
+        )
+        self.assertEqual(manifest["capture_window"], {
+            "mode": "explicit",
+            "since": args.since,
+            "limit": 2,
+            "captured_sessions": 2,
+        })
+
+    def test_failed_session_capture_is_visible_and_blocks_handoff_and_publish(self) -> None:
+        def failed(_session, index):
+            return {
+                "index": index,
+                "id": "session-abc",
+                "provider": "copilot",
+                "error": "events_byte_limit_exceeded",
+                "sources": {},
+                "warnings": [{
+                    "code": "events_byte_limit_exceeded",
+                    "max_bytes": 8,
+                    "observed_bytes": 9,
+                }],
+            }
+
+        with mock.patch.object(retro.session_digest, "digest_one", side_effect=failed):
+            pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+
+        self.assertFalse(pack["session_capture"]["complete"])
+        self.assertEqual(
+            pack["sessions"][0]["error"], "events_byte_limit_exceeded"
+        )
+        with self.assertRaisesRegex(ValueError, "session evidence is incomplete"):
+            retro.emit_print(pack, pack_path)
+        report = self.bound_report_for(pack_path)
+        with self.assertRaisesRegex(ValueError, "session evidence is incomplete"):
+            retro._bound_report_pack(report)
+
     def test_prompt_and_ran_marker_are_private_runtime_state(self) -> None:
         pack = retro.build_pack(self.args())
         pack_path = retro.write_pack(pack)
         retro.emit_print(pack, pack_path)
-        retro.mark_ran("slice@abc")
+        retro.mark_ran("slice@abc", pack_path)
         self.assertTrue((self.runtime_dir / "retro" / "sdk" / "prompt.md").is_file())
         self.assertTrue((self.runtime_dir / "retro" / "ran.json").is_file())
         self.assertTrue(retro.already_ran("slice@abc"))
+        marker = json.loads(retro.RAN_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(marker["schema"], 2)
+        self.assertEqual(marker["completed_snapshots"], [{
+            "slice": "slice@abc",
+            "evidence_pack": pack_path.relative_to(self.root).as_posix(),
+            "sha256": pack_path.stem,
+        }])
         self.assertFalse((self.retro_dir / "prompt.md").exists())
         self.assertFalse((self.retro_dir / ".ran").exists())
+
+    def test_completion_cli_routes_without_capturing_a_new_snapshot(self) -> None:
+        report = self.retro_dir / "2026-01-01-fixture-findings.md"
+        with mock.patch.object(
+                retro, "complete_published_retro", return_value=(True, "completed")
+        ) as complete, mock.patch.object(
+                retro, "build_pack"
+        ) as build, mock.patch.object(
+                sys,
+                "argv",
+                ["retro.py", "--complete-published", str(report)],
+        ):
+            code = retro.main()
+
+        self.assertEqual(0, code)
+        complete.assert_called_once_with(report)
+        build.assert_not_called()
 
     def test_valid_analyzer_result_becomes_the_rankable_schema(self) -> None:
         pack = retro.build_pack(self.args())
@@ -298,6 +440,212 @@ class RetroWorkflowTest(unittest.TestCase):
                          "thread-123")
         self.assertFalse((self.retro_dir / ".sdk").exists())
         self.assertFalse((self.retro_dir / "thread.json").exists())
+
+    def test_immediate_consequence_warrants_retro_even_after_slice_marker(self) -> None:
+        pack = {
+            "artefacts": {}, "gate_logs": {}, "sessions": [],
+            "notes": [{"path": "slice.md", "text": "consequence: native-crash\n"}],
+        }
+        with mock.patch.object(retro, "already_ran", return_value=True), \
+                mock.patch.object(retro, "slice_key", return_value="slice@abc"):
+            warranted, reason = retro.should_trigger(pack)
+        self.assertTrue(warranted)
+        self.assertIn("immediate consequence: native-crash", reason)
+
+    def test_failed_analysis_does_not_write_completion_marker(self) -> None:
+        pack_path = self.runtime_dir / "evidence" / "packs" / ("a" * 64 + ".json")
+        with mock.patch.object(sys, "argv", [
+                "retro.py", "--sdk", "--force", "--quiet"]), \
+                mock.patch.object(
+                    retro, "build_pack",
+                    return_value={
+                        "completion_key": "slice@abc",
+                        "session_capture": {"complete": True},
+                    }), \
+                mock.patch.object(retro, "write_pack", return_value=pack_path), \
+                mock.patch.object(retro_sdk, "run_sdk", return_value=1), \
+                mock.patch.object(retro, "finalise_retro") as finalise:
+            result = retro.main()
+        self.assertEqual(result, 1)
+        finalise.assert_not_called()
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_public_automatic_run_passes_the_frozen_completion_identity(self) -> None:
+        pack_path = self.runtime_dir / "evidence" / "packs" / ("b" * 64 + ".json")
+        pack = {
+            "notes": [], "completion_key": "slice@abc",
+            "session_capture": {"complete": True},
+        }
+        with mock.patch.object(sys, "argv", [
+                "retro.py", "--sdk", "--force", "--quiet"]), \
+                mock.patch.object(retro, "build_pack", return_value=pack), \
+                mock.patch.object(retro, "write_pack", return_value=pack_path), \
+                mock.patch.object(retro_sdk, "run_sdk", return_value=0), \
+                mock.patch.object(
+                    retro, "finalise_retro", return_value=0
+                ) as finalise, \
+                mock.patch.object(retro, "emit_print") as emit:
+            result = retro.main()
+        self.assertEqual(result, 0)
+        finalise.assert_called_once_with(pack, pack_path, "slice@abc")
+        emit.assert_not_called()
+
+    def test_manual_evidence_preparation_never_marks_completion(self) -> None:
+        pack_path = self.runtime_dir / "evidence" / "packs" / ("c" * 64 + ".json")
+        pack = {
+            "notes": [], "completion_key": "slice@abc",
+            "session_capture": {"complete": True},
+        }
+        with mock.patch.object(sys, "argv", [
+                "retro.py", "--print", "--force", "--quiet"]), \
+                mock.patch.object(retro, "build_pack", return_value=pack), \
+                mock.patch.object(retro, "write_pack", return_value=pack_path), \
+                mock.patch.object(retro, "emit_print") as emit, \
+                mock.patch.object(retro, "finalise_retro") as finalise:
+            result = retro.main()
+        self.assertEqual(result, 0)
+        emit.assert_called_once_with(pack, pack_path)
+        finalise.assert_not_called()
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_publication_failure_keeps_notes_and_has_no_completion_marker(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        self.report_for(pack_path)
+        ranked = SimpleNamespace(returncode=0, stdout="", stderr="")
+        render_failed = SimpleNamespace(returncode=1, stdout="", stderr="render failed")
+        with mock.patch.object(
+                retro.subprocess, "run", side_effect=[ranked, render_failed]):
+            result = retro.finalise_retro(
+                pack, pack_path, pack["completion_key"]
+            )
+        self.assertEqual(result, 1)
+        self.assertTrue(self.note.exists())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_successful_publication_archives_then_marks_exact_snapshot(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        self.published_report_for(pack_path)
+        success = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+                retro.subprocess, "run", side_effect=[success, success, success]
+        ):
+            result = retro.finalise_retro(
+                pack, pack_path, pack["completion_key"])
+        self.assertEqual(result, 0)
+        self.assertFalse(self.note.exists())
+        self.assertTrue((self.retro_dir / "archive" / self.note.name).is_file())
+        marker = json.loads(retro.RAN_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(marker["completed_snapshots"][0]["sha256"], pack_path.stem)
+
+    def test_marker_commit_failure_rolls_archived_notes_back(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        self.published_report_for(pack_path)
+        success = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+                retro.subprocess, "run", side_effect=[success, success, success]
+        ), \
+                mock.patch.object(retro, "_commit_ran", side_effect=OSError("locked")):
+            result = retro.finalise_retro(
+                pack, pack_path, pack["completion_key"])
+        self.assertEqual(result, 1)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse((self.retro_dir / "archive" / self.note.name).exists())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_manual_publish_closes_exact_bound_snapshot_idempotently(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        report = self.published_report_for(pack_path)
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertTrue(ok, detail)
+        self.assertFalse(self.note.exists())
+        archived = self.retro_dir / "archive" / self.note.name
+        self.assertTrue(archived.is_file())
+        marker = json.loads(retro.RAN_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(marker["completed_snapshots"], [{
+            "slice": pack["completion_key"],
+            "evidence_pack": pack_path.relative_to(self.root).as_posix(),
+            "sha256": pack_path.stem,
+        }])
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertTrue(ok, detail)
+        self.assertIn("already completed", detail)
+        self.assertEqual(archived.read_text(encoding="utf-8"),
+                         "The human corrected the same workflow twice.\n")
+
+    def test_manual_publish_refuses_report_snapshot_mismatch_without_mutation(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        report = self.published_report_for(pack_path)
+        report.write_text(
+            report.read_text(encoding="utf-8").replace(
+                "session_snapshot: ", "session_snapshot: wrong/"),
+            encoding="utf-8",
+        )
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertFalse(ok)
+        self.assertIn("does not match", detail)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_manual_publish_refuses_unbound_legacy_pack_without_mutation(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack.pop("completion_key")
+        pack_path = retro.write_pack(pack)
+        report = self.published_report_for(pack_path)
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertFalse(ok)
+        self.assertIn("no bound completion key", detail)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_manual_publish_refuses_unranked_report_without_mutation(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        report = self.bound_report_for(pack_path)
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertFalse(ok)
+        self.assertIn("not been ranked and published", detail)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_manual_publish_refuses_unknown_snapshot_citation(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        report = self.published_report_for(pack_path)
+        report.write_text(
+            report.read_text(encoding="utf-8").replace("S1:H1", "S1:H9"),
+            encoding="utf-8", newline="\n",
+        )
+
+        ok, detail = retro.complete_published_retro(report)
+        self.assertFalse(ok)
+        self.assertIn("unknown human turn", detail)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse(retro.RAN_FILE.exists())
+
+    def test_manual_publish_rolls_back_if_report_changes_during_completion(self) -> None:
+        pack = retro.build_pack(self.args())
+        pack_path = retro.write_pack(pack)
+        report = self.published_report_for(pack_path)
+
+        with mock.patch.object(
+                retro, "_publication_unchanged", side_effect=[True, False]):
+            ok, detail = retro.complete_published_retro(report)
+
+        self.assertFalse(ok)
+        self.assertIn("changed during completion", detail)
+        self.assertTrue(self.note.is_file())
+        self.assertFalse((self.retro_dir / "archive" / self.note.name).exists())
+        self.assertFalse(retro.RAN_FILE.exists())
 
 
 if __name__ == "__main__":

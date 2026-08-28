@@ -48,6 +48,7 @@ import retro_rank  # noqa: E402  (sibling module, needs sys.path set first)
 import plan_html  # noqa: E402  (reuse CSS/esc rather than a second visual language)
 import board_client  # noqa: E402  (CSS/JS for the board status strip and interactive forms)
 import retro_queue  # noqa: E402  (the prompt artifacts -- never re-derive a prompt here)
+import retro_ledger  # noqa: E402  (tracked decision ledgers fail closed)
 import md  # noqa: E402  (renders problem/proposal/measure and verbatim quotes -- no second renderer)
 
 ROOT = retro_rank.ROOT
@@ -70,17 +71,15 @@ RAW_COST_RE = re.compile(r"raw cost ([\d.]+)")
 # with one shape each is simpler than one file with a discriminator.
 
 def load_accepted() -> list[dict]:
-    if not ACCEPTED_FILE.exists():
-        return []
-    try:
-        return json.loads(ACCEPTED_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    return retro_ledger.load_entries(
+        ACCEPTED_FILE, label="docs/retro/accepted.json"
+    )
 
 
 def save_accepted(entries: list[dict]) -> None:
-    RETRO_DIR.mkdir(parents=True, exist_ok=True)
-    ACCEPTED_FILE.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    retro_ledger.save_entries(
+        ACCEPTED_FILE, entries, label="docs/retro/accepted.json"
+    )
 
 
 def mark_resolved_if_absent(entries: list[dict], present_titles: set[str]) -> bool:
@@ -377,6 +376,13 @@ DISPATCH_JS = """
   /* ----------------------------------------------------------- decisions */
   function wireDecision(box){
     var slug = box.getAttribute('data-slug');
+    var review = {
+      artifact_schema: Number(box.getAttribute('data-artifact-schema') || 0),
+      artifact_sha256: box.getAttribute('data-artifact-sha256') || '',
+      prompt_sha256: box.getAttribute('data-prompt-sha256') || '',
+      template_sha256: box.getAttribute('data-template-sha256') || '',
+      review_sha256: box.getAttribute('data-review-sha256') || ''
+    };
     var comment = box.querySelector('.comment');
     var approve = box.querySelector('.approve-btn');
     var toggle = box.querySelector('[data-defer]');
@@ -391,7 +397,8 @@ DISPATCH_JS = """
         : ('req-' + Date.now() + '-' + Math.random().toString(16).slice(2));
       B.guard(all, 'approving\\u2026', function(){
         return B.request('/api/finding/approve', {method:'POST',
-          body:{slug:slug, comment:(comment ? comment.value : ''), request_id:requestId}})
+          body:{slug:slug, comment:(comment ? comment.value : ''),
+                request_id:requestId, review:review}})
           .then(function(res){
             if(!res.ok){ B.showError(res.error, res.path); return; }
             B.refresh();
@@ -578,7 +585,39 @@ DISPATCH_JS = """
     var runs = (state && state.runs) || [];
     var byRun = {}, bySlug = {};
     var worker = state && state.providers ? state.providers.worker : null;
-    var automaticWorker = !!(worker && worker.automatic);
+    var automaticWorker = !!(worker && worker.automatic && worker.ready !== false);
+    var warningHost = document.getElementById('provider-warning');
+    if(warningHost){
+      var providerWarnings = [];
+      var configured = (state && state.providers) || {};
+      ['analyzer','worker'].forEach(function(role){
+        var provider = configured[role] || {};
+        var blockers = provider.blockers || [];
+        if(blockers.length){
+          providerWarnings.push('<div class="board-error"><b>' + B.esc(role)
+            + ' unavailable</b><span class="path">' + B.esc(blockers.join('; '))
+            + '</span></div>');
+        }
+      });
+      var due = (state && state.retro_due) || {};
+      var evidenceWarnings = Array.isArray(due.warnings) ? due.warnings : [];
+      if(evidenceWarnings.length){
+        var shownWarnings = evidenceWarnings.slice(0, 3).map(function(item){
+          if(!item || typeof item !== 'object') return 'unclassified warning';
+          var code = String(item.code || 'unclassified warning').slice(0, 96);
+          var note = String(item.note || '').slice(0, 96);
+          var value = String(item.value || '').slice(0, 96);
+          return code + (note ? ' (' + note + ')' : '')
+            + (value ? ': ' + value : '');
+        });
+        var remainingWarnings = evidenceWarnings.length - shownWarnings.length;
+        providerWarnings.push('<div class="board-error"><b>Retrospective evidence warning</b>'
+          + '<span class="path">' + shownWarnings.map(B.esc).join('; ')
+          + (remainingWarnings ? '; +' + B.esc(remainingWarnings) + ' more' : '')
+          + '. Classification may be incomplete.</span></div>');
+      }
+      warningHost.innerHTML = providerWarnings.join('');
+    }
     runs.forEach(function(r){ if(r && r.run_id) byRun[r.run_id] = r; });
     findings.forEach(function(f){ if(f && f.slug) bySlug[f.slug] = f; });
 
@@ -898,8 +937,14 @@ def render_decision(title: str, item: dict | None,
             # at the right of the same row and only reveals its own single
             # input when clicked. Cancel restores the button and clears the
             # text -- an explicit correction from the human, not to regress.
+            review = retro_queue.review_identity(item)
             parts.append(
-                f'<div class="decision-form" data-slug="{esc(item["slug"])}">'
+                f'<div class="decision-form" data-slug="{esc(item["slug"])}" '
+                f'data-artifact-schema="{esc(review["artifact_schema"])}" '
+                f'data-artifact-sha256="{esc(review["artifact_sha256"])}" '
+                f'data-prompt-sha256="{esc(review["prompt_sha256"])}" '
+                f'data-template-sha256="{esc(review["template_sha256"])}" '
+                f'data-review-sha256="{esc(review["review_sha256"])}">'
                 '<textarea class="comment" rows="3" data-board-control '
                 'placeholder="Decisions or tweaks to the proposed solution. '
                 'Leave empty to approve the proposal as written."></textarea>'
@@ -920,12 +965,6 @@ def render_decision(title: str, item: dict | None,
                 '<button type="button" class="defer-cancel-btn" data-cancel>Cancel</button>'
                 "</div></div>"
             )
-    if dfr:
-        # Deferred settled decisions are not just a record -- they carry a
-        # (currently inert, matching the approved mock) control to reopen
-        # them, so the archive does not read as a dead end.
-        parts.append('<div class="row"><button type="button" class="move-back-btn">'
-                     "Move back to To action</button></div>")
     parts.append("</div>")
     return "".join(parts)
 
@@ -1224,6 +1263,7 @@ def render(files: list[Path]) -> str:
         "Ranked by cost -- what this cost the human -- with effort -- how cheap it is to fix -- "
         "shown beside it, never folded in.</p>",
         board_client.shell_html(),
+        '<div id="provider-warning"></div>',
         '<div id="board-status" class="board-only"></div>',
     ]
     doc.extend(body)
@@ -1240,8 +1280,6 @@ def latest_and_all_findings_files() -> list[Path]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stdout", action="store_true", help="print instead of writing")
-    ap.add_argument("--no-board", action="store_true",
-                    help="write the static report without starting or probing the board")
     args = ap.parse_args()
 
     files = latest_and_all_findings_files()
@@ -1257,30 +1295,12 @@ def main() -> int:
     print(f"wrote {OUT.relative_to(ROOT)}")
     if unreviewed:
         print(f"{unreviewed} finding(s) awaiting review -- highest cost {highest_cost:.2f}")
-    if not args.no_board:
-        _print_board_url()
     return 0
 
 
-def _print_board_url() -> None:
-    """Start (or confirm) the local board and print its URL.
-
-    Imported lazily -- see plan_html.py's own `_print_board_url` for why:
-    tools/board.py imports this module at its own top level, so importing it
-    back here at module load would be a real cycle.
-    """
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import board
-        url = board.ensure_running()
-    except Exception as exc:  # noqa: BLE001 -- the board is optional, never fatal
-        print(f"board: not started ({exc})")
-        return
-    if url:
-        print(f"board: {url}retro.html")
-    else:
-        print("board: not started")
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except retro_ledger.LedgerError as exc:
+        print(f"retro view: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

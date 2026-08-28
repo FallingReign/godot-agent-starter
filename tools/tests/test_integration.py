@@ -215,6 +215,7 @@ class TestEndToEnd(BoardTestCase):
         (self.dir / ".gitignore").write_text(".kit/\n", encoding="utf-8")
         (self.dir / "kit.config.json").write_text(json.dumps({
             "schema": 1,
+            "runtime_root": ".kit/runtime",
             "dispatch_policy": {
                 "owned": ["tools", "check.py"],
                 "forbidden": [".kit", "docs/retro", "src"],
@@ -273,6 +274,16 @@ class TestEndToEnd(BoardTestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read().decode("utf-8"))
 
+    def approval_body(self, slug: str, comment: str, *, by: str = "") -> dict:
+        code, detail = _fetch(self.port, f"/api/finding/{slug}")
+        self.assertEqual(code, 200, detail)
+        return {
+            "slug": slug,
+            "comment": comment,
+            "by": by,
+            "review": detail["review"],
+        }
+
     def state_of(self, slug: str) -> dict:
         _, payload = _fetch(self.port, "/api/state")
         return next(f for f in payload["findings"] if f["slug"] == slug)
@@ -307,8 +318,10 @@ class TestEndToEnd(BoardTestCase):
         _, detail = _fetch(self.port, f"/api/finding/{SLUG_A}")
         preview = detail["prompt_preview"]
 
-        code, payload = self.post("/api/finding/approve",
-                                   {"slug": SLUG_A, "comment": comment, "by": "jf"})
+        code, payload = self.post(
+            "/api/finding/approve",
+            self.approval_body(SLUG_A, comment, by="jf"),
+        )
         self.assertEqual(code, 200, payload)
         run_id = payload["run"]["run_id"]
         self.assertTrue(run_id, "approve returned no run")
@@ -332,7 +345,9 @@ class TestEndToEnd(BoardTestCase):
 
         # (d) the finding moves working -> done, and a second approval queues
         self.assertEqual(self.state_of(SLUG_A)["state"], "working")
-        code, _ = self.post("/api/finding/approve", {"slug": SLUG_B, "comment": "second"})
+        code, _ = self.post(
+            "/api/finding/approve", self.approval_body(SLUG_B, "second")
+        )
         self.assertEqual(code, 200)
         self.assertEqual(self.state_of(SLUG_B)["state"], "queued",
                          "a second approval ran concurrently instead of queueing")
@@ -349,7 +364,9 @@ class TestEndToEnd(BoardTestCase):
     def test_a_no_comment_approval_dispatches_the_preview_byte_for_byte(self) -> None:
         _, detail = _fetch(self.port, f"/api/finding/{SLUG_A}")
         preview = detail["prompt_preview"]
-        code, payload = self.post("/api/finding/approve", {"slug": SLUG_A, "comment": ""})
+        code, payload = self.post(
+            "/api/finding/approve", self.approval_body(SLUG_A, "")
+        )
         self.assertEqual(code, 200, payload)
         written = (board.RUNS_DIR / f"{payload['run']['run_id']}.prompt.md").read_text(
             encoding="utf-8")
@@ -360,11 +377,13 @@ class TestEndToEnd(BoardTestCase):
         board.providers.worker_command = (
             lambda _spec: _stub_command(self.stub, "missing")
         )
-        code, first = self.post("/api/finding/approve",
-                                {"slug": SLUG_A, "comment": "plain exit"})
+        code, first = self.post(
+            "/api/finding/approve", self.approval_body(SLUG_A, "plain exit")
+        )
         self.assertEqual(code, 200, first)
-        code, second = self.post("/api/finding/approve",
-                                 {"slug": SLUG_B, "comment": "must wait"})
+        code, second = self.post(
+            "/api/finding/approve", self.approval_body(SLUG_B, "must wait")
+        )
         self.assertEqual(code, 200, second)
         outcome = self.wait_for(SLUG_A, ("blocked", "unverified", "failed"))
         self.assertEqual(outcome["state"], "blocked", outcome["status_detail"])
@@ -400,7 +419,8 @@ class TestAcceptedMigration(BoardTestCase):
         self.assertEqual(board.migrate_accepted_file(), 0)
 
     def test_migration_leaves_a_real_decision_alone(self) -> None:
-        board.api_approve(SLUG_A, "a real amendment")
+        code, payload = self.approve(SLUG_A, "a real amendment")
+        self.assertEqual(code, 200, payload)
         before = self.accepted()
         self.assertEqual(board.migrate_accepted_file(), 0)
         self.assertEqual(self.accepted(), before)

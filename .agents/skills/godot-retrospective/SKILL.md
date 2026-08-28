@@ -60,6 +60,13 @@ was told. Then ask what the kit failed to supply, check or prevent.
 | Human asks whether a process exists | It does not, or it is invisible |
 | Same command run many times | A loop, usually a check that cannot pass |
 | Same file rewritten many times | Missing tooling, see `godot-tooling-friction` |
+
+When a slice directly observed a deterministic consequence, the testimony may
+also carry an exact closed declaration from `docs/retro/notes/README.md`, such
+as `consequence: native-crash` or
+`retro_trigger: repeated-verification-failure`. These declarations affect when
+the retro becomes due; prose, sentiment and guessed severity never do. Omit the
+declaration when the event did not happen.
 | One stage failing repeatedly | Remediation text is not enough to act on |
 | A rule satisfied in a strange way | The rule is passable without complying |
 

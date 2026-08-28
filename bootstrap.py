@@ -45,6 +45,7 @@ SRC = ROOT / "src"
 TOOLS = ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import engine_discovery  # noqa: E402
+import native_engine  # noqa: E402
 
 EXPECTED_GODOT = engine_discovery.EXPECTED_GODOT_VERSION
 DEPENDENCY_LOCK = ROOT / "dependencies.lock.json"
@@ -484,14 +485,21 @@ def check_gdtoolkit(lock, install=False):
     )
 
 
-def check_godot():
+def check_godot(selected_binary=None):
     """Locate Godot without starting the native executable.
 
     Doctor and ordinary setup diagnosis must remain safe even when the local
     engine binary itself is unstable. Exact engine health/version evidence is
     gathered only at the explicit engine boundary in ``kit verify``.
     """
-    binary = find_godot()
+    if selected_binary:
+        try:
+            selected_path = Path(selected_binary).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            selected_path = None
+        binary = str(selected_path) if selected_path and selected_path.is_file() else None
+    else:
+        binary = find_godot()
     if not binary:
         record("godot", MANUAL, "not found",
                f"Download Godot {EXPECTED_GODOT} Standard (NOT .NET) from "
@@ -1161,9 +1169,40 @@ def check_warnings_block():
         record("warnings-block", OK, "strict warnings set to error")
 
 
-def check_import(binary):
+def check_import(binary, attempted=None):
     if not binary:
         record("import-cache", MISSING, "skipped, Godot not found", "")
+        return
+    if (
+        attempted is not None
+        and attempted.failure_class == "engine-authentication-failed"
+    ):
+        record(
+            "import-cache",
+            MISSING,
+            attempted.output.strip() or "Godot authentication failed",
+            f"Point GODOT_BIN to an executable which reports exactly {EXPECTED_GODOT}, "
+            "then run kit setup import again.",
+        )
+        return
+    if attempted is not None and attempted.failure_class:
+        record(
+            "import-cache",
+            MISSING,
+            f"Godot import stopped at the safe native boundary ({attempted.failure_class})",
+            "The unresolved native warning must be cleared by one explicitly approved "
+            "bounded kit verify after the process issue is understood.",
+        )
+        return
+    if attempted is not None and re.search(
+        r"(?im)^\s*(?:SCRIPT ERROR|ERROR|FATAL|CRASH):", attempted.output
+    ):
+        record(
+            "import-cache",
+            MISSING,
+            "Godot import reported an engine or script error",
+            "Fix the first reported error, then run kit setup import again.",
+        )
         return
     if (SRC / ".godot" / "global_script_class_cache.cfg").is_file():
         record("import-cache", OK, ".godot cache present")
@@ -1174,11 +1213,40 @@ def check_import(binary):
 
 def do_import(binary):
     if not binary:
-        return
+        return None
     if not QUIET:
         print(f"  {DIM}importing project (first run can take a minute)...{RST}")
+    try:
+        authenticated = engine_discovery.authenticate_godot(
+            ROOT,
+            candidate=binary,
+            operation="setup-import",
+        )
+        authenticated.assert_unchanged()
+    except engine_discovery.EngineAuthenticationError as exc:
+        return native_engine.NativeResult(
+            exit_code=native_engine.REFUSED_EXIT,
+            output=str(exc),
+            executable=Path(str(binary)).name,
+            started=False,
+            failure_class="engine-authentication-failed",
+            failure_code=exc.status,
+        )
     # Exit code is unreliable here; Godot has returned 1 on a clean first import.
-    run([binary, "--headless", "--path", str(SRC), "--import", "--quit"], timeout=600)
+    # The shared boundary classifies process failures and the caller proves the
+    # operation from the fresh cache plus scanned output.
+    result = native_engine.run_godot(
+        authenticated.path,
+        ["--headless", "--path", str(SRC), "--import", "--quit"],
+        root=ROOT,
+        cwd=ROOT,
+        timeout=600,
+    )
+    native_engine.persist_native_failure(ROOT, result, operation="setup-import")
+    if result.failure_class and not QUIET:
+        for line in result.output.strip().splitlines()[-6:]:
+            print(f"  {YEL}{line}{RST}")
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -1328,6 +1396,7 @@ def main():
                     help="explicitly run git init; never stages or commits")
     ap.add_argument("--import-project", action="store_true",
                     help="explicitly run Godot's headless project import")
+    ap.add_argument("--engine-bin", help=argparse.SUPPRESS)
     ap.add_argument("--format-game", action="store_true",
                     help="explicitly format game GDScript with the local toolchain")
     ap.add_argument("--project-name", metavar="NAME",
@@ -1388,16 +1457,17 @@ def main():
     check_uv()
     requested_downloads = set(args.download_dep)
     check_gdtoolkit(lock, install="gdtoolkit" in requested_downloads)
-    binary = check_godot()
+    binary = check_godot(selected_binary=args.engine_bin)
     check_gut(download="gut" in requested_downloads, lock=lock)
     check_mermaid(download="mermaid" in requested_downloads, lock=lock)
     check_project_name(chosen=args.project_name)
     check_project_shape()
     check_warnings_block()
 
+    import_result = None
     if args.import_project and binary and not (SRC / ".godot" / "global_script_class_cache.cfg").is_file():
-        do_import(binary)
-    check_import(binary)
+        import_result = do_import(binary)
+    check_import(binary, attempted=import_result)
 
     # Deliberately last: Godot rewrites editor_settings-*.tres when it exits,
     # so patching before any Godot invocation silently discards the change.

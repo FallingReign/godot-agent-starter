@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -20,6 +21,7 @@ MARKER_KIND = "portable-agent-kit-root"
 CONFIG_NAME = "kit.config.json"
 GAME_LAYOUTS = (".", "src")
 DEFAULT_RUNTIME_ROOT = ".kit/runtime"
+PRIVATE_RUNTIME_CONTAINER = ".kit"
 
 
 class ProjectContextError(ValueError):
@@ -68,6 +70,54 @@ def _resolve_within(root: Path, value: str | Path, label: str,
     if not allow_root and resolved == root:
         raise ProjectContextError(f"{label} must be private to, not equal to, {root}")
     return resolved
+
+
+def runtime_root_relative(value: str | Path) -> str:
+    """Validate and return the portable project-relative private runtime path.
+
+    Runtime data can contain session testimony, sealed prompts and detached Git
+    metadata.  Merely keeping it somewhere below the repository is not a
+    privacy boundary: it can overlap game or durable documentation paths and a
+    separately maintained dispatch deny-list can miss it.  The one portable
+    private container is therefore ``.kit/`` and the runtime must be a proper
+    descendant of it.
+    """
+    raw = Path(value)
+    if (not str(value).strip() or raw.is_absolute() or ".." in raw.parts):
+        raise ProjectContextError(
+            "runtime root must be a non-empty project-relative path without '..'"
+        )
+    portable = PurePosixPath(str(value).replace("\\", "/"))
+    if (not portable.parts or portable.parts[0] != PRIVATE_RUNTIME_CONTAINER
+            or len(portable.parts) < 2
+            or any(part in ("", ".", "..") for part in portable.parts)):
+        raise ProjectContextError(
+            "runtime root must be a descendant of the project-local .kit directory"
+        )
+    return portable.as_posix()
+
+
+def _require_unredirected_runtime(root: Path, relative: str) -> None:
+    """Reject existing private-root components that redirect into another tree."""
+    cursor = root
+    for component in PurePosixPath(relative).parts:
+        cursor = cursor / component
+        try:
+            info = cursor.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ProjectContextError(
+                f"runtime root component is unreadable: {cursor}: {exc}"
+            ) from exc
+        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        is_reparse = bool(
+            int(getattr(info, "st_file_attributes", 0)) & marker
+        )
+        if not stat.S_ISDIR(info.st_mode) or is_reparse:
+            raise ProjectContextError(
+                f"runtime root component must be an unredirected directory: {cursor}"
+            )
 
 
 def _validate_marker(path: Path) -> None:
@@ -234,8 +284,10 @@ def resolve_project_context(project: str | Path, *, game_layout: str = "src",
             f"game layout must be one of {', '.join(GAME_LAYOUTS)}: {game_layout!r}"
         )
     game_root = _resolve_within(project_root, game_layout, "game root")
+    runtime_relative = runtime_root_relative(runtime_root)
+    _require_unredirected_runtime(project_root, runtime_relative)
     resolved_runtime = _resolve_within(
-        project_root, runtime_root, "runtime root", allow_root=False
+        project_root, runtime_relative, "runtime root", allow_root=False
     )
     return ProjectContext(
         kit_root=kit_root,

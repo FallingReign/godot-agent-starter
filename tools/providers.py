@@ -23,10 +23,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_paths
 
 ROLE_KINDS = {
-    "analyzer": frozenset({"manual", "copilot-sdk"}),
-    "worker": frozenset({"manual", "copilot-cli"}),
+    "analyzer": frozenset({"manual", "copilot-sdk", "codex-cli"}),
+    "worker": frozenset({"manual", "copilot-cli", "codex-cli"}),
+}
+KIND_ALIASES = {
+    "codex": "codex-cli",
+    "openai-codex": "codex-cli",
+    "github-copilot-cli": "copilot-cli",
+    "github-copilot-sdk": "copilot-sdk",
 }
 NODE_MIN = 24
+CODEX_READ_BOUNDARY_BLOCKER = (
+    "Codex CLI execution is unavailable because its sandbox does not enforce "
+    "repository-scoped reads"
+)
+COPILOT_READ_BOUNDARY_BLOCKER = (
+    "Automatic Copilot execution is unavailable because the official adapter "
+    "does not establish a host-enforced repository-scoped read/write boundary"
+)
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}\Z")
 _PERSONA_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -80,6 +94,7 @@ def _parse_spec(role: str, value: object) -> ProviderSpec:
             f"providers.{role} has unsupported key(s): {', '.join(sorted(unknown))}"
         )
     kind = _text(value.get("kind") or "manual", "kind", 32)
+    kind = KIND_ALIASES.get(kind, kind)
     if kind not in ROLE_KINDS[role]:
         raise ProviderConfigError(
             f"providers.{role}.kind must be one of {', '.join(sorted(ROLE_KINDS[role]))}"
@@ -102,6 +117,8 @@ def _parse_spec(role: str, value: object) -> ProviderSpec:
         )
     if role == "worker" and kind == "copilot-cli" and not persona:
         persona = "kit-builder"
+    if kind == "codex-cli" and persona:
+        raise ProviderConfigError("providers using codex-cli do not support persona")
     if role == "analyzer" and persona:
         raise ProviderConfigError("providers.analyzer.persona is not supported")
     return ProviderSpec(
@@ -145,6 +162,11 @@ def from_record(role: str, value: object) -> ProviderSpec:
 
 def _copilot_executable() -> str | None:
     names = ("copilot.exe", "copilot.cmd", "copilot")
+    return next((found for name in names if (found := shutil.which(name))), None)
+
+
+def _codex_executable() -> str | None:
+    names = ("codex.exe", "codex.cmd", "codex")
     return next((found for name in names if (found := shutil.which(name))), None)
 
 
@@ -217,6 +239,61 @@ def _copilot_launcher() -> list[str] | None:
     return None
 
 
+def _codex_package_root(executable: str | None = None) -> Path | None:
+    """Resolve the installed official @openai/codex npm package root."""
+    executable = executable or _codex_executable()
+    if not executable:
+        return None
+    try:
+        shim = Path(executable).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    candidates = (
+        shim.parent,
+        shim.parent / "node_modules" / "@openai" / "codex",
+        shim.parent.parent / "lib" / "node_modules" / "@openai" / "codex",
+    )
+    for candidate in candidates:
+        try:
+            root = candidate.resolve(strict=True)
+            value = json.loads((candidate / "package.json").read_text(encoding="utf-8"))
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            continue
+        if (isinstance(value, dict) and value.get("name") == "@openai/codex"
+                and root.is_dir()):
+            return root
+    return None
+
+
+def _codex_bin_entry(package_root: Path) -> Path | None:
+    """Return Codex's authenticated package-declared CLI entry."""
+    try:
+        value = json.loads((package_root / "package.json").read_text(encoding="utf-8"))
+        configured = value.get("bin") if isinstance(value, dict) else None
+        relative = configured.get("codex") if isinstance(configured, dict) else configured
+        if not isinstance(relative, str) or not relative.strip():
+            return None
+        raw = Path(relative)
+        if raw.is_absolute() or ".." in raw.parts:
+            return None
+        entry = (package_root / raw).resolve(strict=True)
+        entry.relative_to(package_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return entry if entry.is_file() else None
+
+
+def _codex_launcher() -> list[str] | None:
+    """Return a shell-free launcher authenticated as official @openai/codex."""
+    executable = _codex_executable()
+    package_root = _codex_package_root(executable)
+    entry = _codex_bin_entry(package_root) if package_root is not None else None
+    node = shutil.which("node.exe") or shutil.which("node")
+    if node and entry is not None:
+        return [node, str(entry)]
+    return None
+
+
 def copilot_sdk_path() -> Path | None:
     """Resolve the SDK export shipped with the installed Copilot CLI.
 
@@ -258,9 +335,11 @@ def preflight(spec: ProviderSpec) -> list[str]:
             f"{runtime_paths.CONFIG_NAME} before using automatic {spec.role} actions"
         ]
     if spec.kind == "copilot-cli":
-        return [] if _copilot_launcher() else [
+        problems = [] if _copilot_launcher() else [
             "Copilot CLI has no safe shell-free launcher on PATH"
         ]
+        problems.append(COPILOT_READ_BOUNDARY_BLOCKER)
+        return problems
     if spec.kind == "copilot-sdk":
         problems: list[str] = []
         major = _node_major()
@@ -270,6 +349,13 @@ def preflight(spec: ProviderSpec) -> list[str]:
             problems.append(f"Node.js {major} is installed; Copilot SDK needs >= {NODE_MIN}")
         if copilot_sdk_path() is None:
             problems.append("The @github/copilot/sdk entry point is not available from the installed CLI")
+        problems.append(COPILOT_READ_BOUNDARY_BLOCKER)
+        return problems
+    if spec.kind == "codex-cli":
+        problems = [] if _codex_launcher() else [
+            "Official @openai/codex has no authenticated shell-free launcher on PATH"
+        ]
+        problems.append(CODEX_READ_BOUNDARY_BLOCKER)
         return problems
     return [f"unsupported provider kind: {spec.kind}"]
 
@@ -285,35 +371,46 @@ def worker_command(spec: ProviderSpec) -> list[str]:
     it after the provider exits. The approved prompt is supplied on stdin from
     the sealed prompt file, never as a command-line argument.
     """
-    if spec.role != "worker" or spec.kind != "copilot-cli":
+    if spec.role != "worker" or spec.kind not in ("copilot-cli", "codex-cli"):
         raise ProviderConfigError(f"{spec.kind} cannot launch an automatic worker")
-    launcher = _copilot_launcher()
+    if spec.kind == "codex-cli":
+        raise ProviderConfigError(CODEX_READ_BOUNDARY_BLOCKER)
+    raise ProviderConfigError(COPILOT_READ_BOUNDARY_BLOCKER)
+
+
+def _codex_worker_argv(spec: ProviderSpec) -> list[str]:
+    """Proposed bounded argv, retained as a tested contract but not executable.
+
+    The flags close writes, approvals, persistence, search and prompt argv. They
+    do not close host-wide reads, so :func:`worker_command` fails closed until
+    the dispatcher can supply a real repository-scoped read boundary.
+    """
+    if spec.role != "worker" or spec.kind != "codex-cli" or spec.persona:
+        raise ProviderConfigError("invalid codex-cli worker specification")
+    launcher = _codex_launcher()
     if not launcher:
-        raise ProviderConfigError("Copilot CLI has no safe shell-free launcher on PATH")
+        raise ProviderConfigError(
+            "Official @openai/codex has no authenticated shell-free launcher on PATH"
+        )
     command = [
         *launcher,
-        "--agent", spec.persona or "kit-builder",
-        "-s",
-        "--no-ask-user",
-        "--no-auto-update",
-        "--no-color",
-        "--no-experimental",
-        "--no-remote",
-        "--no-remote-export",
-        "--available-tools=view,grep,glob,edit,create,apply_patch",
-        "--allow-tool=read,write",
-        "--deny-tool=shell,url,memory,write(.git)",
-        "--disallow-temp-dir",
-        "--disable-builtin-mcps",
+        "--ask-for-approval", "never",
+        "--sandbox", "workspace-write",
+        "--cd", ".",
     ]
     if spec.model:
         command.extend(["--model", spec.model])
+    command.extend([
+        "exec", "--ephemeral", "--ignore-user-config", "--json", "-",
+    ])
     return command
 
 
 def resume_command(spec: ProviderSpec, session_id: str) -> str:
     """Human-readable resume hint for known adapters; never executed."""
     clean = _text(session_id, "session_id", 256)
+    if clean and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,255}", clean) is None:
+        return ""
     if spec.kind == "copilot-cli" and clean:
         return f"copilot --agent {spec.persona or 'kit-builder'} --resume={clean}"
     return ""

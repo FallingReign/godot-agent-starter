@@ -38,10 +38,10 @@ Stages are grouped as follows:
 | --- | --- |
 | `integrity` | The protected gate is unmodified. Changes to the configured game root's `project.godot` are noted, not failed |
 | `skills` | `.agents/skills/*/SKILL.md` frontmatter is valid, so skills actually load |
-| `schema` | every key in `proposal.json` and `project.shape.json` is a declared field, so an invented one fails here instead of being silently discarded by every reader |
+| `schema` | every key in `proposal.json` and `project.shape.json` is declared; proposal status, design authority, canonical design digests and the reversibility envelope are internally consistent, so an invented or malformed field fails instead of being silently discarded |
 | `shape` | the decision log is well formed and free of placeholder answers |
-| `design` | regenerates `docs/design/INDEX.md` and the tunable binding tables, then reports a declared tunable no code claims, a tunable claimed in code no section declares, a design-declared tunable bound to a `const`, and a section with no resolution line. Regenerates rather than failing on staleness: tuning values change constantly, and a gate that fails on every balance tweak trains people to stop regenerating |
-| `conformance` | Code vs `proposal.json` when `status` is `approved`, including each file's declared `create`/`modify` against the tree at `baseline_sha`, at the depth `involvement` implies. A draft is awaiting review and is not diffed. Structure without `experience`, or a dangling `design_refs` entry, fails; absent design ancestry warns honestly |
+| `design` | parses orthogonal resolution, authority, authorship and confidence metadata; rejects malformed metadata and incomplete agent-authored disclosure; computes canonical SHA-256 with generated bindings excluded; regenerates `docs/design/INDEX.md` and tunable bindings; reports legacy sections that need authority migration and design/code tunable mismatches |
+| `conformance` | Every authored game input vs `proposal.json` when `status` is `recorded` or `approved`, including custom/extensionless content, game-owned tools, project tests, scenes, resources, assets, GDScript and deletions. If `proposal.json` is absent, Git must prove there are no authored changes; otherwise implementation has no design authority and fails. The inverse scope excludes only known generated, private, engine-owned and third-party surfaces. Each `new`/`modify`/`delete` declaration is checked against an exact resolvable `baseline_sha` at the configured involvement depth. Hands-off declarations bind coarse file/directory `scope[]`; module declarations bind complete allowed outgoing dependencies and boundary data; function declarations bind class-qualified identity, contiguous annotations, a typed canonical signature and normalized semantic body change. Git, architecture, baseline, source parsing and untracked-file discovery fail closed. A draft authorizes no implementation. Recorded work is hands-off, reversible and never approval; agent-provisional recorded work requires exact `very-high` confidence. Approved work additionally requires the current `approval_sha256` and active append-only human confirmation entries matching `docs_at`, `design_sha256` and `proposal_sha256`. Full and strict verification reject declared work that is still unbuilt; static verification may display it as planning state. Missing ancestry, stale digests, active rejections, unproposed deviations and hard-to-undo work without approval all fail |
 | `format` | Optional third-party gdtoolkit adapter: `gdformat --check` |
 | `lint` | Optional third-party gdtoolkit adapter: `gdlint` |
 | `sanitise` | Scenes carry no fabricated UIDs and are structurally sound |
@@ -80,6 +80,33 @@ you can edit is not a gate. If `.gate.sha256` is missing or incomplete, restore 
 shipped file from version control or the distribution; the gate never creates a new
 trust root from the files it is meant to verify.
 
+**`schema` fails** — run `kit schema describe proposal` or `kit schema describe
+shape`, then correct only the named source field. Do not invent an alias or add a
+gate exception. Approval fields (`approved_by`, `approved_on`,
+`approval_sha256`) and authority events are cockpit-owned human decisions; never
+hand-fill them to satisfy validation.
+
+**`design` fails** — repair the exact named `docs/design/` section. Resolution,
+authority, authorship and confidence are independent metadata. Agent-authored
+design must remain provisional, use exact `very-high` confidence before any
+reversible implementation, and contain the Quick Read, inference, assumptions,
+veto scope and next go/no-go sections. A legacy or malformed section requires
+explicit migration and cockpit re-review; age and prior prose are not authority.
+
+**`conformance` fails** — use the reported file and reason. Invalid/missing Git
+proof or an unresolved baseline is a stop, not permission to compare the whole
+tree approximately. Authored changes with no `proposal.json` are implementation
+without authority: retrieve or write the design and record the reversible plan
+before continuing. A stale design or proposal digest requires re-reading and
+re-review. An unproposed file, module, action or function is a real deviation:
+record the revision, return the proposal to `draft`, and use `kit serve start`
+for a new exact decision. Do not widen the proposal after the fact or reuse a
+legacy approval. A deleted input must be declared `delete`; an unfamiliar
+extension remains authored scope. At function involvement, the exact typed
+signature and body delta must match, and a missing/unparseable baseline fails
+closed. At module involvement, a dependency outside `may_depend_on` is an
+unapproved boundary change.
+
 **`format` fails** — `kit setup format`. Never bare `gdformat .`; it is
 unscoped and reformats the configured game root's `addons/`, which is
 third-party code.
@@ -110,10 +137,24 @@ iterators and unnarrowed `Variant` values. Worked examples taken from code in th
 reviewed project-neutral examples: **`docs/GDSCRIPT.md`** (generated — regenerate with
 the kit's internal documentation generator during maintenance).
 
-**Symbol navigation.** For go-to-definition and find-references, `tools/gdls.py`
-queries Godot's language server. Advisory, never a gate stage. `refs` works with no
-server running via a text scan. Stop the language-server helper before running the
-gate — a live Godot instance holds `.godot/`, which the gate writes to.
+**Symbol navigation.** The public helper queries Godot's language server and is
+advisory, never a gate stage:
+
+```text
+kit gdls start
+kit gdls status
+kit gdls diagnose scripts/logic/example.gd
+kit gdls symbols scripts/logic/example.gd
+kit gdls refs Example
+kit gdls stop
+```
+
+`refs` works with no server via a text scan. The helper accepts port 6105 only
+when the exact retained receipt, native lock, PID and process identity all still
+match; a foreign listener or reused PID is refused. `status` is read-only and
+surfaces a retained engine which disappeared after startup as unresolved native
+safety evidence. Stop the helper before running the gate — a live Godot instance
+holds `.godot/`, which the gate writes to.
 
 **`grep` fails** — replace the idiom. Full table in `RULES.md`. If a flagged line is
 genuinely correct, append `# gate:allow` to it, use that sparingly, and mention it in
@@ -171,6 +212,19 @@ not mean compiling a custom engine for every game.
 
 **`smoke` fails** — the project does not boot. Check the main scene and its script.
 
+**A native crash, timeout or concurrent-launch refusal occurs** — stop every
+native launch. The gate records a bounded diagnostic in the private verification
+ledger; the cockpit and `kit retro status` surface the unresolved consequence.
+Use `kit verify --static` and `kit self-test` for safe diagnostics, but neither
+clears the warning. Ask the human before one bounded full retry. Only a successful
+complete full or strict native verification resolves the native failure record.
+The retry is digest-bound rather than a boolean: copy the exact SHA-256 shown by
+the warning into `kit verify --confirm-native-retry <sha256>`. The launcher issues
+a private one-run token; the native boundary atomically consumes it at the first
+engine launch and binds it to that exact warning, verification run and Python
+process. Other commands, processes and warning revisions remain refused. The
+token is never an argument, report field or native-child environment variable.
+
 ## Engine quirks the script works around
 
 Do not "fix" these; they are deliberate.
@@ -190,13 +244,59 @@ Do not "fix" these; they are deliberate.
 - GUT exits zero when it collects no tests at all, so a missing summary is treated as a
   failure.
 - Every invocation has a hard timeout; Godot can hang on import.
-- Native launches are serialized. On Windows they run without a console window,
-  inherit an error mode that suppresses modal Application Error / WER dialogs, and
-  a timeout terminates only the process tree owned by that invocation.
+- Native launches are serialized by an OS-backed cross-process guard, including
+  stale-lock recovery. An abandoned authentic engine lock is visible to read-only
+  diagnosis; the next mutating command persists an unresolved warning before it
+  removes the stale lock, and refuses that triggering launch. An unreadable or
+  indeterminate owner is never recovered. Output is drained continuously into a fixed-size tail
+  rather than accumulated in memory. On Windows launches run without a console
+  window, inherit an error mode that suppresses modal Application Error / WER
+  dialogs, and live inside a `KILL_ON_JOB_CLOSE` Job Object whose active-process
+  count must reach zero. On POSIX the owned group has an independent parent
+  lifeline: timeout/cancellation requests `SIGINT`, then a bounded hard fallback
+  kills the group and verifies it after reaping the leader. Nested command
+  supervisors cascade that lifeline, so terminating an outer strict verifier
+  cannot silently leave its checker or bounded engine behind.
+- Native children receive a documented allowlist of OS execution, user-data,
+  temporary-directory, display and locale variables. Verification nonces, retry
+  tokens, provider credentials and secret-like host variables are not inherited.
+- A deliberately retained language-server process is authenticated by its PID,
+  unguessable lock token, creation marker and executable identity. Startup first
+  writes a recoverable `starting` journal, proves the exact live owner, binds the
+  listener to that PID where the OS exposes it, completes a real LSP initialize,
+  then atomically marks the journal `ready`. Any `BaseException` takes the exact
+  cleanup path; an interrupted handoff remains visibly recoverable. Stop refuses
+  PID reuse or unreadable identity and preserves the lock unless termination of
+  the identity-bound root process is proven. Linux uses a pidfd and Windows uses
+  an authenticated process handle; POSIX systems without an identity-bound
+  signalling primitive refuse automated retained-process termination.
+- Two commands intentionally retain authenticated children beyond their short
+  launcher: `kit gdls start`, and cockpit `kit serve start`/`open`. Only those
+  outer invocations permit Windows Job breakaway, and only the exact GDLS or
+  board child requests `CREATE_BREAKAWAY_FROM_JOB`. Every other command remains
+  non-breakaway and fully tree-contained.
+- Windows access-violation status and signal-style native exits are classified as
+  `native-crash`; timeout and concurrent-launch refusal remain distinct. A safe
+  static follow-up cannot overwrite unresolved native evidence. Recovery uses an
+  exact compare-and-swap snapshot, so a newer or unreadable warning cannot be
+  cleared by an older passing verification.
 - The native group stops before project work when the engine does not report the
   exact supported patch version.
+- Explicit non-gate operations use the same rule: setup import, local API-doc
+  generation and language-server startup first bind the resolved executable,
+  its file identity and an exact engine-reported 4.7.2 version. Filename or PATH
+  discovery alone is never execution authority.
 - `--check-only` runs per file, not once for the project, because it reports only the
   first file's errors otherwise.
+
+The boundary does not claim what the host cannot prove. Power loss and an
+uncatchable whole-host termination leave only the durable lock/warning evidence
+for the next run. Linux closes the child-spawn/lifeline gap with `PDEATHSIG`;
+other POSIX kernels have a very small interval between process creation and the
+independent guard becoming ready because the Python standard library exposes no
+atomic parent-death primitive there. If guard startup fails, the launch is killed
+and refused. Automated stop of a deliberately retained server is likewise
+refused on a POSIX host without an identity-bound signalling primitive.
 
 ## Assets and import defaults
 
@@ -260,6 +360,7 @@ every run, because a rule the agent re-reads each run is more reliable than one 
 read once at session start.
 
 The `arch` stage reports modules that exist in code but are absent from
-`arch.rules.json`. It reports rather than fails: at `hands-off` an undeclared
-module is legitimate, and a declared-but-unbuilt module is normal mid-slice. The
-value is the difference between approved intent and built reality in one place.
+`arch.rules.json`. It reports rather than fails: at `hands-off` a module may be
+legitimate when it is covered by a `recorded`, reversible proposal, and a
+declared-but-unbuilt module is normal mid-slice. The value is the difference
+between recorded or approved intent and built reality in one place.

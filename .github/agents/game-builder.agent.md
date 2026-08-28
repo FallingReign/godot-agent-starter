@@ -18,7 +18,8 @@ The `game_root` declared in `kit.config.json`, plus `docs/design/`,
 
 `check.py`, `arch.py`, `sanitise.py`, `gate.rules.json`, `arch.rules.json`,
 `.gate.sha256`, `.agents/skills/`, `AGENTS.md`, `.github/agents/`, `.kit/`,
-and `docs/retro/` except for the factual note described below.
+`.github/copilot-instructions.md`, and `docs/retro/` except for the factual note
+described below.
 
 These are the rules you are judged against. If one of them is wrong, that is a
 finding, not a task: write it into your slice note and carry on. The
@@ -30,12 +31,19 @@ for the full gate and `kit plan` for generated review pages.
 ## Before you write code
 
 Read `docs/design/INDEX.md`, open the two or three sections that matter, and
-state in `design_refs` which end state this work serves.
+state in `design_refs` which end state this work serves and bind its canonical
+`sha256`.
 
 If nothing in the design body says why the work exists, do not reason a rationale
-up from the feature. Say so, offer to work the design out with the human first,
-and let them choose. They may tick the acknowledgement in the plan to proceed
-without design - that is their call to make, not yours.
+and stop unless one inferred design is correct with exactly `very-high`
+confidence. In that exceptional case, write the design first as
+`agent-provisional`, disclose `Authored by: agent`, and include the Quick read,
+inference rationale, assumptions, veto scope and next go/no-go.
+
+No-design acknowledgements are legacy history and never grant authority. A
+`recorded` proposal permits only hands-off work inside a documented reversible
+envelope; it is not approval. Stop at every `go-no-go`. Only the human may
+confirm the exact design digest and set an approved proposal.
 
 ## At the end of a slice
 
@@ -62,7 +70,15 @@ the code silently dropped them.
 
 ## Friction
 Six attempts to author the map file through patch tooling.
+
+## Retrospective signal
+consequence: native-crash
+retro_trigger: repeated-correction
 ```
+
+Include `Retrospective signal` only when the consequence was actually observed.
+Use exact closed codes from `docs/retro/notes/README.md`; never infer a severity
+from tone or use `none` as a placeholder.
 
 Do not draw conclusions and do not propose kit changes. Record what happened.
 The retrospective reads across many of these and finds the patterns you cannot

@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 import bootstrap  # noqa: E402
 import check as gate  # noqa: E402
+from tools import native_engine  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -511,29 +512,54 @@ class EngineLaunchSerialization(unittest.TestCase):
     def test_only_one_process_can_hold_the_godot_launch_lock(self) -> None:
         with _temporary_directory() as temp:
             lock = Path(temp) / "runtime" / "godot-process.lock"
-            with mock.patch.object(gate, "ENGINE_LOCK_FILE", lock):
-                first, problem = gate._acquire_engine_lock()
+            with mock.patch.object(native_engine, "engine_lock_path", return_value=lock):
+                first, problem = native_engine.acquire_engine_lock(ROOT)
                 self.assertIsNotNone(first, problem)
-                second, problem = gate._acquire_engine_lock()
+                second, problem = native_engine.acquire_engine_lock(ROOT)
                 self.assertIsNone(second)
                 self.assertIn("another Godot launch", problem)
-                gate._release_engine_lock("not-the-owner")
+                native_engine.release_engine_lock(ROOT, "not-the-owner")
                 self.assertTrue(lock.exists())
-                gate._release_engine_lock(first)
+                native_engine.release_engine_lock(ROOT, first)
                 self.assertFalse(lock.exists())
 
     def test_stale_process_lock_is_recovered_once(self) -> None:
         with _temporary_directory() as temp:
             lock = Path(temp) / "runtime" / "godot-process.lock"
+            warning = Path(temp) / "runtime" / "native-warning.json"
             lock.parent.mkdir(parents=True)
+            identity = native_engine.ProcessIdentity(
+                2147483647,
+                "test",
+                "stale-owner",
+                "a" * 64,
+                "Godot.exe",
+            )
             lock.write_text(
-                json.dumps({"pid": 2147483647, "token": "stale"}) + "\n",
+                json.dumps(
+                    {
+                        "schema": 2,
+                        "pid": 2147483647,
+                        "token": "stale",
+                        "process_identity": identity.as_json(),
+                    }
+                ) + "\n",
                 encoding="utf-8",
             )
-            with mock.patch.object(gate, "ENGINE_LOCK_FILE", lock):
-                token, problem = gate._acquire_engine_lock()
+            with mock.patch.object(
+                native_engine, "engine_lock_path", return_value=lock
+            ), mock.patch.object(
+                native_engine, "native_warning_path", return_value=warning
+            ), mock.patch.object(
+                native_engine, "_pid_liveness", return_value=native_engine.PID_DEAD
+            ):
+                token, problem = native_engine.acquire_engine_lock(ROOT)
+                self.assertIsNone(token)
+                self.assertIn("triggering launch was refused", problem)
+                self.assertTrue(warning.exists())
+                token, problem = native_engine.acquire_engine_lock(ROOT)
                 self.assertIsNotNone(token, problem)
-                gate._release_engine_lock(token)
+                native_engine.release_engine_lock(ROOT, token)
             self.assertFalse(lock.exists())
 
 

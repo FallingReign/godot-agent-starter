@@ -37,6 +37,8 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
 import runtime_paths  # noqa: E402
+import proposal_authority  # noqa: E402
+import process_supervisor  # noqa: E402
 
 SCHEMA = 1
 EXIT_OK = 0
@@ -61,6 +63,12 @@ MAINTAINER_GATE_SKIPS = frozenset(
         "SKIP design",
         "SKIP conformance",
     }
+)
+GATE_RECEIPT_ENV = (
+    "KIT_VERIFY_NONCE",
+    "KIT_VERIFY_AUTH_KEY",
+    "KIT_VERIFY_REPOSITORY_SHA256",
+    "KIT_NATIVE_RETRY_TOKEN",
 )
 
 
@@ -100,41 +108,29 @@ def _text(value: object) -> str:
 def _default_runner(
     command: Sequence[str], cwd: Path, timeout: int, environment: Mapping[str, str]
 ) -> ProcessOutcome:
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            [str(part) for part in command],
-            cwd=cwd,
-            env=dict(environment),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-        return ProcessOutcome(
-            completed.returncode,
-            completed.stdout or "",
-            completed.stderr or "",
-            time.monotonic() - started,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return ProcessOutcome(
-            None,
-            _text(exc.stdout),
-            _text(exc.stderr),
-            time.monotonic() - started,
-            timed_out=True,
-        )
-    except OSError as exc:
-        return ProcessOutcome(
-            None,
-            "",
-            "",
-            time.monotonic() - started,
-            launch_error=f"{type(exc).__name__}: {exc}",
-        )
+    outcome = process_supervisor.run_supervised(
+        [str(part) for part in command],
+        cwd=cwd,
+        timeout=timeout,
+        environment=dict(environment),
+        capture_output=True,
+        allow_child_breakaway=False,
+    )
+    containment_error = (
+        "child-process termination could not be verified"
+        if not outcome.termination_verified
+        else "child process was cancelled"
+        if outcome.cancelled
+        else ""
+    )
+    return ProcessOutcome(
+        outcome.returncode,
+        outcome.stdout or "",
+        outcome.stderr or "",
+        outcome.duration_seconds,
+        timed_out=outcome.timed_out and outcome.termination_verified,
+        launch_error=outcome.launch_error or containment_error,
+    )
 
 
 def _atomic_bytes(path: Path, content: bytes) -> None:
@@ -207,23 +203,14 @@ def _private_verification_root(root: Path) -> Path:
 @contextlib.contextmanager
 def _exclusive_run(lock_path: Path):
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
+        with process_supervisor.exclusive_file_lock(
+            lock_path, label="strict verification"
+        ):
+            yield
+    except process_supervisor.ExclusiveLockUnavailable as exc:
         raise StrictVerifyError(
-            f"another strict verification may be running ({lock_path})"
+            f"{exc} ({lock_path})"
         ) from exc
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as lock:
-            json.dump({"pid": os.getpid(), "started_at": _utc_now()}, lock, sort_keys=True)
-            lock.write("\n")
-            lock.flush()
-            os.fsync(lock.fileno())
-        yield
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _json_object(output: str) -> dict[str, Any] | None:
@@ -232,6 +219,12 @@ def _json_object(output: str) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _without_gate_receipt(environment: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: value for key, value in environment.items() if key not in GATE_RECEIPT_ENV
+    }
 
 
 def _classify_doctor(outcome: ProcessOutcome) -> tuple[str, str]:
@@ -276,6 +269,22 @@ def _classify_doctor(outcome: ProcessOutcome) -> tuple[str, str]:
     if unsupported:
         return "blocked", "missing required dependency: " + ", ".join(unsupported)
     return "passed", "read-only environment readiness is complete"
+
+
+def _classify_source_state(outcome: ProcessOutcome) -> tuple[str, str]:
+    if outcome.timed_out:
+        return "failed", "Git source-state check timed out"
+    if outcome.launch_error:
+        return "blocked", f"Git source-state check could not start: {outcome.launch_error}"
+    if outcome.returncode != 0:
+        return "blocked", "Git could not prove a clean, reconstructable source state"
+    dirty = [line for line in outcome.stdout.splitlines() if line.strip()]
+    if dirty:
+        return (
+            "blocked",
+            f"strict verification requires a clean source state ({len(dirty)} changed path(s))",
+        )
+    return "passed", "Git proved the source state is clean and reconstructable"
 
 
 def _maintainer_fixture_present(root: Path) -> bool:
@@ -436,6 +445,38 @@ def _release_metadata(root: Path) -> list[str]:
     return blockers
 
 
+def _authority_receipt_evidence(root: Path) -> dict[str, Any]:
+    proposal_path = root / "proposal.json"
+    shape_path = root / "project.shape.json"
+    if not proposal_path.is_file() or not shape_path.is_file():
+        return {
+            "receipt_trust": "no-exact-authority-event",
+            "receipt_reasons": ["no active portable proposal/decision pair"],
+        }
+    try:
+        proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+        shape = json.loads(shape_path.read_text(encoding="utf-8"))
+        if not isinstance(proposal, dict) or not isinstance(shape, dict):
+            raise ValueError("authority inputs must be objects")
+        state = proposal_authority.exact_approval_state(root, proposal, shape)
+        return {
+            "receipt_trust": str(state.get("receipt_trust") or "invalid"),
+            "receipt_reasons": [
+                str(reason) for reason in state.get("receipt_reasons", [])
+            ],
+        }
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        proposal_authority.AuthorityError,
+    ) as exc:
+        return {
+            "receipt_trust": "invalid",
+            "receipt_reasons": [f"authority evidence could not be projected: {exc}"],
+        }
+
+
 def _overall_status(stages: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
     statuses = {str(stage.get("status")) for stage in stages}
     if "failed" in statuses:
@@ -468,6 +509,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             "KIT_STRICT_VERIFY": "1",
             "KIT_TEST_TMPDIR": str(test_scratch),
             "NO_COLOR": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -480,6 +522,19 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
 
     with _exclusive_run(verification / "strict.lock"):
         commands = (
+            (
+                "source-state",
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                60,
+                _classify_source_state,
+            ),
             (
                 "doctor",
                 [sys.executable, str(root / "kit.py"), "doctor", "--json"],
@@ -524,6 +579,12 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                     }
                 )
                 continue
+            stage_environment = dict(environment)
+            if name != "gate":
+                # The outer public kit command binds one nonce to the single
+                # authoritative gate receipt. Doctor and the regression suite
+                # may invoke nested checks; they must not overwrite it.
+                stage_environment = _without_gate_receipt(stage_environment)
             stage, outcome = _run_stage(
                 name=name,
                 command=command,
@@ -532,13 +593,18 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 root=root,
                 run_directory=run_directory,
                 runner=selected_runner,
-                environment=environment,
+                environment=stage_environment,
             )
             stages.append(stage)
             if outcome.timed_out:
                 abort_remaining = (
                     "an earlier timeout may have left a child process; overlap refused"
                 )
+            if name == "source-state" and stage["status"] != "passed":
+                abort_remaining = (
+                    "source state is not clean and reconstructable; later commands were not started"
+                )
+                stage["reason"] += "; later commands were not started"
             if name == "doctor" and stage["status"] != "passed":
                 abort_remaining = (
                     "doctor did not prove readiness; later commands were not started"
@@ -612,7 +678,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                         root=root,
                         run_directory=run_directory,
                         runner=selected_runner,
-                        environment=environment,
+                        environment=_without_gate_receipt(environment),
                     )
                     stages.append(stage)
                     if outcome.timed_out:
@@ -687,6 +753,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             "run_id": run_id,
             "logs_directory": _relative(run_directory, root),
             "report_path": _relative(report_path, root),
+            "authority_receipt": _authority_receipt_evidence(root),
             "environment": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),

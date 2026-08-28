@@ -6,10 +6,12 @@ import contextlib
 import os
 import shutil
 import tempfile
+import types
 import unittest
 import uuid
 from pathlib import Path
 from typing import Iterator
+from unittest import mock
 
 import sys
 
@@ -223,6 +225,99 @@ class EngineDiscoveryTest(unittest.TestCase):
 
         self.assertIsNone(selected.path)
         self.assertEqual("not-found", selected.source)
+
+    def test_unversioned_candidate_requires_engine_reported_exact_version(self) -> None:
+        generic = self._file(self.base / "bin" / "godot.exe")
+        selection = engine_discovery.EngineSelection(
+            generic.resolve(), "path-generic", selected_version=None
+        )
+        result = types.SimpleNamespace(
+            exit_code=0,
+            output="4.7.2.stable.official.fixture\n",
+            failure_class=None,
+        )
+        runner = mock.Mock(return_value=result)
+
+        authenticated = engine_discovery.authenticate_godot(
+            self.root,
+            selection=selection,
+            operation="gdls-start",
+            runner=runner,
+        )
+
+        self.assertEqual(generic.resolve(), authenticated.path)
+        self.assertEqual("4.7.2", authenticated.version)
+        runner.assert_called_once_with(
+            generic.resolve(),
+            ["--headless", "--version"],
+            root=self.root.resolve(),
+            cwd=self.root.resolve(),
+            timeout=30,
+        )
+
+    def test_unversioned_non_engine_is_rejected_after_only_the_probe(self) -> None:
+        candidate = self._file(self.base / "unversioned-engine-candidate")
+        selection = engine_discovery.EngineSelection(
+            candidate, "environment", selected_version=None
+        )
+        result = types.SimpleNamespace(
+            exit_code=2,
+            output="unknown option --headless\n",
+            failure_class=None,
+        )
+        runner = mock.Mock(return_value=result)
+
+        with self.assertRaises(engine_discovery.EngineAuthenticationError) as caught:
+            engine_discovery.authenticate_godot(
+                self.root,
+                selection=selection,
+                operation="setup-import",
+                runner=runner,
+            )
+
+        self.assertEqual("engine_probe_failed", caught.exception.status)
+        self.assertEqual(1, runner.call_count)
+
+    def test_known_filename_mismatch_is_rejected_without_a_probe(self) -> None:
+        stale = self._file(self.base / "Godot_v4.7.1-stable_win64.exe")
+        selection = engine_discovery.EngineSelection(
+            stale.resolve(), "environment", selected_version="4.7.1"
+        )
+        runner = mock.Mock()
+
+        with self.assertRaises(engine_discovery.EngineAuthenticationError) as caught:
+            engine_discovery.authenticate_godot(
+                self.root,
+                selection=selection,
+                operation="godot-docs-build",
+                runner=runner,
+            )
+
+        self.assertEqual("engine_version_mismatch", caught.exception.status)
+        runner.assert_not_called()
+
+    def test_ambiguous_or_missing_reported_version_fails_closed(self) -> None:
+        generic = self._file(self.base / "bin" / "Godot.exe")
+        selection = engine_discovery.EngineSelection(
+            generic.resolve(), "path-generic", selected_version=None
+        )
+        for output in ("Godot Engine\n", "4.7.2 and 4.7.1\n"):
+            with self.subTest(output=output):
+                result = types.SimpleNamespace(
+                    exit_code=0,
+                    output=output,
+                    failure_class=None,
+                )
+                with self.assertRaises(
+                    engine_discovery.EngineAuthenticationError
+                ) as caught:
+                    engine_discovery.authenticate_godot(
+                        self.root,
+                        selection=selection,
+                        operation="gdls-start",
+                        runner=mock.Mock(return_value=result),
+                    )
+                self.assertEqual("engine_version_unknown", caught.exception.status)
 
 
 if __name__ == "__main__":

@@ -358,6 +358,8 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         plan = dump_dom(browser, f"http://127.0.0.1:{port}/plan.html", profile)
         s = "live/plan-banner"
         check(s, "body is board-live", "board-live" in body_class(plan))
+        check(s, "the cockpit banner is quiet while live",
+              banner(plan, "board-banner").strip() == "")
         rb = banner(plan, "retro-banner")
         check(s, "the plan says a retrospective is due", "retrospective is due" in rb, rb[:80])
         check(s, "the plan says findings are awaiting a decision",
@@ -382,7 +384,11 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               f"{disabled}/{total}")
 
         plan = dump_dom(browser, f"http://127.0.0.1:{port}/plan.html", profile)
-        check("live/board-down", "the plan banner degrades to nothing",
+        plan_banner = banner(plan, "board-banner")
+        check("live/board-down", "the plan shows the same cockpit outage",
+              "not reachable" in plan_banner and "kit serve" in plan_banner,
+              plan_banner[:80])
+        check("live/board-down", "retro state stays quiet while the cockpit is down",
               banner(plan, "retro-banner").strip() == "")
     finally:
         stop_board(proc)
@@ -393,19 +399,19 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         html = dump_dom(browser, url, profile)
         s = f"file/{page}"
         check(s, "body is board-file", "board-file" in body_class(html), body_class(html))
+        b = banner(html, "board-banner")
+        check(s, "the page says it is read-only because it is a file",
+              "Read-only" in b, b[:80])
+        check(s, "it says decisions need the loopback cockpit",
+              "loopback cockpit" in b)
         if page == "retro.html":
-            b = banner(html, "board-banner")
-            check(s, "the page says it is read-only because it is a file",
-                  "Read-only" in b, b[:80])
-            check(s, "it says approval and dispatch need the loopback board",
-                  "loopback board" in b)
             total, disabled = controls(html)
             check(s, "controls are disabled, not clickable-but-inert",
                   total > 0 and disabled == total, f"{disabled}/{total}")
             check(s, "the report and its prompts are still readable",
                   html.count("<pre>") > 0 and "prompt-block" in html)
         else:
-            check(s, "the plan banner is silent", banner(html, "retro-banner").strip() == "")
+            check(s, "the retro banner is silent", banner(html, "retro-banner").strip() == "")
 
     print(f"\n{checks - len(failures)}/{checks} browser checks passed")
     return 1 if failures else 0

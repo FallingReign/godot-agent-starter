@@ -7,10 +7,9 @@ GENERATED, never authored. Five sources, all machine-readable:
     proposal.json        the approved structure for the current slice
     arch.py --json       the real module graph, derived from code
     git                  what changed recently, and since approval
-    docs/                how the kit works: gate, rules, workflow
-    docs/design/         what the game is: settled design that code depends on
+    referenced docs/design/  only the player-experience sections this slice cites
 
-Documentation is rendered to HTML at generation time and inlined, not fetched.
+Referenced design is rendered to HTML at generation time and inlined, not fetched.
 file:// blocks fetch() in Chrome and Edge, so a plan opened by double-clicking
 cannot load a sibling .md at all. Inlining is the only approach that works for
 the way this page is actually opened.
@@ -27,7 +26,7 @@ it stood when the slice started, rather than as it stands after the damage.
 
 Diagrams use inert local markup, open questions retain stable decision IDs, and
 all paths are relative so the page works directly from disk or through the
-authenticated loopback board without an external wrapper.
+capability-protected loopback board without an external wrapper.
 """
 from __future__ import annotations
 
@@ -46,6 +45,11 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import md as markdown  # noqa: E402  (sibling module, not a package)
 import board_client  # noqa: E402  (shared generated-page navigation)
+import cockpit  # noqa: E402  (shared decision and verification view)
+import authored_scope  # noqa: E402  (shared inverse authored-game classifier)
+import gd_signature  # noqa: E402  (shared canonical GDScript signatures)
+import design as design_contract  # noqa: E402  (canonical design digests)
+import proposal_authority  # noqa: E402  (exact current/historical approval)
 import schema as artifact_schema  # noqa: E402  (shared artefact contract)
 import project_context  # noqa: E402  (shared configured roots)
 import release as kit_release  # noqa: E402  (authoritative fixed kit paths)
@@ -62,6 +66,10 @@ OUT = ROOT / "plan.html"
 SNAP_DIR = ROOT / "plan"
 
 DEPTH = {"hands-off": 0, "module": 1, "file": 2, "function": 3}
+
+
+class ArchitectureGraphError(RuntimeError):
+    """The implementation graph could not be proven from current source."""
 
 
 def load(path: Path) -> Dict[str, Any]:
@@ -178,6 +186,39 @@ def rows(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
             and not any(k.startswith("_") for k in i)]
 
 
+def question_relation(question: Dict[str, Any], proposal: Dict[str, Any]) -> str:
+    """Classify an open question against the current proposal.
+
+    Relation fields are optional so existing project shapes remain readable.
+    Their absence is surfaced as legacy/unscoped rather than interpreted as a
+    relation to every future slice.
+    """
+    related_slices = {
+        item.strip()
+        for item in question.get("related_slices", [])
+        if isinstance(item, str) and item.strip()
+    } if isinstance(question.get("related_slices"), list) else set()
+    related_design_refs = {
+        item.strip().replace("\\", "/")
+        for item in question.get("related_design_refs", [])
+        if isinstance(item, str) and item.strip()
+    } if isinstance(question.get("related_design_refs"), list) else set()
+    if not related_slices and not related_design_refs:
+        return "legacy"
+    active_slice = str(proposal.get("slice") or "").strip()
+    active_design_refs = {
+        str(item.get("section") or "").strip().replace("\\", "/")
+        for item in rows(proposal, "design_refs")
+        if item.get("section")
+    }
+    if (
+        (active_slice and active_slice in related_slices)
+        or bool(active_design_refs.intersection(related_design_refs))
+    ):
+        return "related"
+    return "other"
+
+
 def git(*args: str) -> Tuple[int, str]:
     if not shutil.which("git"):
         return 1, ""
@@ -189,32 +230,13 @@ def git(*args: str) -> Tuple[int, str]:
         return 1, ""
 
 
-SKIP_PREFIX = (
-    "tests/", "addons/", "tools/", ".checklogs/", ".git/", ".kit/",
-    ".godot/", ".godot_doc/",
-)
-ROOT_KIT_PREFIX = (
-    ".agents/", ".checklogs/", ".git/", ".github/", ".kit/",
-    ".godot_doc/", "docs/", "plan/",
-)
-ROOT_PROJECT_STATE = {
-    "plan.html", "retro.html", "project.shape.json", "proposal.json",
-    "retro.config.json",
-}
-SKIP_SUFFIX = (".import", ".uid")
-
-
 def is_authored_game_file(rel: str) -> bool:
     """Return whether a ``res://``-relative path is authored game content."""
-    if rel == "project.godot" or rel.startswith(SKIP_PREFIX):
-        return False
-    if CONTEXT.game_layout == "." and (
-        rel in ROOT_PROJECT_STATE
-        or rel.startswith(ROOT_KIT_PREFIX)
-        or kit_release.is_allowlisted(rel)
-    ):
-        return False
-    return not rel.endswith(SKIP_SUFFIX)
+    return authored_scope.is_authored_game_file(
+        rel,
+        game_layout=CONTEXT.game_layout,
+        is_kit_file=kit_release.is_allowlisted,
+    )
 
 
 def real_files() -> set:
@@ -235,6 +257,23 @@ def real_files() -> set:
             if is_authored_game_file(rel):
                 out.add(rel)
     return out
+
+
+def authored_modules(files: set[str]) -> set[str]:
+    """Module existence comes from every authored input, not only code edges."""
+    try:
+        rules = json.loads((ROOT / "arch.rules.json").read_text(encoding="utf-8"))
+        depth = max(1, int(rules.get("module_depth", 2)))
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+        depth = 2
+    modules: set[str] = set()
+    for relative in files:
+        parent = str(Path(relative).parent).replace("\\", "/")
+        if parent in ("", "."):
+            modules.add("(root)")
+        else:
+            modules.add("/".join(parent.split("/")[:depth]))
+    return modules
 
 
 def touched_since(baseline: str) -> set | None:
@@ -276,10 +315,21 @@ def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
         p = subprocess.run([sys.executable, str(script), "--json"],
                            capture_output=True, text=True, timeout=60)
         data = json.loads(p.stdout) if p.stdout.strip() else {}
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return [], "", {}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise ArchitectureGraphError(
+            f"arch.py did not return a readable graph: {exc}"
+        ) from exc
     if not isinstance(data, dict):
-        return [], "", {}
+        raise ArchitectureGraphError("arch.py returned a non-object graph")
+    errors = data.get("errors")
+    if isinstance(errors, list) and errors:
+        detail = "; ".join(str(error) for error in errors if str(error).strip())
+        raise ArchitectureGraphError(detail or "arch.py reported a source error")
+    if getattr(p, "returncode", 0) != 0 and not data.get("modules"):
+        detail = str(getattr(p, "stderr", "") or "").strip()
+        raise ArchitectureGraphError(
+            detail or f"arch.py exited {p.returncode} without a graph"
+        )
     # arch.py emits modules as {path: [dependencies]}.
     raw = data.get("modules")
     mods: List[Dict[str, Any]] = []
@@ -317,7 +367,8 @@ def recent(limit: int = 12) -> List[Dict[str, str]]:
 
 def read_docs(folder: Path, prefix: str,
               skip: Optional[Path] = None,
-              targets: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+              targets: Optional[Dict[str, str]] = None,
+              only: Optional[set[str]] = None) -> List[Dict[str, str]]:
     """Documentation, with its body pre-rendered to HTML and inlined.
 
     Rendered here rather than fetched in the browser because file:// forbids
@@ -340,6 +391,10 @@ def read_docs(folder: Path, prefix: str,
         # twice with a duplicate anchor.
         if skip is not None and skip in f.parents:
             continue
+        rel = f.relative_to(folder).as_posix()
+        source = f"{prefix}{rel}"
+        if only is not None and source not in only:
+            continue
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -353,8 +408,6 @@ def read_docs(folder: Path, prefix: str,
         # rendered pane rather than to raw markdown the browser will not format.
         anchor = "doc-" + re.sub(r"[^a-z0-9]+", "-",
                                  f"{prefix}{f.relative_to(folder).as_posix()}".lower()).strip("-")
-        rel = f.relative_to(folder).as_posix()
-        source = f"{prefix}{rel}"
         if targets:
             text = rewrite_doc_links(text, source, targets)
         out.append({"path": source, "title": title,
@@ -385,17 +438,21 @@ def documentation_targets(specs: List[Tuple[Path, str, Optional[Path]]]) -> Dict
 
 def rewrite_doc_links(text: str, source: str,
                       targets: Dict[str, str]) -> str:
-    """Point local Markdown links at their inlined document panes."""
+    """Point local docs at inlined panes or the board's safe asset surface."""
     pattern = re.compile(r"(\]\()([^\s)]+)")
     base = source.rsplit("/", 1)[0]
 
     def replace(match: "re.Match[str]") -> str:
         url = match.group(2)
-        if not url.lower().endswith(".md") or url.startswith(("#", "/")):
+        if url.startswith(("#", "/")) or re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I):
             return match.group(0)
-        target = posixpath.normpath(posixpath.join(base, url))
-        anchor = targets.get(target)
-        return f"{match.group(1)}{anchor}" if anchor else match.group(0)
+        clean, suffix = re.match(r"^([^?#]*)(.*)$", url).groups()
+        target = posixpath.normpath(posixpath.join(base, clean))
+        if not target.startswith("docs/design/"):
+            return match.group(0)
+        anchor = targets.get(target) if clean.lower().endswith(".md") else None
+        destination = anchor or "/" + target + suffix
+        return f"{match.group(1)}{destination}"
 
     return pattern.sub(replace, text)
 
@@ -485,6 +542,7 @@ code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size
 padding:1.5px 7px;border-radius:9px;border:1px solid var(--line);color:var(--dim)}
 .tag.built{color:var(--ok);border-color:#1f4d2b}
 .tag.missing{color:var(--warn);border-color:#5a4410}
+.tag.deleted{color:#8bd3ff;border-color:#285a73}
 .tag.extra{color:var(--bad);border-color:#5c2224}
 .tag.new{color:#7fd4ff;border-color:#1d4a63}
 .tag.modified{color:#d8b4fe;border-color:#4a2f63}
@@ -581,6 +639,19 @@ border-radius:7px;padding:11px 13px}
 .decision-card .answer{color:#c5ced8;font-size:12.5px}
 .decision-card ul{margin:6px 0 0;padding-left:19px;color:#c5ced8}
 .decision-card code{user-select:all}
+.decision-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.decision-actions button{border:1px solid var(--line);border-radius:6px;background:#202735;
+color:var(--fg);padding:7px 11px;cursor:pointer;font-weight:600}
+.decision-actions button.approve{background:#15351f;border-color:#2f7d48}
+.decision-actions button.veto{background:#36191a;border-color:#7d3033}
+.decision-comment{width:100%;min-height:64px;margin-top:9px;padding:8px 10px;
+border:1px solid var(--line);border-radius:6px;background:#0d1117;color:var(--fg);
+font:13px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.fact-list{display:grid;gap:5px;font-size:12.5px;color:#c5ced8}
+.fact-list b{color:var(--dim);font-size:11px;text-transform:uppercase;
+letter-spacing:.05em;margin-right:5px}
+.design-disclosure{border-top:1px solid var(--line);margin-top:5px;padding-top:7px}
+.design-excerpt{white-space:pre-wrap;margin-top:3px;color:#c5ced8}
 .clear{background:#101b14;border-color:#1f4d2b;border-left-color:var(--ok)}
 .record{margin-top:22px;border:1px solid var(--line);border-radius:9px;background:#11141b}
 .record>summary{cursor:pointer;padding:14px 16px;font-weight:650;list-style:none}
@@ -611,17 +682,64 @@ RETRO_BANNER_JS = """
   B.onState(function(state){
     var parts = [];
     var due = (state && state.retro_due) || {};
+    var providers = (state && state.providers) || {};
+    var analyzer = providers.analyzer || {kind:'manual', automatic:false};
     var findings = (state && state.findings) || [];
     var waiting = findings.filter(function(f){
       return (f.state || 'awaiting_review') === 'awaiting_review';
     }).length;
 
+    var evidenceWarnings = Array.isArray(due.warnings) ? due.warnings : [];
+    if(evidenceWarnings.length){
+      var shownWarnings = evidenceWarnings.slice(0, 3).map(function(item){
+        if(!item || typeof item !== 'object') return 'unclassified warning';
+        var code = String(item.code || 'unclassified warning').slice(0, 96);
+        var note = String(item.note || '').slice(0, 96);
+        var value = String(item.value || '').slice(0, 96);
+        return code + (note ? ' (' + note + ')' : '')
+          + (value ? ': ' + value : '');
+      });
+      var remainingWarnings = evidenceWarnings.length - shownWarnings.length;
+      parts.push('<div class="rb due"><b>Retrospective evidence warning:</b> '
+        + shownWarnings.map(B.esc).join('; ')
+        + (remainingWarnings ? '; +' + B.esc(remainingWarnings) + ' more' : '')
+        + '. Classification may be incomplete.'
+        + '<a href="/retro.html">Inspect the evidence</a></div>');
+    }
+
     if(due.due){
-      parts.push('<div class="rb due"><b>A retrospective is due.</b> '
-        + B.esc(due.unarchived) + ' unarchived slice note'
-        + (Number(due.unarchived) === 1 ? '' : 's')
-        + ' against a threshold of ' + B.esc(due.threshold) + '. '
-        + 'Running one spends quota.'
+      function triggerCodes(entries){
+        return (entries || []).map(function(item){
+          return item && item.code ? String(item.code) : '';
+        }).filter(function(code){ return !!code; });
+      }
+      var immediate = triggerCodes(due.immediate_consequences);
+      var prompted = triggerCodes(due.prompt_triggers);
+      var reason = '';
+      if(immediate.length){
+        reason = '<b>Immediate retrospective consequence: '
+          + immediate.map(B.esc).join(', ') + '.</b> Review this before routine note count.';
+      }else if(prompted.length){
+        reason = '<b>Retrospective trigger: ' + prompted.map(B.esc).join(', ')
+          + '.</b> The declared pattern warrants review now.';
+      }else{
+        reason = '<b>Routine retrospective is due.</b> ' + B.esc(due.unarchived)
+          + ' unarchived slice note' + (Number(due.unarchived) === 1 ? '' : 's')
+          + ' reached the threshold of ' + B.esc(due.threshold) + '.';
+      }
+      var execution = '';
+      var blockers = analyzer.blockers || [];
+      if(!analyzer.automatic || analyzer.kind === 'manual'){
+        execution = ' Deterministic local evidence is available for a manual handoff; '
+          + 'opening this cockpit calls no model and spends no provider quota.';
+      }else if(analyzer.ready !== false && blockers.length === 0){
+        execution = ' The automatic analyzer is ready. Explicitly running it may spend provider quota.';
+      }else{
+        execution = ' Automatic analysis is blocked: ' + B.esc(blockers.join('; ')
+          || 'the configured adapter is unavailable')
+          + '. Deterministic local evidence remains available.';
+      }
+      parts.push('<div class="rb due">' + reason + execution
         + '<a href="/retro.html">Open the retrospective board</a></div>');
     }
     if(waiting){
@@ -636,6 +754,53 @@ RETRO_BANNER_JS = """
 </script>
 """
 
+PLAN_DECISION_JS = """
+<script>
+(function(){
+  var B = window.Board;
+  var host = document.getElementById('plan-decision-controls')
+    || document.getElementById('plan-reconsider-controls')
+    || document.getElementById('plan-recorded-controls');
+  var sentinel = document.getElementById('plan-live-state');
+  if(!B || !sentinel) return;
+  var fingerprint = String(sentinel.getAttribute('data-plan-fingerprint') || '');
+  var comment = host ? host.querySelector('.decision-comment') : null;
+  var buttons = host ? host.querySelectorAll('[data-plan-action]') : [];
+  function decide(button){
+    var action = String(button.getAttribute('data-plan-action') || '');
+    var reason = comment ? String(comment.value || '').trim() : '';
+    if(action !== 'approve' && !reason){
+      B.showError('Say what must change before vetoing or requesting changes.');
+      if(comment) comment.focus();
+      return;
+    }
+    B.guard(Array.prototype.slice.call(buttons), 'recording\u2026', function(){
+      return B.request('/api/plan/decision', {method:'POST', body:{
+        action:action, fingerprint:fingerprint, comment:reason
+      }}).then(function(result){
+        if(!result.ok){ B.reportIfFailed(result); return result; }
+        window.location.reload();
+        return result;
+      });
+    });
+  }
+  if(host){
+    for(var i=0; i<buttons.length; i++){
+      buttons[i].addEventListener('click', (function(button){
+        return function(){ decide(button); };
+      })(buttons[i]));
+    }
+  }
+  B.onState(function(state){
+    var live = state && state.plan;
+    if(!fingerprint || !live || !live.fingerprint || live.fingerprint === fingerprint) return;
+    for(var i=0; i<buttons.length; i++) buttons[i].disabled = true;
+    B.showError('The plan or bound design changed after this page loaded. Refresh before continuing.');
+  });
+})();
+</script>
+"""
+
 
 def state_tag(state: str) -> str:
     """Labels a reader can act on.
@@ -645,7 +810,8 @@ def state_tag(state: str) -> str:
     a problem, so they get different words.
     """
     label = {"built": "built", "missing": "to do", "extra": "unproposed",
-             "modified": "modified", "new": "new", "existing": "existing"}[state]
+             "modified": "modified", "new": "new", "existing": "existing",
+             "deleted": "deleted"}[state]
     return f'<span class="tag {state}">{label}</span>'
 
 
@@ -673,9 +839,39 @@ def approved_history() -> Dict[str, Any]:
             if code != 0:
                 continue
             obj = json.loads(blob)
+            shape_code, shape_blob = git("show", f"{sha}:project.shape.json")
+            if shape_code != 0:
+                continue
+            shape = json.loads(shape_blob)
         except Exception:
             continue
-        if str(obj.get("status", "")).strip() != "approved":
+        design_digests: Dict[str, str] = {}
+        refs = obj.get("design_refs") if isinstance(obj, dict) else []
+        valid_material = True
+        for ref in refs if isinstance(refs, list) else []:
+            if not isinstance(ref, dict):
+                valid_material = False
+                break
+            section = str(ref.get("section") or "")
+            if (
+                not section.startswith("docs/design/")
+                or "\\" in section
+                or ".." in section.split("/")
+                or not section.endswith(".md")
+            ):
+                valid_material = False
+                break
+            design_code, design_blob = git("show", f"{sha}:{section}")
+            if design_code != 0:
+                valid_material = False
+                break
+            design_digests[section] = design_contract.design_sha256(design_blob)
+        if not valid_material:
+            continue
+        exact = proposal_authority.exact_approval_material(
+            obj, shape if isinstance(shape, dict) else {}, design_digests
+        )
+        if not exact["approved"]:
             continue
         for key in out:
             for item in obj.get(key, []) or []:
@@ -687,7 +883,10 @@ def approved_history() -> Dict[str, Any]:
                 if ident in seen:
                     continue
                 seen.add(ident)
-                out[key].append(item)
+                # Newest commit wins. A delete is a tombstone, not a historic
+                # approval that should keep the removed thing green forever.
+                if str(item.get("action") or "") != "delete":
+                    out[key].append(item)
     return out
 
 
@@ -707,6 +906,8 @@ def file_state(path: str, prop_files: Dict[str, Any], built: set,
             return "existing"
         return "extra"
     act = str(meta.get("action", "") or "")
+    if act == "delete" and path not in built:
+        return "deleted"
     if path in built:
         return {"new": "new", "modify": "modified"}.get(act, "built")
     return "missing"
@@ -736,16 +937,43 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
     # function approved in slices 0-2 as "exists without approval", which makes
     # the diagram cry wolf -- worse than showing no state at all.
     hist = history or {"files": [], "modules": [], "functions": []}
-    prop_funcs: Dict[str, set] = {}
-    for fn_ in list(rows(prop, "functions")) + list(rows(hist, "functions")):
+    # GDScript has no overloads, so one file/name pair has one current approved
+    # signature. Historical proposals are newest-first; the first occurrence
+    # wins, then the current proposal overrides it (including deletions).
+    prop_funcs: Dict[str, Dict[str, str]] = {}
+    seen_history: set[Tuple[str, str]] = set()
+    for fn_ in rows(hist, "functions"):
         f = str(fn_.get("file", "")).strip().replace("\\", "/")
         sig = str(fn_.get("signature", "") or "")
-        # Match on the function name: a proposed signature is rarely
-        # character-identical to what gets written, and comparing whole strings
-        # would report every implemented function as missing.
-        m = re.search(r"func\s+([A-Za-z_]\w*)", sig)
-        if f and m:
-            prop_funcs.setdefault(f, set()).add(m.group(1))
+        try:
+            parsed = gd_signature.parse_proposal_signature(sig)
+        except gd_signature.SignatureError:
+            # Legacy malformed history is not authority. Current proposal
+            # signatures are rejected by schema validation before rendering.
+            continue
+        class_scope = str(fn_.get("class_scope") or "").strip()
+        identity = f"{class_scope}.{parsed.name}" if class_scope else parsed.name
+        key = (f, identity)
+        if not f or key in seen_history:
+            continue
+        seen_history.add(key)
+        if str(fn_.get("action", "") or "") != "delete":
+            prop_funcs.setdefault(f, {})[identity] = parsed.canonical
+    for fn_ in rows(prop, "functions"):
+        f = str(fn_.get("file", "")).strip().replace("\\", "/")
+        sig = str(fn_.get("signature", "") or "")
+        try:
+            parsed = gd_signature.parse_proposal_signature(sig)
+        except gd_signature.SignatureError:
+            continue
+        if not f:
+            continue
+        class_scope = str(fn_.get("class_scope") or "").strip()
+        identity = f"{class_scope}.{parsed.name}" if class_scope else parsed.name
+        if str(fn_.get("action", "") or "") == "delete":
+            prop_funcs.setdefault(f, {}).pop(identity, None)
+        else:
+            prop_funcs.setdefault(f, {})[identity] = parsed.canonical
 
     hist_files = {str(f.get("path", "")).strip().replace("\\", "/")
                   for f in rows(hist, "files") if f.get("path")}
@@ -773,7 +1001,9 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
         return text.replace('"', "'").replace("\n", " ")
 
     lines = ["graph LR"]
-    states: Dict[str, List[str]] = {"built": [], "missing": [], "extra": []}
+    states: Dict[str, List[str]] = {
+        "built": [], "missing": [], "extra": [], "deleted": []
+    }
 
     root = nid("res://")
     lines.append(f'    {root}(["res://"])')
@@ -794,9 +1024,15 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
             lines.append(f'    {n}["{label(parts[i])}/"]')
             lines.append(f"    {parent} --> {n}")
             if sub in approved_mods:
-                states["built" if any(f.startswith(sub + "/") and f in built
-                                      for f in show)
-                       else "missing"].append(n)
+                module_meta = prop_mods.get(sub, {})
+                if module_meta.get("action") == "delete" and not any(
+                    f.startswith(sub + "/") and f in built for f in show
+                ):
+                    states["deleted"].append(n)
+                else:
+                    states["built" if any(f.startswith(sub + "/") and f in built
+                                          for f in show)
+                           else "missing"].append(n)
             elif any(f.startswith(sub + "/") and f not in approved_files
                      for f in show):
                 states["extra"].append(n)
@@ -810,8 +1046,13 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
             parent = nid(str(Path(f).parent).replace("\\", "/"))
         proposed = f in approved_files
         exists = f in built
-        st = "built" if (proposed and exists) else ("missing" if proposed
-                                                    else "extra")
+        action = str(prop_files.get(f, {}).get("action") or "")
+        st = (
+            "deleted" if proposed and action == "delete" and not exists
+            else "built" if proposed and exists
+            else "missing" if proposed
+            else "extra"
+        )
         n = nid(f)
         lines.append(f'    {n}["{label(Path(f).name)}"]')
         lines.append(f"    {parent} --> {n}")
@@ -820,24 +1061,47 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
         if depth < 3:
             continue
         real = tree.get(f, {})
-        real_names = {fn_["name"] for fn_ in real.get("functions", [])
-                      if isinstance(fn_, dict) and fn_.get("name")}
-        want = prop_funcs.get(f, set())
+        wanted_by_identity = prop_funcs.get(f, {})
+        observed_identities: set[str] = set()
         for fn_ in real.get("functions", []):
             if not isinstance(fn_, dict):
                 continue
+            raw_signature = str(fn_.get("signature", "") or "")
+            try:
+                real_signature = gd_signature.parse_proposal_signature(
+                    raw_signature
+                ).canonical
+            except gd_signature.SignatureError:
+                # Invalid architecture data must never satisfy a proposal. The
+                # arch.py producer normally rejects it before the plan runs.
+                real_signature = ""
+            real_identity = str(fn_.get("identity") or fn_.get("name") or "")
             # Engine callbacks are noise in a design view: nobody proposes
             # _ready, and listing them drowns the functions that were.
-            if fn_.get("private") and fn_["name"] not in want:
+            if fn_.get("private") and real_identity not in wanted_by_identity:
                 continue
-            fst = "built" if fn_["name"] in want else "extra"
-            fnid = nid(f + "::" + fn_["name"])
-            lines.append(f'    {fnid}("{label(str(fn_.get("signature", "")))}")')
+            matches_reviewed_signature = (
+                wanted_by_identity.get(real_identity) == real_signature
+            )
+            if matches_reviewed_signature and real_identity:
+                observed_identities.add(real_identity)
+            fst = "built" if matches_reviewed_signature else "extra"
+            display = (
+                f"{real_identity}: {raw_signature}"
+                if "." in real_identity else raw_signature
+            )
+            fnid = nid(f + "::" + (real_identity or real_signature or raw_signature))
+            lines.append(f'    {fnid}("{label(display)}")')
             lines.append(f"    {nid(f)} --> {fnid}")
             states[fst].append(fnid)
-        for missing in sorted(want - real_names):
-            fnid = nid(f + "::" + missing)
-            lines.append(f'    {fnid}("{label(missing)}()")')
+        for missing_identity in sorted(set(wanted_by_identity) - observed_identities):
+            missing = wanted_by_identity[missing_identity]
+            fnid = nid(f + "::" + missing_identity)
+            display = (
+                f"{missing_identity}: {missing}"
+                if "." in missing_identity else missing
+            )
+            lines.append(f'    {fnid}("{label(display)}")')
             lines.append(f"    {nid(f)} --> {fnid}")
             states["missing"].append(fnid)
 
@@ -846,6 +1110,7 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
     lines.append("    classDef missing fill:#33290f,stroke:#b08b2a,"
                  "color:#f6e6bd,stroke-dasharray:4 3")
     lines.append("    classDef extra fill:#3a1620,stroke:#c0485f,color:#ffdbe3")
+    lines.append("    classDef deleted fill:#102b3a,stroke:#3a9cc4,color:#d7f3ff")
     for st, nodes in states.items():
         if nodes:
             lines.append(f"    class {','.join(sorted(set(nodes)))} {st}")
@@ -861,9 +1126,11 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
            history: Dict[str, Any] | None = None,
            doc_targets: Dict[str, str] | None = None,
            changed: set | None = None,
-           deleted: set | None = None) -> str:
+           deleted: set | None = None,
+           cockpit_state: Dict[str, Any] | None = None) -> str:
     level = str(shape.get("involvement", "") or "").strip()
     depth = DEPTH.get(level, 3)
+    cockpit_state = cockpit_state if isinstance(cockpit_state, dict) else {}
     name = shape.get("name") or "Untitled"
     pitch = shape.get("pitch") or ""
 
@@ -878,11 +1145,22 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     a(f"<h1>{esc(name)}</h1>")
     if pitch:
         a(f'<p class="sub">{esc(pitch)}</p>')
-    status = str(prop.get("status", "") or "").strip().lower()
+    status = str(
+        cockpit_state.get("status") or prop.get("status", "") or ""
+    ).strip().lower()
     if status == "draft" and depth > 0:
         a('<div class="banner draft"><b>Draft awaiting your review.</b> '
-          "Nothing has been built against this yet. Read it, then tell the "
-          "agent to approve it or what to change.</div>")
+          "Review the player outcome, design authority, and veto envelope below.</div>")
+    elif status == "recorded" and not bool(cockpit_state.get("approval_required")):
+        a('<div class="banner ok"><b>Recorded reversible work.</b> '
+          "The agent may continue only inside the stated veto envelope and must stop at "
+          "the next go/no-go point.</div>")
+    elif status == "recorded-stale" or (
+            status == "recorded" and bool(cockpit_state.get("approval_required"))):
+        a('<div class="banner draft"><b>Autonomous continuation is blocked.</b> '
+          + esc(str(cockpit_state.get("approval_blocker") or
+                    "The recorded design or reversible envelope is no longer exact."))
+          + " Revise and re-record the plan before implementation continues.</div>")
     elif status == "approved":
         who = prop.get("approved_by") or ""
         when = prop.get("approved_on") or ""
@@ -890,6 +1168,12 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
           + (f" by {esc(str(who))}" if who else "")
           + (f" on {esc(str(when))}" if when else "")
           + ". Colours below show what has been built against it.</div>")
+    elif status == "approval-stale":
+        reasons = cockpit_state.get("exact_approval", {}).get("reasons", []) \
+            if isinstance(cockpit_state.get("exact_approval"), dict) else []
+        a('<div class="banner draft"><b>Stored approval is not valid evidence.</b> '
+          + esc("; ".join(str(item) for item in reasons) or "The exact authority chain is stale.")
+          + " Return the proposal to draft and review it again.</div>")
 
     bits = [f"involvement <b>{esc(level or 'unset')}</b>"]
     if snapshot:
@@ -902,27 +1186,22 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     # renders nothing at all rather than an error (it must never make the plan
     # look broken to say something optional).
     a('<div id="retro-banner"></div>')
-    # The plan has no board controls and therefore needs no connectivity
-    # banner, but a page/server protocol mismatch is security-relevant and
-    # must remain visible instead of falling through to console-only output.
-    a('<div id="board-errors"></div>')
+    a(board_client.shell_html())
 
     # ---- decision-first front door. The old page put the current decision,
     # the implementation tree, every historical decision and every document
     # at one visual level. Preserve that record below, but first answer the
     # three questions a reviewer actually arrives with: what are we trying to
     # achieve, what needs my decision, and what evidence changed since approval?
-    front_questions = rows(shape, "questions")
+    all_questions = rows(shape, "questions")
+    front_questions = [
+        question for question in all_questions
+        if question_relation(question, prop) == "related"
+    ]
     front_refs = [r for r in rows(prop, "design_refs") if r.get("section")]
     front_slice = str(prop.get("slice", "") or "").strip()
-    front_acks = {
-        str(x.get("warning", "") or "").strip(): x
-        for x in rows(prop, "acknowledged")
-        if str(x.get("slice", "") or "").strip() == front_slice
-    }
-    front_has_struct = any(rows(prop, key) for key in ("modules", "files", "functions"))
-    needs_design_decision = (front_has_struct and not front_refs
-                             and "no-design-refs" not in front_acks)
+    front_has_struct = any(rows(prop, key) for key in ("scope", "modules", "files", "functions"))
+    needs_design_decision = front_has_struct and not front_refs
     front_prop_files = {
         str(f.get("path", "")).strip().replace("\\", "/")
         for f in rows(prop, "files") if f.get("path")
@@ -936,10 +1215,40 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         if file_state(path, {path: {}}, built, front_history) == "missing"
     )
     deleted_paths = set(deleted or ())
-    extra_paths = sorted((changed or set()) - front_prop_files)
-    decision_count = (1 if status == "draft" else 0) + len(front_questions)
+    changed_paths = set(changed or ())
+    if depth == 0:
+        scope_rows = rows(prop, "scope")
+        def inside_scope(path: str) -> bool:
+            for boundary in scope_rows:
+                raw = str(boundary.get("path") or "")
+                if boundary.get("kind") == "file" and path == raw:
+                    return True
+                if boundary.get("kind") == "directory" and (
+                    path == raw or path.startswith(raw.rstrip("/") + "/")
+                ):
+                    return True
+            return False
+        extra_paths = sorted(path for path in changed_paths if not inside_scope(path))
+    elif depth == 1:
+        declared_modules = {
+            str(item.get("path") or "").rstrip("/") for item in rows(prop, "modules")
+            if item.get("path")
+        }
+        extra_paths = sorted(
+            path for path in changed_paths
+            if not any(path == module or path.startswith(module + "/")
+                       for module in declared_modules)
+        )
+    else:
+        extra_paths = sorted(changed_paths - front_prop_files)
+    approval_required = bool(cockpit_state.get("approval_required", status == "draft"))
+    approval_available = bool(cockpit_state.get("approval_available", True))
+    recorded_decision_available = bool(
+        cockpit_state.get("recorded_decision_available", False)
+    )
+    decision_count = (1 if approval_required else 0) + len(front_questions)
     decision_count += 1 if needs_design_decision else 0
-    decision_count += 1 if status == "approved" and extra_paths else 0
+    decision_count += 1 if status in ("approved", "recorded", "recorded-stale") and extra_paths else 0
     exp = prop.get("experience")
     player_does = (str(exp.get("player_does", "") or "").strip()
                    if isinstance(exp, dict) else "")
@@ -947,19 +1256,36 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                   if isinstance(exp, dict) else "")
     outcome = player_does or front_slice or pitch or "No active outcome has been recorded."
 
-    a('<section class="front" aria-label="Plan summary">')
+    live_fingerprint = str(cockpit_state.get("fingerprint") or "")
+    a(f'<section class="front" id="plan-live-state" '
+      f'data-plan-fingerprint="{esc(live_fingerprint)}" aria-label="Plan summary">')
     a('<div class="front-grid">')
-    a('<div class="front-card"><h2>Current outcome</h2>')
+    quick = cockpit_state.get("quick_read") if isinstance(cockpit_state.get("quick_read"), dict) else {}
+    authority = (cockpit_state.get("design_authority")
+                 if isinstance(cockpit_state.get("design_authority"), dict) else {})
+    authority_trust = str(cockpit_state.get("authority_trust") or "").strip()
+    reversibility = (cockpit_state.get("reversibility")
+                     if isinstance(cockpit_state.get("reversibility"), dict) else {})
+    go_no_go = (cockpit_state.get("go_no_go")
+                if isinstance(cockpit_state.get("go_no_go"), dict) else {})
+    verification = (cockpit_state.get("verification")
+                    if isinstance(cockpit_state.get("verification"), dict) else {})
+
+    a('<div class="front-card"><h2>Quick read</h2>')
     a(f'<div class="outcome">{esc(outcome)}</div>')
     if feels_like:
         a(f'<div class="m">Intended feel: {esc(feels_like)}</div>')
     if front_slice and player_does:
         a(f'<div class="m mono">slice {esc(front_slice)}</div>')
+    not_this = str(quick.get("not_this") or (exp.get("not_this") if isinstance(exp, dict) else "") or "").strip()
+    if not_this:
+        a(f'<div class="m">Not this: {esc(not_this)}</div>')
     a('<div class="front-meta">')
-    status_label = ("approval required" if status == "draft" else
+    status_label = ("approval required" if approval_required else
+                    "recorded reversible" if status == "recorded" else
                     "approved" if status == "approved" else
                     status or "not proposed")
-    status_cls = "warn" if status == "draft" else "ok" if status == "approved" else ""
+    status_cls = "warn" if approval_required else "ok" if status in ("approved", "recorded") else ""
     a(f'<span class="metric {status_cls}">{esc(status_label)}</span>')
     a(f'<span class="metric{(" bad" if decision_count else " ok")}">'
       f'{decision_count} decision{("" if decision_count == 1 else "s")} needed</span>')
@@ -972,7 +1298,16 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
           f'{("" if len(extra_paths) == 1 else "s")}</span>')
     a('</div></div>')
 
-    a('<div class="front-card"><h2>Latest evidence</h2>')
+    a('<div class="front-card"><h2>Latest verification</h2>')
+    verify_status = str(verification.get("status") or "not-run")
+    verify_cls = "ok" if verify_status == "fresh" else "bad" if verify_status == "failed" else "warn"
+    a(f'<div class="front-meta"><span class="metric {verify_cls}">{esc(verify_status)}</span></div>')
+    if verification.get("failure_class"):
+        a(f'<div class="m mono">{esc(verification.get("failure_class"))}</div>')
+    if verification.get("summary"):
+        a(f'<div class="m">{esc(verification.get("summary"))}</div>')
+    if verification.get("recorded_at"):
+        a(f'<div class="m mono">{esc(verification.get("recorded_at"))}</div>')
     baseline = str(prop.get("baseline_sha", "") or "").strip()
     if baseline:
         a(f'<div class="t">Compared with <code>{esc(baseline[:12])}</code></div>')
@@ -985,20 +1320,84 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         if deleted_paths:
             a(f'<div class="m">{len(deleted_paths)} of those '
               f'{("was" if len(deleted_paths) == 1 else "were")} deleted.</div>')
-    a('<div class="m" style="margin-top:8px">Observed repository change scope, not a '
-      'completion claim. Only verification can prove the result.</div>')
+    a('<div class="m" style="margin-top:8px">Repository change scope is context; the '
+      'verification state above is the completion evidence.</div>')
     a('</div></div>')
+
+    a('<div class="front-grid">')
+    a('<div class="front-card"><h2>Design authority</h2><div class="fact-list">')
+    a(f'<div><b>Authority</b>{esc(authority.get("authority") or authority.get("status") or "not recorded")}</div>')
+    if authority.get("authored_by"):
+        a(f'<div><b>Authored by</b>{esc(authority.get("authored_by"))}</div>')
+    if authority.get("confidence"):
+        a(f'<div><b>Confidence</b>{esc(authority.get("confidence"))}</div>')
+    if authority.get("summary"):
+        a(f'<div>{esc(authority.get("summary"))}</div>')
+    if authority_trust:
+        a(f'<div><b>Trust boundary</b>{esc(authority_trust)}</div>')
+    disclosures = authority.get("disclosures")
+    if isinstance(disclosures, list):
+        for disclosure in disclosures:
+            if not isinstance(disclosure, dict):
+                continue
+            a('<div class="design-disclosure">')
+            a(f'<div><b>Design section</b><code>{esc(disclosure.get("section"))}</code></div>')
+            if disclosure.get("quick_read"):
+                a(f'<div><b>Quick read</b><div class="design-excerpt">'
+                  f'{esc(disclosure.get("quick_read"))}</div></div>')
+            if disclosure.get("why_inference"):
+                a(f'<div><b>Why this inference</b>{esc(disclosure.get("why_inference"))}</div>')
+            if disclosure.get("assumptions"):
+                a(f'<div><b>Assumptions</b>{esc(disclosure.get("assumptions"))}</div>')
+            if disclosure.get("veto_and_go_no_go"):
+                a(f'<div><b>Veto and go/no-go</b><div class="design-excerpt">'
+                  f'{esc(disclosure.get("veto_and_go_no_go"))}</div></div>')
+            a('</div>')
+    a('</div></div>')
+    a('<div class="front-card"><h2>Reversibility and go/no-go</h2><div class="fact-list">')
+    a(f'<div><b>State</b>{esc(reversibility.get("state") or reversibility.get("status") or "not recorded")}</div>')
+    if reversibility.get("veto_scope"):
+        a(f'<div><b>Veto scope</b>{esc(reversibility.get("veto_scope"))}</div>')
+    if reversibility.get("hard_to_undo"):
+        a(f'<div><b>Hard to undo</b>{esc(reversibility.get("hard_to_undo"))}</div>')
+    next_gate = reversibility.get("next_go_no_go") or go_no_go.get("summary")
+    if next_gate:
+        a(f'<div><b>Next go/no-go</b>{esc(next_gate)}</div>')
+    a('</div></div></div>')
 
     a('<h2>Needs your decision</h2>')
     a('<div class="decision-stack">')
-    if status == "draft":
-        a('<div class="decision-card"><div class="ask">Approve this outcome and plan?</div>'
-          '<div class="answer">Review the experience and implementation detail below, then '
-          'tell the agent to approve it or name the change you need.</div></div>')
+    if approval_required:
+        a('<div class="decision-card"><div class="ask">Approve the design and plan?</div>'
+          '<div class="answer">Approval confirms the referenced player-experience design, '
+          'binds its exact intent and reviewed plan, and authorizes this proposal. '
+          'A later design-and-plan veto remains attached to each design intent until '
+          'another explicit confirmation. It never dispatches provider work.</div>')
+        fingerprint = str(cockpit_state.get("fingerprint") or "")
+        if not snapshot and fingerprint and approval_available:
+            a(f'<div id="plan-decision-controls" data-plan-fingerprint="{esc(fingerprint)}">')
+            a('<textarea id="plan-decision-comment" class="decision-comment" '
+              'data-board-control placeholder="What should change? Required for veto or request changes."></textarea>')
+            a('<div class="decision-actions">'
+              '<button type="button" class="approve" data-plan-action="approve" '
+              'data-board-control>Approve design and plan</button>'
+              '<button type="button" data-plan-action="request-changes" '
+              'data-board-control>Request changes</button>'
+              '<button type="button" class="veto" data-plan-action="veto" '
+              'data-board-control>Veto design and plan</button></div></div>')
+        elif snapshot:
+            a('<div class="m">Snapshots are immutable review records. Open the living plan to decide.</div>')
+        else:
+            blocker = str(cockpit_state.get("approval_blocker") or "").strip()
+            a('<div class="m warn"><b>This decision cannot be recorded yet.</b> '
+              + esc(blocker or "The complete design-authority contract is unavailable.")
+              + " Resolve the named blocker, then refresh the living plan."
+              + '</div>')
+        a('</div>')
     if needs_design_decision:
-        a('<div class="decision-card"><div class="ask">Build without a recorded design end state?</div>'
-          '<div class="answer">Recommended: settle the missing design section first. If you '
-          'accept the inference, tell the agent why; it cannot acknowledge this for you.</div></div>')
+        a('<div class="decision-card"><div class="ask">Design backing is missing.</div>'
+          '<div class="answer">Implementation cannot begin. Record the intended player '
+          'experience and outcome in docs/design before approving this proposal.</div></div>')
     for q in front_questions:
         qid = str(q.get("id", "") or "").strip()
         a('<div class="decision-card">')
@@ -1014,9 +1413,11 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         if qid:
             a(f'<div class="m">Reply in chat with <code>{esc(qid)}</code> and your choice.</div>')
         a('</div>')
-    if status == "approved" and extra_paths:
-        a('<div class="decision-card"><div class="ask">The implementation differs from the approved plan.</div>')
-        a('<div class="answer">Decide whether to revise and re-approve the plan before work continues: ')
+    if status in ("approved", "recorded", "recorded-stale") and extra_paths:
+        boundary_label = "approved" if status == "approved" else "recorded"
+        a('<div class="decision-card"><div class="ask">The implementation differs from the '
+          + boundary_label + ' plan.</div>')
+        a('<div class="answer">Revise the plan and re-establish its exact authority before work continues: ')
         a(', '.join(
             f'<code>{esc(path)}</code>{" (deleted)" if path in deleted_paths else ""}'
             for path in extra_paths[:4]
@@ -1028,10 +1429,54 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         remaining = (f' {len(missing_paths)} approved file'
                      f'{(" remains" if len(missing_paths) == 1 else "s remain")} to be observed.'
                      if missing_paths else "")
+        open_record = (
+            f' {len(all_questions)} other open question'
+            f'{(" remains" if len(all_questions) == 1 else "s remain")} in the full record.'
+            if all_questions else ""
+        )
         a('<div class="decision-card clear"><div class="ask">No decision is waiting.</div>'
-          '<div class="answer">No unresolved product choice is recorded.'
-          + esc(remaining) + '</div></div>')
+          '<div class="answer">No unresolved product choice related to the active '
+          'proposal is recorded.' + esc(open_record) + esc(remaining) + '</div></div>')
     a('</div>')
+    if status == "approved" and not snapshot:
+        fingerprint = str(cockpit_state.get("fingerprint") or "")
+        if fingerprint:
+            a('<details class="record"><summary>Reconsider this approval</summary>'
+              '<div class="record-body"><p class="legend">Request changes withdraws '
+              'only this exact plan approval and preserves confirmed design authority. '
+              'Veto design and plan rejects each referenced design intent independently '
+              'of later baseline, envelope or plan edits until another explicit cockpit '
+              'confirmation. Agent-authored sections return to provisional metadata; '
+              'human-authored section metadata remains intact while the veto ledger blocks '
+              'implementation. Neither action dispatches work.</p>')
+            a(f'<div id="plan-reconsider-controls" data-plan-fingerprint="{esc(fingerprint)}">')
+            a('<textarea class="decision-comment" data-board-control '
+              'placeholder="Why is this approval changing? Required."></textarea>')
+            a('<div class="decision-actions">'
+              '<button type="button" data-plan-action="request-changes" '
+              'data-board-control>Request changes</button>'
+              '<button type="button" class="veto" data-plan-action="veto" '
+              'data-board-control>Veto design and plan</button></div></div></div></details>')
+    if status == "recorded" and recorded_decision_available and not snapshot:
+        fingerprint = str(cockpit_state.get("fingerprint") or "")
+        if fingerprint:
+            a('<details class="record"><summary>Pause or veto recorded autonomous work</summary>'
+              '<div class="record-body"><p class="legend">Request changes pauses '
+              'implementation by returning this exact recorded plan to draft while leaving '
+              'its current design-authority state unchanged. The revised plan must '
+              're-establish a valid recorded reversible contract before work resumes. '
+              'Veto design and plan also rejects each referenced exact design intent. That '
+              'veto survives later baseline, envelope and plan-only edits until the '
+              'player-experience intent changes or a later explicit cockpit confirmation '
+              'supersedes it. Both actions require a reason; neither dispatches work.</p>')
+            a(f'<div id="plan-recorded-controls" data-plan-fingerprint="{esc(fingerprint)}">')
+            a('<textarea class="decision-comment" data-board-control '
+              'placeholder="Why should this recorded work pause or be vetoed? Required."></textarea>')
+            a('<div class="decision-actions">'
+              '<button type="button" data-plan-action="request-changes" '
+              'data-board-control>Request changes</button>'
+              '<button type="button" class="veto" data-plan-action="veto" '
+              'data-board-control>Veto design and plan</button></div></div></div></details>')
     a('<details class="record"><summary>Review full plan and project record</summary>'
       '<div class="record-body">')
     a('<p class="legend">Implementation detail, design ancestry, history, architecture and '
@@ -1070,54 +1515,15 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     # and a claim.
     refs = [r for r in rows(prop, "design_refs") if r.get("section")]
 
-    # ---- no design behind this slice. This is the one warning that must be
-    # impossible to scroll past, because it is the difference between work
-    # descended from a decision and work descended from an inference. It is
-    # NOT a blocking check: a gate satisfiable only by writing something gets
-    # something written, and fabricated ancestry that resolves is worse than
-    # an honest gap. So it renders as a decision for the human to make, with
-    # the recommendation stated plainly, and the acceptance recorded.
-    cur_slice = str(prop.get("slice", "") or "").strip()
-    acks = {}
-    for x in rows(prop, "acknowledged"):
-        if str(x.get("slice", "") or "").strip() == cur_slice:
-            w = str(x.get("warning", "") or "").strip()
-            if w:
-                acks[w] = x
+    # ---- no design behind this slice is a stop, not an acknowledgement path.
+    # A warning cannot grant player-intent authority and legacy acknowledgements
+    # remain historical only.
     has_struct = any(rows(prop, k) for k in ("modules", "files", "functions"))
     if has_struct and not refs:
-        got = acks.get("no-design-refs")
         a("<h2>No design behind this slice</h2>")
-        if got:
-            a('<div class="banner ok">')
-            a("<b>&#9745; Accepted.</b> You chose to build this without design "
-              "backing it.")
-            w = str(got.get("why", "") or "").strip()
-            who = str(got.get("by", "") or "").strip()
-            when = str(got.get("on", "") or "").strip()
-            if w:
-                a(f"<div style='margin-top:6px'>{esc(w)}</div>")
-            tail = " &middot; ".join(esc(x) for x in (who, when) if x)
-            if tail:
-                a(f"<div class='m' style='margin-top:4px'>{tail}</div>")
-            a("</div>")
-        else:
-            a('<div class="banner draft">')
-            a("<b>&#9744; Nothing in <code>docs/design/</code> says why this "
-              "work exists.</b>")
-            a("<div style='margin-top:8px'>Ticking this means the agent builds "
-              "on its own inference rather than on your design. The inference "
-              "may be reasonable, but it will not be written down, and the next "
-              "slice will build on top of it.</div>")
-            a("<div style='margin-top:8px'><b>Recommended instead:</b> tell the "
-              "agent to enter design mode and work the section out with you "
-              "first. It is one short conversation, and everything after it is "
-              "descended from a decision you made.</div>")
-            a("<div style='margin-top:8px'>To accept anyway, tell the agent to "
-              "record it in <code>acknowledged[]</code> with your reason. It "
-              "must not tick this for you, and the acceptance applies to this "
-              "slice only.</div>")
-            a("</div>")
+        a('<div class="banner draft"><b>Implementation is blocked.</b> '
+          "Write the intended player experience and outcome in "
+          "<code>docs/design/</code>, cite it here, and regenerate the plan.</div>")
 
     if refs:
         a("<h2>Why this work exists</h2>")
@@ -1175,8 +1581,19 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                  for m in mods if m.get("path")}
 
     if depth == 0:
-        a('<p class="empty">Hands-off: no structure was proposed for approval.'
-          " Everything below is a record of what exists.</p>")
+        scope_rows = rows(prop, "scope")
+        if scope_rows:
+            a('<p class="empty">Hands-off: the agent recorded coarse reversible '
+              "boundaries rather than asking you to approve modules or files.</p><ul class=f>")
+            for boundary in scope_rows:
+                a("<li>" + state_tag("built")
+                  + f'<span class="mono">{esc(boundary.get("path"))}</span>'
+                  + f'<span class="tag act">{esc(boundary.get("kind"))} · '
+                    f'{esc(boundary.get("action"))}</span>'
+                  + f'<div class="why">{esc(boundary.get("why"))}</div></li>')
+            a("</ul>")
+        else:
+            a('<p class="empty">Hands-off work has no recorded coarse scope and cannot verify.</p>')
     if not prop_mods and not prop_files and depth > 0:
         a('<p class="empty">Nothing approved yet. The agent proposes the'
           " structure, you approve it, and it lands here before any code.</p>")
@@ -1186,6 +1603,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
       + state_tag("missing") + " approved, not written &nbsp; "
       + state_tag("new") + " new file &nbsp; "
       + state_tag("modified") + " changed &nbsp; "
+      + state_tag("deleted") + " completed deletion &nbsp; "
       + state_tag("existing") + " approved earlier &nbsp; "
       + state_tag("extra") + " exists without approval</p>")
 
@@ -1233,7 +1651,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                 fact = str(fn.get("action", "") or "")
                 fwhy = str(fn.get("why", "") or "")
                 fst = "new" if fact == "new" else (
-                    "modified" if fact == "modify" else "missing")
+                    "modified" if fact == "modify" else "deleted")
                 a("<li>" + state_tag(fst)
                   + f'<span class="sig mono">{esc(fn.get("signature"))}</span>'
                   + (f'<div class="why">{esc(fwhy)}</div>' if fwhy
@@ -1259,7 +1677,10 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         meta = prop_mods.get(mod, {})
         if mod not in prop_mods and not any(owner.get(f) == mod for f in candidates):
             continue
-        if mod in prop_mods and mod in real_mods:
+        action = str(meta.get("action") or "")
+        if mod in prop_mods and action == "delete" and mod not in real_mods:
+            st = "deleted"
+        elif mod in prop_mods and mod in real_mods:
             st = "built"
         elif mod in prop_mods:
             st = "missing"
@@ -1308,6 +1729,24 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     for q in questions:
         a('<div class="card q">')
         a(f'<div class="t">{esc(q.get("question"))}</div>')
+        relation = question_relation(q, prop)
+        if relation == "related":
+            a('<div class="m"><b>Current proposal:</b> its explicit relation matches '
+              'this slice or one of its design sections.</div>')
+        elif relation == "legacy":
+            a('<div class="m warn"><b>Legacy/unscoped question:</b> retained in the '
+              'record, but not promoted into the active cockpit. Add an exact '
+              '<code>related_slices</code> or <code>related_design_refs</code> relation '
+              'when it applies.</div>')
+        else:
+            a('<div class="m"><b>Other work:</b> related to another slice or design '
+              'section and retained in the full record.</div>')
+        if q.get("related_slices"):
+            a(f'<div class="m mono">related slices: '
+              f'{esc(", ".join(str(item) for item in q.get("related_slices", [])))}</div>')
+        if q.get("related_design_refs"):
+            a(f'<div class="m mono">related design: '
+              f'{esc(", ".join(str(item) for item in q.get("related_design_refs", [])))}</div>')
         if q.get("blocks"):
             a(f'<div class="m">blocks: {esc(q.get("blocks"))}</div>')
         opts = q.get("options")
@@ -1343,12 +1782,16 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     if revs:
         a("<h2>How the plan changed</h2>")
         for r in revs:
+            what = r.get("what") or r.get("what_changed") or ""
+            why = r.get("why") or r.get("because") or ""
+            on = r.get("on") or r.get("date") or ""
+            decided_by = r.get("decided_by") or r.get("approved_by") or ""
             a('<div class="card"><div class="t">'
-              f'{esc(r.get("what_changed"))}</div>')
-            if r.get("because"):
-                a(f'<div class="m">because: {esc(r.get("because"))}</div>')
-            a(f'<div class="m mono">{esc(r.get("date"))} · '
-              f'{esc(r.get("approved_by"))}</div></div>')
+              f'{esc(what)}</div>')
+            if why:
+                a(f'<div class="m">because: {esc(why)}</div>')
+            a(f'<div class="m mono">{esc(on)} · '
+              f'{esc(decided_by)}</div></div>')
 
     # ---- settled: the ledger, never deleted
     decisions = rows(shape, "decisions")
@@ -1474,7 +1917,10 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
       "openTarget();"
       "</script>")
 
-    a(board_client.core_js())
+    board_url = board_client.last_known_board_url()
+    review_path = f"plan/{snapshot}.html" if snapshot else "plan.html"
+    a(board_client.core_js(board_url + review_path if board_url else ""))
+    a(PLAN_DECISION_JS)
     a(RETRO_BANNER_JS)
 
     if mermaid_path:
@@ -1517,38 +1963,72 @@ def main() -> int:
 
     shape = load(SHAPE)
     prop = load(PROPOSAL)
+    cockpit_state = cockpit.plan_view(ROOT)
     history = approved_history()
-    mods, mermaid, tree = module_graph()
+    try:
+        mods, mermaid, tree = module_graph()
+    except ArchitectureGraphError as exc:
+        print("plan: implementation graph could not be verified; existing output "
+              "was preserved", file=sys.stderr)
+        print(f"  {exc}", file=sys.stderr)
+        return 1
     present = real_files()
+    dependency_by_module = {
+        str(item.get("path") or ""): item for item in mods if item.get("path")
+    }
+    mods = [
+        dependency_by_module.get(module, {"path": module, "depends_on": []})
+        for module in sorted(authored_modules(present) | set(dependency_by_module))
+    ]
     scoped = touched_since(str(prop.get("baseline_sha", "") or "").strip())
     built = present if scoped is None else present & scoped
     deleted = set() if scoped is None else scoped - present
-    doc_specs = [(DOCS, "docs/", DESIGN), (DESIGN, "docs/design/", None)]
-    doc_targets = documentation_targets(doc_specs)
-    kit_docs = read_docs(DOCS, "docs/", skip=DESIGN, targets=doc_targets)
-    design_docs = read_docs(DESIGN, "docs/design/", targets=doc_targets)
+    referenced: set[str] = set()
+    for ref in rows(prop, "design_refs"):
+        section = str(ref.get("section") or "").split("#", 1)[0].strip().replace("\\", "/")
+        if section and not section.startswith("docs/design/"):
+            section = "docs/design/" + section
+        if section.startswith("docs/design/") and ".." not in section.split("/"):
+            referenced.add(posixpath.normpath(section))
+    doc_specs = [(DESIGN, "docs/design/", None)]
+    doc_targets = {
+        path: anchor
+        for path, anchor in documentation_targets(doc_specs).items()
+        if path in referenced
+    }
+    kit_docs: List[Dict[str, str]] = []
+    design_docs = read_docs(
+        DESIGN, "docs/design/", targets=doc_targets, only=referenced
+    )
 
-    def build(depth: int) -> str:
+    def build(depth: int, snapshot_label: str = "") -> str:
         return render(shape, prop, mods, mermaid, built, recent(),
-                      kit_docs, design_docs, args.slice, mermaid_src(depth),
-                      tree, history, doc_targets, scoped, deleted)
+                      kit_docs, design_docs, snapshot_label, mermaid_src(depth),
+                      tree, history, doc_targets, scoped, deleted, cockpit_state)
 
     doc = build(0)
 
     if args.stdout:
         print(doc)
         return 0
+    safe = ""
+    snap = None
+    if args.slice:
+        safe = cockpit.snapshot_label(args.slice)
+        snap = SNAP_DIR / f"{safe}.html"
+        if snap.exists():
+            print(f"plan: snapshot already exists and will not be overwritten: "
+                  f"{snap.relative_to(ROOT)}", file=sys.stderr)
+            return 1
     OUT.write_text(doc, encoding="utf-8")
     print(f"wrote {OUT.relative_to(ROOT)}")
     if args.slice:
         SNAP_DIR.mkdir(exist_ok=True)
-        safe = "".join(c if c.isalnum() or c in "-_" else "-"
-                       for c in args.slice)[:60]
-        snap = SNAP_DIR / f"{safe}.html"
         # Rendered again at depth 1: the snapshot lives in plan/, so its
         # reference to the vendored bundle needs one level of ../ that the
         # root page does not.
-        snap.write_text(build(1), encoding="utf-8")
+        assert snap is not None
+        snap.write_text(build(1, safe), encoding="utf-8")
         print(f"wrote {snap.relative_to(ROOT)}  (snapshot, kept for comparison)")
     return 0
 

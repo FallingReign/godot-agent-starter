@@ -79,10 +79,10 @@ class ProjectRootDiscovery(unittest.TestCase):
         with _scratch() as project:
             _write_marker(project)
             found = context.resolve_project_context(
-                project, game_layout=".", runtime_root=".private/agent-runtime"
+                project, game_layout=".", runtime_root=".kit/agent-runtime"
             )
             self.assertEqual(project, found.game_root)
-            self.assertEqual((project / ".private" / "agent-runtime").resolve(),
+            self.assertEqual((project / ".kit" / "agent-runtime").resolve(),
                              found.runtime_root)
             self.assertEqual(".", found.git_pathspec)
             self.assertEqual("scripts/main.gd", found.game_relative("scripts/main.gd"))
@@ -107,7 +107,7 @@ class ProjectRootDiscovery(unittest.TestCase):
                 json.dumps({
                     "schema": 1,
                     "game_root": ".",
-                    "runtime_root": ".private/runtime",
+                    "runtime_root": ".kit/private-runtime",
                     "providers": {},
                 }),
                 encoding="utf-8",
@@ -119,7 +119,7 @@ class ProjectRootDiscovery(unittest.TestCase):
             self.assertEqual(project, found.game_root)
             self.assertEqual(".", found.game_layout)
             self.assertEqual(
-                (project / ".private" / "runtime").resolve(), found.runtime_root
+                (project / ".kit" / "private-runtime").resolve(), found.runtime_root
             )
 
     def test_configured_context_fails_closed_on_invalid_or_linked_config(self) -> None:
@@ -165,7 +165,9 @@ class ProjectRootDiscovery(unittest.TestCase):
         with _scratch() as project:
             _write_marker(project)
             outside = project.parent / "outside-runtime"
-            for runtime in ("../outside", outside):
+            for runtime in (
+                "../outside", outside, ".", ".kit", "state/runtime", "src/runtime"
+            ):
                 with self.subTest(runtime=runtime):
                     with self.assertRaises(context.ProjectContextError):
                         context.resolve_project_context(project, runtime_root=runtime)
@@ -181,7 +183,7 @@ class ProjectRootDiscovery(unittest.TestCase):
             project.mkdir()
             outside.mkdir()
             _write_marker(project)
-            link = project / "linked"
+            link = project / ".kit" / "linked"
             path_resolve = Path.resolve
 
             def redirected_resolve(path: Path, *args, **kwargs) -> Path:
@@ -199,7 +201,19 @@ class ProjectRootDiscovery(unittest.TestCase):
                 Path, "resolve", autospec=True, side_effect=redirected_resolve
             ):
                 with self.assertRaisesRegex(context.ProjectContextError, "escapes"):
-                    context.resolve_project_context(project, runtime_root="linked/runtime")
+                    context.resolve_project_context(
+                        project, runtime_root=".kit/linked/runtime"
+                    )
+
+    def test_runtime_container_must_be_an_unredirected_directory(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            (project / ".kit").write_text("not a directory", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                context.ProjectContextError, "unredirected directory"
+            ):
+                context.resolve_project_context(project)
 
 
 class DispatchPathPolicy(unittest.TestCase):

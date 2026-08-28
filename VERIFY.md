@@ -3,7 +3,7 @@
 This document defines the evidence required to call the kit reusable and
 release-ready. It validates the kit, not the starter game or its design.
 
-Use the public launcher throughout: `\.\kit.cmd` on Windows or `./kit` on
+Use the public launcher throughout: `.\kit.cmd` on Windows or `./kit` on
 macOS/Linux. Commands below use the platform-neutral name `kit`.
 
 ## Safety boundaries
@@ -68,28 +68,64 @@ does not prove engine behavior.
 
 ```text
 kit plan
+kit plan --snapshot
 ```
 
 Open `plan.html` and `retro.html` directly. Confirm:
 
-- the plan begins with the current outcome, truthful state, latest evidence and
-  the next decision;
+- the plan begins with the player-facing Quick Read, exact design authority,
+  reversible envelope, next go/no-go point, truthful implementation state,
+  verification freshness and the one current decision;
 - the retrospective begins with problem, recommended change, success measure and
   a clear decision;
 - detailed records, hashes, prompts, diagrams and diagnostics are available but
   collapsed by default;
-- file mode is read-only and explains how to start the board;
+- the retained snapshot is immutable and bound to the reviewed proposal/design
+  fingerprint;
+- file mode is read-only, labels the cockpit live/down/file state truthfully and
+  explains the exact `kit serve` lifecycle;
 - no server or provider starts merely because the pages were generated or opened.
 
 For live decision controls:
 
 ```text
 kit serve
+kit serve status
+kit serve open
+kit serve stop
 ```
 
-Confirm the printed URL is loopback, both pages load, mutation controls work only
-through the authenticated served page, and cross-origin or tokenless requests are
-rejected. Stop the server after inspection.
+Confirm the printed review URL is the real loopback `plan.html` page, both pages
+load, start/reuse does not implicitly open a browser, `open` is the only browser
+side effect, and mutation controls work only through the capability-protected
+served page. Stale plan fingerprints, malformed design, tokenless/cross-origin requests
+and unsupported legacy approval contracts must be rejected with zero partial
+source or ledger writes. Confirm stop refuses while an owned run is active and
+otherwise terminates the recorded cockpit cleanly.
+
+Approval acceptance requires:
+
+- exact `docs/design/...` references and canonical design digests;
+- complete design metadata and implementation eligibility;
+- agent-authored design only at `very-high` confidence, with Quick Read,
+  inference, assumptions, veto scope and next go/no-go content;
+- recorded hands-off work only inside explicit coarse file/directory `scope[]`
+  boundaries and an explicitly reversible envelope;
+- an operator confirmation event bound to the complete current proposal digest,
+  with portable-policy evidence never presented as person authentication;
+- veto superseding the exact confirmation, with a later approval requiring a
+  new current digest;
+- Git baseline and all authored changed-file scope proven fail-closed;
+- absent `proposal.json` accepted only when Git proves zero authored game changes;
+- inverse authored scope including custom/extensionless content, tests and
+  deletions;
+- complete proposed module dependency boundaries compared with the real graph;
+- function-level canonical typed signatures and normalized bodies compared
+  with the exact baseline source;
+- any unproposed module, file, function or action treated as a blocking
+  deviation.
+- a static run may report declared work as unbuilt, while full and strict
+  verification must reject that state as incomplete.
 
 ### 5. Retrospective workflow
 
@@ -105,12 +141,24 @@ must not call a model. An automatic analyzer must be refused unless the explicit
 
 Evidence acceptance requires:
 
-- repository-scoped source sessions;
+- repository-scoped Copilot and Codex sessions, including active and archived
+  Codex rollouts whose scope comes only from their first trusted session cwd;
+- resumed Codex tasks ordered by latest rollout activity, with duplicate
+  active/archive IDs selecting the newest activity without retaining bodies;
 - POSIX paths compared case-sensitively and Windows paths compared according to
   Windows semantics;
 - injected platform instructions filtered while genuine opening tasks remain;
+- no assistant/tool bodies, hidden reasoning, environment values, raw command
+  output or absolute source paths retained in evidence;
+- Copilot AIU and Codex token metrics kept separate, with no inferred monetary
+  cost;
+- parent/child Codex linkage retained without duplicating inherited human
+  messages;
 - immutable snapshot hashes and stable source IDs;
 - findings citing the exact snapshot used;
+- manual publication closing only that exact content-addressed snapshot after
+  ranking and both views succeed, with note rollback on report drift or marker
+  failure;
 - transient packs, queues, prompts and logs under `.kit/runtime/` only;
 - tracked human decisions kept separate from retry/execution state.
 
@@ -121,18 +169,24 @@ Dispatch acceptance requires:
 - no prompt content in shell text or process arguments;
 - loopback Host, Origin, content-type, body-size and capability checks;
 - protected declared scope rejected before clone, provider startup or spend;
-- one isolated job at a time, idempotent retries and stop-on-first-failure;
+- one isolated job at a time, exact-approval replay safety and stop-on-first-failure;
 - detached Git metadata during provider access;
 - changed-path and commit verification on the trusted host;
 - exit zero with no relevant edit treated as failure;
 - `kit verify --static` recorded before integration;
 - no automatic engine launch.
 
+Automatic Copilot and Codex analysis/dispatch must fail closed while their
+configured hosts cannot prove repository-only reads at the OS boundary. This
+refusal is an accepted security outcome; both interactive workflows and manual
+evidence handoff remain usable.
+
 ### 6. Release archive
 
-Release construction is intentionally blocked until an approved top-level
-`LICENSE*` or `COPYING*` exists and `VERSION` contains one safe version line.
-Once those human-owned decisions are present:
+Release construction requires the approved top-level `LICENSE` and the single
+safe version identity in `VERSION`. Both are present in the canonical kit and
+must remain part of every verified archive. The source repository must be clean;
+uncommitted or untracked bytes are not production provenance:
 
 ```text
 kit release build ../godot-agent-kit.zip
@@ -142,6 +196,13 @@ kit release verify ../godot-agent-kit.zip
 
 Build the same source twice to different output paths. The archives and reported
 SHA-256 values must be byte-identical.
+
+The canonical manifest must report `receipt_trust: portable-policy`, identity
+model `portable-policy-audit`, and the source project's pre-exclusion receipt
+state. Verification and smoke must reject any other archive trust or identity
+label. This proves portable policy consistency, not who operated the cockpit.
+A present contradictory local receipt blocks build; no proposal/shape state is
+reported as `not-applicable-no-project-state`.
 
 Inspect the member list. It must contain every fixed kit file, all canonical
 personas and every shipped skill, plus the canonical manifest and approved legal
@@ -154,6 +215,12 @@ metadata. It must not contain:
 - `.kit/runtime/`;
 - secrets, environment files, caches or unreviewed tools;
 - local absolute paths.
+
+`ARCHITECTURE.md` must equal the canonical empty release template even when the
+source checkout's generated graph contains project-only modules and edges.
+Verification must reject a manifest that reauthorizes different architecture
+bytes. The destination project generates its own graph with `kit architecture
+update`.
 
 Verification must reject malformed or tampered archives without extracting:
 
@@ -180,6 +247,13 @@ The gate performs one engine health check after all static stages. If it fails,
 every native stage must be skipped and no second engine process may start. If a
 native stage fails, every later native stage must likewise be skipped.
 
+On Windows, a simulated or real native access violation must be classified as
+`native-crash`, modal Application Error UI must be suppressed, and only the
+owned process tree may be terminated. The private verification ledger must keep
+that warning active after a passing static check; only a later successful full
+or strict native run resolves it. The cockpit and `kit retro status` must expose
+the unresolved consequence without relaunching Godot.
+
 Strict success requires every stage supported and passed, retained evidence under
 the configured private runtime, release-archive smoke validation, and no unsupported
 skip converted into a false green.
@@ -199,15 +273,16 @@ real projects therefore continue to reject every skipped stage.
 | Root and layout portability | Project-context fixtures cover root/src layouts, nested invocation and unsafe paths |
 | Setup safety | Mutation-boundary fixtures preserve existing HEAD, staged, working and untracked state |
 | Engine selection and containment | Resolver and engine-boundary tests cover stale variables, exact-version console preference, no-launch diagnosis, owned timeouts and failure-cascade suppression |
+| Verification evidence | Cockpit tests cover immutable runs and unresolved-native recovery; CLI unit tests replace the writer so `kit self-test` cannot overwrite the project's real latest-verification pointer |
 | Dependency provenance | The public source-audit command downloads and authenticates every canonical direct lock artifact without installing it; a stable tree-digest fixture guards the GUT lock contract |
-| Planning UX | Frontend byte and DOM tests assert decision-first ordering, truthful states and read-only file behavior |
-| Evidence integrity | Session-evidence tests cover source classification, stable IDs, hashes and repository/path semantics |
-| Retrospective lifecycle | Workflow tests cover manual defaults, spend confirmation, immutable findings inputs and publication |
+| Planning UX | Cockpit, frontend byte and DOM tests assert exact approvals, atomic veto/rollback, decision-first ordering, truthful live/file/down states, canonical function status and immutable snapshots |
+| Evidence integrity | Session-evidence tests cover Copilot/Codex discovery, before/after repository re-authentication, explicit session/byte/record refusal limits, privacy-minimised field allowlists, provider-specific usage, parent linkage, stable IDs, hashes and repository/path semantics |
+| Retrospective lifecycle | Workflow tests cover consequence urgency, unresolved crash persistence, manual defaults, spend confirmation, immutable findings inputs and publication |
 | Board security | HTTP tests cover bind address, Host, Origin, capability, content type, body bounds and response shape |
 | Provider command safety | Adapter tests prove a closed registry, safe identifiers, official package entry point and prompt-free argv |
 | Worker isolation | Run-result tests cover detached Git metadata, scope, hooks/config neutrality, no-op rejection and integration |
 | Dispatch seams | Production-shaped integration tests prove prompt parity, sequential operation and halt-on-failure |
-| Releases | ZIP/TAR tests cover determinism, allowlist completeness, leak exclusion, link/reparse rejection and smoke launch |
+| Releases | ZIP/TAR tests cover determinism, clean provenance, explicit portable-policy receipt trust, pre-exclusion receipt mismatch refusal, allowlist completeness, leak exclusion, link/reparse rejection and smoke launch |
 | Strict orchestration and CI | Strict tests cover fail-closed prerequisites/evidence and the three-platform official-source workflow |
 
 ## What local static evidence cannot prove
@@ -250,6 +325,8 @@ The kit is release-ready only when all answers are yes:
 - [ ] `kit self-test` passes with native engine disabled.
 - [ ] `kit verify --static` passes after a human-approved integrity baseline.
 - [ ] `plan.html` and `retro.html` satisfy the decision-first visual review.
+- [ ] Exact design/proposal approval, veto, stale-page and rollback fixtures pass.
+- [ ] Copilot and Codex evidence fixtures pass with privacy and cost semantics intact.
 - [ ] Retrospective evidence and dispatch seam tests pass.
 - [ ] Approved legal metadata and version identity exist.
 - [ ] Two release builds are byte-identical and independently verify.

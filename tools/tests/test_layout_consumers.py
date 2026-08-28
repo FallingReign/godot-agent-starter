@@ -142,7 +142,10 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
             ):
                 touched = plan_html.touched_since("a" * 40)
 
-        self.assertEqual({"content/item.json", "scripts/player.gd"}, files)
+        self.assertEqual(
+            {"content/item.json", "scripts/player.gd", "tools/internal.py"},
+            files,
+        )
         self.assertEqual({"content/new.json", "scripts/player.gd"}, touched)
 
     def test_conformance_maps_git_paths_for_both_supported_layouts(self) -> None:
@@ -162,6 +165,42 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
                 gate.repository_game_relative("src/scripts/main.gd"),
             )
             self.assertIsNone(gate.repository_game_relative("../outside"))
+
+
+class ProviderGovernanceBridge(unittest.TestCase):
+    def test_copilot_bridge_fail_closes_and_game_builder_cannot_edit_it(self) -> None:
+        bridge = (ROOT / ".github" / "copilot-instructions.md").read_text(
+            encoding="utf-8"
+        )
+        persona = (ROOT / ".github" / "agents" / "game-builder.agent.md").read_text(
+            encoding="utf-8"
+        )
+        shared = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("@../AGENTS.md", bridge)
+        self.assertIn("cannot load `AGENTS.md`, stop", bridge)
+        self.assertIn("no implementation may", bridge)
+        self.assertIn(".github/copilot-instructions.md", persona)
+        self.assertIn(".github/copilot-instructions.md", shared)
+
+    def test_portable_policy_evidence_is_not_described_as_person_authentication(self) -> None:
+        documents = {
+            path: (ROOT / path).read_text(encoding="utf-8")
+            for path in (
+                "AGENTS.md",
+                "README.md",
+                "VERIFY.md",
+                "docs/DESIGN.md",
+                "tools/plan_html.py",
+            )
+        }
+        combined = "\n".join(documents.values()).lower()
+
+        self.assertNotIn("authenticated review cockpit", combined)
+        self.assertNotIn("authenticated served page", combined)
+        self.assertIn("not proof that a person's identity was authenticated", combined)
+        self.assertIn("not person authentication", combined)
+        self.assertIn("local-audit-matched", documents["AGENTS.md"])
 
 
 if __name__ == "__main__":

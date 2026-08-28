@@ -11,13 +11,14 @@ the gate prints it on every run.
 
 | Value | Before writing code |
 | --- | --- |
-| `hands-off` | Nothing. Build it, report what you built and the gate result. |
+| `hands-off` | No routine structure approval. Declare coarse game-root-relative file or directory `scope[]`; build only inside it from bound design while the work remains reversible; stop at the next go/no-go. |
 | `module` | Propose the modules, their boundaries, and the data that crosses them. Wait. |
 | `file` | As `module`, plus every file you will create or modify. Wait. |
 | `function` | As `file`, plus function signatures and how they connect. Wait. |
 
-It is a working preference, not a fact about the game, so it is editable rather
-than append-only. A human may raise or lower it at any time, including mid-slice.
+It is a working preference, not authority to infer the game. It is editable
+rather than append-only, and a human may raise or lower it at any time. It never
+relaxes design ancestry, confidence, reversibility or gate checks.
 
 ## Extend before you create
 
@@ -38,23 +39,30 @@ draft, and the human reviews the rendered view rather than a wall of prose.
 1. Write `experience` **first**: what the player does, how it should feel, how
    the camera behaves, what the controls do, and in `not_this` the nearest thing
    this is deliberately not. See "Experience before structure" below.
-2. Fill `design_refs`: the design section this work is descended from, plus one
-   line on why. See "Cite the design, do not restate it" below.
-3. If the visual outcome can be approximated with vector shapes or layout
+2. Fill `design_refs`: the design section this work is descended from, one line
+   on why, and the canonical `sha256` printed by `tools/design.py`. See "Cite
+   the design, do not restate it" below.
+3. Fill `design_authority`: whether the cited design is `human-confirmed` or
+   `agent-provisional`, who authored it, and its confidence. Provisional design
+   authorizes implementation only at exact `very-high` confidence.
+4. Fill `reversibility`: the current state, what can be vetoed, what would be
+   hard to undo, and the next go/no-go. This is the boundary of autonomy.
+5. If the visual outcome can be approximated with vector shapes or layout
    boxes, write `mockup.svg` as inline SVG. If it cannot, say why in
    `mockup.not_possible`. See "Mock it when you can draw it" below.
-4. Fill the structure to the depth the involvement level implies: modules at
-   `module`, plus files at `file`, plus signatures at `function`. Set
-   `baseline_sha` to `git rev-parse HEAD` and `"status": "draft"`.
-5. Run `kit plan`.
-6. Tell the human the draft is ready with a **clickable link** using the
-   absolute file URI, for example
-   `[Open plan.html](file:///C:/path/to/repo/plan.html)`. Do not only name the
-   file. Summarise in two or three lines at most. Do not restate the proposal
-   in chat; that is what the view is for.
-7. Wait. **Do not write code.**
-8. On approval, set `"status": "approved"` with `approved_by` and
-   `approved_on`, then build.
+6. Fill the structure to the depth the involvement level implies: coarse file
+   or directory `scope[]` at `hands-off`; modules at `module`, plus files at
+   `file`, plus signatures at `function`. Set `baseline_sha` to
+   `git rev-parse HEAD` and `"status": "draft"`.
+7. Run `kit serve` and use its exact HTTP review link. `file://` is a visible
+   read-only fallback, never an interactive approval path.
+8. At `module`, `file` or `function`, wait. **Do not write code.** At
+   `hands-off`, use `"status": "recorded"` and continue only while every
+   authored change remains inside `scope[]` and `reversibility.state` remains
+   `reversible`.
+9. At a go/no-go, set `"status": "draft"` and stop. The cockpit's explicit
+   **Approve design and plan** action binds the reviewed design and records
+   `approved_by` and `approved_on`; silence and a green gate never do.
 
 ## Experience before structure
 
@@ -77,13 +85,16 @@ is worth more than three lines describing what it is.
 
 ## Cite the design, do not restate it
 
-Every slice is either descended from a design choice or is a throwaway prototype
-informing one. It does not have to *write* design. It has to point at the design
-it serves, so a reader can follow the chain from a file back to why the game
-needs it.
+Every slice descends from design; a throwaway prototype descends from the design
+question it exists to answer. It does not have to *write* design. It has to point
+at the design it serves, so a reader can follow the chain from a file back to why
+the game needs it.
 
-`design_refs` is a list of `{section, why}`. The section is a path under
-`docs/design/`; the `why` is one line connecting this slice to that end state.
+`design_refs` is a list of `{section, why, sha256}`. The section is the full
+repository-relative path beginning `docs/design/`, for example
+`docs/design/experience/movement.md`; the `why` is one line connecting this
+slice to that end state; the digest binds authority to the exact authored design
+rather than a filename whose contents can change later.
 
 The reference must reach an **end state**, not the feature immediately above.
 "The interface must respond" is one step up and rules nothing out. "Every
@@ -98,9 +109,9 @@ A reference to a file that does not exist fails the gate, and should: it reads a
 though the reason was written down when it was not. Either write the section or
 drop the reference.
 
-A slice with genuinely no design ancestry is possible — a throwaway prototype
-built to answer a design question. Say that in `experience.player_does` rather
-than inventing a lineage for it.
+A throwaway probe still cites the design question it exists to answer. There is
+no implementation exception with no design ancestry: without a written player
+experience or outcome, even a prototype is guessing what evidence matters.
 
 ## Mock it when you can draw it
 
@@ -118,19 +129,21 @@ picture is worse than none, because it gets approved.
 Only inert shape markup is rendered. Script tags, event handlers and embedded
 content are stripped, so do not put anything interactive in it.
 
-A draft is not a contract. The `conformance` stage only diffs an `approved`
-proposal, so writing a draft early enforces nothing and risks nothing. What it
-buys is a reviewable artefact instead of a chat message, and a draft that
-survives the turn ending.
+A draft is not implementation authority. The `conformance` stage blocks a
+draft, diffs an `approved` proposal, and also checks a hands-off `recorded`
+proposal while its reversible envelope remains open. Writing the draft early
+buys a reviewable artefact instead of a chat message.
 
 ## Deviation is expected
 
 You will discover mid-build that the proposal was wrong. That is normal and it
 is not a failure. What is a failure is deviating silently.
 
-When the code needs to differ: stop, append an entry to `revisions`, update the
-affected section, set `status` back to `draft`, regenerate the view, and ask the
-human to look again. At `hands-off`, record it and carry on.
+When the code needs to differ: append an entry to `revisions` and update the
+affected section. At `hands-off`, carry on only if the change is still design-
+backed, very-high confidence when provisional, and inside the same reversible
+envelope; keep `status` as `recorded`. Otherwise set `status` back to `draft`,
+regenerate the view, and stop at the go/no-go.
 
 Reverting to `draft` is what makes a revision visible. An approved proposal that
 quietly changes is the same failure as no proposal at all.
@@ -169,6 +182,8 @@ than none, because it manufactures the appearance of approval.
 - Ask for approval of a structure that exists only in your chat message. Write
   the draft, render it, point at it.
 - Set `status` to `approved` yourself. Only a human approval flips it.
+- Treat `recorded` as a weaker spelling of approval. It is a factual record of
+  reversible hands-off work, and cannot cross a go/no-go.
 - Treat a green gate as approval. Conformance reports; it does not consent.
 - Leave `baseline_sha` empty. Without it, every pre-existing file reads as
   unproposed and the report becomes noise the human learns to skip.

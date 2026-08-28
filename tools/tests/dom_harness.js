@@ -270,7 +270,10 @@ function run(html, opts) {
   const ctx = {
     console: {log() {}, warn() {}, error() {}},
     document: built.doc,
-    location: {protocol: opts.protocol || 'http:', origin: 'http://127.0.0.1:8899', hash: ''},
+    location: {
+      protocol: opts.protocol || 'http:', origin: 'http://127.0.0.1:8899', hash: '',
+      reloads: 0, reload() { this.reloads += 1; }
+    },
     fetch: makeFetch(opts.routes || {}, log),
     setTimeout(fn, ms) { timers.push({fn: fn, ms: ms}); return timers.length; },
     clearTimeout() {},
@@ -309,8 +312,15 @@ const HEALTH_OK = () => response(200, JSON.stringify({
 function stateBody(overrides) {
   return JSON.stringify(Object.assign({
     board: {port: 8899, pid: 1, schema: 2, version: ACTIVE_BOARD_VERSION},
-    retro_due: {unarchived: 11, threshold: 10, due: true},
-    providers: {worker: {automatic: false, available: true, kind: 'manual'}},
+    retro_due: {unarchived: 11, threshold: 10, due: true,
+                trigger_level: 'routine', immediate_consequences: [], prompt_triggers: [],
+                warnings: []},
+    providers: {
+      analyzer: {automatic: false, ready: true, blockers: [], kind: 'manual',
+                 preflight: 'manual-handoff'},
+      worker: {automatic: false, ready: true, blockers: [], kind: 'manual',
+               preflight: 'manual-handoff'}
+    },
     findings: [],
     runs: []
   }, overrides || {}));
@@ -376,6 +386,40 @@ async function main() {
       check(S, 'manual worker mode says no worker will launch',
             manualQuota && /does not launch a worker/.test(manualQuota.innerHTML),
             manualQuota ? manualQuota.innerHTML : 'no copy');
+      const providerWarning = env.doc.getElementById('provider-warning');
+      check(S, 'manual providers are neutral rather than unavailable',
+            providerWarning && providerWarning.innerHTML === '',
+            providerWarning ? providerWarning.innerHTML : 'missing');
+
+      const evidenceWarningEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          retro_due: {unarchived: 0, threshold: 10, due: false,
+            trigger_level: 'none', immediate_consequences: [], prompt_triggers: [],
+            warnings: [
+              {code: 'retro_note_unreadable', note: '<unsafe-note>'},
+              {code: 'unknown_retro_signal', note: 'two.md', value: 'mystery-signal'},
+              {code: 'malformed_retro_signal', note: 'three.md'},
+              {code: 'must-not-render', note: 'four.md'}
+            ]},
+          findings: [], runs: []
+        }))
+      }});
+      const evidenceWarning = evidenceWarningEnv.doc.getElementById('provider-warning');
+      check(S, 'retro decision view renders bounded evidence warnings',
+            evidenceWarning
+            && /Retrospective evidence warning/.test(evidenceWarning.innerHTML)
+            && /retro_note_unreadable/.test(evidenceWarning.innerHTML)
+            && /unknown_retro_signal/.test(evidenceWarning.innerHTML)
+            && /mystery-signal/.test(evidenceWarning.innerHTML)
+            && /malformed_retro_signal/.test(evidenceWarning.innerHTML)
+            && /\+1 more/.test(evidenceWarning.innerHTML)
+            && !/must-not-render/.test(evidenceWarning.innerHTML),
+            evidenceWarning ? evidenceWarning.innerHTML : 'missing');
+      check(S, 'retro decision view escapes evidence warning details',
+            evidenceWarning && /&lt;unsafe-note&gt;/.test(evidenceWarning.innerHTML)
+            && !/<unsafe-note>/.test(evidenceWarning.innerHTML),
+            evidenceWarning ? evidenceWarning.innerHTML : 'missing');
 
       const automaticEnv = await run(html, {routes: {
         '/api/health': HEALTH_OK(),
@@ -443,13 +487,147 @@ async function main() {
       }
     } else {
       const banner = env.doc.getElementById('retro-banner');
-      check(S, 'plan banner announces the due retrospective',
-            banner && /retrospective is due/i.test(banner.innerHTML), banner ? banner.innerHTML : 'missing');
+      check(S, 'plan banner names the routine reason',
+            banner && /Routine retrospective is due/.test(banner.innerHTML),
+            banner ? banner.innerHTML : 'missing');
+      check(S, 'manual analysis names deterministic local evidence and no spend',
+            banner && /Deterministic local evidence/.test(banner.innerHTML)
+            && /spends no provider quota/.test(banner.innerHTML),
+            banner ? banner.innerHTML : 'missing');
       check(S, 'plan banner announces findings awaiting a decision',
             banner && /awaiting your decision/i.test(banner.innerHTML));
       check(S, 'plan banner links into the retro board',
             banner && /href="\/retro\.html"/.test(banner.innerHTML));
+
+      const warningEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          retro_due: {unarchived: 0, threshold: 10, due: false,
+            trigger_level: 'none', immediate_consequences: [], prompt_triggers: [],
+            warnings: [
+              {code: 'retro_note_unreadable', note: '<unsafe-note>'},
+              {code: 'unknown_retro_signal', note: 'two.md', value: 'mystery-signal'},
+              {code: 'malformed_retro_signal', note: 'three.md'},
+              {code: 'must-not-render', note: 'four.md'}
+            ]},
+          findings: [], runs: []
+        }))
+      }});
+      const warningBanner = warningEnv.doc.getElementById('retro-banner');
+      check(S, 'bounded retrospective evidence warnings remain visible when not due',
+            warningBanner
+            && /Retrospective evidence warning/.test(warningBanner.innerHTML)
+            && /retro_note_unreadable/.test(warningBanner.innerHTML)
+            && /unknown_retro_signal/.test(warningBanner.innerHTML)
+            && /mystery-signal/.test(warningBanner.innerHTML)
+            && /malformed_retro_signal/.test(warningBanner.innerHTML)
+            && /\+1 more/.test(warningBanner.innerHTML)
+            && !/must-not-render/.test(warningBanner.innerHTML),
+            warningBanner ? warningBanner.innerHTML : 'missing');
+      check(S, 'retrospective warning details are escaped',
+            warningBanner && /&lt;unsafe-note&gt;/.test(warningBanner.innerHTML)
+            && !/<unsafe-note>/.test(warningBanner.innerHTML),
+            warningBanner ? warningBanner.innerHTML : 'missing');
+
+      const consequenceEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          retro_due: {unarchived: 0, threshold: 10, due: true,
+            trigger_level: 'immediate',
+            immediate_consequences: [{code: 'native-crash', notes: ['verification:r1']}],
+            prompt_triggers: []},
+          findings: [], runs: []
+        }))
+      }});
+      const consequence = consequenceEnv.doc.getElementById('retro-banner');
+      check(S, 'immediate consequence is shown before routine count',
+            consequence && /Immediate retrospective consequence: native-crash/.test(consequence.innerHTML)
+            && consequence.innerHTML.indexOf('native-crash') < consequence.innerHTML.indexOf('local evidence'),
+            consequence ? consequence.innerHTML : 'missing');
+
+      const automaticEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          retro_due: {unarchived: 1, threshold: 10, due: true,
+            trigger_level: 'prompt', immediate_consequences: [],
+            prompt_triggers: [{code: 'wrong-built', notes: ['one.md']}]},
+          providers: {
+            analyzer: {automatic: true, ready: true, blockers: [], kind: 'copilot-sdk'},
+            worker: {automatic: false, ready: true, blockers: [], kind: 'manual'}
+          }, findings: [], runs: []
+        }))
+      }});
+      const automaticBanner = automaticEnv.doc.getElementById('retro-banner');
+      check(S, 'automatic ready analysis names trigger and possible spend',
+            automaticBanner && /Retrospective trigger: wrong-built/.test(automaticBanner.innerHTML)
+            && /may spend provider quota/.test(automaticBanner.innerHTML),
+            automaticBanner ? automaticBanner.innerHTML : 'missing');
+
+      const blocker = 'Codex analyzer cannot enforce repository-scoped reads';
+      const blockedEnv = await run(html, {routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody({
+          providers: {
+            analyzer: {automatic: true, ready: false, blockers: [blocker], kind: 'codex-cli'},
+            worker: {automatic: false, ready: true, blockers: [], kind: 'manual'}
+          }, findings: [], runs: []
+        }))
+      }});
+      const blockedBanner = blockedEnv.doc.getElementById('retro-banner');
+      check(S, 'blocked analyzer reports the exact adapter blocker and local fallback',
+            blockedBanner && blockedBanner.innerHTML.indexOf(blocker) >= 0
+            && /local evidence remains available/.test(blockedBanner.innerHTML),
+            blockedBanner ? blockedBanner.innerHTML : 'missing');
     }
+  }
+
+  /* ------------------------- 1a. recorded reversible operator controls */
+  if (!isRetro && /id="plan-recorded-controls"/.test(html)) {
+    const S = 'recorded-plan-decision';
+    const env = await run(html, {routes: {
+      '/api/health': HEALTH_OK(),
+      '/api/state': response(200, stateBody()),
+      '/api/plan/decision': response(200, JSON.stringify({ok: true, dispatched: false}))
+    }});
+    const host = env.doc.getElementById('plan-recorded-controls');
+    const reason = host && host.querySelector('.decision-comment');
+    const request = host && host.querySelector('[data-plan-action="request-changes"]');
+    const veto = host && host.querySelector('[data-plan-action="veto"]');
+    check(S, 'recorded controls expose request changes and veto',
+          !!host && !!reason && !!request && !!veto);
+
+    if (veto) { veto.fire('click'); }
+    await settle();
+    check(S, 'an empty reason is rejected before any mutation',
+          env.log.filter(x => x.method === 'POST').length === 0,
+          JSON.stringify(env.log));
+    check(S, 'the missing reason is explained in the page',
+          env.doc.querySelectorAll('.board-error').some(e => /Say what must change/.test(e.innerHTML)));
+
+    if (reason) { reason.value = 'The recorded boundary needs review.'; }
+    if (request) { request.fire('click'); }
+    await settle();
+    if (veto) { veto.fire('click'); }
+    await settle();
+    const mutations = env.log.filter(x => x.method === 'POST');
+    const bodies = mutations.map(x => JSON.parse(x.body));
+    check(S, 'both actions post to the bounded plan decision route',
+          mutations.length === 2
+          && mutations.every(x => x.url === '/api/plan/decision'));
+    check(S, 'each mutation carries the ephemeral board capability',
+          mutations.every(x => x.headers['X-Kit-Board-Token'] === 'dom-harness-capability'));
+    check(S, 'request changes carries the exact fingerprint and required reason',
+          bodies[0] && bodies[0].action === 'request-changes'
+          && bodies[0].fingerprint === 'f'.repeat(64)
+          && bodies[0].comment === 'The recorded boundary needs review.',
+          JSON.stringify(bodies[0] || {}));
+    check(S, 'veto carries the same exact reviewed fingerprint and reason',
+          bodies[1] && bodies[1].action === 'veto'
+          && bodies[1].fingerprint === 'f'.repeat(64)
+          && bodies[1].comment === 'The recorded boundary needs review.',
+          JSON.stringify(bodies[1] || {}));
+    check(S, 'successful decisions refresh the living cockpit', env.ctx.location.reloads === 2,
+          String(env.ctx.location.reloads));
   }
 
   /* --------------------------------------- 1b. ordering and partitioning */
@@ -598,15 +776,15 @@ async function main() {
     const env = await run(html, {routes: {'*': () => Promise.reject(new Error('ECONNREFUSED'))}});
     check(S, 'body is marked board-down', env.doc.body.classList.contains('board-down'));
     const banner = env.doc.getElementById('board-banner');
+    check(S, 'the page says the cockpit is not reachable',
+          banner && /not reachable/i.test(banner.innerHTML));
+    check(S, 'the page names the URL it tried',
+          banner && /127\.0\.0\.1:8899/.test(banner.innerHTML), banner ? banner.innerHTML : '');
+    check(S, 'the page says how to bring the cockpit back',
+          banner && /kit serve/.test(banner.innerHTML));
+    check(S, 'a retry control exists that does not need a reload',
+          !!env.doc.getElementById('board-retry'));
     if (isRetro) {
-      check(S, 'the page says the board is not reachable',
-            banner && /not reachable/i.test(banner.innerHTML));
-      check(S, 'the page names the URL it tried',
-            banner && /127\.0\.0\.1:8899/.test(banner.innerHTML), banner ? banner.innerHTML : '');
-      check(S, 'the page says how to bring the board back',
-            banner && /kit serve/.test(banner.innerHTML));
-      check(S, 'a retry control exists that does not need a reload',
-            !!env.doc.getElementById('board-retry'));
       const ctrls = env.doc.querySelectorAll('[data-board-control]');
       check(S, 'every control is visibly disabled, not clickable-but-inert',
             ctrls.length > 0 && ctrls.every(c => c.disabled === true), String(ctrls.length));
@@ -639,13 +817,21 @@ async function main() {
     const env = await run(html, {protocol: 'file:', routes: {}});
     check(S, 'no request is attempted under file://', env.log.length === 0, JSON.stringify(env.log));
     check(S, 'no polling timer is armed under file://', env.timers.length === 0);
+    const banner = env.doc.getElementById('board-banner');
+    check(S, 'the page says it is read-only because it was opened as a file',
+          banner && /Read-only/.test(banner.innerHTML) && /file:\/\//.test(banner.innerHTML),
+          banner ? banner.innerHTML.slice(0, 160) : 'missing');
+    check(S, 'it explains interactive decisions need the loopback cockpit',
+          banner && /loopback cockpit/.test(banner.innerHTML));
+    const reviewUrl = 'http://127.0.0.1:54321/'
+      + (isRetro ? 'retro.html' : 'plan.html');
+    check(S, 'the exact loopback review URL is a usable link',
+          banner && banner.innerHTML.includes(
+            '<a href="' + reviewUrl + '">' + reviewUrl + '</a>'),
+          banner ? banner.innerHTML : 'missing');
+    check(S, 'the review URL is not rendered as inert code',
+          banner && !banner.innerHTML.includes('<code>' + reviewUrl + '</code>'));
     if (isRetro) {
-      const banner = env.doc.getElementById('board-banner');
-      check(S, 'the page says it is read-only because it was opened as a file',
-            banner && /Read-only/.test(banner.innerHTML) && /file:\/\//.test(banner.innerHTML),
-            banner ? banner.innerHTML.slice(0, 160) : 'missing');
-      check(S, 'it explains approval and dispatch need the loopback board',
-            banner && /loopback board/.test(banner.innerHTML));
       const ctrls = env.doc.querySelectorAll('[data-board-control]');
       check(S, 'controls are disabled under file://',
             ctrls.length > 0 && ctrls.every(c => c.disabled === true));

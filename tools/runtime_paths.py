@@ -9,6 +9,7 @@ callers opt in to creating directories.
 from __future__ import annotations
 
 import json
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_NAME = "kit.config.json"
 CONFIG_SCHEMA = 1
 DEFAULT_RUNTIME = ".kit/runtime"
+PRIVATE_ROOT = ".kit"
 
 
 class RuntimeConfigError(ValueError):
@@ -25,6 +27,30 @@ class RuntimeConfigError(ValueError):
 
 def _inside(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
+
+
+def _is_reparse(info: object) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+
+def _require_unredirected_directories(root: Path, relative: Path) -> None:
+    """Reject an existing runtime component that can redirect or hold data."""
+    cursor = root
+    for component in relative.parts:
+        cursor = cursor / component
+        try:
+            info = cursor.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise RuntimeConfigError(
+                f"runtime_root component is unreadable: {cursor}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(info.st_mode) or _is_reparse(info):
+            raise RuntimeConfigError(
+                f"runtime_root component must be an unredirected directory: {cursor}"
+            )
 
 
 def load_config(root: Path = DEFAULT_ROOT) -> dict[str, Any]:
@@ -46,12 +72,23 @@ def load_config(root: Path = DEFAULT_ROOT) -> dict[str, Any]:
 
 def _relative_private_root(root: Path, configured: object) -> Path:
     raw = str(configured or DEFAULT_RUNTIME).strip()
-    candidate = Path(raw)
+    candidate = Path(raw.replace("\\", "/"))
     if not raw or candidate.is_absolute() or ".." in candidate.parts:
         raise RuntimeConfigError("runtime_root must be a non-empty project-relative path without '..'")
+    portable = candidate.as_posix()
+    if (not portable.startswith(PRIVATE_ROOT + "/")
+            or portable == PRIVATE_ROOT):
+        raise RuntimeConfigError(
+            "runtime_root must be a descendant of the project-local .kit directory"
+        )
+    _require_unredirected_directories(root, candidate)
     resolved = (root / candidate).resolve(strict=False)
-    if not _inside(resolved, root) or resolved == root:
-        raise RuntimeConfigError("runtime_root must remain private to the project root")
+    private = (root / PRIVATE_ROOT).resolve(strict=False)
+    if (not _inside(resolved, root) or not _inside(resolved, private)
+            or resolved == private):
+        raise RuntimeConfigError(
+            "runtime_root must be a descendant of the project-local .kit directory"
+        )
     return resolved
 
 
@@ -93,6 +130,10 @@ class RuntimePaths:
         return self.runtime / "retro" / "ran.json"
 
     @property
+    def retro_completion_lock(self) -> Path:
+        return self.runtime / "retro" / "completion.lock"
+
+    @property
     def board_state(self) -> Path:
         return self.runtime / "board" / "state.json"
 
@@ -109,6 +150,26 @@ class RuntimePaths:
         return self.runtime / "board" / "runs"
 
     @property
+    def verification_runs(self) -> Path:
+        return self.runtime / "verification" / "runs"
+
+    @property
+    def verification_latest(self) -> Path:
+        return self.runtime / "verification" / "latest.json"
+
+    @property
+    def plan_decisions(self) -> Path:
+        return self.runtime / "cockpit" / "plan-decisions"
+
+    @property
+    def plan_decision_lock(self) -> Path:
+        return self.runtime / "cockpit" / "decision.lock"
+
+    @property
+    def plan_decision_transaction(self) -> Path:
+        return self.runtime / "cockpit" / "decision-transaction.json"
+
+    @property
     def dispatch_workspaces(self) -> Path:
         return self.runtime / "dispatch" / "workspaces"
 
@@ -120,6 +181,8 @@ class RuntimePaths:
             self.retro_queue,
             self.retro_sdk,
             self.board_runs,
+            self.verification_runs,
+            self.plan_decisions,
             self.dispatch_workspaces,
         ):
             path.mkdir(parents=True, exist_ok=True)

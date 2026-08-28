@@ -76,6 +76,13 @@ def _fixture_repository(base: Path, *, license_file: bool = True,
     required = {
         ".agent-kit.json": '{"kind":"portable-agent-kit-root","schema":1}\r\n',
         "AGENTS.md": "# Agent rules\r\nNo secrets.\r\n",
+        "ARCHITECTURE.md": (
+            "# Architecture\r\n\r\n"
+            "```mermaid\r\n"
+            "graph TD\r\n"
+            "    source_only_module_alpha --> source_only_module_beta\r\n"
+            "```\r\n"
+        ),
         "README.md": "# Test kit\r\nDeterministic release.\r\n",
         "bootstrap.py": "#!/usr/bin/env python3\r\nprint('bootstrap')\r\n",
         "check.py": "#!/usr/bin/env python3\r\nprint('check')\r\n",
@@ -104,10 +111,6 @@ def _fixture_repository(base: Path, *, license_file: bool = True,
         if not (root / Path(relative)).exists():
             _write(root, relative, f"# Reviewed fixture: {relative}\r\n")
 
-    # Additional pattern-allowlisted surfaces remain extensible.
-    _write(root, ".agents/skills/example/SKILL.md", "# Example skill\r\n")
-    _write(root, ".github/agents/example.agent.md", "# Example agent\r\n")
-
     # Tracked and untracked state that must never enter the archive.
     excluded = {
         "src/game.gd": "src-leak-marker",
@@ -116,8 +119,8 @@ def _fixture_repository(base: Path, *, license_file: bool = True,
         "docs/retro/evidence/pack.json": "evidence-leak-marker",
         "docs/retro/queue/item.json": "queue-leak-marker",
         "docs/retro/runs/run.log": "run-leak-marker",
-        "project.shape.json": "shape-leak-marker",
-        "proposal.json": "proposal-leak-marker",
+        "project.shape.json": '{"marker":"shape-leak-marker"}\n',
+        "proposal.json": '{"marker":"proposal-leak-marker"}\n',
         "retro.config.json": "retro-config-leak-marker",
         "plan.html": "plan-leak-marker",
         "retro.html": "retro-html-leak-marker",
@@ -166,7 +169,14 @@ def _synthetic_smoke_archive(base: Path) -> Path:
         ),
         "kit": b'#!/bin/sh\nexec python3 "$(dirname "$0")/kit.py" "$@"\n',
         "kit.cmd": b'@echo off\npython "%~dp0kit.py" %*\n',
-        "kit.py": b"#!/usr/bin/env python3\nprint('usage: kit')\n",
+        "kit.py": (
+            b"#!/usr/bin/env python3\n"
+            b"import sys\n"
+            b"from pathlib import Path\n"
+            b"sys.path.insert(0, str(Path(__file__).parent / 'tools'))\n"
+            b"import process_supervisor\n"
+            b"print('usage: kit')\n"
+        ),
         "tools/project_context.py": b"# synthetic project context\n",
         "tools/providers.py": b"# synthetic providers\n",
         "tools/release.py": b"# synthetic release tool\n",
@@ -174,6 +184,8 @@ def _synthetic_smoke_archive(base: Path) -> Path:
     }
     for relative in sorted(release.REQUIRED_KIT_FILES):
         content.setdefault(relative, f"# synthetic {relative}\n".encode("utf-8"))
+    content["ARCHITECTURE.md"] = release.CANONICAL_ARCHITECTURE
+    content["arch.rules.json"] = release.CANONICAL_ARCH_RULES
     files = [
         release.ReleaseFile(
             name,
@@ -187,6 +199,11 @@ def _synthetic_smoke_archive(base: Path) -> Path:
         ["LICENSE"],
         files,
         {"commit": "a" * 40, "dirty": False},
+        {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+        },
     )
     members = {item.path: (item.content, item.mode) for item in files}
     members[release.MANIFEST_PATH] = (release._canonical_json(manifest), 0o644)
@@ -217,6 +234,11 @@ class TestDeterministicBuild(ReleaseTestCase):
         self.assertEqual(output_one.read_bytes(), output_two.read_bytes())
         self.assertEqual(first["archive_sha256"], second["archive_sha256"])
         self.assertEqual(first["source"], {"commit": commit, "dirty": False})
+        self.assertEqual(first["authority_evidence"], {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "no-exact-authority-event",
+        })
 
         inspected = release.inspect_archive(output_one)
         verified = release.verify_archive(output_one)
@@ -224,17 +246,27 @@ class TestDeterministicBuild(ReleaseTestCase):
         manifest = inspected["manifest"]
         self.assertEqual(manifest["version"], "1.2.3")
         self.assertEqual(manifest["source"], {"commit": commit, "dirty": False})
+        self.assertEqual(manifest["authority_evidence"], {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "no-exact-authority-event",
+        })
         self.assertEqual(manifest["license_files"], ["LICENSE"])
         manifest_text = json.dumps(manifest, sort_keys=True)
         self.assertNotIn(str(root.resolve()).replace("\\", "/"), manifest_text)
 
         contents = _member_contents(output_one)
         expected = set(release.REQUIRED_KIT_FILES) | {
-            "LICENSE", ".agents/skills/example/SKILL.md",
-            ".github/agents/example.agent.md", release.MANIFEST_PATH,
+            "LICENSE", release.MANIFEST_PATH,
         }
         self.assertEqual(set(contents), expected)
         self.assertNotIn(b"\r", contents["README.md"])
+        self.assertEqual(
+            contents["ARCHITECTURE.md"], release.CANONICAL_ARCHITECTURE
+        )
+        self.assertEqual(
+            contents["arch.rules.json"], release.CANONICAL_ARCH_RULES
+        )
         combined = b"\n".join(contents.values())
         for marker in (
                 b"src-leak-marker", b"design-leak-marker",
@@ -244,11 +276,15 @@ class TestDeterministicBuild(ReleaseTestCase):
                 b"environment-secret-marker", b"secret-directory-marker",
                 b"tool-leak-marker", b"cache-leak-marker", b"pytest-leak-marker"):
             self.assertNotIn(marker, combined)
+        self.assertNotIn(b"source_only_module_alpha", combined)
+        self.assertNotIn(b"source_only_module_beta", combined)
 
         with zipfile.ZipFile(output_one, "r") as archive:
             names = [info.filename for info in archive.infolist()]
             self.assertEqual(names, sorted(names))
             self.assertTrue(all(info.date_time == release.FIXED_ZIP_TIME
+                                for info in archive.infolist()))
+            self.assertTrue(all(info.compress_type == zipfile.ZIP_STORED
                                 for info in archive.infolist()))
             modes = {info.filename: stat.S_IMODE(info.external_attr >> 16)
                      for info in archive.infolist()}
@@ -275,16 +311,156 @@ class TestDeterministicBuild(ReleaseTestCase):
                             and member.uname == "" and member.gname == ""
                             for member in members))
 
-    def test_untracked_nonallowlisted_file_marks_dirty_but_never_leaks(self) -> None:
+    def test_gzip_wrapper_uses_canonical_stored_deflate_blocks(self) -> None:
+        self.assertEqual(
+            "1f8b08000000000000ff010300fcff616263c241243503000000",
+            release._stored_gzip(b"abc").hex(),
+        )
+
+    def test_project_architecture_rules_are_replaced_before_release(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        project_marker = "project_inventory_must_depend_on_project_combat"
+        _write(
+            root,
+            "arch.rules.json",
+            json.dumps({
+                "module_depth": 2,
+                "modules": {
+                    "scripts/project_inventory": {
+                        "description": project_marker,
+                        "may_depend_on": ["scripts/project_combat"],
+                    },
+                },
+            }) + "\n",
+        )
+        _git(root, "add", "arch.rules.json")
+        _git(root, "-c", "commit.gpgsign=false", "commit", "-qm", "project rules")
+        archive = self.scratch / "out" / "canonical-rules.zip"
+
+        release.build_release(root, archive)
+
+        contents = _member_contents(archive)
+        self.assertEqual(
+            release.CANONICAL_ARCH_RULES, contents["arch.rules.json"]
+        )
+        self.assertNotIn(project_marker.encode("utf-8"), b"\n".join(contents.values()))
+
+    def test_dirty_source_is_inspectable_but_cannot_build_production_release(self) -> None:
         root, commit = _fixture_repository(self.scratch)
         _write(root, "private/operator-token.txt", "untracked-private-marker")
         output = self.scratch / "out" / "dirty.zip"
 
-        report = release.build_release(root, output)
+        with self.assertRaisesRegex(release.ReleaseError, "requires a clean source"):
+            release.build_release(root, output)
 
-        self.assertEqual(report["source"], {"commit": commit, "dirty": True})
-        self.assertNotIn(b"untracked-private-marker",
-                         b"\n".join(_member_contents(output).values()))
+        self.assertFalse(output.exists())
+        source, _porcelain = release._git_state(root)
+        self.assertEqual(source, {"commit": commit, "dirty": True})
+
+    def test_dirty_manifest_is_visible_to_inspection_but_rejected_as_release(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        manifest["source"]["dirty"] = True
+        contents[release.MANIFEST_PATH] = release._canonical_json(manifest)
+        members = {
+            name: (content, 0o755 if name.endswith(".py") or name == "kit" else 0o644)
+            for name, content in contents.items()
+        }
+        release._write_zip(archive, members)
+
+        inspected = release.inspect_archive(archive)
+        self.assertTrue(inspected["manifest"]["source"]["dirty"])
+        with self.assertRaisesRegex(release.ReleaseError, "not production provenance"):
+            release.verify_archive(archive)
+
+    def test_archive_requires_explicit_portable_policy_authority_label(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        for field, invalid in (
+            ("receipt_trust", "local-audit-matched"),
+            ("identity_model", "authenticated-human"),
+            ("project_receipt_trust", "invalid"),
+        ):
+            with self.subTest(field=field):
+                changed = dict(manifest)
+                changed["authority_evidence"] = dict(manifest["authority_evidence"])
+                changed["authority_evidence"][field] = invalid
+                contents[release.MANIFEST_PATH] = release._canonical_json(changed)
+                members = {
+                    name: (
+                        content,
+                        0o755 if name.endswith(".py") or name == "kit" else 0o644,
+                    )
+                    for name, content in contents.items()
+                }
+                release._write_zip(archive, members)
+                with self.assertRaisesRegex(
+                    release.ReleaseError, "receipt_trust|identity model|receipt trust"
+                ):
+                    release.verify_archive(archive)
+
+    def test_no_project_state_records_not_applicable_portable_policy(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        (root / "proposal.json").unlink()
+        (root / "project.shape.json").unlink()
+        _git(root, "add", "--all")
+        _git(root, "-c", "commit.gpgsign=false", "commit", "-qm", "remove project state")
+
+        report = release.build_release(root, self.scratch / "out" / "kit.zip")
+
+        self.assertEqual(report["authority_evidence"], {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+        })
+
+    def test_present_invalid_project_receipt_blocks_before_exclusion(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        invalid = {
+            "receipt_trust": "invalid",
+            "receipt_reasons": ["private local receipt contradicts durable event"],
+        }
+        with mock.patch(
+            "proposal_authority.exact_approval_state", return_value=invalid
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                "pre-exclusion authority receipt is invalid.*contradicts",
+            ):
+                release.build_release(root, self.scratch / "out" / "kit.zip")
+
+    def test_project_receipt_is_reauthenticated_after_input_collection(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        before = {
+            "receipt_trust": "local-audit-matched",
+            "receipt_reasons": ["private receipt matches"],
+        }
+        after = {
+            "receipt_trust": "invalid",
+            "receipt_reasons": ["private receipt changed during build"],
+        }
+        with mock.patch(
+            "proposal_authority.exact_approval_state",
+            side_effect=(before, after),
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                "pre-exclusion authority receipt is invalid.*changed during build",
+            ):
+                release.build_release(root, self.scratch / "out" / "kit.zip")
+
+    def test_partial_project_authority_state_fails_closed(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        (root / "proposal.json").unlink()
+        _git(root, "add", "--all")
+        _git(root, "-c", "commit.gpgsign=false", "commit", "-qm", "partial state")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError, "must either both exist or both be absent"
+        ):
+            release.build_release(root, self.scratch / "out" / "kit.zip")
 
 
 class TestSemanticIsolation(ReleaseTestCase):
@@ -353,8 +529,7 @@ class TestRequiredMetadata(ReleaseTestCase):
         invalid_root, _commit = _fixture_repository(invalid)
         _write(invalid_root, "VERSION", "not a version with spaces\n")
         with self.assertRaisesRegex(release.ReleaseError, "VERSION must be one line"):
-            release.build_release(invalid_root,
-                                  self.scratch / "out" / "invalid-version.zip")
+            release.collect_files(invalid_root)
 
     def test_output_inside_source_tree_is_refused(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
@@ -363,6 +538,37 @@ class TestRequiredMetadata(ReleaseTestCase):
 
 
 class TestSourcePathSafety(ReleaseTestCase):
+    def test_canonical_release_surface_sets_are_complete_and_exact(self) -> None:
+        actual_tools = {
+            path.relative_to(REPOSITORY).as_posix()
+            for path in (REPOSITORY / "tools").glob("*.py")
+        }
+        actual_tests = {
+            path.relative_to(REPOSITORY).as_posix()
+            for path in (REPOSITORY / "tools" / "tests").glob("test_*.py")
+        }
+        actual_skills = {
+            path.relative_to(REPOSITORY).as_posix()
+            for path in (REPOSITORY / ".agents" / "skills").glob("*/SKILL.md")
+        }
+        actual_agents = {
+            path.relative_to(REPOSITORY).as_posix()
+            for path in (REPOSITORY / ".github" / "agents").glob("*.agent.md")
+        }
+
+        self.assertEqual(actual_tools, set(release.TOOL_FILES))
+        self.assertTrue(actual_tests.issubset(release.VALIDATION_FILES))
+        self.assertEqual(actual_skills, set(release.REQUIRED_SKILL_FILES))
+        self.assertEqual(actual_agents, set(release.REQUIRED_AGENT_FILES))
+
+    def test_unreviewed_skill_or_persona_is_not_pattern_allowlisted(self) -> None:
+        self.assertFalse(release.is_allowlisted(
+            ".agents/skills/unreviewed/SKILL.md"
+        ))
+        self.assertFalse(release.is_allowlisted(
+            ".github/agents/unreviewed.agent.md"
+        ))
+
     def test_allowlisted_source_symlink_is_refused_before_reading(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
         readme = root / "README.md"
@@ -471,7 +677,33 @@ class TestPrivateRuntimePolicy(ReleaseTestCase):
             '{"schema":1,"runtime_root":"../outside"}\n',
         )
 
-        with self.assertRaisesRegex(release.ReleaseError, "runtime_root is unsafe"):
+        with self.assertRaisesRegex(release.ReleaseError, "project-relative path"):
+            release._private_runtime_root(root)
+
+    def test_repository_local_runtime_outside_dot_kit_fails_closed(self) -> None:
+        root = self.scratch / "source"
+        root.mkdir()
+        for configured in ("state/private", "src/runtime", "docs/private", ".kit"):
+            with self.subTest(configured=configured):
+                _write(
+                    root,
+                    "kit.config.json",
+                    json.dumps({"schema": 1, "runtime_root": configured}) + "\n",
+                )
+                with self.assertRaisesRegex(release.ReleaseError, "descendant.*\\.kit"):
+                    release._private_runtime_root(root)
+
+    def test_private_runtime_container_cannot_be_a_file(self) -> None:
+        root = self.scratch / "source"
+        root.mkdir()
+        _write(
+            root,
+            "kit.config.json",
+            '{"schema":1,"runtime_root":".kit/runtime"}\n',
+        )
+        _write(root, ".kit", "not a private directory")
+
+        with self.assertRaisesRegex(release.ReleaseError, "unredirected directory"):
             release._private_runtime_root(root)
 
 
@@ -488,11 +720,81 @@ class TestReleaseSmoke(ReleaseTestCase):
             report["smoke"]["launcher"],
         )
         self.assertTrue((workspace / "kit.py").is_file())
+        self.assertTrue((workspace / "tools" / "process_supervisor.py").is_file())
+        self.assertEqual(
+            release.CANONICAL_ARCH_RULES,
+            (workspace / "arch.rules.json").read_bytes(),
+        )
+        self.assertTrue(
+            (workspace / "tools" / "tests" / "test_native_process_containment.py").is_file()
+        )
         with self.assertRaisesRegex(release.ReleaseError, "already exists"):
             release.smoke_archive(archive, workspace)
 
 
 class TestVerification(ReleaseTestCase):
+    def test_manifest_cannot_authorize_project_generated_architecture(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        contaminated = (
+            b"# Architecture\n\n```mermaid\ngraph TD\n"
+            b"project_inventory --> project_combat\n```\n"
+        )
+        entry = next(
+            item for item in manifest["files"]
+            if item["path"] == "ARCHITECTURE.md"
+        )
+        entry["bytes"] = len(contaminated)
+        entry["sha256"] = release.hashlib.sha256(contaminated).hexdigest()
+        contents["ARCHITECTURE.md"] = contaminated
+        contents[release.MANIFEST_PATH] = release._canonical_json(manifest)
+        members = {
+            name: (
+                content,
+                0o755 if name.endswith(".py") or name == "kit" else 0o644,
+            )
+            for name, content in contents.items()
+        }
+        release._write_zip(archive, members)
+
+        self.assertEqual(release.inspect_archive(archive)["format"], "zip")
+        with self.assertRaisesRegex(
+            release.ReleaseError, "canonical empty release template"
+        ):
+            release.verify_archive(archive)
+
+    def test_manifest_cannot_authorize_project_architecture_rules(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        contaminated = json.dumps({
+            "module_depth": 2,
+            "modules": {"scripts/project_combat": {"may_depend_on": []}},
+        }).encode("utf-8") + b"\n"
+        entry = next(
+            item for item in manifest["files"]
+            if item["path"] == "arch.rules.json"
+        )
+        entry["bytes"] = len(contaminated)
+        entry["sha256"] = release.hashlib.sha256(contaminated).hexdigest()
+        contents["arch.rules.json"] = contaminated
+        contents[release.MANIFEST_PATH] = release._canonical_json(manifest)
+        members = {
+            name: (
+                content,
+                0o755 if name.endswith(".py") or name == "kit" else 0o644,
+            )
+            for name, content in contents.items()
+        }
+        release._write_zip(archive, members)
+
+        self.assertEqual(release.inspect_archive(archive)["format"], "zip")
+        with self.assertRaisesRegex(
+            release.ReleaseError, "canonical genre-neutral release template"
+        ):
+            release.verify_archive(archive)
+
     def test_tampered_member_fails_hash_verification(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
         original = self.scratch / "out" / "original.zip"

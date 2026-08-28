@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 import unittest
@@ -143,7 +144,8 @@ class TestGeneration(QueueTestCase):
             "schema", "slug", "title", "normalised_title", "severity", "sessions",
             "fix_files", "fix_lines", "human_turns", "body", "prompt",
             "evidence_snapshot", "dispatchable", "dispatch_blockers",
-            "source_file", "source_sha256", "generated_at",
+            "source_file", "source_sha256", "generated_at", "prompt_sha256",
+            "template_sha256", "artifact_sha256",
         })
         self.assertEqual(item["normalised_title"],
                          retro_rank.normalise_title(item["title"]))
@@ -153,6 +155,10 @@ class TestGeneration(QueueTestCase):
         self.assertTrue(item["dispatchable"])
         self.assertEqual(item["dispatch_blockers"], [])
         self.assertEqual(retro_queue.dispatch_eligibility(item), (True, []))
+        review = retro_queue.review_identity(item)
+        self.assertEqual(review["artifact_schema"], retro_queue.SCHEMA)
+        self.assertEqual(review["artifact_sha256"], item["artifact_sha256"])
+        self.assertEqual(len(review["review_sha256"]), 64)
 
     def test_prompt_carries_restrictions_and_strict_finding(self) -> None:
         prompt = self.build()[0]["prompt"]
@@ -236,6 +242,40 @@ fix_lines: 2
         self.assertFalse(items[0]["dispatchable"])
         self.assertIn("evidence_snapshot: missing (legacy report)",
                       items[0]["dispatch_blockers"])
+
+    def test_legacy_copilot_v1_snapshot_remains_dispatchable(self) -> None:
+        repository = os.path.normcase(os.path.abspath(self.root)).replace("\\", "/").rstrip("/")
+        manifest = {
+            "schema": 1,
+            "kind": "copilot-session-evidence",
+            "repository": repository,
+            "sessions": [{
+                "ordinal": 1,
+                "session_id": "legacy-session",
+                "name": "legacy",
+                "started": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T01:00:00Z",
+                "sources": {},
+                "warnings": [],
+                "evidence": {
+                    "turns": 1, "cost": 1.0, "model": "legacy",
+                    "persona": "game-builder", "gate_fails": {},
+                    "gate_passes": 0, "loops": {}, "rewrites": {},
+                    "human_messages": [{
+                        "citation": "legacy-session:H1", "text": "Legacy correction."
+                    }],
+                },
+            }],
+        }
+        path = session_evidence.write_manifest(self.session_evidence, manifest)
+        snapshot = path.relative_to(self.root).as_posix()
+        self.findings.write_text(_findings(
+            snapshot, first_cite="S1:H1").replace("sessions: [S1; S2]", "sessions: [S1]")
+            .replace("; S2:H9", ""), encoding="utf-8")
+
+        items = self.build()
+        self.assertTrue(items[0]["dispatchable"], items[0]["dispatch_blockers"])
+        self.assertEqual(items[0]["human_turns"][0]["quote"], "Legacy correction.")
 
     def test_tampered_snapshot_is_rejected_by_build_and_revalidation(self) -> None:
         snapshot_path = self.root / self.snapshot
@@ -351,6 +391,53 @@ class TestLoadingAndStaleness(QueueTestCase):
         self.assertTrue(retro_queue.is_stale(item))
         self.findings.unlink()
         self.assertTrue(retro_queue.is_stale(item))
+
+    def test_noncanonical_and_traversal_slugs_never_reach_other_json(self) -> None:
+        item = self.build()[0]
+        outside = self.queue.parent / "outside.json"
+        outside.write_text(json.dumps(item), encoding="utf-8")
+        for slug in (
+            "../outside", "..\\outside", "/outside", "A-Title", "two--hyphens",
+            "a" * (retro_queue.MAX_SLUG_CHARS + 1),
+        ):
+            with self.subTest(slug=slug):
+                self.assertIsNone(retro_queue.canonical_slug(slug))
+                self.assertIsNone(retro_queue.load_item(slug, self.queue))
+
+    def test_tampered_complete_artifact_digest_fails_closed(self) -> None:
+        item = self.build()[0]
+        path = self.queue / f"{item['slug']}.json"
+        tampered = json.loads(path.read_text(encoding="utf-8"))
+        tampered["prompt"] += "\nunreviewed instruction\n"
+        path.write_text(json.dumps(tampered), encoding="utf-8")
+        loaded = retro_queue.load_item(item["slug"], self.queue)
+        self.assertIsNotNone(loaded)
+        dispatchable, blockers = retro_queue.dispatch_eligibility(loaded)
+        self.assertFalse(dispatchable)
+        self.assertIn("artifact: prompt digest does not match its exact bytes", blockers)
+
+    def test_artifact_symlink_is_not_a_queue_item(self) -> None:
+        item = self.build()[0]
+        path = self.queue / f"{item['slug']}.json"
+        target = self.queue / "target.json"
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        try:
+            path.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation is unavailable: {exc}")
+        self.assertIsNone(retro_queue.load_item(item["slug"], self.queue))
+
+    def test_findings_source_must_be_a_direct_regular_retro_file(self) -> None:
+        item = self.build()[0]
+        path = self.queue / f"{item['slug']}.json"
+        outside = self.root / "outside-findings.md"
+        outside.write_bytes(self.findings.read_bytes())
+        item["source_file"] = outside.relative_to(self.root).as_posix()
+        item["source_sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
+        item["artifact_sha256"] = retro_queue.artifact_sha256(item)
+        path.write_text(json.dumps(item), encoding="utf-8")
+        self.assertIsNone(retro_queue.load_item(item["slug"], self.queue))
 
 
 class TestRenderAndBoardRead(QueueTestCase):

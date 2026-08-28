@@ -31,6 +31,18 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(providers.ProviderConfigError):
             self.select("analyzer", {"analyzer": {"kind": "copilot-cli"}})
 
+    def test_compatibility_aliases_normalize_to_closed_official_kinds(self) -> None:
+        self.assertEqual(
+            self.select("worker", {"worker": {"kind": "codex"}}).kind,
+            "codex-cli",
+        )
+        self.assertEqual(
+            self.select("worker", {
+                "worker": {"kind": "github-copilot-cli", "persona": "kit-builder"}
+            }).kind,
+            "copilot-cli",
+        )
+
     def test_provider_timeout_is_bounded_and_part_of_the_bound_record(self) -> None:
         spec = self.select(
             "worker", {"worker": {"kind": "manual", "timeout_minutes": 45}}
@@ -43,30 +55,20 @@ class ProviderTests(unittest.TestCase):
             )
 
     @mock.patch("tools.providers._copilot_launcher", return_value=["copilot"])
-    def test_worker_command_is_argv_not_shell(self, _launcher: mock.Mock) -> None:
+    def test_copilot_worker_fails_closed_without_host_read_boundary(
+        self, _launcher: mock.Mock
+    ) -> None:
         spec = self.select(
             "worker",
             {"worker": {"kind": "copilot-cli", "model": "small", "persona": "kit-builder"}},
         )
-        command = providers.worker_command(spec)
-        self.assertEqual(command[:3], ["copilot", "--agent", "kit-builder"])
-        self.assertNotIn("-p", command)
-        self.assertFalse(any("prompt" in argument for argument in command))
-        permission = next(arg for arg in command if arg.startswith("--allow-tool="))
-        self.assertEqual("--allow-tool=read,write", permission)
-        self.assertIn(
-            "--available-tools=view,grep,glob,edit,create,apply_patch", command
+        self.assertEqual(
+            providers.preflight(spec), [providers.COPILOT_READ_BOUNDARY_BLOCKER]
         )
-        self.assertIn("--deny-tool=shell,url,memory,write(.git)", command)
-        self.assertIn("--disallow-temp-dir", command)
-        self.assertIn("--no-ask-user", command)
-        self.assertIn("--no-auto-update", command)
-        self.assertIn("--no-remote", command)
-        self.assertIn("--no-remote-export", command)
-        self.assertIn("--disable-builtin-mcps", command)
-        self.assertNotIn("--allow-all-tools", command)
-        self.assertNotIn("--allow-all-paths", command)
-        self.assertEqual(command[-2:], ["--model", "small"])
+        with self.assertRaisesRegex(
+            providers.ProviderConfigError, "host-enforced repository-scoped"
+        ):
+            providers.worker_command(spec)
 
     def test_provider_identifiers_cannot_smuggle_shell_syntax(self) -> None:
         for field, value in (("model", "small&whoami"), ("persona", "kit|builder")):
@@ -77,6 +79,12 @@ class ProviderTests(unittest.TestCase):
                     self.select(
                         "worker", {"worker": {"kind": "copilot-cli", field: value}}
                     )
+
+    def test_codex_rejects_unsupported_persona_instead_of_ignoring_it(self) -> None:
+        with self.assertRaisesRegex(providers.ProviderConfigError, "do not support persona"):
+            self.select("worker", {
+                "worker": {"kind": "codex-cli", "persona": "kit-builder"}
+            })
 
     def test_bound_provider_records_are_revalidated(self) -> None:
         original = providers.ProviderSpec(
@@ -94,8 +102,53 @@ class ProviderTests(unittest.TestCase):
             "tools.providers.copilot_sdk_path", return_value=None
         ):
             problems = providers.preflight(spec)
-        self.assertEqual(len(problems), 2)
+        self.assertEqual(len(problems), 3)
         self.assertIn("needs >= 24", problems[0])
+        self.assertEqual(problems[-1], providers.COPILOT_READ_BOUNDARY_BLOCKER)
+
+    def test_resume_hint_rejects_shell_metacharacters(self) -> None:
+        spec = providers.ProviderSpec("worker", "copilot-cli", persona="kit-builder")
+        self.assertEqual(providers.resume_command(spec, "good-session_123"),
+                         "copilot --agent kit-builder --resume=good-session_123")
+        self.assertEqual(providers.resume_command(spec, "x&whoami"), "")
+
+    @mock.patch("tools.providers._codex_launcher", return_value=["node", "codex.js"])
+    def test_codex_analyzer_is_recognized_but_execution_is_explicitly_unavailable(
+            self, _launcher: mock.Mock) -> None:
+        spec = self.select("analyzer", {"analyzer": {"kind": "openai-codex"}})
+        self.assertEqual(spec.kind, "codex-cli")
+        self.assertEqual(providers.preflight(spec), [providers.CODEX_READ_BOUNDARY_BLOCKER])
+
+    @mock.patch("tools.providers._codex_launcher", return_value=["node", "codex.js"])
+    def test_codex_worker_uses_exact_sandboxed_stdin_argv(
+            self, _launcher: mock.Mock) -> None:
+        spec = self.select("worker", {
+            "worker": {"kind": "codex-cli", "model": "gpt-5.6-sol"}
+        })
+        self.assertEqual(providers.preflight(spec), [providers.CODEX_READ_BOUNDARY_BLOCKER])
+        with self.assertRaisesRegex(providers.ProviderConfigError,
+                                    "does not enforce repository-scoped reads"):
+            providers.worker_command(spec)
+        command = providers._codex_worker_argv(spec)
+
+        self.assertEqual(command, [
+            "node", "codex.js",
+            "--ask-for-approval", "never",
+            "--sandbox", "workspace-write",
+            "--cd", ".",
+            "--model", "gpt-5.6-sol",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--json",
+            "-",
+        ])
+        joined = " ".join(command)
+        self.assertNotIn("dangerously-bypass", joined)
+        self.assertNotIn("yolo", joined)
+        self.assertNotIn("search", joined)
+        self.assertNotIn("login", joined)
+        self.assertNotIn("install", joined)
 
     def test_windows_npm_shim_uses_node_entry_without_cmd(self) -> None:
         root = Path("C:/npm/node_modules/@github/copilot")
@@ -111,6 +164,21 @@ class ProviderTests(unittest.TestCase):
                 mock.patch("tools.providers._copilot_bin_entry", return_value=entry), \
                 mock.patch("tools.providers.shutil.which", side_effect=which):
             launcher = providers._copilot_launcher()
+        self.assertEqual(["C:/node/node.exe", str(entry)], launcher)
+
+    def test_codex_launcher_uses_only_authenticated_package_entry(self) -> None:
+        root = Path("C:/npm/node_modules/@openai/codex")
+        entry = root / "bin" / "codex.js"
+
+        def which(name: str) -> str | None:
+            return "C:/node/node.exe" if name in ("node.exe", "node") else None
+
+        with mock.patch("tools.providers._codex_executable",
+                        return_value="C:/npm/codex.cmd"), \
+                mock.patch("tools.providers._codex_package_root", return_value=root), \
+                mock.patch("tools.providers._codex_bin_entry", return_value=entry), \
+                mock.patch("tools.providers.shutil.which", side_effect=which):
+            launcher = providers._codex_launcher()
         self.assertEqual(["C:/node/node.exe", str(entry)], launcher)
 
     def test_sdk_path_resolves_the_export_beside_a_windows_npm_shim(self) -> None:

@@ -9,9 +9,11 @@ A separate pipeline from delivery. Delivery turns a request into working code.
 Discovery turns an idea into a written end state that later work can descend
 from.
 
-They are different sessions with different outputs. Do not write code in a
-discovery session, and do not silently start one in the middle of a build - say
-that is what you are doing.
+They are different pipelines with different outputs. Do not write code while
+discovering, and do not silently start discovery in the middle of a build - say
+that is what you are doing. After the design artefact exists, a hands-off agent
+may explicitly transition back to delivery only under the provisional-design
+rule below.
 
 ## When to enter
 
@@ -73,12 +75,21 @@ as answers arrive. It does not need to be complete to exist.
 | Direction | A leaning, what it would rule out, what would confirm it. |
 | Settled | The answer, the reasoning, what would invalidate it. |
 
-**Never fill a section past the resolution the human has actually reached.** A
-plausible answer written into a gap reads as intent to the next agent, and it
-will be built on. An empty section is honest; a fabricated one is not
-recoverable.
+**Never hide an inference inside design as though the human supplied it.** By
+default, ask rather than fill a gap. One narrow exception exists: if established
+design and repository evidence force one answer with exact `very-high`
+confidence, write it as `agent-provisional`, disclose agent authorship, explain
+the inference and assumptions, and provide a front-loaded Quick read plus veto
+scope and next go/no-go. See `godot-design-sections` for the exact shape.
 
-If you find yourself inventing the answer, that is the signal to ask instead.
+Below very-high confidence, or where two materially different experiences
+remain plausible, ask. An empty question is honest; an undisclosed plausible
+answer is not recoverable.
+
+Agent-provisional settled design may authorize hands-off delivery only while
+the proposal is `recorded` and every change remains cheap to veto. Stop and ask
+for explicit approval before the first difficult-to-reverse commitment. Silence
+is never confirmation.
 
 ## Where it lands
 

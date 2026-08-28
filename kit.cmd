@@ -1,6 +1,7 @@
 @echo off
 setlocal
 set "KIT_ROOT=%~dp0"
+set "PYTHONDONTWRITEBYTECODE=1"
 
 where py >nul 2>&1
 if not errorlevel 1 goto use_py

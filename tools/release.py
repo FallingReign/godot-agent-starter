@@ -12,7 +12,7 @@ Project/game state and runtime retrospective state are never candidates.
 from __future__ import annotations
 
 import argparse
-import gzip
+import binascii
 import hashlib
 import io
 import json
@@ -29,12 +29,120 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = "RELEASE-MANIFEST.json"
-SCHEMA = 1
+SCHEMA = 2
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MAX_MEMBERS = 512
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+
+# ``ARCHITECTURE.md`` in a working project is generated from that game's code.
+# It remains a required kit member so a newly installed project has the normal
+# architecture workflow, but release bytes must not disclose the source game's
+# module names or edges. Verification binds this complete template rather than
+# trusting a manifest to authorize arbitrary project-generated graph content.
+CANONICAL_ARCHITECTURE = b"""# Architecture
+
+This distributable starts with no game modules or dependency edges. The file is
+regenerated from the target project's code; it is not a snapshot of the project
+that built the kit.
+
+Regenerate it after adding game code:
+
+```text
+kit architecture update
+```
+
+## Module graph
+
+<!-- BEGIN GENERATED GRAPH -->
+
+```mermaid
+graph TD
+```
+
+<!-- END GENERATED GRAPH -->
+
+## Project boundaries
+
+Record allowed module dependencies in `arch.rules.json`. The generated graph
+then shows what the target project actually contains, while `kit verify --stage
+arch` checks those observed edges against the declared policy.
+"""
+
+# ``arch.rules.json`` is mutable project architecture just as much as the
+# generated graph above.  Shipping the source copy would disclose a project's
+# module names, descriptions and dependency policy, even when no matching game
+# file happened to make that residue visible to the text scanner.  A release
+# therefore carries this fixed, genre-neutral starting policy instead.
+CANONICAL_ARCH_RULES = b"""{
+  "_comment": [
+    "Default genre-neutral module boundaries for a newly installed kit.",
+    "Paths are relative to the configured game root (Godot res://).",
+    "Revise these defaults deliberately for the destination project, then run kit architecture update."
+  ],
+  "module_depth": 2,
+  "modules": {
+    "scenes": {
+      "description": "scene files and presentation",
+      "may_depend_on": [
+        "scripts",
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "scripts": {
+      "description": "node layer and presentation wiring",
+      "may_depend_on": [
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "scripts/data": {
+      "description": "typed configuration and external-data boundary",
+      "may_depend_on": []
+    },
+    "scripts/logic": {
+      "description": "pure rules with no scene, node or autoload dependency",
+      "may_depend_on": [
+        "scripts/data"
+      ]
+    },
+    "tests": {
+      "description": "project test harnesses",
+      "may_depend_on": [
+        "scripts",
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "tests/unit": {
+      "description": "logic and data tests",
+      "may_depend_on": [
+        "scripts/logic",
+        "scripts/data"
+      ]
+    },
+    "tools": {
+      "description": "headless project validators not shipped in the game",
+      "may_depend_on": []
+    }
+  },
+  "forbid_autoload_use_in": [
+    "scripts/logic/",
+    "scripts/data/"
+  ],
+  "type_boundary": {
+    "_note": "Rename or extend these paths when the destination project deliberately adopts another layout.",
+    "boundary": [
+      "scripts/data/"
+    ],
+    "interior": [
+      "scripts/logic/"
+    ]
+  }
+}
+"""
 
 LEGAL_FILES = frozenset({
     "LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "COPYING.md",
@@ -50,6 +158,7 @@ ROOT_FILES = frozenset({
     ".gitattributes",
     ".gdlintrc",
     ".gitignore",
+    ".github/copilot-instructions.md",
     "AGENTS.md",
     "ARCHITECTURE.md",
     "CLAUDE.md",
@@ -84,22 +193,29 @@ DOC_FILES = frozenset({
 })
 
 TOOL_FILES = frozenset({
+    "tools/authored_scope.py",
     "tools/board.py",
     "tools/board_client.py",
+    "tools/cockpit.py",
     "tools/design.py",
     "tools/engine_discovery.py",
     "tools/friction.py",
     "tools/gddoc.py",
+    "tools/gd_signature.py",
     "tools/gdls.py",
     "tools/gen_gdscript_doc.py",
     "tools/md.py",
+    "tools/native_engine.py",
     "tools/plan_html.py",
+    "tools/process_supervisor.py",
     "tools/project_context.py",
+    "tools/proposal_authority.py",
     "tools/providers.py",
     "tools/release.py",
     "tools/retro.py",
     "tools/retro_due.py",
     "tools/retro_html.py",
+    "tools/retro_ledger.py",
     "tools/retro_queue.py",
     "tools/retro_rank.py",
     "tools/retro_sdk.py",
@@ -118,23 +234,33 @@ VALIDATION_FILES = frozenset({
     "tools/tests/mock_board.py",
     "tools/tests/page_parts.py",
     "tools/tests/test_board_api.py",
+    "tools/tests/test_authored_scope.py",
     "tools/tests/test_bootstrap.py",
+    "tools/tests/test_cockpit.py",
+    "tools/tests/test_design_conformance.py",
+    "tools/tests/test_design_governance.py",
     "tools/tests/test_engine_discovery.py",
     "tools/tests/test_engine_boundary.py",
     "tools/tests/test_frontend.py",
     "tools/tests/test_friction.py",
+    "tools/tests/test_gate_receipt.py",
+    "tools/tests/test_gd_signature.py",
     "tools/tests/test_integration.py",
     "tools/tests/test_kit_cli.py",
     "tools/tests/test_layout_consumers.py",
+    "tools/tests/test_native_engine.py",
+    "tools/tests/test_native_process_containment.py",
     "tools/tests/test_project_context.py",
     "tools/tests/test_providers.py",
     "tools/tests/test_release.py",
     "tools/tests/test_retro_due.py",
+    "tools/tests/test_retro_ledgers.py",
     "tools/tests/test_retro_queue.py",
     "tools/tests/test_retro_workflow.py",
     "tools/tests/test_run_result.py",
     "tools/tests/test_runtime_paths.py",
     "tools/tests/test_session_evidence.py",
+    "tools/tests/test_signature_consumers.py",
     "tools/tests/test_strict_verify.py",
 })
 
@@ -173,12 +299,19 @@ REQUIRED_SKILL_FILES = frozenset({
 REQUIRED_KIT_FILES = (
     (FIXED_FILES - LEGAL_FILES) | REQUIRED_AGENT_FILES | REQUIRED_SKILL_FILES
 )
-SKILL_PATH_RE = re.compile(r"\.agents/skills/[A-Za-z0-9_-]+/SKILL\.md\Z")
-AGENT_PATH_RE = re.compile(r"\.github/agents/[A-Za-z0-9_-]+\.agent\.md\Z")
 SAFE_ARCHIVE_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\Z")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+ARCHIVE_RECEIPT_TRUST = "portable-policy"
+AUTHORITY_IDENTITY_MODEL = "portable-policy-audit"
+NO_PROJECT_RECEIPT = "not-applicable-no-project-state"
+PROJECT_RECEIPT_TRUST = frozenset({
+    "local-audit-matched",
+    "portable-policy",
+    "no-exact-authority-event",
+    NO_PROJECT_RECEIPT,
+})
 PROJECT_TEXT_SUFFIXES = frozenset({
     ".cfg", ".gd", ".gdshader", ".json", ".md", ".tres", ".tscn",
 })
@@ -225,8 +358,7 @@ class ArchiveMember:
 
 def is_allowlisted(path: str) -> bool:
     """Return whether a normalized repository-relative path may ship."""
-    return path in FIXED_FILES or bool(
-        SKILL_PATH_RE.fullmatch(path) or AGENT_PATH_RE.fullmatch(path))
+    return path in REQUIRED_KIT_FILES or path in LEGAL_FILES
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -342,21 +474,13 @@ def _legal_paths(root: Path) -> list[str]:
 def _private_runtime_root(root: Path) -> Path:
     """Resolve the one source-local directory allowed to hold release scratch."""
     try:
-        config = json.loads((root / "kit.config.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        try:
+            import runtime_paths
+        except ImportError:
+            from tools import runtime_paths  # type: ignore[no-redef]
+        return runtime_paths.resolve(root).runtime
+    except (OSError, ValueError, RuntimeError) as exc:
         raise ReleaseError(f"cannot resolve private runtime_root: {exc}") from exc
-    value = config.get("runtime_root") if isinstance(config, dict) else None
-    relative = Path(value) if isinstance(value, str) else Path(".")
-    if (not isinstance(value, str) or not value.strip() or relative.is_absolute()
-            or relative.as_posix() == "." or ".." in relative.parts):
-        raise ReleaseError("kit.config.json runtime_root is unsafe")
-    root_resolved = root.resolve()
-    runtime = (root_resolved / relative).resolve(strict=False)
-    try:
-        runtime.relative_to(root_resolved)
-    except ValueError as exc:
-        raise ReleaseError("kit.config.json runtime_root escapes the release root") from exc
-    return runtime
 
 
 def _configured_game_root(root: Path) -> Path | None:
@@ -523,6 +647,10 @@ def collect_files(root: Path) -> tuple[str, list[str], list[ReleaseFile]]:
         if not is_allowlisted(relative):
             raise ReleaseError(f"internal allowlist error for path: {relative}")
         content = _read_stable(_source_path(root, relative), relative)
+        if relative == "ARCHITECTURE.md":
+            content = CANONICAL_ARCHITECTURE
+        elif relative == "arch.rules.json":
+            content = CANONICAL_ARCH_RULES
         total += len(content)
         if total > MAX_TOTAL_BYTES:
             raise ReleaseError(f"release content exceeds {MAX_TOTAL_BYTES} bytes")
@@ -560,12 +688,94 @@ def _git_state(root: Path) -> tuple[dict, str]:
     return source, fingerprint
 
 
+def _source_authority_evidence(root: Path) -> dict[str, str]:
+    """Describe the authority evidence available before project state is excluded.
+
+    A release archive deliberately carries no proposal, design, decision ledger or
+    private receipt.  Its own trust label therefore describes only the portable
+    policy audit.  When both project authority inputs exist in the source tree, we
+    additionally project their exact receipt state before exclusion and refuse a
+    present local mismatch.  No value here claims to authenticate a person.
+    """
+    proposal_path = root / "proposal.json"
+    shape_path = root / "project.shape.json"
+    proposal_present = (
+        proposal_path.exists()
+        or proposal_path.is_symlink()
+        or _is_reparse_point(proposal_path)
+    )
+    shape_present = (
+        shape_path.exists()
+        or shape_path.is_symlink()
+        or _is_reparse_point(shape_path)
+    )
+    if not proposal_present and not shape_present:
+        project_receipt_trust = NO_PROJECT_RECEIPT
+    else:
+        if proposal_present != shape_present:
+            raise ReleaseError(
+                "cannot evaluate pre-exclusion authority receipt: proposal.json and "
+                "project.shape.json must either both exist or both be absent"
+            )
+        try:
+            proposal = json.loads(
+                _read_stable(
+                    _source_path(root, "proposal.json"), "proposal.json"
+                ).decode("utf-8")
+            )
+            shape = json.loads(
+                _read_stable(
+                    _source_path(root, "project.shape.json"), "project.shape.json"
+                ).decode("utf-8")
+            )
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ReleaseError(
+                f"cannot evaluate pre-exclusion authority receipt: {exc}"
+            ) from exc
+        if not isinstance(proposal, dict) or not isinstance(shape, dict):
+            raise ReleaseError(
+                "cannot evaluate pre-exclusion authority receipt: proposal and shape "
+                "roots must be JSON objects"
+            )
+        try:
+            try:
+                import proposal_authority
+            except ImportError:
+                from tools import proposal_authority  # type: ignore[no-redef]
+            state = proposal_authority.exact_approval_state(root, proposal, shape)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            raise ReleaseError(
+                f"cannot evaluate pre-exclusion authority receipt: {exc}"
+            ) from exc
+        project_receipt_trust = str(state.get("receipt_trust") or "")
+        if project_receipt_trust == "invalid":
+            reasons = state.get("receipt_reasons")
+            details = "; ".join(
+                str(reason) for reason in reasons
+                if isinstance(reason, str) and reason.strip()
+            ) if isinstance(reasons, list) else ""
+            suffix = f": {details}" if details else ""
+            raise ReleaseError(
+                "pre-exclusion authority receipt is invalid" + suffix
+            )
+        if project_receipt_trust not in PROJECT_RECEIPT_TRUST:
+            raise ReleaseError(
+                "pre-exclusion authority receipt returned an unsupported trust state"
+            )
+    return {
+        "receipt_trust": ARCHIVE_RECEIPT_TRUST,
+        "identity_model": AUTHORITY_IDENTITY_MODEL,
+        "project_receipt_trust": project_receipt_trust,
+    }
+
+
 def _manifest(version: str, legal_paths: list[str], files: list[ReleaseFile],
-              source: dict) -> dict:
+              source: dict, authority_evidence: dict[str, str]) -> dict:
     return {
         "schema": SCHEMA,
         "version": version,
         "source": source,
+        "authority_evidence": authority_evidence,
         "license_files": legal_paths,
         "normalization": {
             "line_endings": "lf",
@@ -604,18 +814,19 @@ def _archive_kind(path: Path) -> str:
 
 def _write_zip(path: Path, members: dict[str, tuple[bytes, int]]) -> None:
     with path.open("wb") as raw:
-        with zipfile.ZipFile(
-                raw, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        # Stored members are intentionally uncompressed. DEFLATE output is not
+        # canonical across compressor/library versions, so fixed metadata alone
+        # cannot make a production archive cross-host reproducible.
+        with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as archive:
             archive.comment = b""
             for name in sorted(members):
                 content, mode = members[name]
                 info = zipfile.ZipInfo(name, FIXED_ZIP_TIME)
-                info.compress_type = zipfile.ZIP_DEFLATED
+                info.compress_type = zipfile.ZIP_STORED
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | mode) << 16
                 info.flag_bits |= 0x800
-                archive.writestr(info, content, compress_type=zipfile.ZIP_DEFLATED,
-                                 compresslevel=9)
+                archive.writestr(info, content, compress_type=zipfile.ZIP_STORED)
         raw.flush()
         os.fsync(raw.fileno())
 
@@ -633,20 +844,33 @@ def _tar_info(name: str, content: bytes, mode: int) -> tarfile.TarInfo:
     return info
 
 
+def _stored_gzip(content: bytes) -> bytes:
+    """Return one canonical RFC 1952 stream using only stored DEFLATE blocks."""
+    encoded = bytearray(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [content[index:index + 65535] for index in range(0, len(content), 65535)]
+    if not chunks:
+        chunks = [b""]
+    for index, chunk in enumerate(chunks):
+        # BFINAL followed by BTYPE=00 and zero padding to the byte boundary.
+        encoded.append(1 if index == len(chunks) - 1 else 0)
+        length = len(chunk)
+        encoded.extend(length.to_bytes(2, "little"))
+        encoded.extend((length ^ 0xFFFF).to_bytes(2, "little"))
+        encoded.extend(chunk)
+    encoded.extend((binascii.crc32(content) & 0xFFFFFFFF).to_bytes(4, "little"))
+    encoded.extend((len(content) & 0xFFFFFFFF).to_bytes(4, "little"))
+    return bytes(encoded)
+
+
 def _write_tar(path: Path, members: dict[str, tuple[bytes, int]], compressed: bool) -> None:
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name in sorted(members):
+            content, mode = members[name]
+            archive.addfile(_tar_info(name, content, mode), io.BytesIO(content))
+    payload = _stored_gzip(tar_bytes.getvalue()) if compressed else tar_bytes.getvalue()
     with path.open("wb") as raw:
-        if compressed:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
-                               compresslevel=9, mtime=0) as zipped:
-                with tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-                    for name in sorted(members):
-                        content, mode = members[name]
-                        archive.addfile(_tar_info(name, content, mode), io.BytesIO(content))
-        else:
-            with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-                for name in sorted(members):
-                    content, mode = members[name]
-                    archive.addfile(_tar_info(name, content, mode), io.BytesIO(content))
+        raw.write(payload)
         raw.flush()
         os.fsync(raw.fileno())
 
@@ -677,12 +901,25 @@ def build_release(root: Path, output: Path) -> dict:
 
     kind = _archive_kind(output)
     source_before, status_before = _git_state(root)
+    if source_before["dirty"]:
+        raise ReleaseError(
+            "production release requires a clean source repository; "
+            "commit or otherwise settle every tracked and untracked change first"
+        )
+    authority_before = _source_authority_evidence(root)
     version, legal_paths, files = collect_files(root)
+    authority_after = _source_authority_evidence(root)
+    if authority_before != authority_after:
+        raise ReleaseError(
+            "pre-exclusion authority receipt changed while building release inputs"
+        )
     source_after, status_after = _git_state(root)
     if source_before != source_after or status_before != status_after:
         raise ReleaseError("source repository changed while building release inputs")
 
-    manifest = _manifest(version, legal_paths, files, source_after)
+    manifest = _manifest(
+        version, legal_paths, files, source_after, authority_after
+    )
     members = {release_file.path: (release_file.content, release_file.mode)
                for release_file in files}
     members[MANIFEST_PATH] = (_canonical_json(manifest), 0o644)
@@ -803,7 +1040,8 @@ def _parse_manifest(member: ArchiveMember) -> dict:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReleaseError(f"release manifest is not valid UTF-8 JSON: {exc}") from exc
     expected_keys = {
-        "schema", "version", "source", "license_files", "normalization", "files",
+        "schema", "version", "source", "authority_evidence", "license_files",
+        "normalization", "files",
     }
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
         raise ReleaseError("release manifest fields are malformed")
@@ -818,6 +1056,23 @@ def _parse_manifest(member: ArchiveMember) -> dict:
         raise ReleaseError("release manifest source commit is malformed")
     if not isinstance(source.get("dirty"), bool):
         raise ReleaseError("release manifest dirty indicator is malformed")
+    authority_evidence = manifest.get("authority_evidence")
+    if not isinstance(authority_evidence, dict) or set(authority_evidence) != {
+        "receipt_trust", "identity_model", "project_receipt_trust",
+    }:
+        raise ReleaseError("release manifest authority evidence is malformed")
+    if authority_evidence.get("receipt_trust") != ARCHIVE_RECEIPT_TRUST:
+        raise ReleaseError(
+            "release manifest receipt_trust must be portable-policy"
+        )
+    if authority_evidence.get("identity_model") != AUTHORITY_IDENTITY_MODEL:
+        raise ReleaseError(
+            "release manifest authority identity model is malformed"
+        )
+    if authority_evidence.get("project_receipt_trust") not in PROJECT_RECEIPT_TRUST:
+        raise ReleaseError(
+            "release manifest project receipt trust is malformed"
+        )
     if manifest.get("normalization") != {
             "line_endings": "lf",
             "regular_mode": "0644",
@@ -884,6 +1139,10 @@ def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     if manifest_member is None:
         raise ReleaseError(f"archive is missing {MANIFEST_PATH}")
     manifest = _parse_manifest(manifest_member)
+    if manifest["source"]["dirty"]:
+        raise ReleaseError(
+            "release manifest records dirty source and is not production provenance"
+        )
     if manifest_member.content != _canonical_json(manifest) or manifest_member.mode != 0o644:
         raise ReleaseError("release manifest is not canonically encoded")
     expected = {entry["path"]: entry for entry in manifest["files"]}
@@ -908,6 +1167,14 @@ def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     version_content = members["VERSION"].content.decode("utf-8").strip()
     if version_content != manifest["version"]:
         raise ReleaseError("VERSION content does not match release manifest")
+    if members["ARCHITECTURE.md"].content != CANONICAL_ARCHITECTURE:
+        raise ReleaseError(
+            "ARCHITECTURE.md is not the canonical empty release template"
+        )
+    if members["arch.rules.json"].content != CANONICAL_ARCH_RULES:
+        raise ReleaseError(
+            "arch.rules.json is not the canonical genre-neutral release template"
+        )
     for license_path in manifest["license_files"]:
         if not members[license_path].content.strip():
             raise ReleaseError(f"archive legal metadata is empty: {license_path}")
@@ -917,6 +1184,7 @@ def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
         "format": kind,
         "version": manifest["version"],
         "source": manifest["source"],
+        "authority_evidence": manifest["authority_evidence"],
         "files": len(expected),
         "archive_sha256": archive_hash,
     }

@@ -66,6 +66,9 @@ the detail on one screen is the same fact twice.
 # Confirming an action
 
 _Resolution: settled_
+_Authority: human-confirmed_
+_Authored by: human_
+_Confidence: very-high_
 
 You activate a focused action and receive immediate visual and audible
 acknowledgement. Confirmation feels crisp without becoming distracting.
@@ -98,16 +101,62 @@ Headings after that are whatever the section needs - `Behaviour`,
 appears only where it constrains implementation, and then as a specific heading
 such as `Why continuous`, never as a generic `Why this way`.
 
-Four headings are load-bearing and must match exactly:
+Four metadata lines are load-bearing and must match exactly:
+
+- `_Resolution: <level>_` - one of `settled`, `direction`, `question`.
+- `_Authority: <authority>_` - `human-confirmed` or `agent-provisional`.
+- `_Authored by: <author>_` - `human` or `agent`; this never changes when a
+  human later confirms agent-authored design.
+- `_Confidence: <level>_` - `very-high`, `high`, `medium` or `low`.
+
+Resolution and authority are orthogonal. `settled` describes how complete the
+answer is; it does not say who supplied it or whether a human confirmed it.
+
+Three headings are structurally load-bearing and must match exactly:
 
 - `## Tunables` - the tunable table. `tools/design.py` locates it by this heading.
 - `## Open` - unresolved questions. This is how they reach the plan view.
 - `## What would settle it` - for a section at question resolution.
-- `_Resolution: <level>_` - one of `settled`, `direction`, `question`.
 
 The resolution line is the tier gate. A section may exist as a question with no
 answer; it may not be filled with a plausible inference, because that reads as
 intent to the next agent and gets built on.
+
+## Agent-authored provisional design
+
+An agent may write the missing answer only when the evidence supports exact
+`very-high` confidence. It marks the section `agent-provisional`, preserves
+`_Authored by: agent_`, and adds these non-empty headings:
+
+```markdown
+## Quick read
+
+- **Player does:** ...
+- **Player experiences:** ...
+- **Successful outcome:** ...
+
+## Why this inference
+
+The specific established design and observed evidence that force this reading.
+
+## Assumptions
+
+- Every assumption whose failure would change the design.
+
+## Veto and go/no-go
+
+- **Veto scope:** What remains cheap to remove or change.
+- **Next go/no-go:** The first difficult-to-reverse commitment.
+```
+
+This disclosure remains after confirmation. Confirmation changes only
+`_Authority` to `human-confirmed`; it never rewrites history to claim a human
+authored the section. Below very-high confidence the section may record a
+question or direction, but it cannot authorize implementation.
+
+`tools/design.py` computes the canonical SHA-256 cited by proposals. It
+normalizes line endings and excludes generated binding tables, so a platform
+checkout or code-derived projection cannot silently invalidate human intent.
 
 ## Tunables
 

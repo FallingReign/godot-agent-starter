@@ -29,8 +29,10 @@ both generated pages and works from a file:// double-click with no network.
 """
 from __future__ import annotations
 
+import html
 import hashlib
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,10 +44,50 @@ import runtime_paths  # noqa: E402
 BOARD_STATE = runtime_paths.resolve(ROOT).board_state
 PROTOCOL_SCHEMA = 2
 PROTOCOL_FILES = (
-    "board.py", "board_client.py", "providers.py", "run_result.py",
+    "board.py", "board_client.py", "cockpit.py", "providers.py", "run_result.py",
     "runtime_paths.py", "retro_queue.py", "retro_rank.py", "retro_due.py",
     "session_digest.py", "retro_html.py", "plan_html.py",
 )
+
+_SAFE_REVIEW_HINT = re.compile(
+    r"http://127\.0\.0\.1:(?P<port>[0-9]{1,5})/(?:plan|retro)\.html"
+)
+
+
+def _is_safe_review_hint(value: str) -> bool:
+    """Return whether ``value`` is one exact kit cockpit review URL.
+
+    The link is deliberately narrower than a generic URL allowlist.  Generated
+    file-mode pages may make only the canonical loopback plan and retro views
+    clickable; snapshots, alternate hosts, credentials, suffixes, query
+    strings and fragments remain visible text.
+    """
+    match = _SAFE_REVIEW_HINT.fullmatch(value)
+    if match is None:
+        return False
+    port_text = match.group("port")
+    port = int(port_text)
+    return 1 <= port <= 65535 and port_text == str(port)
+
+
+def _review_hint_html(value: str) -> str:
+    """Render a review hint as one safe link or escaped inert text."""
+    if not value:
+        return ""
+    escaped = html.escape(value, quote=True)
+    if _is_safe_review_hint(value):
+        return f'<a href="{escaped}">{escaped}</a>'
+    return f"<code>{escaped}</code>"
+
+
+def _inline_json(value: str) -> str:
+    """Encode text for an inline script without permitting ``</script>``."""
+    return (
+        json.dumps(value, ensure_ascii=True)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
 
 
 def protocol_version() -> str:
@@ -107,6 +149,7 @@ border:1px solid var(--line);background:var(--card);display:none}
 #board-banner.readonly{border-color:#4a4326;background:#221f14}
 #board-banner b{display:block;margin-bottom:4px}
 #board-banner code{background:#0d1117;padding:1px 6px;border-radius:4px;user-select:all}
+#board-banner .how a{color:var(--acc);overflow-wrap:anywhere}
 #board-banner .how{color:var(--dim);margin-top:5px}
 #board-banner button{margin-top:8px}
 
@@ -146,12 +189,14 @@ def core_js(board_url_hint: str = "") -> str:
     `board_url_hint` is baked in so a page opened under file:// can still
     print the loopback URL it should have been opened on.
     """
-    hint = json.dumps(board_url_hint or "")
+    raw_hint = str(board_url_hint or "")
+    hint = _inline_json(raw_hint)
+    hint_html = _inline_json(_review_hint_html(raw_hint))
     version = json.dumps(protocol_version())
     return """
 <script>
 window.Board = (function(){
-  var HINT = __HINT__;
+  var HINT = __HINT__, HINT_HTML = __HINT_HTML__;
   var EXPECTED_SCHEMA = __SCHEMA__, EXPECTED_VERSION = __VERSION__;
   var POLL_MS = __POLL__, POLL_MAX_MS = __POLLMAX__;
   var isFile = (location.protocol === 'file:');
@@ -297,20 +342,21 @@ window.Board = (function(){
     if(mode === 'file'){
       el.className = 'show readonly';
       el.innerHTML = '<b>Read-only \\u2014 opened as a file</b>'
-        + 'This report is complete and readable, but approving a finding and '
-        + 'dispatching a worker need the loopback board: the browser blocks '
+        + 'This report is complete and readable, but interactive decisions '
+        + 'need the loopback cockpit: the browser blocks '
         + 'requests from a <code>file://</code> page.'
         + '<div class="how">Open '
-        + (HINT ? '<code>' + esc(HINT) + '</code>' : 'the board URL')
+        + (HINT ? HINT_HTML : 'the board URL')
         + ' instead. If nothing is listening, run '
-        + '<code>kit serve</code>, which starts the board and prints the URL.</div>';
+        + '<code>kit serve</code>, which refreshes both views, starts the cockpit, '
+        + 'and prints the exact review URL.</div>';
       return;
     }
     el.className = 'show down';
-    el.innerHTML = '<b>The board is not reachable</b>'
+    el.innerHTML = '<b>The cockpit is not reachable</b>'
       + 'Controls on this page are disabled because nothing answered at '
       + '<code>' + esc(boardUrl()) + '</code>. The page you are reading may have '
-      + 'outlived the board process that served it.'
+      + 'outlived the cockpit process that served it.'
       + '<div class="how">Bring it back with '
       + '<code>kit serve</code>, then press Retry.</div>'
       + '<button type="button" id="board-retry">Retry now</button>';
@@ -432,9 +478,11 @@ window.Board = (function(){
           isFile:function(){ return isFile; }, mode:function(){ return mode; }};
 })();
 </script>
-""".replace("__HINT__", hint).replace("__SCHEMA__", str(PROTOCOL_SCHEMA)).replace(
-        "__VERSION__", version
-    ).replace("__POLL__", str(_POLL_MS)).replace("__POLLMAX__", str(_POLL_MAX_MS))
+""".replace("__HINT__", hint).replace("__HINT_HTML__", hint_html).replace(
+        "__SCHEMA__", str(PROTOCOL_SCHEMA)
+    ).replace("__VERSION__", version).replace("__POLL__", str(_POLL_MS)).replace(
+        "__POLLMAX__", str(_POLL_MAX_MS)
+    )
 
 
 def shell_html() -> str:

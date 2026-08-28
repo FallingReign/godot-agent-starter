@@ -9,10 +9,13 @@ are human-owned, and every automatic worker is bounded and verified.
 ```text
 kit retro status                  # due state; never calls a model
 kit retro run                     # prepare evidence with manual default
+kit retro run --since ISO --limit N  # explicit snapshot-bound history window
 kit retro run --confirm-spend     # explicit automatic analyzer action
-kit retro publish                 # validate findings and refresh the board
-kit plan                          # refresh decision-first pages
-kit serve                         # authenticated loopback board
+kit retro publish                 # validate, publish and close the exact snapshot
+kit serve start                   # start/reuse capability-protected local cockpit
+kit serve status                  # inspect lifecycle without opening it
+kit serve open                    # explicit browser side effect
+kit serve stop                    # stop when no owned run is active
 ```
 
 Both model-backed roles default to `manual` in `kit.config.json`. With that
@@ -24,20 +27,64 @@ startup, a timer, or a missing dependency.
 With the manual default, `retro run` freezes and prepares evidence but does not
 invent a provider call. A reviewer or manually chosen analyzer writes the resulting
 `docs/retro/*-findings.md`; `retro publish` then validates its citations and success
-measures, builds immutable dispatch artifacts, and refreshes both decision views.
+measures, builds immutable dispatch artifacts, refreshes both decision views,
+archives only the note bytes captured by that evidence pack, and exposes the
+completion marker. Ranking or rendering failure leaves the snapshot open. Report
+drift or marker failure rolls note moves back, so publication cannot create a
+false completed state.
 For an automatic analyzer, `--confirm-spend` is necessary but not sufficient: the
 configured analyzer must be a known adapter and pass its read-only preflight.
 Worker dispatch is a separate human decision made on the board after the exact
 recommendation is visible.
+
+Interactive Copilot and Codex are both supported. Their automatic roles are
+recognized but deliberately refused: neither current host proves at the OS
+boundary that unrelated files are unreadable. Interactive use and manual
+evidence handoff remain available. A security refusal is a truthful boundary,
+not a setup error and not a reason to install another provider.
+Before either read-boundary blocker is removed, its automatic adapter must use
+the shared `tools/process_supervisor.py` parent-death containment and prove
+owner-death cleanup on both Windows and POSIX. Repository isolation and process
+containment are separate prerequisites.
 
 ## Evidence contract
 
 Raw chat databases and `events.json`/`events.jsonl` files are discovery inputs,
 not finding citations and never dispatch inputs. The capture step selects only
 sessions belonging to this repository and reduces them into an immutable
-snapshot under `.kit/runtime/evidence/sessions/`. A snapshot records its source
+snapshot under `.kit/runtime/evidence/sessions/`. It discovers Copilot sources
+and active/archived Codex rollouts. Copilot workspace metadata is authenticated
+before and after its bounded event capture; Codex capture re-authenticates
+repository scope from captured `session_meta` and later `turn_context` records.
+Parent/child linkage is retained without
+copying inherited human messages into a child. A snapshot records its source
 identity and content hash; changing or replacing it makes downstream artifacts
 invalid rather than silently changing what a citation means.
+
+Codex discovery orders rollouts by their latest filesystem activity, so a task
+resumed long after creation is still among the recent sessions. Duplicate active
+and archived copies of one session resolve to the copy with later activity; the
+ordering check reads metadata only and does not retain conversation bodies.
+
+Evidence uses a strict stored-field allowlist. It does not retain assistant or
+tool bodies, hidden reasoning, environment values, raw output or absolute source
+paths. Retained human testimony is sensitive by definition. High-confidence
+credentials and local paths in it are redacted as best-effort defense in depth,
+not as a promise that arbitrary secrets can be detected. Copilot AIU and Codex
+token categories are kept in their native
+units. `monetary_cost` remains null unless an authoritative provider value
+exists; the kit never invents an exchange rate or cost estimate.
+
+Matching session count, source bytes and parsed event records have independent
+named limits. A limit failure records the observed and maximum values and
+produces no partial digest. An explicit `--since` or `--limit` is a visible
+operator-selected evidence window; without one, older matching history is never
+silently dropped to make capture fit.
+The default therefore captures every matching repository session inside the hard
+limits; it has no implicit recent-session count. The exact explicit window, when
+present, is part of the content-addressed snapshot. Any selected session whose
+source changes scope or exceeds a limit remains visible in the private pack as a
+capture failure, and blocks both analyzer handoff and publication.
 
 Citation IDs are scoped to one named snapshot. `S3:H4` is meaningful only with
 that snapshot's identity and hash; it is not a globally stable conversation ID.
@@ -48,6 +95,14 @@ under `.kit/runtime/evidence/`; the pointer is not itself evidence.
 The private runtime may contain verbatim human messages, prompts and logs. It is
 gitignored, excluded from releases and must not be copied into durable docs.
 Findings should quote only the minimum needed to explain a recurring mechanism.
+
+Retrospective urgency also comes from consequences. `native-crash`,
+`false-green`, `unauthorized-provider-use`, `irreversible-without-approval`, and
+`work-destroyed` are immediate. `wrong-built`, `repeated-correction`, and
+`repeated-verification-failure` are prompt-level. Slice notes may declare the
+exact code when directly observed. A `native-crash` also comes automatically
+from the verification ledger even with zero notes, survives later static checks,
+and clears only after a successful complete native verification.
 
 ## What each role owns
 
@@ -79,12 +134,20 @@ A dispatchable finding contains all of the following:
 Missing measures, unresolved citations, legacy unbound findings, malformed
 artifacts and changed source files are visible as blockers. The board refuses
 their approval/dispatch; it never rebuilds a prompt behind the reviewer's back.
+Malformed `accepted.json` or `deferred.json` is likewise a blocking error and is
+never treated as an empty ledger or overwritten by the next decision.
+Ledger mutations hold an operating-system lock across the complete
+read-modify-write transaction. A renderer or other process that loaded older
+bytes must pass their compare-and-swap check or stop visibly; concurrent distinct
+decisions are serialized rather than replacing one another.
 
 Queue artifacts live in `.kit/runtime/retro/queue/`. The page, preview and spawn
 read the same validated artifact. The sealed prompt file is piped to the worker's
 standard input and is never put through a command shell or exposed in its process
-arguments. Approving twice with the same idempotency key
-returns the original decision/run rather than launching a second worker.
+arguments. Replaying the same exact reviewed artifact, amendment and retry target
+returns the original decision/run rather than launching a second worker. The
+browser request ID is diagnostic metadata, not a general idempotency key; a
+different approval identity conflicts unless it is an explicit eligible retry.
 Approvals are processed sequentially so two workers cannot race on a gate file.
 A failed worker stops the queue. Manual, unavailable or invalid providers and an
 unstable repository do not erase the human decision: the item remains visibly
@@ -159,6 +222,8 @@ resume hint only when the configured adapter supports one.
 | `docs/retro/accepted.json` | durable human approvals and comments |
 | `docs/retro/deferred.json` | durable human deferrals and reasons |
 | `.kit/runtime/evidence/` | private immutable session snapshots and evidence packs |
+| `.kit/runtime/verification/` | immutable verification runs and unresolved native-failure state |
+| `.kit/runtime/cockpit/plan-decisions/` | exact private cockpit decision receipts |
 | `.kit/runtime/retro/queue/` | validated dispatch artifacts |
 | `.kit/runtime/board/` | process state, locks, prompts, logs and run results |
 

@@ -59,6 +59,7 @@ class FakeRunner:
     def __init__(
         self,
         *,
+        source: strict_verify.ProcessOutcome | None = None,
         doctor: strict_verify.ProcessOutcome | None = None,
         gate: strict_verify.ProcessOutcome | None = None,
         unit: strict_verify.ProcessOutcome | None = None,
@@ -66,6 +67,7 @@ class FakeRunner:
         archive_one: bytes = b"deterministic-release",
         archive_two: bytes | None = None,
     ) -> None:
+        self.source = source or strict_verify.ProcessOutcome(0, "")
         self.doctor = doctor or strict_verify.ProcessOutcome(0, _doctor())
         self.gate = gate or strict_verify.ProcessOutcome(
             0, "PASS  integrity\nPASS  typecheck\nGATE PASSED\n"
@@ -79,6 +81,7 @@ class FakeRunner:
         self.archive_one = archive_one
         self.archive_two = archive_one if archive_two is None else archive_two
         self.commands: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
         self.release_builds = 0
 
     def __call__(
@@ -90,8 +93,11 @@ class FakeRunner:
     ) -> strict_verify.ProcessOutcome:
         argv = [str(part) for part in command]
         self.commands.append(argv)
+        self.environments.append(dict(environment))
         if "KIT_STRICT_VERIFY" not in environment:
             raise AssertionError("strict environment marker was not supplied")
+        if Path(argv[0]).name.lower() in ("git", "git.exe"):
+            return self.source
         script_name = Path(argv[1]).name
         if script_name == "kit.py":
             return self.doctor
@@ -176,6 +182,7 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(
             [stage["name"] for stage in report["stages"]],
             [
+                "source-state",
                 "doctor",
                 "gate",
                 "unit-tests",
@@ -189,11 +196,17 @@ class StrictSuccessTests(StrictFixture):
             ],
         )
         self.assertTrue(all(stage["status"] == "passed" for stage in report["stages"]))
-        self.assertEqual(len(runner.commands), 9)
-        self.assertIn("doctor", runner.commands[0])
-        self.assertEqual(runner.commands[1][1], str(self.root / "check.py"))
-        self.assertIn("unittest", runner.commands[2])
-        self.assertTrue(runner.commands[3][1].endswith("browser_check.py"))
+        self.assertEqual(
+            "no-exact-authority-event",
+            report["authority_receipt"]["receipt_trust"],
+        )
+        self.assertNotIn("authenticated", json.dumps(report["authority_receipt"]).lower())
+        self.assertEqual(len(runner.commands), 10)
+        self.assertEqual("git", runner.commands[0][0])
+        self.assertIn("doctor", runner.commands[1])
+        self.assertEqual(runner.commands[2][1], str(self.root / "check.py"))
+        self.assertIn("unittest", runner.commands[3])
+        self.assertTrue(runner.commands[4][1].endswith("browser_check.py"))
 
         report_path = self.root / report["report_path"]
         retained = json.loads(report_path.read_text(encoding="utf-8"))
@@ -222,6 +235,36 @@ class StrictSuccessTests(StrictFixture):
         gate = next(item for item in report["stages"] if item["name"] == "gate")
         self.assertEqual(gate["status"], "passed")
         self.assertIn("canonical maintainer", gate["reason"])
+
+    def test_only_the_authoritative_gate_receives_the_public_nonce(self) -> None:
+        runner = FakeRunner()
+        with mock.patch.dict(
+            strict_verify.os.environ,
+            {
+                "KIT_VERIFY_NONCE": "a" * 32,
+                "KIT_VERIFY_AUTH_KEY": "b" * 64,
+                "KIT_VERIFY_REPOSITORY_SHA256": "c" * 64,
+                "KIT_NATIVE_RETRY_TOKEN": "d" * 64,
+            },
+        ):
+            _report, code = self.run_with(runner)
+
+        self.assertEqual(strict_verify.EXIT_OK, code)
+        receipt_keys = set(strict_verify.GATE_RECEIPT_ENV)
+        self.assertFalse(receipt_keys.intersection(runner.environments[0]))
+        self.assertFalse(receipt_keys.intersection(runner.environments[1]))
+        self.assertEqual("a" * 32, runner.environments[2]["KIT_VERIFY_NONCE"])
+        self.assertEqual("b" * 64, runner.environments[2]["KIT_VERIFY_AUTH_KEY"])
+        self.assertEqual(
+            "c" * 64,
+            runner.environments[2]["KIT_VERIFY_REPOSITORY_SHA256"],
+        )
+        self.assertEqual(
+            "d" * 64,
+            runner.environments[2]["KIT_NATIVE_RETRY_TOKEN"],
+        )
+        for environment in runner.environments[3:]:
+            self.assertFalse(receipt_keys.intersection(environment))
 
 
 class StrictFailureTests(StrictFixture):
@@ -311,12 +354,12 @@ class StrictFailureTests(StrictFixture):
         report, code = self.run_with(runner)
 
         self.assertEqual(code, strict_verify.EXIT_FAILED)
-        self.assertEqual(len(runner.commands), 2)
+        self.assertEqual(len(runner.commands), 3)
         self.assertEqual(
-            [item["status"] for item in report["stages"][:4]],
-            ["passed", "failed", "not_run", "not_run"],
+            [item["status"] for item in report["stages"][:5]],
+            ["passed", "passed", "failed", "not_run", "not_run"],
         )
-        gate = report["stages"][1]
+        gate = report["stages"][2]
         self.assertEqual(
             (self.root / gate["stdout_log"]).read_text(encoding="utf-8"),
             "partial gate output\n",
@@ -327,9 +370,9 @@ class StrictFailureTests(StrictFixture):
         report, code = self.run_with(runner)
 
         self.assertEqual(code, strict_verify.EXIT_FAILED)
-        self.assertEqual(report["stages"][0]["status"], "failed")
-        self.assertIn("not one JSON", report["stages"][0]["reason"])
-        self.assertEqual(len(runner.commands), 1)
+        self.assertEqual(report["stages"][1]["status"], "failed")
+        self.assertIn("not one JSON", report["stages"][1]["reason"])
+        self.assertEqual(len(runner.commands), 2)
 
     def test_release_builds_must_be_byte_identical(self) -> None:
         runner = FakeRunner(archive_one=b"first", archive_two=b"second")
@@ -348,7 +391,7 @@ class StrictBlockedTests(StrictFixture):
         report, code = self.run_with(runner)
 
         self.assertEqual(code, strict_verify.EXIT_BLOCKED)
-        self.assertEqual(len(runner.commands), 4)
+        self.assertEqual(len(runner.commands), 5)
         stage = report["stages"][-1]
         self.assertEqual(stage["name"], "release-metadata")
         self.assertEqual(stage["status"], "blocked")
@@ -361,8 +404,22 @@ class StrictBlockedTests(StrictFixture):
         report, code = self.run_with(runner)
 
         self.assertEqual(code, strict_verify.EXIT_BLOCKED)
-        self.assertEqual(len(runner.commands), 1)
-        self.assertEqual(report["stages"][0]["status"], "blocked")
+        self.assertEqual(len(runner.commands), 2)
+        self.assertEqual(report["stages"][1]["status"], "blocked")
+        self.assertTrue(all(
+            stage["status"] == "not_run" for stage in report["stages"][2:]
+        ))
+
+    def test_dirty_source_state_stops_before_any_project_command(self) -> None:
+        runner = FakeRunner(
+            source=strict_verify.ProcessOutcome(0, " M tools/strict_verify.py\n")
+        )
+        report, code = self.run_with(runner)
+
+        self.assertEqual(strict_verify.EXIT_BLOCKED, code)
+        self.assertEqual(1, len(runner.commands))
+        self.assertEqual("source-state", report["stages"][0]["name"])
+        self.assertEqual("blocked", report["stages"][0]["status"])
         self.assertTrue(all(
             stage["status"] == "not_run" for stage in report["stages"][1:]
         ))
@@ -385,6 +442,54 @@ class StrictCliTests(unittest.TestCase):
 
         self.assertEqual(code, strict_verify.EXIT_BLOCKED)
         self.assertEqual(json.loads(output.getvalue()), payload)
+
+    def test_default_runner_uses_shared_bounded_process_containment(self) -> None:
+        supervised = strict_verify.process_supervisor.SupervisedResult(
+            0, "ok\n", "", 0.25
+        )
+        with mock.patch.object(
+            strict_verify.process_supervisor,
+            "run_supervised",
+            return_value=supervised,
+        ) as run:
+            outcome = strict_verify._default_runner(
+                ["git", "status"],
+                REPOSITORY,
+                30,
+                {"NO_COLOR": "1"},
+            )
+
+        self.assertEqual(0, outcome.returncode)
+        self.assertEqual("ok\n", outcome.stdout)
+        run.assert_called_once_with(
+            ["git", "status"],
+            cwd=REPOSITORY,
+            timeout=30,
+            environment={"NO_COLOR": "1"},
+            capture_output=True,
+            allow_child_breakaway=False,
+        )
+
+    def test_default_runner_surfaces_unverified_termination_as_launch_failure(self) -> None:
+        supervised = strict_verify.process_supervisor.SupervisedResult(
+            None,
+            "partial",
+            "",
+            30.0,
+            timed_out=True,
+            termination_verified=False,
+        )
+        with mock.patch.object(
+            strict_verify.process_supervisor,
+            "run_supervised",
+            return_value=supervised,
+        ):
+            outcome = strict_verify._default_runner(
+                ["git", "status"], REPOSITORY, 30, {}
+            )
+
+        self.assertFalse(outcome.timed_out)
+        self.assertIn("termination could not be verified", outcome.launch_error)
 
 
 class StrictCiContractTests(unittest.TestCase):

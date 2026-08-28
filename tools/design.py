@@ -17,6 +17,7 @@ Run with no arguments to regenerate both and report problems.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -37,7 +38,10 @@ BIND_BEGIN = "<!-- BEGIN GENERATED BINDINGS -->"
 BIND_END = "<!-- END GENERATED BINDINGS -->"
 
 RE_TITLE = re.compile(r"^#\s+(.+?)\s*$", re.M)
-RE_RESOLUTION = re.compile(r"^_Resolution:\s*([a-z]+)", re.M | re.I)
+RE_RESOLUTION = re.compile(r"^_Resolution:\s*([^_\r\n]+?)\s*_\s*$", re.M | re.I)
+RE_AUTHORITY = re.compile(r"^_Authority:\s*([^_\r\n]+?)\s*_\s*$", re.M | re.I)
+RE_AUTHORED_BY = re.compile(r"^_Authored by:\s*([^_\r\n]+?)\s*_\s*$", re.M | re.I)
+RE_CONFIDENCE = re.compile(r"^_Confidence:\s*([^_\r\n]+?)\s*_\s*$", re.M | re.I)
 RE_H2 = re.compile(r"^##\s+(.+?)\s*$", re.M)
 RE_MD_LINK = re.compile(r"\[[^\]]*\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
 RE_TUNE_ROW = re.compile(r"^\|\s*`([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)`\s*\|", re.M | re.I)
@@ -48,6 +52,12 @@ RE_DECL = re.compile(
 )
 
 RESOLUTIONS = ("question", "direction", "settled")
+AUTHORITIES = ("human-confirmed", "agent-provisional")
+AUTHORS = ("human", "agent")
+CONFIDENCES = ("very-high", "high", "medium", "low")
+AGENT_SECTIONS = (
+    "Quick read", "Why this inference", "Assumptions", "Veto and go/no-go",
+)
 EXCLUDED_GAME_DIRS = {
     ".agents", ".checklogs", ".git", ".github", ".godot", ".godot_doc",
     ".kit", "addons", "docs", "tests", "tools",
@@ -76,6 +86,51 @@ def first_sentence(text: str, limit: int = 160) -> str:
     return s
 
 
+def active_markdown_text(text: str) -> str:
+    """Project only authored Markdown that is active, preserving byte offsets.
+
+    Metadata, required headings and labels inside HTML comments or fenced code
+    are examples, not design authority. Replacing inactive characters with
+    spaces (while preserving line endings) lets every existing regex retain
+    exact spans without allowing those examples to satisfy the contract.
+    """
+    chars = list(text)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, end):
+            if chars[index] not in ("\r", "\n"):
+                chars[index] = " "
+
+    for match in re.finditer(r"<!--.*?(?:-->|\Z)", text, re.S):
+        blank(match.start(), match.end())
+
+    offset = 0
+    fence_character = ""
+    fence_width = 0
+    for line in text.splitlines(keepends=True):
+        content_length = len(line.rstrip("\r\n"))
+        projected = "".join(chars[offset:offset + content_length])
+        stripped = projected.lstrip(" \t")
+        fence = re.match(r"(`{3,}|~{3,})", stripped)
+        if not fence_character:
+            if fence is not None:
+                marker = fence.group(1)
+                fence_character = marker[0]
+                fence_width = len(marker)
+                blank(offset, offset + len(line))
+        else:
+            closing = re.match(
+                re.escape(fence_character) + "{" + str(fence_width) + r",}\s*$",
+                stripped,
+            )
+            blank(offset, offset + len(line))
+            if closing is not None:
+                fence_character = ""
+                fence_width = 0
+        offset += len(line)
+    return "".join(chars)
+
+
 def section_body(text: str, heading: str) -> str:
     """Text under a given h2, up to the next h2."""
     pat = re.compile(r"^##\s+" + re.escape(heading) + r"\s*$(.*?)(?=^##\s|\Z)", re.M | re.S | re.I)
@@ -83,37 +138,186 @@ def section_body(text: str, heading: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def strip_generated(text: str) -> str:
+def canonical_design_text(text: str) -> str:
+    """Return the stable design bytes that proposals approve and cite.
+
+    Generated binding tables are a view over code and must not invalidate a
+    design approval. Line endings and terminal newlines are normalized so the
+    digest is portable across Windows, macOS and Linux; authored content is not
+    otherwise rewritten.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if BIND_BEGIN in text and BIND_END in text:
         head, rest = text.split(BIND_BEGIN, 1)
         _, tail = rest.split(BIND_END, 1)
-        return head + tail
-    return text
+        head = head.rstrip("\n")
+        tail = tail.lstrip("\n")
+        text = head + ("\n\n" if tail else "\n") + tail
+    return text.rstrip("\n") + "\n"
 
 
-def parse_design(path: Path) -> dict:
+def strip_generated(text: str) -> str:
+    """Compatibility name for consumers that need the authored design only."""
+    return canonical_design_text(text)
+
+
+def design_sha256(text: str) -> str:
+    return hashlib.sha256(canonical_design_text(text).encode("utf-8")).hexdigest()
+
+
+def _metadata_value(pattern: re.Pattern[str], text: str) -> str:
+    match = pattern.search(text)
+    return match.group(1).strip().lower() if match else "unstated"
+
+
+def _has_label(body: str, label: str) -> bool:
+    pattern = (
+        r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?" + re.escape(label)
+        + r"(?:\*\*)?\s*:"
+    )
+    return bool(re.search(pattern, body, re.I))
+
+
+def parse_design(path: Path, *, design_root: Path | None = None) -> dict:
     raw = path.read_text(encoding="utf-8", errors="replace")
-    text = strip_generated(raw)
-    rel = path.relative_to(DESIGN).as_posix()
+    text = canonical_design_text(raw)
+    active = active_markdown_text(text)
+    rel = path.relative_to(design_root or DESIGN).as_posix()
 
-    tm = RE_TITLE.search(text)
+    tm = RE_TITLE.search(active)
     title = tm.group(1).strip() if tm else path.stem.replace("-", " ").capitalize()
 
-    rm = RE_RESOLUTION.search(text)
-    resolution = rm.group(1).lower() if rm else "unstated"
+    resolution = _metadata_value(RE_RESOLUTION, active)
+    authority = _metadata_value(RE_AUTHORITY, active)
+    authored_by = _metadata_value(RE_AUTHORED_BY, active)
+    confidence = _metadata_value(RE_CONFIDENCE, active)
 
-    intent = section_body(text, "Intent")
+    metadata_errors: list[str] = []
+    metadata_warnings: list[str] = []
+    metadata_started = bool(re.search(
+        r"^_(?:Authority|Authored by|Confidence):", active, re.M | re.I
+    ))
+    resolution_lines = len(re.findall(r"^_Resolution:", active, re.M | re.I))
+
+    if metadata_started:
+        nonempty = [line.strip() for line in active.splitlines() if line.strip()]
+        expected_patterns = (
+            RE_TITLE,
+            RE_RESOLUTION,
+            RE_AUTHORITY,
+            RE_AUTHORED_BY,
+            RE_CONFIDENCE,
+        )
+        positioned = len(nonempty) >= len(expected_patterns) and all(
+            pattern.fullmatch(nonempty[index]) is not None
+            for index, pattern in enumerate(expected_patterns)
+        )
+        if not positioned:
+            metadata_errors.append(
+                "Design metadata must be one complete block immediately below the single title"
+            )
+        if len(RE_TITLE.findall(active)) != 1:
+            metadata_errors.append("Design title must appear exactly once")
+
+    if resolution_lines > 1:
+        metadata_errors.append("Resolution metadata must appear exactly once")
+    elif resolution == "unstated" and resolution_lines == 1:
+        metadata_errors.append("Resolution metadata is malformed")
+    elif resolution == "unstated":
+        metadata_warnings.append("legacy section has no Resolution metadata")
+    elif resolution not in RESOLUTIONS:
+        metadata_errors.append(
+            f"Resolution must be one of {', '.join(RESOLUTIONS)} (got {resolution!r})"
+        )
+
+    if metadata_started:
+        for label, value, allowed, pattern in (
+            ("Authority", authority, AUTHORITIES, RE_AUTHORITY),
+            ("Authored by", authored_by, AUTHORS, RE_AUTHORED_BY),
+            ("Confidence", confidence, CONFIDENCES, RE_CONFIDENCE),
+        ):
+            line_count = len(re.findall(
+                r"^_" + re.escape(label) + r":", active, re.M | re.I
+            ))
+            valid_count = len(pattern.findall(active))
+            if line_count == 0:
+                metadata_errors.append(f"{label} is required when design metadata is present")
+            elif line_count > 1:
+                metadata_errors.append(f"{label} metadata must appear exactly once")
+            elif valid_count != 1:
+                metadata_errors.append(f"{label} metadata is malformed")
+            elif value not in allowed:
+                metadata_errors.append(
+                    f"{label} must be one of {', '.join(allowed)} (got {value!r})"
+                )
+    else:
+        metadata_warnings.append(
+            "legacy section has no Authority, Authored by or Confidence metadata"
+        )
+
+    if authority == "agent-provisional" and authored_by != "agent":
+        metadata_errors.append("agent-provisional design must disclose Authored by as agent")
+
+    intent = section_body(active, "Intent")
     if not intent:
         # fall back to the first paragraph after the title
-        after = text[tm.end():] if tm else text
-        after = re.sub(r"^_Resolution:[^\n]*\n", "", after.lstrip(), flags=re.M)
+        after = active[tm.end():] if tm else active
+        after = re.sub(
+            r"^_(?:Resolution|Authority|Authored by|Confidence):[^\n]*\n",
+            "",
+            after.lstrip(),
+            flags=re.M | re.I,
+        )
         intent = after.strip().split("\n\n")[0] if after.strip() else ""
 
-    headings = [h for h in RE_H2.findall(text)]
-    declared = sorted(set(RE_TUNE_ROW.findall(section_body(text, "Tunables"))))
+    headings = [h for h in RE_H2.findall(active)]
+    if authored_by == "agent" or authority == "agent-provisional":
+        for heading in AGENT_SECTIONS:
+            if not section_body(active, heading):
+                metadata_errors.append(
+                    f"agent-authored design requires a non-empty '## {heading}' section"
+                )
+        quick_read = section_body(active, "Quick read")
+        for label in ("Player does", "Player experiences", "Successful outcome"):
+            if quick_read and not _has_label(quick_read, label):
+                metadata_errors.append(
+                    f"Quick read requires a '{label}:' line"
+                )
+        veto = section_body(active, "Veto and go/no-go")
+        for label in ("Veto scope", "Next go/no-go"):
+            if veto and not _has_label(veto, label):
+                metadata_errors.append(
+                    f"Veto and go/no-go requires a '{label}:' line"
+                )
+
+    metadata_complete = (
+        resolution in RESOLUTIONS
+        and authority in AUTHORITIES
+        and authored_by in AUTHORS
+        and confidence in CONFIDENCES
+        and not metadata_errors
+    )
+    implementation_eligible = (
+        metadata_complete
+        and resolution == "settled"
+        and (
+            authority == "human-confirmed"
+            or (
+                authority == "agent-provisional"
+                and authored_by == "agent"
+                and confidence == "very-high"
+            )
+        )
+    )
+    if authority == "agent-provisional" and confidence in CONFIDENCES \
+            and confidence != "very-high":
+        metadata_warnings.append(
+            "agent-provisional design is not implementation-eligible below very-high confidence"
+        )
+    declared = sorted(set(RE_TUNE_ROW.findall(section_body(active, "Tunables"))))
 
     links = []
-    for target in RE_MD_LINK.findall(text):
+    for target in RE_MD_LINK.findall(active):
         resolved = (path.parent / target).resolve()
         try:
             links.append(resolved.relative_to(DESIGN.resolve()).as_posix())
@@ -124,12 +328,42 @@ def parse_design(path: Path) -> dict:
         "path": rel,
         "title": title,
         "resolution": resolution,
+        "authority": authority,
+        "authored_by": authored_by,
+        "confidence": confidence,
+        "sha256": design_sha256(raw),
+        "implementation_eligible": implementation_eligible,
+        "metadata_errors": metadata_errors,
+        "metadata_warnings": metadata_warnings,
         "summary": first_sentence(intent),
+        "why_inference": section_body(active, "Why this inference"),
+        "assumptions": section_body(active, "Assumptions"),
+        "quick_read": section_body(active, "Quick read"),
+        "veto_and_go_no_go": section_body(active, "Veto and go/no-go"),
         "headings": headings,
         "declared_tunables": declared,
         "links": sorted(set(links)),
-        "has_constraints": bool(section_body(text, "Constraints it imposes")),
+        "has_constraints": bool(section_body(active, "Constraints it imposes")),
     }
+
+
+def replace_active_metadata(
+    text: str, label: str, expected: str, replacement: str
+) -> str:
+    """Replace one validated active metadata value without touching examples."""
+    projection = active_markdown_text(text)
+    pattern = re.compile(
+        r"(?mi)^_" + re.escape(label) + r":\s*" + re.escape(expected) + r"_\s*$"
+    )
+    matches = list(pattern.finditer(projection))
+    if len(matches) != 1:
+        raise ValueError(f"active {label} metadata is missing or duplicated")
+    match = matches[0]
+    original = text[match.start():match.end()]
+    value = re.sub(
+        re.escape(expected), replacement, original, count=1, flags=re.I
+    )
+    return text[:match.start()] + value + text[match.end():]
 
 
 def scan_tunables() -> dict[str, dict]:
@@ -222,11 +456,15 @@ def ready_to_work(docs: list[dict], bound: dict[str, dict]) -> list[tuple[str, s
     out = []
     for d in docs:
         unbound = [t for t in d["declared_tunables"] if t not in bound]
-        if d["resolution"] == "settled" and unbound:
+        if d["resolution"] == "settled" and d["implementation_eligible"] and unbound:
+            authority_note = (
+                "agent-provisional; reversible work only; "
+                if d["authority"] == "agent-provisional" else ""
+            )
             if len(unbound) == len(d["declared_tunables"]):
-                out.append((d["path"], f"settled, nothing built \u2014 {len(unbound)} tunable(s) unbound"))
+                out.append((d["path"], f"settled, {authority_note}nothing built \u2014 {len(unbound)} tunable(s) unbound"))
             else:
-                out.append((d["path"], f"partly built \u2014 {len(unbound)} of {len(d['declared_tunables'])} tunable(s) unbound"))
+                out.append((d["path"], f"{authority_note}partly built \u2014 {len(unbound)} of {len(d['declared_tunables'])} tunable(s) unbound"))
         elif d["resolution"] == "question":
             settle = "what would settle it" in [h.lower() for h in d["headings"]]
             out.append((d["path"], "open question" + (" \u2014 has a stated way to settle it" if settle else "")))
@@ -251,14 +489,35 @@ def build_index(docs: list[dict], bound: dict[str, dict], undeclared: list[str])
             "## Sections",
             "",
             "Nothing yet. Sections are created when there is a real question to record,",
-            "at whatever resolution they have. See `README.md` in this folder.",
+            "at whatever resolution they have. See [docs/DESIGN.md](../DESIGN.md).",
             "",
         ]
     else:
-        lines += ["## Sections", "", "| Section | Resolution | What it is about |", "|---|---|---|"]
+        lines += [
+            "## Sections", "",
+            "| Section | Resolution | Authority | What it is about |",
+            "|---|---|---|---|",
+        ]
         for d in docs:
             summary = d["summary"] or "_no intent stated_"
-            lines.append(f"| [{d['title']}]({d['path']}) | {d['resolution']} | {summary} |")
+            authority = d["authority"]
+            if authority == "unstated":
+                authority = "legacy / unstated"
+            lines.append(
+                f"| [{d['title']}]({d['path']}) | {d['resolution']} | "
+                f"{authority} | {summary} |"
+            )
+        lines.append("")
+
+    needs_authority = [
+        d for d in docs
+        if d["resolution"] == "settled" and not d["implementation_eligible"]
+    ]
+    if needs_authority:
+        lines += ["## Needs design authority", ""]
+        for d in needs_authority:
+            reason = "; ".join(d["metadata_errors"] + d["metadata_warnings"])
+            lines.append(f"- `{d['path']}` \u2014 {reason or 'not implementation-eligible'}")
         lines.append("")
 
     ready = ready_to_work(docs, bound)
@@ -323,10 +582,18 @@ def main() -> int:
     undeclared = sorted(t for t in bound if t not in declared_all)
     unbound = sorted(t for t in declared_all if t not in bound)
     unstated = [d["path"] for d in docs if d["resolution"] not in RESOLUTIONS]
+    metadata_errors = [
+        f"{d['path']}: {message}"
+        for d in docs for message in d["metadata_errors"]
+    ]
+    metadata_warnings = [
+        f"{d['path']}: {message}"
+        for d in docs for message in d["metadata_warnings"]
+    ]
     const_bound = sorted(t for t in declared_all if bound.get(t, {}).get("kind") == "const")
 
     wrote = []
-    if not args.check:
+    if not args.check and not metadata_errors:
         for p, d in zip(files, docs):
             if d["declared_tunables"] or BIND_BEGIN in p.read_text(encoding="utf-8", errors="replace"):
                 if write_bindings(p, d["declared_tunables"], bound):
@@ -345,11 +612,13 @@ def main() -> int:
             "unbound": unbound,
             "undeclared": undeclared,
             "unstated_resolution": unstated,
+            "metadata_errors": metadata_errors,
+            "metadata_warnings": metadata_warnings,
             "const_bound": const_bound,
             "ready": ready_to_work(docs, bound),
             "rewrote": wrote,
         }, indent=2))
-        return 0
+        return 1 if metadata_errors else 0
 
     print(f"design: {len(docs)} section(s), {len(declared_all)} tunable(s) declared, {len(bound)} claimed in code")
     for w in wrote:
@@ -362,7 +631,11 @@ def main() -> int:
         print(f"  note: `{t}` is design-declared as tunable but bound to a const, so it cannot be adjusted")
     for p in unstated:
         print(f"  note: {p} states no resolution line")
-    return 0
+    for message in metadata_warnings:
+        print(f"  note: {message}")
+    for message in metadata_errors:
+        print(f"  error: {message}")
+    return 1 if metadata_errors else 0
 
 
 if __name__ == "__main__":

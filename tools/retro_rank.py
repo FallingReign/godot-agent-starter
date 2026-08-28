@@ -65,12 +65,14 @@ DEFERRED_FILE = RETRO_DIR / "deferred.json"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_paths  # noqa: E402
+import retro_ledger  # noqa: E402
 import session_digest  # noqa: E402  (needs sys.path set first)
 import session_evidence  # noqa: E402
 
 _RUNTIME = runtime_paths.resolve(ROOT)
 SESSION_EVIDENCE_DIR = _RUNTIME.session_evidence
 BOARD_STATE_FILE = _RUNTIME.board_state
+DECISION_LOCK_DIR = _RUNTIME.runtime / "retro" / "ledger-locks"
 
 # --------------------------------------------------------------- tunables
 #
@@ -230,12 +232,9 @@ def implemented_findings() -> list[dict]:
     commit date), so a caller can show what to watch for alongside the fact
     that it shipped.
     """
-    accepted_file = RETRO_DIR / "accepted.json"
-    try:
-        accepted = (json.loads(accepted_file.read_text(encoding="utf-8"))
-                    if accepted_file.exists() else [])
-    except (OSError, ValueError):
-        accepted = []
+    accepted = retro_ledger.load_entries(
+        RETRO_DIR / "accepted.json", label="docs/retro/accepted.json"
+    )
     if not accepted:
         return []
 
@@ -485,11 +484,22 @@ def _snapshot_citations(relative: str) -> tuple[dict[str, dict], dict[str, str],
         return {}, {}, [f"session snapshot hash mismatch: {relative!r}"]
     if not isinstance(manifest, dict) or session_evidence.canonical_bytes(manifest) != content:
         return {}, {}, [f"session snapshot is not canonical: {relative!r}"]
-    if (manifest.get("schema") != session_evidence.SCHEMA
-            or manifest.get("kind") != session_evidence.KIND):
+    current = (manifest.get("schema") == session_evidence.SCHEMA
+               and manifest.get("kind") == session_evidence.KIND)
+    legacy = (manifest.get("schema") == session_evidence.LEGACY_SCHEMA
+              and manifest.get("kind") == session_evidence.LEGACY_KIND)
+    if not current and not legacy:
         return {}, {}, [f"unexpected session snapshot kind: {relative!r}"]
     canonical_repository = os.path.normcase(os.path.abspath(ROOT)).replace("\\", "/").rstrip("/")
-    if manifest.get("repository") != canonical_repository:
+    repository_matches = False
+    if current and isinstance(manifest.get("repository"), dict):
+        repository_matches = (
+            manifest["repository"].get("scope_id")
+            == session_evidence.repository_scope(ROOT)["scope_id"]
+        )
+    elif legacy:
+        repository_matches = manifest.get("repository") == canonical_repository
+    if not repository_matches:
         return {}, {}, [f"session snapshot repository provenance mismatch: {relative!r}"]
     sessions = manifest.get("sessions")
     if not isinstance(sessions, list):
@@ -516,6 +526,7 @@ def _snapshot_citations(relative: str) -> tuple[dict[str, dict], dict[str, str],
             human.append(message["text"])
         digests[tag] = {
             "id": session.get("session_id", ""),
+            "provider": session.get("provider", "copilot"),
             "started": session.get("started", ""),
             "updated": session.get("updated", ""),
             "model": evidence.get("model", ""),
@@ -695,17 +706,24 @@ def score(
 # --------------------------------------------------------------- deferred
 
 def load_deferred() -> list[dict]:
-    if not DEFERRED_FILE.exists():
-        return []
-    try:
-        return json.loads(DEFERRED_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    return retro_ledger.load_entries(
+        DEFERRED_FILE, label="docs/retro/deferred.json"
+    )
 
 
 def save_deferred(entries: list[dict]) -> None:
-    RETRO_DIR.mkdir(parents=True, exist_ok=True)
-    DEFERRED_FILE.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    retro_ledger.save_entries(
+        DEFERRED_FILE, entries, label="docs/retro/deferred.json",
+        lock_dir=DECISION_LOCK_DIR,
+    )
+
+
+def update_deferred(transform) -> list[dict]:
+    """Serialize one deferred-ledger read-modify-write across processes."""
+    return retro_ledger.update_entries(
+        DEFERRED_FILE, transform, label="docs/retro/deferred.json",
+        lock_dir=DECISION_LOCK_DIR,
+    )
 
 
 def apply_deferred_votes(findings: list[dict], scored: dict[str, tuple[float, list[str]]]) -> list[str]:
@@ -714,34 +732,42 @@ def apply_deferred_votes(findings: list[dict], scored: dict[str, tuple[float, li
     A deferred finding absent from this evidence, deferred before today, is a
     confirmed win and gets marked resolved rather than re-litigated forever.
     """
-    entries = load_deferred()
     today = date.today().isoformat()
     present = {normalise_title(f["title"]) for f in findings if len(f["human_turns"]) > 0}
     console_notes: list[str] = []
 
-    for e in entries:
-        key = normalise_title(e.get("finding", ""))
-        if key in present and e.get("date", today) < today:
-            title = next(f["title"] for f in findings if normalise_title(f["title"]) == key)
-            cost, effort, notes = scored[title]
-            boosted = cost * DEFERRED_RECURRENCE_BOOST
-            scored[title] = (boosted, effort, notes + [
-                f"deferred on {e['date']} (\"{e.get('reason', '')}\") and recurred with new evidence "
-                f"-- boosted {DEFERRED_RECURRENCE_BOOST}x"
-            ])
-            recurred = e.setdefault("recurred_at", [])
-            if today not in recurred:
-                recurred.append(today)
-            console_notes.append(f"deferred finding recurred: {e.get('finding')!r} (deferred {e['date']})")
-        elif key not in present and not e.get("resolved_at") and e.get("date", today) < today:
-            e["resolved_at"] = today
-            console_notes.append(
-                f"confirmed win: {e.get('finding')!r} deferred on {e['date']} is absent from this "
-                f"evidence -- marked resolved"
-            )
+    def apply(entries: list[dict]) -> list[dict]:
+        for entry in entries:
+            key = normalise_title(entry.get("finding", ""))
+            if key in present and entry.get("date", today) < today:
+                title = next(
+                    finding["title"] for finding in findings
+                    if normalise_title(finding["title"]) == key
+                )
+                cost, effort, notes = scored[title]
+                boosted = cost * DEFERRED_RECURRENCE_BOOST
+                scored[title] = (boosted, effort, notes + [
+                    f"deferred on {entry['date']} (\"{entry.get('reason', '')}\") "
+                    f"and recurred with new evidence -- boosted "
+                    f"{DEFERRED_RECURRENCE_BOOST}x"
+                ])
+                recurred = entry.setdefault("recurred_at", [])
+                if today not in recurred:
+                    recurred.append(today)
+                console_notes.append(
+                    f"deferred finding recurred: {entry.get('finding')!r} "
+                    f"(deferred {entry['date']})"
+                )
+            elif (key not in present and not entry.get("resolved_at")
+                  and entry.get("date", today) < today):
+                entry["resolved_at"] = today
+                console_notes.append(
+                    f"confirmed win: {entry.get('finding')!r} deferred on "
+                    f"{entry['date']} is absent from this evidence -- marked resolved"
+                )
+        return entries
 
-    if entries:
-        save_deferred(entries)
+    update_deferred(apply)
     return console_notes
 
 
@@ -820,12 +846,9 @@ def unreviewed_summary() -> tuple[int, float]:
     banner, check.py's retro_nudge and retro_html.py's own summary line all
     call this rather than each re-deriving "unreviewed" from scratch.
     """
-    accepted_file = RETRO_DIR / "accepted.json"
-    try:
-        accepted = (json.loads(accepted_file.read_text(encoding="utf-8"))
-                    if accepted_file.exists() else [])
-    except (OSError, ValueError):
-        accepted = []
+    accepted = retro_ledger.load_entries(
+        RETRO_DIR / "accepted.json", label="docs/retro/accepted.json"
+    )
     decided = {normalise_title(e.get("finding", "")) for e in accepted}
     decided |= {normalise_title(e.get("finding", "")) for e in load_deferred()}
 
@@ -915,4 +938,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except retro_ledger.LedgerError as exc:
+        print(f"retro ranking: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

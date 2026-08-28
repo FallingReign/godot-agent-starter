@@ -1,6 +1,6 @@
 # Workflow
 
-The public entry point is `kit` (`\.\kit.cmd` on Windows, `./kit` on
+The public entry point is `kit` (`.\kit.cmd` on Windows, `./kit` on
 macOS/Linux). Internal implementation scripts are not part of the developer
 workflow.
 
@@ -21,17 +21,27 @@ Use a worktree for long-running or multi-file work when practical.
 
 1. State one observable outcome and the question this increment answers.
 2. Retrieve only the relevant design sections. If no end state grounds the work,
-   switch to design discovery instead of inventing intent.
+   switch to design discovery. Ask the human unless one inferred design is
+   defensible at exactly `very-high` confidence; if so, disclose it as
+   agent-authored and agent-provisional before delivery continues.
 3. Check `project.shape.json` for settled decisions, direction, open questions and
    the configured human involvement level.
-4. At `module`, `file` or `function` involvement, write the required proposal to
-   `proposal.json`, regenerate with `kit plan`, and wait for human approval.
+4. Write the proposal with design digests, design authority and the reversible
+   envelope. At `hands-off`, record coarse file/directory `scope[]` boundaries;
+   `recorded` permits work only inside them while it is reversible.
+   At `module`, `file` or `function`, keep it `draft`, run `kit serve start`,
+   give the human the printed loopback `plan.html` URL, and wait for a cockpit
+   decision on that exact fingerprint. Module scope includes the complete
+   allowed outgoing dependency set and boundary data; file scope includes new,
+   modified and deleted authored inputs; function scope additionally binds each
+   changed GDScript function's typed canonical signature and purpose.
 5. Build the thinnest increment that runs and can be judged. Do not deliver an
    invisible infrastructure layer as though it answered an experience question.
 6. Run `kit verify --static` while engine evidence is unnecessary or unsafe. Run
    full `kit verify` only when the native-engine boundary is intended and safe.
 7. Regenerate `kit plan`. If the result needs visual judgement, launch it through
-   the approved project workflow and report what automation cannot prove.
+   the approved project workflow only when no unresolved native failure or
+   concurrent engine process exists, and report what automation cannot prove.
 8. At the slice boundary, run `kit friction` and record the factual slice note.
    If retrospective status is due, follow `kit retro status` and the public retro
    workflow.
@@ -43,19 +53,62 @@ that remains unverified.
 ## Approval and change control
 
 `proposal.json` is the durable proposal; chat is not. Write experience first,
-then an inline SVG mockup when the outcome is vector-approximable, then structure.
-Draft status is non-binding. Only the human changes it to approved.
+then an inline SVG mockup when the outcome is vector-approximable, then
+`design_authority`, `reversibility`, and structure.
+
+- `draft` authorizes no implementation.
+- `recorded` is a non-approval audit state for hands-off work inside a reversible
+  envelope and its explicit coarse `scope[]`. Agent-provisional design additionally
+  requires exact `very-high` confidence.
+- `approved` records explicit human approval and requires human-confirmed design.
+
+Only an explicit operator action in the local loopback cockpit may supply
+`approved_by`, `approved_on`, `approval_sha256`, the transition to `approved`,
+and append-only `authority_action: confirm` entries bound to matching
+`docs_at`, `design_sha256`, `design_intent_sha256` and `proposal_sha256`.
+Each event also carries a portable `cockpit_receipt_id`, the exact reviewed
+fingerprint and a tamper-evident receipt digest. The gate rejects missing or
+inconsistent receipt evidence, so hand-filling only the approval fields cannot
+silently grant authority. This is not cryptographic person authentication: a
+writer with repository access can deliberately forge both an event and its
+public hash. Local operator presence and repository write access are explicit
+policy trust boundaries. When the originating private runtime receipt is
+present, a mismatch fails closed; when it is absent after clone or CI, the
+cockpit labels the event `portable-policy`, never verified or authenticated.
+Stronger human identity would require an explicitly provisioned signing
+mechanism and key policy. It is an optional future integration, not a dependency
+the kit installs or infers. Never hand-fill authority events.
+At every involvement level, `reversibility.state: go-no-go` stops work before
+the hard-to-undo commitment. **Request changes** withdraws only the exact
+reviewed plan and leaves the referenced design-authority state unchanged,
+including confirmed authority when present. This wording applies equally to a
+recorded agent-provisional plan: `recorded` was never approval. **Veto design and
+plan** binds every referenced section's authority-normalized design intent; a
+baseline, envelope or other plan-only edit cannot erase it. It remains active
+until that exact intent changes or a later explicit cockpit confirmation
+supersedes it. Agent-authored confirmed sections return to provisional metadata;
+human-authored section metadata is not rewritten, but its veto still blocks
+implementation.
+
+An open question is promoted into the active cockpit only when its optional
+`related_slices[]` or `related_design_refs[]` relation matches the current
+proposal. Older unscoped questions remain visible in the full project record
+with a legacy label; they are not silently discarded or presented as decisions
+for unrelated work.
 
 If implementation needs a materially different structure:
 
 1. stop before silently deviating;
 2. append the reason to `revisions`;
 3. return the proposal to draft;
-4. run `kit plan`;
-5. ask for the changed decision.
+4. run `kit serve start` and give the human the printed review URL;
+5. either re-record a still-reversible hands-off plan or ask for the changed
+   decision.
 
-An absent design reference is not something an agent acknowledges for itself.
-Offer the human the choice between discovery and an explicitly recorded inference.
+An absent design reference cannot be acknowledged into authority. Write the
+missing design first. If the agent authors it, the document must contain the
+Quick read, inference rationale, assumptions, veto scope and next go/no-go; it
+remains provisional until the human confirms the exact digest.
 
 ## Worktrees and the editor
 
@@ -89,9 +142,11 @@ kit self-test
 
 Doctor reports the executable path without running it. Static verification cannot
 discover or launch it. Self-test additionally sets an enforced no-engine boundary.
-Resume a full verification only after the human explicitly approves one bounded
-retry. The gate performs one health check and suppresses all later native stages
-after the first failure.
+The cockpit and `kit retro status` keep the unresolved native consequence visible;
+a later static, fast or targeted check does not clear it. Resume a full
+verification only after the human explicitly approves one bounded retry. The gate
+performs one health check and suppresses all later native stages after the first
+failure. Only a successful complete native verification resolves the warning.
 
 ## Architecture changes
 
@@ -109,6 +164,14 @@ Review both the generated graph and the difference from the approved proposal.
 An undeclared module and a forbidden dependency are different facts: declare a
 clear module, but redesign a boundary violation unless widening the boundary was
 the actual decision.
+
+Conformance uses one inverse authored-input policy: every regular file under the
+configured game root is in scope unless it is a known generated sidecar, engine
+file, private runtime surface or third-party dependency. Custom content
+extensions, extensionless content, project tests and deletions therefore cannot
+disappear from review. Function-level review compares canonical typed signatures
+and normalized bodies at the exact Git baseline; a source or baseline it cannot
+parse or retrieve is a blocking unknown, not an omitted function.
 
 ## Scenes, assets and persisted content
 
@@ -155,7 +218,14 @@ kit release build ../godot-agent-kit.zip
 kit release verify ../godot-agent-kit.zip
 ```
 
-Legal metadata and a version are mandatory. Full `kit verify --strict` and the
+Legal metadata, a version and a clean source repository are mandatory. A dirty
+manifest may be inspected diagnostically but cannot pass production release
+verification. Build and verification also require the manifest's explicit
+`receipt_trust: portable-policy` and `portable-policy-audit` identity model.
+This is reviewable policy evidence, not person authentication. Any project
+proposal/shape receipt state is evaluated before those files are excluded; a
+present mismatch blocks the build, while a clean kit with no project state is
+explicitly not applicable. Full `kit verify --strict` and the
 three-platform CI matrix remain required release evidence and may run only after
 the engine boundary is safe. Building an archive is local; publishing is a
 separate human-controlled action.

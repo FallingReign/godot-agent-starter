@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -17,9 +16,14 @@ sys.path.insert(0, str(ROOT))
 
 import bootstrap  # noqa: E402
 import check as gate  # noqa: E402
+from tools import native_engine  # noqa: E402
 
 
 class EngineInvocationBoundary(unittest.TestCase):
+    def setUp(self) -> None:
+        for items in gate.RUN_DIAGNOSTICS.values():
+            items.clear()
+
     def invoke(self, *arguments: str) -> tuple[int, str]:
         output = io.StringIO()
         scratch = ROOT / ".checklogs"
@@ -106,32 +110,69 @@ class EngineInvocationBoundary(unittest.TestCase):
         self.assertIn("unsupported engine version 4.7.1", output)
         self.assertIn("typecheck (skipped: previous native-engine check failed)", output)
 
-    def test_engine_timeout_terminates_the_owned_process_tree(self) -> None:
+    def test_engine_timeout_from_shared_boundary_is_recorded_by_the_gate(self) -> None:
         scratch = ROOT / ".checklogs"
         scratch.mkdir(exist_ok=True)
         log = scratch / "owned-engine-timeout-test.log"
-        process = mock.Mock()
-        process.communicate.side_effect = (
-            subprocess.TimeoutExpired(["Godot.exe"], 1, output=b"partial"),
-            (b"partial", None),
+        result = native_engine.NativeResult(
+            exit_code=124,
+            output="partial\nTIMEOUT after 1s; owned process tree terminated\n",
+            executable="Godot.exe",
+            started=True,
+            failure_class="engine-timeout",
+            failure_code="native-engine-timeout",
+            timeout_seconds=1,
         )
-        process.returncode = None
         try:
             with mock.patch.object(
-                gate, "_acquire_engine_lock", return_value=("owned-token", "")
-            ), mock.patch.object(
-                gate, "_release_engine_lock"
-            ) as release, mock.patch.object(
-                gate, "_start_owned_engine_process", return_value=process
-            ), mock.patch.object(
-                gate, "_terminate_owned_process_tree"
-            ) as terminate:
-                code, output = gate.run(["Godot.exe", "--headless"], 1, log)
+                native_engine, "run_godot", return_value=result
+            ), mock.patch.object(native_engine, "persist_native_failure") as persist:
+                code, output = gate.run(
+                    ["Godot.exe", "--headless"], 1, log, native=True
+                )
 
             self.assertEqual(124, code)
             self.assertIn("owned process tree terminated", output)
-            terminate.assert_called_once_with(process)
-            release.assert_called_once_with("owned-token")
+            self.assertEqual(
+                "native-engine-timeout",
+                gate.RUN_DIAGNOSTICS["timeouts"][0]["code"],
+            )
+            persist.assert_called_once()
+        finally:
+            log.unlink(missing_ok=True)
+
+    def test_native_access_violation_is_visible_and_classified(self) -> None:
+        scratch = ROOT / ".checklogs"
+        scratch.mkdir(exist_ok=True)
+        log = scratch / "owned-engine-crash-test.log"
+        result = native_engine.NativeResult(
+            exit_code=-1073741819,
+            output=(
+                "engine stopped\nNATIVE ENGINE CRASH: process exited before the "
+                "operation completed (exit -1073741819, 0xC0000005).\n"
+            ),
+            executable="Godot.exe",
+            started=True,
+            failure_class="native-crash",
+            failure_code="native-crash",
+            windows_status="0xC0000005",
+        )
+        try:
+            with mock.patch.object(
+                native_engine, "run_godot", return_value=result
+            ), mock.patch.object(native_engine, "persist_native_failure"):
+                code, output = gate.run(
+                    ["Godot.exe", "--headless"], 1, log, native=True
+                )
+
+            self.assertEqual(-1073741819, code)
+            self.assertIn("NATIVE ENGINE CRASH", output)
+            self.assertRegex(output, r"0xC0000005")
+            self.assertTrue(gate.ERROR_RE.search(output))
+            self.assertEqual(
+                "native-crash",
+                gate.RUN_DIAGNOSTICS["native_crashes"][0]["code"],
+            )
         finally:
             log.unlink(missing_ok=True)
 

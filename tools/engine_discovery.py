@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only selection of the Godot executable used by public kit commands.
+"""Select Godot safely, then authenticate it at an explicit native boundary.
 
-The selected engine is still authenticated by ``check.py --headless --version``
-before any project stage runs.  This module only resolves paths without starting
-an executable, so ``kit doctor`` can remain offline and safe.
+``select_godot`` is deliberately read-only so ``kit doctor`` can locate an
+engine without starting it.  Selection is not execution authority: every
+non-gate native operation must call ``authenticate_godot`` first.  That probe
+is shell-free, bounded by the shared native-process boundary, and binds the
+resolved path, the engine-reported patch version, and the file identity which
+was authenticated.
 """
 from __future__ import annotations
 
@@ -13,13 +16,53 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 EXPECTED_GODOT_VERSION = "4.7.2"
 
 _VERSIONED_NAME = re.compile(
     r"(?i)godot(?:[_-]?v)?(?P<version>\d+\.\d+\.\d+)"
 )
+_REPORTED_VERSION = re.compile(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])")
+_ENGINE_ERROR = re.compile(r"(?im)^\s*(?:SCRIPT ERROR|ERROR|FATAL|CRASH):")
+
+
+class EngineAuthenticationError(RuntimeError):
+    """A selected executable did not prove it is the supported engine."""
+
+    def __init__(self, message: str, *, status: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(frozen=True)
+class EngineFileIdentity:
+    """Stable-enough identity for the exact executable file which was probed."""
+
+    path: Path
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+@dataclass(frozen=True)
+class AuthenticatedEngine:
+    """Execution authority for one selected path and reported patch version."""
+
+    path: Path
+    version: str
+    source: str
+    identity: EngineFileIdentity
+
+    def assert_unchanged(self) -> None:
+        """Refuse if the executable was replaced after its version probe."""
+        current = _file_identity(self.path)
+        if current != self.identity:
+            raise EngineAuthenticationError(
+                "selected Godot changed after version authentication; refusing launch",
+                status="engine_identity_changed",
+            )
 
 
 @dataclass(frozen=True)
@@ -54,6 +97,157 @@ def version_from_name(value: str | Path) -> str | None:
     """Return a version encoded in an official-style executable name."""
     match = _VERSIONED_NAME.search(Path(value).name)
     return match.group("version") if match else None
+
+
+def _file_identity(path: Path) -> EngineFileIdentity:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        stat = resolved.stat()
+    except (OSError, RuntimeError) as exc:
+        raise EngineAuthenticationError(
+            "selected Godot executable is no longer readable; refusing launch",
+            status="engine_unavailable",
+        ) from exc
+    if not resolved.is_file():
+        raise EngineAuthenticationError(
+            "selected Godot path is not a file; refusing launch",
+            status="engine_unavailable",
+        )
+    return EngineFileIdentity(
+        path=resolved,
+        device=int(stat.st_dev),
+        inode=int(stat.st_ino),
+        size=int(stat.st_size),
+        modified_ns=int(stat.st_mtime_ns),
+    )
+
+
+def _selection_for_candidate(root: Path, candidate: str | Path) -> EngineSelection:
+    identity = _file_identity(
+        Path(candidate) if Path(candidate).is_absolute() else root / Path(candidate)
+    )
+    named_version = version_from_name(identity.path)
+    return EngineSelection(
+        path=identity.path,
+        source="provided",
+        requested=str(candidate),
+        requested_version=named_version,
+        selected_version=named_version,
+    )
+
+
+def authenticate_godot(
+    root: Path,
+    *,
+    selection: EngineSelection | None = None,
+    candidate: str | Path | None = None,
+    operation: str,
+    timeout: int = 30,
+    runner: Callable[..., Any] | None = None,
+) -> AuthenticatedEngine:
+    """Authenticate one selected executable before a non-gate native launch.
+
+    A version encoded in a filename is useful discovery evidence but is never
+    accepted as process evidence.  The exact resolved executable is run once
+    with ``--headless --version`` through the bounded native runner.  No shell
+    is involved.  A non-zero exit, native failure, ambiguous/missing version,
+    reported mismatch, or executable replacement fails closed.
+
+    ``candidate`` exists for internal commands which receive the public kit's
+    selected path.  Callers may instead pass the complete read-only
+    ``selection``.  Supplying neither performs a fresh selection.
+    """
+    if selection is not None and candidate is not None:
+        raise ValueError("pass either selection or candidate, not both")
+    canonical_root = root.expanduser().resolve(strict=True)
+    selected = (
+        selection
+        if selection is not None
+        else _selection_for_candidate(canonical_root, candidate)
+        if candidate is not None
+        else select_godot(canonical_root)
+    )
+    if selected.path is None:
+        raise EngineAuthenticationError(
+            f"{operation} needs Godot {EXPECTED_GODOT_VERSION}; no executable was selected",
+            status="engine_unavailable",
+        )
+    if selected.known_mismatch:
+        raise EngineAuthenticationError(
+            f"{operation} refused Godot {selected.selected_version} at {selected.path}; "
+            f"expected exactly {EXPECTED_GODOT_VERSION}",
+            status="engine_version_mismatch",
+        )
+
+    before = _file_identity(selected.path)
+    if runner is None:
+        import native_engine
+
+        runner = native_engine.run_godot
+    result = runner(
+        before.path,
+        ["--headless", "--version"],
+        root=canonical_root,
+        cwd=canonical_root,
+        timeout=timeout,
+    )
+    failure_class = str(getattr(result, "failure_class", "") or "")
+    if failure_class:
+        try:
+            import native_engine
+
+            native_engine.persist_native_failure(
+                canonical_root,
+                result,
+                operation=f"{operation}-version-probe",
+            )
+        except (AttributeError, TypeError):
+            # A test runner or third-party result may intentionally implement
+            # only the probe-result protocol. Authentication still fails.
+            pass
+        raise EngineAuthenticationError(
+            f"{operation} could not authenticate Godot at the safe native boundary "
+            f"({failure_class})",
+            status="engine_probe_failed",
+        )
+
+    exit_code = int(getattr(result, "exit_code", 1))
+    output = str(getattr(result, "output", "") or "")
+    if exit_code != 0 or _ENGINE_ERROR.search(output):
+        raise EngineAuthenticationError(
+            f"{operation} version probe failed; the selected executable was not launched "
+            "for the requested operation",
+            status="engine_probe_failed",
+        )
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    versions = set(_REPORTED_VERSION.findall(lines[-1] if lines else ""))
+    if len(versions) != 1:
+        raise EngineAuthenticationError(
+            f"{operation} could not determine one engine-reported patch version; "
+            "refusing launch",
+            status="engine_version_unknown",
+        )
+    reported = next(iter(versions))
+    if reported != EXPECTED_GODOT_VERSION:
+        raise EngineAuthenticationError(
+            f"{operation} refused engine-reported Godot {reported} at {before.path}; "
+            f"expected exactly {EXPECTED_GODOT_VERSION}",
+            status="engine_version_mismatch",
+        )
+
+    after = _file_identity(before.path)
+    if after != before:
+        raise EngineAuthenticationError(
+            "selected Godot changed during version authentication; refusing launch",
+            status="engine_identity_changed",
+        )
+    return AuthenticatedEngine(
+        path=before.path,
+        version=reported,
+        source=selected.source,
+        identity=before,
+    )
 
 
 def _official_names(system_name: str) -> tuple[str, ...]:

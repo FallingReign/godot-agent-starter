@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -52,7 +53,7 @@ SESSION_EVIDENCE_DIR = _RUNTIME.session_evidence
 import retro_rank  # noqa: E402  (needs sys.path set first)
 import session_evidence  # noqa: E402
 
-SCHEMA = 3
+SCHEMA = 4
 
 _SNAPSHOT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 _SECTION_ORDER = ("problem", "proposal", "measure")
@@ -100,6 +101,8 @@ COMMENT_PREAMBLE = (
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
+_CANONICAL_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+MAX_SLUG_CHARS = 128
 
 
 def slug_for(title: str) -> str:
@@ -109,11 +112,60 @@ def slug_for(title: str) -> str:
     change; the slug is that key reduced to characters legal in a filename on
     every platform this runs on.
     """
-    return _SLUG_RE.sub("", retro_rank.normalise_title(title)).strip("-")
+    reduced = _SLUG_RE.sub("", retro_rank.normalise_title(title)).strip("-")
+    return re.sub(r"-+", "-", reduced)[:MAX_SLUG_CHARS].rstrip("-")
+
+
+def canonical_slug(value: object) -> str | None:
+    """Return one bounded queue slug, or ``None`` for any alternate spelling."""
+    if not isinstance(value, str) or value != value.strip():
+        return None
+    if not value or len(value) > MAX_SLUG_CHARS:
+        return None
+    return value if _CANONICAL_SLUG_RE.fullmatch(value) is not None else None
 
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_json_bytes(value: dict) -> bytes:
+    return (json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n").encode("utf-8")
+
+
+def template_sha256() -> str:
+    """Identity of the exact prompt join contract used after human approval."""
+    return _sha256(_canonical_json_bytes({
+        "artifact_schema": SCHEMA,
+        "dispatch_header": DISPATCH_HEADER,
+        "comment_heading": COMMENT_HEADING,
+        "comment_preamble": COMMENT_PREAMBLE,
+    }))
+
+
+def artifact_sha256(item: dict) -> str:
+    """Content identity of the complete queue record, excluding this digest."""
+    payload = dict(item)
+    payload.pop("artifact_sha256", None)
+    return _sha256(_canonical_json_bytes(payload))
+
+
+def review_identity(item: dict) -> dict[str, object]:
+    """Digests a browser must echo to approve exactly this rendered artifact."""
+    identity: dict[str, object] = {
+        "artifact_schema": item.get("schema"),
+        "artifact_sha256": item.get("artifact_sha256", ""),
+        "prompt_sha256": item.get("prompt_sha256", ""),
+        "template_sha256": item.get("template_sha256", ""),
+    }
+    identity["review_sha256"] = _sha256(_canonical_json_bytes(identity))
+    return identity
+
+
+def dispatch_prompt_sha256(item: dict, comment: str = "") -> str:
+    return _sha256(render_prompt(item, comment).encode("utf-8"))
 
 
 def _now_iso() -> str:
@@ -213,14 +265,27 @@ def _snapshot_digests(reference: str) -> tuple[dict[str, dict], list[str]]:
     canonical = session_evidence.canonical_bytes(manifest)
     if canonical != content:
         return {}, ["evidence_snapshot: JSON is not in canonical manifest form"]
-    if (manifest.get("schema") != session_evidence.SCHEMA
-            or manifest.get("kind") != session_evidence.KIND):
+    current = (manifest.get("schema") == session_evidence.SCHEMA
+               and manifest.get("kind") == session_evidence.KIND)
+    legacy = (manifest.get("schema") == session_evidence.LEGACY_SCHEMA
+              and manifest.get("kind") == session_evidence.LEGACY_KIND)
+    if not current and not legacy:
         return {}, ["evidence_snapshot: unsupported schema or kind"]
-    try:
-        repository = _canonical_path(str(manifest.get("repository") or ""))
-    except (OSError, ValueError):
-        repository = ""
-    if repository != _canonical_path(ROOT):
+    repository_matches = False
+    if current and isinstance(manifest.get("repository"), dict):
+        repository_matches = (
+            manifest["repository"].get("scope_id")
+            == session_evidence.repository_scope(ROOT)["scope_id"]
+        )
+    elif legacy:
+        try:
+            repository_matches = (
+                _canonical_path(str(manifest.get("repository") or ""))
+                == _canonical_path(ROOT)
+            )
+        except (OSError, ValueError):
+            repository_matches = False
+    if not repository_matches:
         return {}, ["evidence_snapshot: repository provenance does not match this repository"]
 
     sessions = manifest.get("sessions")
@@ -344,6 +409,15 @@ def dispatch_eligibility(item: dict) -> tuple[bool, list[str]]:
     """Revalidate an artifact at GET/approval time, failing legacy data closed."""
     if item.get("schema") != SCHEMA:
         return False, ["artifact: legacy schema has no verified evidence binding"]
+    expected_prompt_digest = _sha256(str(item.get("prompt", "")).encode("utf-8"))
+    expected_template_digest = template_sha256()
+    expected_artifact_digest = artifact_sha256(item)
+    if item.get("prompt_sha256") != expected_prompt_digest:
+        return False, ["artifact: prompt digest does not match its exact bytes"]
+    if item.get("template_sha256") != expected_template_digest:
+        return False, ["artifact: prompt template or schema digest is stale"]
+    if item.get("artifact_sha256") != expected_artifact_digest:
+        return False, ["artifact: canonical content digest does not match"]
     declared = item.get("dispatchable")
     stored = item.get("dispatch_blockers")
     if not isinstance(declared, bool) or not isinstance(stored, list) or any(
@@ -442,7 +516,7 @@ def build(findings_dir: Path | None = None, queue_dir: Path | None = None) -> li
         seen.add(slug)
         human_turns = _human_turns(finding, digests)
         blockers = _finding_blockers(finding, human_turns, snapshot_blockers)
-        items.append({
+        item = {
             "schema": SCHEMA,
             "slug": slug,
             "title": finding["title"],
@@ -462,7 +536,11 @@ def build(findings_dir: Path | None = None, queue_dir: Path | None = None) -> li
             else path.name,
             "source_sha256": _sha256(source_bytes),
             "generated_at": generated_at,
-        })
+        }
+        item["prompt_sha256"] = _sha256(item["prompt"].encode("utf-8"))
+        item["template_sha256"] = template_sha256()
+        item["artifact_sha256"] = artifact_sha256(item)
+        items.append(item)
 
     queue_dir.mkdir(parents=True, exist_ok=True)
     keep = {f"{item['slug']}.json" for item in items} | {"index.json"}
@@ -504,27 +582,112 @@ def _write_json(path: Path, payload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _is_reparse(info: os.stat_result) -> bool:
+    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(getattr(info, "st_file_attributes", 0) & marker)
+
+
+def _regular_file_bytes(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes | None:
+    """Read one unchanged regular non-link file without following its final name."""
+    try:
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or _is_reparse(before)
+                or before.st_size < 0 or before.st_size > maximum):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        after = os.fstat(descriptor)
+        if (not stat.S_ISREG(after.st_mode) or _is_reparse(after)
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or after.st_size > maximum):
+            return None
+        with os.fdopen(descriptor, "rb", closefd=True) as source:
+            descriptor = -1
+            content = source.read(maximum + 1)
+        return content if len(content) <= maximum else None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _direct_regular_child_bytes(directory: Path, path: Path) -> bytes | None:
+    """Read only a direct regular child of a real queue directory."""
+    try:
+        directory_info = directory.lstat()
+        if not stat.S_ISDIR(directory_info.st_mode) or _is_reparse(directory_info):
+            return None
+        canonical_directory = directory.resolve(strict=True)
+        if path.parent.resolve(strict=True) != canonical_directory:
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return _regular_file_bytes(path, maximum=4 * 1024 * 1024)
+
+
+def _bounded_findings_source(value: object) -> Path | None:
+    """Resolve one direct regular ``docs/retro/*-findings.md`` source."""
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value) > 512 or "\\" in value
+            or any(ord(character) < 32 for character in value)):
+        return None
+    relative = PurePosixPath(value)
+    if (relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts)
+            or not relative.name.endswith("-findings.md") or ":" in relative.parts[0]):
+        return None
+    path = ROOT.joinpath(*relative.parts)
+    retro_root = ROOT / "docs" / "retro"
+    try:
+        if path.parent.resolve(strict=True) != retro_root.resolve(strict=True):
+            return None
+        info = path.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
+        return None
+    return path
+
+
 def load_index(queue_dir: Path | None = None) -> dict:
     """The index as written, or an empty one. Pure filesystem read."""
-    path = (queue_dir or QUEUE_DIR) / "index.json"
+    directory = queue_dir or QUEUE_DIR
+    path = directory / "index.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        content = _direct_regular_child_bytes(directory, path)
+        data = json.loads(content.decode("utf-8")) if content is not None else None
+    except (UnicodeError, ValueError):
         return {"schema": SCHEMA, "generated_at": "", "items": []}
     if not isinstance(data, dict):
         return {"schema": SCHEMA, "generated_at": "", "items": []}
-    data.setdefault("items", [])
+    if data.get("schema") != SCHEMA:
+        return {"schema": SCHEMA, "generated_at": "", "items": []}
+    items = data.get("items")
+    data["items"] = (
+        [slug for slug in items if canonical_slug(slug) is not None]
+        if isinstance(items, list) else []
+    )
     return data
 
 
 def load_item(slug: str, queue_dir: Path | None = None) -> dict | None:
     """One artifact by slug, or None. Pure filesystem read -- no session logs."""
-    path = (queue_dir or QUEUE_DIR) / f"{slug}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    canonical = canonical_slug(slug)
+    if canonical is None:
         return None
-    return data if isinstance(data, dict) else None
+    directory = queue_dir or QUEUE_DIR
+    path = directory / f"{canonical}.json"
+    try:
+        content = _direct_regular_child_bytes(directory, path)
+        data = json.loads(content.decode("utf-8")) if content is not None else None
+    except (UnicodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("slug") != canonical:
+        return None
+    if _bounded_findings_source(data.get("source_file")) is None:
+        return None
+    return data
 
 
 def load_by_title(title: str, queue_dir: Path | None = None) -> dict | None:
@@ -539,13 +702,13 @@ def is_stale(item: dict) -> bool:
     logs at dispatch time: the worker must receive the prompt the human
     reviewed, or nothing.
     """
-    source = item.get("source_file") or ""
-    if not source:
+    path = _bounded_findings_source(item.get("source_file"))
+    if path is None:
         return True
-    path = ROOT / source
     try:
-        return _sha256(path.read_bytes()) != item.get("source_sha256")
-    except OSError:
+        content = _regular_file_bytes(path)
+        return content is None or _sha256(content) != item.get("source_sha256")
+    except (OSError, ValueError):
         return True
 
 

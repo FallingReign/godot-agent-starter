@@ -409,7 +409,17 @@ def _dispatch_policy(root: Path, baseline_sha: str) -> tuple[
             raise runtime_paths.RuntimeConfigError(
                 "kit.config.json dispatch_policy.forbidden must be a string list"
             )
-        return project_context.PathPolicy.create(root, owned, forbidden), []
+        runtime_relative = project_context.runtime_root_relative(
+            config.get("runtime_root", "")
+        )
+        # Private runtime is derived from the same immutable baseline as the
+        # ownership policy.  A maintainer cannot accidentally make session
+        # evidence or detached Git metadata writable by omitting it from the
+        # hand-maintained forbidden list.
+        derived_forbidden = [*forbidden, runtime_relative]
+        return project_context.PathPolicy.create(
+            root, owned, derived_forbidden
+        ), []
     except (runtime_paths.RuntimeConfigError,
             project_context.ProjectContextError, OSError) as exc:
         return None, [f"dispatch ownership policy is invalid: {exc}"]

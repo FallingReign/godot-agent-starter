@@ -50,6 +50,11 @@ desktop.ini
 # they are the record of how the plan moved between slices.
 plan.html
 
+# Generated design index. Authored sections under docs/design/ are durable;
+# this retrieval projection is regenerated from them and must not dirty a
+# canonical kit or a project after verification.
+docs/design/INDEX.md
+
 # Generated retrospective board, for the same reason: rewritten on every gate
 # run and on every board request. docs/retro/*-findings.md is the durable
 # record; this is only a view of it.

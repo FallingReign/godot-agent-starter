@@ -35,23 +35,62 @@ HARNESS = ROOT / "tools" / "tests" / "dom_harness.js"
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import page_parts  # noqa: E402
+import board_client  # noqa: E402
 import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
 
 def generated(name: str, build) -> str:
-    path = ROOT / name
-    if not path.exists():
-        # Generator entry points use argparse. Discovery's argv belongs to
-        # unittest, not to those entry points; leaking it makes a clean checkout
-        # fail only when the ignored generated page is absent.
-        arguments = [f"generate-{name}"]
-        if name == "retro.html":
-            # A regression test must never leave a background board behind.
-            arguments.append("--no-board")
+    # Generator entry points use argparse. Discovery's argv belongs to
+    # unittest, not to those entry points. Always exercise current source;
+    # reading an existing generated page makes byte tests bless stale output.
+    arguments = [f"generate-{name}", "--stdout"]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
         with mock.patch.object(sys, "argv", arguments):
-            build()
-    return path.read_text(encoding="utf-8")
+            result = build()
+    if result not in (None, 0):
+        raise AssertionError(f"{name} generator returned {result}")
+    return output.getvalue()
+
+
+class FileModeReviewHint(unittest.TestCase):
+    def test_only_exact_canonical_loopback_views_are_links(self) -> None:
+        for page in ("plan", "retro"):
+            url = f"http://127.0.0.1:54321/{page}.html"
+            with self.subTest(url=url):
+                self.assertEqual(
+                    f'<a href="{url}">{url}</a>',
+                    board_client._review_hint_html(url),
+                )
+
+    def test_every_other_hint_is_escaped_inert_text(self) -> None:
+        unsafe = (
+            "https://127.0.0.1:54321/plan.html",
+            "http://localhost:54321/plan.html",
+            "http://127.0.0.1:54321/plan.html?approve=1",
+            "http://127.0.0.1:54321/plan.html#decision",
+            "http://127.0.0.1:54321/plan/one.html",
+            "http://127.0.0.1:0/plan.html",
+            "http://127.0.0.1:65536/retro.html",
+            "http://127.0.0.1:054321/retro.html",
+            'http://127.0.0.1:54321/plan.html"><img src=x onerror=alert(1)>',
+        )
+        for value in unsafe:
+            with self.subTest(value=value):
+                rendered = board_client._review_hint_html(value)
+                self.assertTrue(rendered.startswith("<code>"), rendered)
+                self.assertNotIn("<a ", rendered)
+                self.assertNotIn("<img", rendered)
+                if "<" in value:
+                    self.assertIn("&lt;", rendered)
+
+    def test_untrusted_hint_cannot_close_the_inline_script(self) -> None:
+        payload = "</script><script>globalThis.injected=true</script>"
+        script = board_client.core_js(payload)
+        self.assertNotIn(payload, script)
+        self.assertIn("\\u003c/script\\u003e", script)
+        self.assertEqual(1, script.count("</script>"))
 
 
 class RetroPageBytes(unittest.TestCase):
@@ -329,10 +368,9 @@ class PlanPageBytes(unittest.TestCase):
         idx = self.html.index('<div id="retro-banner"></div>')
         self.assertNotIn("retrospective is due", self.html[idx:idx + 400])
 
-    def test_plan_has_no_alarming_board_banner(self) -> None:
-        """plan.html carries no #board-banner: a dead board must not make the
-        plan look broken. It is retro.html that has something to say about it."""
-        self.assertNotIn('id="board-banner"', self.html)
+    def test_plan_reuses_the_truthful_cockpit_banner(self) -> None:
+        self.assertIn('<div id="board-banner"></div>', self.html)
+        self.assertIn("exact review URL", self.html)
 
     def test_plan_leads_with_decisions_and_collapses_the_record(self) -> None:
         summary = self.html.index('aria-label="Plan summary"')
@@ -344,6 +382,9 @@ class PlanPageBytes(unittest.TestCase):
         self.assertLess(record, architecture)
         self.assertIn('<details class="record"><summary>', self.html)
         self.assertNotIn('<details class="record" open', self.html)
+        self.assertIn('id="plan-live-state"', self.html)
+        self.assertIn("if(!B || !sentinel) return", self.html)
+        self.assertIn("plan or bound design changed", self.html)
 
     def test_plan_does_not_offer_unsaved_question_controls(self) -> None:
         self.assertNotIn('type="radio"', self.html)
@@ -355,7 +396,168 @@ class PlanPageBytes(unittest.TestCase):
         self.assertIn("This page never pretends a local click was saved", page)
 
     def test_repository_observation_is_not_presented_as_verification(self) -> None:
-        self.assertIn("Observed repository change scope, not a completion claim", self.html)
+        self.assertIn("Repository change scope is context", self.html)
+        self.assertIn("Latest verification", self.html)
+
+    def test_agent_provisional_disclosure_is_visible_before_the_full_record(self) -> None:
+        page = plan_html.render(
+            {}, {"status": "draft"}, [], "", set(), [], [], [], "",
+            cockpit_state={
+                "status": "draft",
+                "approval_required": True,
+                "approval_available": False,
+                "authority_trust": (
+                    "Receipt binding is tamper-evident, not cryptographic person authentication."
+                ),
+                "design_authority": {
+                    "authority": "agent-provisional",
+                    "authored_by": "agent",
+                    "confidence": "very-high",
+                    "disclosures": [{
+                        "section": "docs/design/experience.md",
+                        "quick_read": (
+                            "- Player does: accepts one focused action.\n"
+                            "- Successful outcome: understands its consequence."
+                        ),
+                        "why_inference": "The requested outcome requires legible acknowledgement.",
+                        "assumptions": "The feedback remains local and removable.",
+                        "veto_and_go_no_go": (
+                            "- Veto scope: remove the isolated feedback.\n"
+                            "- Next go/no-go: before content depends on it."
+                        ),
+                    }],
+                },
+                "verification": {"status": "not-run"},
+            },
+        )
+
+        section = page.index("docs/design/experience.md")
+        quick_read = page.index("Player does: accepts one focused action")
+        inference = page.index("Why this inference")
+        assumptions = page.index("Assumptions")
+        veto = page.index("Veto and go/no-go")
+        record = page.index("Review full plan and project record")
+        self.assertLess(section, record)
+        self.assertLess(quick_read, record)
+        self.assertLess(inference, record)
+        self.assertLess(assumptions, record)
+        self.assertLess(veto, record)
+        self.assertIn("not cryptographic person authentication", page)
+
+    def test_only_explicitly_related_questions_are_promoted(self) -> None:
+        questions = [
+            {
+                "id": "slice-related",
+                "question": "Question for this slice?",
+                "blocks": "The active interaction.",
+                "related_slices": ["active-slice"],
+            },
+            {
+                "id": "design-related",
+                "question": "Question for this design?",
+                "blocks": "The cited player outcome.",
+                "related_design_refs": ["docs/design/active.md"],
+            },
+            {
+                "id": "other-work",
+                "question": "Question for other work?",
+                "blocks": "Another slice.",
+                "related_slices": ["other-slice"],
+            },
+            {
+                "id": "legacy-question",
+                "question": "Legacy question without a relation?",
+                "blocks": "Older work.",
+            },
+        ]
+        proposal = {
+            "slice": "active-slice",
+            "status": "recorded",
+            "design_refs": [{"section": "docs/design/active.md"}],
+        }
+        page = plan_html.render(
+            {"questions": questions}, proposal, [], "", set(), [], [], [], "",
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "verification": {"status": "not-run"},
+            },
+        )
+        front, record = page.split("Review full plan and project record", 1)
+
+        self.assertIn("Question for this slice?", front)
+        self.assertIn("Question for this design?", front)
+        self.assertNotIn("Question for other work?", front)
+        self.assertNotIn("Legacy question without a relation?", front)
+        self.assertIn("Question for other work?", record)
+        self.assertIn("Legacy question without a relation?", record)
+        self.assertIn("Legacy/unscoped question", record)
+        self.assertIn("2 decisions needed", front)
+
+    def test_approved_boundary_clears_approve_action_but_can_be_reconsidered(self) -> None:
+        page = plan_html.render(
+            {},
+            {"status": "approved", "experience": {}},
+            [], "", set(), [], [], [], "",
+            cockpit_state={
+                "status": "approved",
+                "approval_required": False,
+                "fingerprint": "f" * 64,
+                "authority_trust": (
+                    "The local receipt is tamper-evident but does not "
+                    "cryptographically authenticate a person."
+                ),
+                "verification": {"status": "not-run"},
+            },
+        )
+        self.assertIn("No decision is waiting", page)
+        self.assertNotIn(">Approve design and plan</button>", page)
+        self.assertIn("Reconsider this approval", page)
+        self.assertIn(">Request changes</button>", page)
+        self.assertIn(">Veto design and plan</button>", page)
+        self.assertIn("withdraws only this exact plan approval", page)
+        self.assertIn("independently of later baseline, envelope or plan edits", page)
+        self.assertIn("does not cryptographically authenticate a person", page)
+
+    def test_recorded_reversible_work_exposes_pause_and_veto_controls(self) -> None:
+        page = plan_html.render(
+            {"name": "Recorded fixture", "involvement": "hands-off"},
+            {"status": "recorded", "experience": {}},
+            [], "", set(), [], [], [], "",
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "recorded_decision_available": True,
+                "fingerprint": "f" * 64,
+                "verification": {"status": "not-run"},
+            },
+        )
+
+        self.assertIn("No decision is waiting", page)
+        self.assertNotIn(">Approve design and plan</button>", page)
+        self.assertIn("Pause or veto recorded autonomous work", page)
+        self.assertIn('id="plan-recorded-controls"', page)
+        self.assertIn(">Request changes</button>", page)
+        self.assertIn(">Veto design and plan</button>", page)
+        self.assertIn("returning this exact recorded plan to draft", page)
+        self.assertIn("design-authority state unchanged", page)
+        self.assertIn("survives later baseline, envelope and plan-only edits", page)
+        self.assertIn("Both actions require a reason; neither dispatches work", page)
+        self.assertIn("document.getElementById('plan-recorded-controls')", page)
+
+        snapshot = plan_html.render(
+            {"name": "Recorded fixture", "involvement": "hands-off"},
+            {"status": "recorded", "experience": {}},
+            [], "", set(), [], [], [], "immutable-slice",
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "recorded_decision_available": True,
+                "fingerprint": "f" * 64,
+                "verification": {"status": "not-run"},
+            },
+        )
+        self.assertNotIn('id="plan-recorded-controls"', snapshot)
 
     def test_plan_only_calls_baseline_diff_paths_unapproved_changes(self) -> None:
         without_baseline = plan_html.render(
@@ -371,6 +573,51 @@ class PlanPageBytes(unittest.TestCase):
         )
         self.assertIn("1 unapproved change", with_baseline)
         self.assertIn("removed.gd</code> (deleted)", with_baseline)
+
+    def test_recorded_out_of_scope_change_is_a_waiting_decision(self) -> None:
+        page = plan_html.render(
+            {"involvement": "hands-off"},
+            {
+                "status": "recorded",
+                "baseline_sha": "a" * 40,
+                "scope": [
+                    {
+                        "kind": "directory",
+                        "path": "scripts/logic",
+                        "action": "modify",
+                        "why": "The reversible implementation belongs here.",
+                    }
+                ],
+            },
+            [], "", set(), [], [], [], "",
+            changed={"tests/unit/test_unplanned.gd"},
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "verification": {"status": "not-run"},
+            },
+        )
+
+        self.assertIn("1 unapproved change", page)
+        self.assertIn("differs from the recorded plan", page)
+        self.assertNotIn("No decision is waiting", page)
+
+    def test_recorded_stale_copy_names_the_blocker_without_migration_advice(self) -> None:
+        page = plan_html.render(
+            {"involvement": "hands-off"}, {"status": "recorded"},
+            [], "", set(), [], [], [], "",
+            cockpit_state={
+                "status": "recorded-stale",
+                "approval_required": True,
+                "approval_available": False,
+                "approval_blocker": "The bound design digest is stale.",
+                "verification": {"status": "not-run"},
+            },
+        )
+
+        self.assertIn("The bound design digest is stale", page)
+        self.assertIn("Resolve the named blocker", page)
+        self.assertNotIn("until this plan is migrated", page)
 
     def test_invalid_source_preserves_the_last_valid_plan(self) -> None:
         stderr = io.StringIO()
@@ -449,6 +696,11 @@ class Harness(unittest.TestCase):
         with mock.patch.object(retro_html, "collect", return_value=data), \
                 mock.patch.object(retro_html, "mark_resolved_if_absent", return_value=False), \
                 mock.patch.object(
+                    board_client,
+                    "last_known_board_url",
+                    return_value="http://127.0.0.1:54321/",
+                ), \
+                mock.patch.object(
                     retro_html.retro_queue, "load_by_title",
                     side_effect=lambda title: artifacts.get(
                         retro_html.retro_rank.normalise_title(title)
@@ -468,6 +720,11 @@ class Harness(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         output = io.StringIO()
         with mock.patch.object(plan_html, "OUT", target), \
+                mock.patch.object(
+                    board_client,
+                    "last_known_board_url",
+                    return_value="http://127.0.0.1:54321/",
+                ), \
                 mock.patch.object(sys, "argv", ["plan_html.py"]), \
                 contextlib.redirect_stdout(output):
             result = plan_html.main()
@@ -478,13 +735,45 @@ class Harness(unittest.TestCase):
             )
         return target
 
+    @staticmethod
+    def _recorded_plan_fixture() -> Path:
+        """Render deterministic recorded controls for browser-level action proof."""
+        target = ROOT / ".checklogs" / "tests" / "plan-recorded-harness.html"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(
+            board_client,
+            "last_known_board_url",
+            return_value="http://127.0.0.1:54321/",
+        ):
+            html = plan_html.render(
+                {"name": "Recorded fixture", "involvement": "hands-off"},
+                {
+                    "slice": "a reversible response",
+                    "status": "recorded",
+                    "experience": {"player_does": "Chooses one action."},
+                },
+                [], "", set(), [], [], [], "",
+                cockpit_state={
+                    "status": "recorded",
+                    "approval_required": False,
+                    "recorded_decision_available": True,
+                    "fingerprint": "f" * 64,
+                    "verification": {"status": "not-run"},
+                },
+            )
+        target.write_text(html, encoding="utf-8")
+        return target
+
     def _run(self, page: str) -> dict:
         node = shutil.which("node")
         if not node:
             self.skipTest("node not on PATH; DOM harness skipped")
-        target = (
-            self._retro_fixture() if page == "retro.html" else self._plan_fixture()
-        )
+        if page == "retro.html":
+            target = self._retro_fixture()
+        elif page == "plan-recorded.html":
+            target = self._recorded_plan_fixture()
+        else:
+            target = self._plan_fixture()
         proc = subprocess.run([node, str(HARNESS), str(target)], cwd=ROOT,
                               capture_output=True, text=True)
         try:
@@ -509,6 +798,11 @@ class Harness(unittest.TestCase):
 
     def test_plan_html_behaves_in_every_state(self) -> None:
         self._run("plan.html")
+
+    def test_recorded_plan_controls_post_exact_reasoned_actions(self) -> None:
+        data = self._run("plan-recorded.html")
+        scenarios = {r["scenario"] for r in data["results"]}
+        self.assertIn("recorded-plan-decision", scenarios)
 
 
 if __name__ == "__main__":

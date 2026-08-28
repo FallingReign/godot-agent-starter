@@ -27,6 +27,7 @@ engine itself (`resources` stage), so scenes are not off limits.
 | `export_presets.cfg` | Human-authored |
 | `<game_root>/addons/**` | Third-party |
 | `.gate.sha256` | Only `kit integrity accept` writes it, and only a human may run that after reviewing the protected-file diff |
+| `.github/copilot-instructions.md` | Provider-governance bridge. Game builders must not edit the instructions that make Copilot load the shared contract |
 
 ## Permanently human-only
 

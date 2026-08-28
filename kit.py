@@ -16,28 +16,39 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 TOOLS = Path(__file__).resolve().parent / "tools"
 sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import engine_discovery  # noqa: E402
 import providers  # noqa: E402
+import cockpit  # noqa: E402
+import runtime_paths  # noqa: E402
+import native_engine  # noqa: E402
+import process_supervisor  # noqa: E402
 
 MIN_PYTHON = (3, 10)
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_REFUSED = 3
 
-_PROVIDER_EXECUTABLES = {"claude", "copilot", "gemini"}
+_PROVIDER_EXECUTABLES = {"claude", "codex", "copilot", "gemini"}
 _ENGINE_STAGES = {"import", "typecheck", "resources", "gut", "smoke"}
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_VERIFY_NONCE = re.compile(r"^[0-9a-f]{32}$")
+_VERIFY_SECRET = re.compile(r"^[0-9a-f]{64}$")
 
 
 class CliError(RuntimeError):
@@ -144,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run every non-engine gate stage without discovering or launching Godot",
     )
+    verify.add_argument(
+        "--confirm-native-retry",
+        default="",
+        metavar="WARNING_SHA256",
+        help=(
+            "authorize one full/strict recovery run for the exact unresolved "
+            "native-warning digest"
+        ),
+    )
     verify.set_defaults(action="verify")
 
     self_test = commands.add_parser(
@@ -212,6 +232,29 @@ def build_parser() -> argparse.ArgumentParser:
     docs_search.add_argument("value")
     docs_search.set_defaults(action="godot_docs")
 
+    gdls = commands.add_parser(
+        "gdls", help="manage the kit-owned Godot language-server helper"
+    )
+    _add_common_options(gdls)
+    gdls_commands = gdls.add_subparsers(dest="gdls_command", required=True)
+    for name, help_text in (
+        ("start", "start the exact-version kit-owned language server"),
+        ("status", "inspect ownership and native safety without starting Godot"),
+        ("stop", "stop only the exactly owned language-server process"),
+    ):
+        command = gdls_commands.add_parser(name, help=help_text)
+        _add_common_options(command)
+        command.set_defaults(action="gdls")
+    for name, help_text, value_name in (
+        ("diagnose", "request fresh diagnostics for one GDScript file", "file"),
+        ("symbols", "list document symbols for one GDScript file", "file"),
+        ("refs", "find references or text matches for one symbol", "symbol"),
+    ):
+        command = gdls_commands.add_parser(name, help=help_text)
+        _add_common_options(command)
+        command.add_argument("value", metavar=value_name)
+        command.set_defaults(action="gdls")
+
     friction = commands.add_parser(
         "friction", help="report committed authoring churn at a slice boundary"
     )
@@ -223,10 +266,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser("plan", help="regenerate the living plan")
     _add_common_options(plan)
+    plan.add_argument(
+        "--snapshot",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="NAME",
+        help="also keep a fingerprinted review snapshot (optional label)",
+    )
     plan.set_defaults(action="plan")
 
-    serve = commands.add_parser("serve", help="ensure the local board is running")
+    serve = commands.add_parser("serve", help="manage the local review cockpit")
     _add_common_options(serve)
+    serve.add_argument(
+        "serve_command",
+        nargs="?",
+        choices=("start", "status", "open", "stop"),
+        default="start",
+        help="start/reuse, inspect, explicitly open, or stop the cockpit",
+    )
     serve.set_defaults(action="serve")
 
     retro = commands.add_parser("retro", help="retrospective status and explicit runs")
@@ -247,6 +305,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-spend",
         action="store_true",
         help="confirm that this explicit provider action may spend quota",
+    )
+    retro_run.add_argument(
+        "--since",
+        help="explicit ISO lower bound for repository session activity",
+    )
+    retro_run.add_argument(
+        "--limit",
+        type=int,
+        help="explicitly select the most recent N matching sessions",
     )
     retro_run.set_defaults(action="retro_run")
 
@@ -350,6 +417,86 @@ def _verification_environment(
     return {"GODOT_BIN": str(selected.path)}, selected
 
 
+def _native_retry_environment(
+    project: Path,
+    args: argparse.Namespace,
+    *,
+    nonce: str,
+    warning: native_engine.NativeWarningSnapshot,
+) -> dict[str, str]:
+    supplied = str(getattr(args, "confirm_native_retry", "") or "").strip().lower()
+    needs_engine = _verification_needs_engine(args)
+    if not needs_engine:
+        if supplied:
+            raise CliError(
+                "--confirm-native-retry is valid only for a full or strict native recovery run",
+                code=EXIT_REFUSED,
+                status="native_retry_scope_refused",
+            )
+        return {}
+    if warning.state == native_engine.WARNING_CLEAN:
+        if supplied:
+            raise CliError(
+                "native retry confirmation is stale; there is no unresolved warning",
+                code=EXIT_REFUSED,
+                status="native_retry_stale",
+            )
+        return {}
+    if warning.state != native_engine.WARNING_UNRESOLVED or not warning.identity:
+        raise CliError(
+            "native warning state cannot be authenticated; engine verification is refused",
+            code=EXIT_REFUSED,
+            status="native_warning_unreadable",
+        )
+    if supplied != warning.identity:
+        raise CliError(
+            "an unresolved native application failure requires one explicit bounded retry; "
+            "review the warning and rerun full/strict verification with "
+            f"--confirm-native-retry {warning.identity}",
+            code=EXIT_REFUSED,
+            status="native_retry_confirmation_required",
+        )
+    try:
+        token = native_engine.authorize_recovery_retry(
+            project,
+            warning.identity,
+            nonce,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CliError(
+            f"native retry authorization could not be recorded: {exc}",
+            code=EXIT_REFUSED,
+            status="native_retry_authorization_failed",
+        ) from exc
+    return {"KIT_NATIVE_RETRY_TOKEN": token}
+
+
+def _selected_engine_path(project: Path, *, operation: str) -> Path:
+    """Resolve one public engine candidate without launching it.
+
+    Exact authentication belongs to the delegated native operation.  This
+    selector still rejects a filename-known mismatch before delegation; an
+    unversioned candidate is passed only to a child which performs the bounded
+    engine-reported version probe before its requested launch.
+    """
+    selected = engine_discovery.select_godot(project)
+    if selected.known_mismatch:
+        raise CliError(
+            f"{operation} refused Godot {selected.selected_version} at {selected.path}; "
+            f"expected exactly {engine_discovery.EXPECTED_GODOT_VERSION}.",
+            code=EXIT_REFUSED,
+            status="engine_version_mismatch",
+        )
+    if selected.path is None:
+        raise CliError(
+            f"{operation} needs Godot {engine_discovery.EXPECTED_GODOT_VERSION}; "
+            "run kit doctor for the supported official-binary locations.",
+            code=EXIT_REFUSED,
+            status="engine_unavailable",
+        )
+    return selected.path
+
+
 def _looks_like_provider_action(command: Sequence[str]) -> bool:
     if not command:
         return False
@@ -366,6 +513,7 @@ def _run_process(
     cwd: Path,
     timeout: int,
     allow_provider: bool = False,
+    allow_child_breakaway: bool = False,
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = [str(part) for part in command]
@@ -375,27 +523,42 @@ def _run_process(
             code=EXIT_REFUSED,
             status="confirmation_required",
         )
-    try:
-        return subprocess.run(
-            argv,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            shell=False,
-            env=({**os.environ, **environment} if environment else None),
+    outcome = process_supervisor.run_supervised(
+        argv,
+        cwd=cwd,
+        timeout=timeout,
+        environment=({**os.environ, **environment} if environment else None),
+        capture_output=True,
+        allow_child_breakaway=allow_child_breakaway,
+    )
+    if not outcome.termination_verified:
+        raise CliError(
+            f"child-process termination could not be verified: {Path(argv[0]).name}",
+            status="containment_unverified",
         )
-    except subprocess.TimeoutExpired as exc:
+    if outcome.timed_out:
         raise CliError(
             f"command timed out after {timeout}s: {Path(argv[0]).name}",
             status="timed_out",
-        ) from exc
-    except OSError as exc:
-        raise CliError(f"could not start command: {exc}") from exc
+        )
+    if outcome.cancelled:
+        raise CliError(
+            f"command was cancelled: {Path(argv[0]).name}",
+            status="cancelled",
+        )
+    if outcome.launch_error:
+        raise CliError(f"could not start command: {outcome.launch_error}")
+    if outcome.returncode is None:
+        raise CliError(
+            f"child-process containment could not be verified: {Path(argv[0]).name}",
+            status="containment_unverified",
+        )
+    return subprocess.CompletedProcess(
+        argv,
+        outcome.returncode,
+        outcome.stdout or "",
+        outcome.stderr or "",
+    )
 
 
 def _run_process_inherited(
@@ -421,23 +584,37 @@ def _run_process_inherited(
             code=EXIT_REFUSED,
             status="confirmation_required",
         )
-    try:
-        return subprocess.run(
-            argv,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-            shell=False,
-            env=({**os.environ, **environment} if environment else None),
+    outcome = process_supervisor.run_supervised(
+        argv,
+        cwd=cwd,
+        timeout=timeout,
+        environment=({**os.environ, **environment} if environment else None),
+        capture_output=False,
+        allow_child_breakaway=False,
+    )
+    if not outcome.termination_verified:
+        raise CliError(
+            f"child-process termination could not be verified: {Path(argv[0]).name}",
+            status="containment_unverified",
         )
-    except subprocess.TimeoutExpired as exc:
+    if outcome.timed_out:
         raise CliError(
             f"command timed out after {timeout}s: {Path(argv[0]).name}",
             status="timed_out",
-        ) from exc
-    except OSError as exc:
-        raise CliError(f"could not start command: {exc}") from exc
+        )
+    if outcome.cancelled:
+        raise CliError(
+            f"command was cancelled: {Path(argv[0]).name}",
+            status="cancelled",
+        )
+    if outcome.launch_error:
+        raise CliError(f"could not start command: {outcome.launch_error}")
+    if outcome.returncode is None:
+        raise CliError(
+            f"child-process containment could not be verified: {Path(argv[0]).name}",
+            status="containment_unverified",
+        )
+    return subprocess.CompletedProcess(argv, outcome.returncode, None, None)
 
 
 def _process_payload(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -461,12 +638,44 @@ def _output_tail(text: str, limit: int = 12) -> list[str]:
     return lines[-limit:]
 
 
+def _final_json_object(text: str) -> dict[str, Any] | None:
+    """Parse one command receipt after any preceding human-readable log lines.
+
+    Long-lived tools may explain stale-state recovery before emitting their
+    single-line JSON receipt. Only the final non-empty line is authoritative;
+    accepting an earlier object would let trailing failure text be ignored.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        value = json.loads(lines[-1])
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _gdls_read_only_status(project: Path) -> dict[str, Any] | None:
+    """Inspect retained GDLS ownership without starting or stopping anything."""
+    tool = project / "tools" / "gdls.py"
+    if not tool.is_file():
+        return None
+    result = _run_process(
+        [sys.executable, str(tool), "status"],
+        cwd=project,
+        timeout=30,
+    )
+    return _final_json_object(result.stdout or "")
+
+
 def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
     """Consume the authoritative read-only bootstrap probe.
 
     Bootstrap's default mode is the setup detector contract. Doctor never
-    passes its mutating or opt-in capability flags, and invokes no second
-    process, so this command cannot accidentally become a setup shortcut.
+    passes its mutating or opt-in capability flags. It also asks the GDLS
+    helper for a read-only ownership status so a retained engine which vanished
+    after startup is visible before another GDLS command. Neither probe starts,
+    stops or authenticates Godot.
     """
     bootstrap = _script(project, "bootstrap.py")
     result = _run_process(
@@ -483,6 +692,24 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
         and result.returncode in (0, 1)
         and (result.returncode == 0) == state.get("complete")
     )
+    native_warning = cockpit.persisted_native_warning(project)
+    warnings = [native_warning] if native_warning else []
+    gdls_status = _gdls_read_only_status(project)
+    gdls_warning = (
+        gdls_status.get("warning")
+        if isinstance(gdls_status, dict)
+        and isinstance(gdls_status.get("warning"), dict)
+        else None
+    )
+    if gdls_warning:
+        code = str(gdls_warning.get("code") or "gdls-native-safety")
+        if not any(str(item.get("code") or "") == code for item in warnings):
+            warnings.append({
+                "code": code,
+                "recorded_at": None,
+                "operation": "gdls status",
+                "summary": str(gdls_warning.get("summary") or "GDLS native safety is unresolved"),
+            })
     if not valid:
         output = (result.stdout or "") + (result.stderr or "")
         payload = {
@@ -492,10 +719,22 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
             "project": str(project),
             "bootstrap": state,
             "check": {"available": (project / "check.py").is_file()},
+            "warnings": warnings,
+            "gdls": gdls_status,
             "process": _process_summary(result),
         }
         human = ["doctor: bootstrap probe failed"]
         human.extend("  " + line for line in _output_tail(output))
+        for warning in warnings:
+            human.append(f"  warning [{warning['code']}]: {warning['summary']}")
+            warning_identity = warning.get("warning_sha256")
+            if isinstance(warning_identity, str) and _VERIFY_SECRET.fullmatch(
+                warning_identity
+            ):
+                human.append(
+                    "  bounded retry (after explicit approval): "
+                    f"kit verify --confirm-native-retry {warning_identity}"
+                )
         return EXIT_FAILED, payload, human
 
     ready = bool(state["complete"])
@@ -522,6 +761,8 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
             "bootstrap_result": check_result,
         },
         "blocking": blocking,
+        "warnings": warnings,
+        "gdls": gdls_status,
         "process": _process_summary(result),
     }
     human = [f"doctor: {status}", f"  project: {project}"]
@@ -529,6 +770,16 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
         human.append("  blocking: " + ", ".join(blocking))
     else:
         human.append(f"  setup checks: {len(results)}")
+    for warning in warnings:
+        human.append(f"  warning [{warning['code']}]: {warning['summary']}")
+        warning_identity = warning.get("warning_sha256")
+        if isinstance(warning_identity, str) and _VERIFY_SECRET.fullmatch(
+            warning_identity
+        ):
+            human.append(
+                "  bounded retry (after explicit approval): "
+                f"kit verify --confirm-native-retry {warning_identity}"
+            )
     human.append("  bootstrap ran in read-only, offline detection mode")
     return code, payload, human
 
@@ -570,6 +821,11 @@ def _setup(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
         )
     else:
         command = [sys.executable, str(bootstrap), *flags[operation]]
+        if operation == "import":
+            selected_engine = _selected_engine_path(
+                project, operation="setup import"
+            )
+            command.extend(["--engine-bin", str(selected_engine)])
         if operation in targets:
             command.extend(["--operation-target", targets[operation]])
         result = _run_process(command, cwd=project, timeout=900)
@@ -610,7 +866,297 @@ def _integrity_accept(
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
+def _gate_summary_path(project: Path, nonce: str | None = None) -> Path:
+    suffix = f"-{nonce}" if nonce else ""
+    return project / ".checklogs" / f"run-summary{suffix}.json"
+
+
+def _prepare_gate_summary(project: Path, nonce: str) -> None:
+    """A previous gate's crash evidence must never be attributed to this run."""
+    if _VERIFY_NONCE.fullmatch(nonce) is None:
+        raise CliError(
+            "verification run identity is invalid",
+            code=EXIT_REFUSED,
+            status="diagnostics_identity_invalid",
+        )
+    try:
+        _gate_summary_path(project, nonce).unlink(missing_ok=True)
+    except OSError as exc:
+        raise CliError(
+            f"cannot clear stale gate diagnostics: {exc}",
+            code=EXIT_REFUSED,
+            status="diagnostics_locked",
+        ) from exc
+
+
+def _read_gate_summary(
+    project: Path,
+    nonce: str,
+    auth_key: str,
+    repository_sha256: str,
+) -> dict[str, Any] | None:
+    """Read only diagnostics cryptographically bound to this public run."""
+    if (
+        _VERIFY_NONCE.fullmatch(nonce) is None
+        or _VERIFY_SECRET.fullmatch(auth_key) is None
+        or _VERIFY_SECRET.fullmatch(repository_sha256) is None
+    ):
+        return None
+    try:
+        raw = json.loads(
+            _gate_summary_path(project, nonce).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema") != 2
+        or raw.get("run_id") != nonce
+        or raw.get("repository_sha256") != repository_sha256
+    ):
+        return None
+    supplied_auth = raw.get("auth_sha256")
+    if not isinstance(supplied_auth, str) or _VERIFY_SECRET.fullmatch(supplied_auth) is None:
+        return None
+    authenticated = dict(raw)
+    authenticated.pop("auth_sha256", None)
+    canonical = json.dumps(
+        authenticated,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected_auth = hmac.new(
+        bytes.fromhex(auth_key), canonical, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_auth, expected_auth):
+        return None
+    failed = raw.get("failed")
+    results = raw.get("results")
+    diagnostics = raw.get("diagnostics")
+    if (
+        not isinstance(failed, bool)
+        or not isinstance(results, list)
+        or not isinstance(diagnostics, dict)
+    ):
+        return None
+    fields = {
+        "native_crashes": ("code", "executable", "exit_code", "windows_status"),
+        "engine_refusals": ("code", "executable"),
+        "engine_start_failures": ("code", "executable", "exit_code"),
+        "timeouts": ("code", "executable", "timeout_seconds"),
+    }
+    safe_diagnostics: dict[str, list[dict[str, Any]]] = {}
+    for kind, allowed in fields.items():
+        entries = diagnostics.get(kind) if isinstance(diagnostics.get(kind), list) else []
+        safe_diagnostics[kind] = [
+            {key: entry.get(key) for key in allowed if key in entry}
+            for entry in entries[:20]
+            if isinstance(entry, dict)
+        ]
+    return {
+        "schema": 2,
+        "run_id": nonce,
+        "repository_sha256": repository_sha256,
+        "auth_sha256": supplied_auth,
+        "failed": failed,
+        "results": [str(line)[:500] for line in results[:200]],
+        "diagnostics": safe_diagnostics,
+    }
+
+
+def _strict_report_is_valid(
+    project: Path,
+    report: object,
+    process_returncode: int,
+    gate_summary: dict[str, Any] | None,
+) -> bool:
+    """Validate the public strict contract, including whether its gate ran."""
+    if not isinstance(report, dict):
+        return False
+    if (
+        report.get("schema") != 1
+        or report.get("command") != "strict-verify"
+        or report.get("exit_code") not in (EXIT_OK, EXIT_FAILED, EXIT_REFUSED)
+        or process_returncode != report.get("exit_code")
+        or report.get("status") not in ("passed", "failed", "blocked")
+        or report.get("ok") is not (report.get("exit_code") == EXIT_OK)
+    ):
+        return False
+    try:
+        if Path(str(report.get("project"))).resolve() != project.resolve():
+            return False
+    except (OSError, ValueError):
+        return False
+    stages = report.get("stages")
+    if stages is None:
+        return bool(
+            report.get("status") == "blocked"
+            and report.get("exit_code") == EXIT_REFUSED
+            and isinstance(report.get("error"), str)
+            and report.get("error")
+            and gate_summary is None
+        )
+    if not isinstance(stages, list) or not stages:
+        return False
+    authority_receipt = report.get("authority_receipt")
+    if (
+        not isinstance(authority_receipt, dict)
+        or authority_receipt.get("receipt_trust")
+        not in (
+            "local-audit-matched",
+            "portable-policy",
+            "invalid",
+            "no-exact-authority-event",
+        )
+        or not isinstance(authority_receipt.get("receipt_reasons"), list)
+    ):
+        return False
+    names: set[str] = set()
+    statuses: list[str] = []
+    gate_status: str | None = None
+    for stage in stages:
+        if not isinstance(stage, dict):
+            return False
+        name = stage.get("name")
+        status = stage.get("status")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in names
+            or status not in ("passed", "failed", "blocked", "not_run")
+        ):
+            return False
+        names.add(name)
+        statuses.append(str(status))
+        if name == "gate":
+            gate_status = str(status)
+    if "failed" in statuses:
+        expected_status, expected_exit = "failed", EXIT_FAILED
+    elif "blocked" in statuses or "not_run" in statuses:
+        expected_status, expected_exit = "blocked", EXIT_REFUSED
+    elif set(statuses) == {"passed"}:
+        expected_status, expected_exit = "passed", EXIT_OK
+    else:
+        return False
+    if (
+        report.get("status") != expected_status
+        or report.get("exit_code") != expected_exit
+    ):
+        return False
+    if expected_status == "passed" and authority_receipt.get("receipt_trust") == "invalid":
+        return False
+    if gate_status in ("passed", "failed"):
+        return gate_summary is not None
+    if gate_status in ("blocked", "not_run"):
+        return gate_summary is None
+    return False
+
+
+@contextlib.contextmanager
+def _verification_run_lock(project: Path) -> Iterator[None]:
+    """Refuse overlapping public verifies using an OS-owned file lock.
+
+    The file is intentionally persistent; process exit releases the kernel
+    lock, so stale-file deletion and its read/unlink race are unnecessary.
+    """
+    try:
+        paths = runtime_paths.resolve(project, create=True)
+    except (OSError, ValueError, runtime_paths.RuntimeConfigError) as exc:
+        raise CliError(
+            f"cannot establish verification lock: {exc}",
+            code=EXIT_REFUSED,
+            status="verification_lock_unavailable",
+        ) from exc
+    path = paths.verification_runs.parent / "public-verify.lock"
+    try:
+        with process_supervisor.exclusive_file_lock(
+            path, label="public verification"
+        ):
+            yield
+    except process_supervisor.ExclusiveLockUnavailable as exc:
+        raise CliError(
+            str(exc),
+            code=EXIT_REFUSED,
+            status="verification_in_progress",
+        ) from exc
+    except OSError as exc:
+        raise CliError(
+            f"cannot establish verification lock: {exc}",
+            code=EXIT_REFUSED,
+            status="verification_lock_unavailable",
+        ) from exc
+
+
 def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
+    with _verification_run_lock(project):
+        repository_start = cockpit.repository_fingerprint(project)
+        repository_sha256 = repository_start.get("digest")
+        if (
+            not repository_start.get("available")
+            or not isinstance(repository_sha256, str)
+            or _VERIFY_SECRET.fullmatch(repository_sha256) is None
+        ):
+            raise CliError(
+                "verification cannot bind evidence to the current repository state: "
+                + str(repository_start.get("reason") or "fingerprint unavailable"),
+                code=EXIT_REFUSED,
+                status="repository_fingerprint_unavailable",
+            )
+        code, payload, human = _verify_once(
+            project,
+            args,
+            repository_sha256=repository_sha256,
+        )
+        repository_end = cockpit.repository_fingerprint(project)
+        repository_stable = bool(
+            repository_end.get("available")
+            and repository_end.get("digest") == repository_sha256
+        )
+        payload["repository_start"] = repository_start
+        payload["repository_end"] = repository_end
+        payload["repository_stable"] = repository_stable
+        if code == EXIT_OK and not repository_stable:
+            code = EXIT_FAILED
+            payload["ok"] = False
+            payload["status"] = "repository_changed_during_verification"
+            human.append(
+                "  evidence: repository content changed while verification was running"
+            )
+        payload["exit_code"] = code
+        if os.environ.get("KIT_SELF_TEST") != "1":
+            try:
+                payload["verification_record"] = cockpit.record_verification(
+                    project, payload
+                )
+            except (OSError, cockpit.CockpitError) as exc:
+                payload["verification_record"] = {
+                    "status": "insufficient",
+                    "error": f"verification result could not be persisted: {exc}",
+                }
+                human.append(f"  evidence ledger: unavailable ({exc})")
+                if code == EXIT_OK:
+                    code = EXIT_FAILED
+                    payload["ok"] = False
+                    payload["status"] = "evidence_persistence_failed"
+                    payload["exit_code"] = code
+        return code, payload, human
+
+
+def _verify_once(
+    project: Path,
+    args: argparse.Namespace,
+    *,
+    repository_sha256: str,
+) -> tuple[int, dict[str, Any], list[str]]:
+    nonce = uuid.uuid4().hex
+    auth_key = secrets.token_hex(32)
+    warning_start = native_engine.snapshot_native_warning(project)
+    warning_snapshot = {
+        "state": warning_start.state,
+        "identity": warning_start.identity,
+    }
+    _prepare_gate_summary(project, nonce)
     if args.strict:
         if args.stage or args.fast or args.static:
             raise CliError(
@@ -619,21 +1165,39 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
                 status="strict_scope_refused",
             )
         environment, engine_selection = _verification_environment(project, args)
+        retry_environment = _native_retry_environment(
+            project,
+            args,
+            nonce=nonce,
+            warning=warning_start,
+        )
+        environment = {
+            **(environment or {}),
+            **retry_environment,
+            "KIT_VERIFY_NONCE": nonce,
+            "KIT_VERIFY_AUTH_KEY": auth_key,
+            "KIT_VERIFY_REPOSITORY_SHA256": repository_sha256,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         strict = _script(project, "tools", "strict_verify.py")
         result = _run_process(
             [sys.executable, str(strict), "--json"],
             cwd=project,
-            timeout=7200,
+            timeout=10800,
             environment=environment,
         )
         try:
             report = json.loads(result.stdout or "")
         except ValueError:
             report = None
-        valid = (
-            isinstance(report, dict)
-            and report.get("exit_code") in (EXIT_OK, EXIT_FAILED, EXIT_REFUSED)
-            and result.returncode == report.get("exit_code")
+        gate_summary = _read_gate_summary(
+            project, nonce, auth_key, repository_sha256
+        )
+        valid = _strict_report_is_valid(
+            project,
+            report,
+            result.returncode,
+            gate_summary,
         )
         if not valid:
             code, status = EXIT_FAILED, "strict_report_invalid"
@@ -646,6 +1210,8 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
             "status": status,
             "project": str(project),
             "strict": True,
+            "verification_nonce": nonce,
+            "native_warning_start": warning_snapshot,
             "report": report,
             "process": _process_payload(result),
             "engine": (
@@ -655,6 +1221,7 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
                 }
                 if engine_selection and engine_selection.path else None
             ),
+            "gate_summary": gate_summary,
         }
         human = [f"verify strict: {status}"]
         if isinstance(report, dict):
@@ -677,9 +1244,6 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
             code=EXIT_REFUSED,
             status="static_scope_refused",
         )
-    environment, engine_selection = _verification_environment(project, args)
-    check = _script(project, "check.py")
-    command = [sys.executable, str(check)]
     for stage in args.stage:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", stage):
             raise CliError(
@@ -687,6 +1251,24 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
                 code=EXIT_REFUSED,
                 status="invalid_stage",
             )
+    environment, engine_selection = _verification_environment(project, args)
+    retry_environment = _native_retry_environment(
+        project,
+        args,
+        nonce=nonce,
+        warning=warning_start,
+    )
+    environment = {
+        **(environment or {}),
+        **retry_environment,
+        "KIT_VERIFY_NONCE": nonce,
+        "KIT_VERIFY_AUTH_KEY": auth_key,
+        "KIT_VERIFY_REPOSITORY_SHA256": repository_sha256,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    check = _script(project, "check.py")
+    command = [sys.executable, str(check)]
+    for stage in args.stage:
         command.extend(["--only", stage])
     if args.fast:
         command.append("--fast")
@@ -705,9 +1287,12 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
     output = (result.stdout or "") + (result.stderr or "")
     plain_output = _ANSI_ESCAPE.sub("", output)
     skips = re.findall(r"(?m)^\s*SKIP\s+(.+?)\s*$", plain_output)
-    gate_passed = result.returncode == 0 and (
-        streamed or "GATE PASSED" in plain_output
+    gate_summary = _read_gate_summary(
+        project, nonce, auth_key, repository_sha256
     )
+    gate_passed = result.returncode == 0 and gate_summary is not None and (
+        streamed or "GATE PASSED" in plain_output
+    ) and gate_summary.get("failed") is False
     if not gate_passed:
         code, status = EXIT_FAILED, "failed"
     else:
@@ -718,6 +1303,8 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
         "status": status,
         "project": str(project),
         "strict": False,
+        "verification_nonce": nonce,
+        "native_warning_start": warning_snapshot,
         "stages": list(args.stage),
         "fast": bool(args.fast),
         "static": bool(args.static),
@@ -730,6 +1317,7 @@ def _verify(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any
             }
             if engine_selection and engine_selection.path else None
         ),
+        "gate_summary": gate_summary,
     }
     human = [f"verify: {status}"]
     if skips:
@@ -753,6 +1341,14 @@ def _self_test(
     ]
     environment = {
         "KIT_ENGINE_DISABLED": "1",
+        "KIT_SELF_TEST": "1",
+        # A strict verifier may itself carry a public gate nonce.  The
+        # self-test's mocked/nested checks must never write that outer run's
+        # evidence receipt.
+        "KIT_VERIFY_NONCE": "",
+        "KIT_VERIFY_AUTH_KEY": "",
+        "KIT_VERIFY_REPOSITORY_SHA256": "",
+        "KIT_NATIVE_RETRY_TOKEN": "",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     streamed = not bool(getattr(args, "json_output", False))
@@ -872,11 +1468,16 @@ def _godot_docs(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
     operation = args.godot_docs_command
-    arguments = {
-        "build": ("--build",),
-        "show": (getattr(args, "value", ""),),
-        "search": ("--search", getattr(args, "value", "")),
-    }[operation]
+    if operation == "build":
+        arguments = (
+            "--build",
+            "--engine",
+            str(_selected_engine_path(project, operation="godot-docs build")),
+        )
+    elif operation == "show":
+        arguments = (getattr(args, "value", ""),)
+    else:
+        arguments = ("--search", getattr(args, "value", ""))
     return _maintenance_process(
         project,
         label=f"godot-docs {operation}",
@@ -884,6 +1485,55 @@ def _godot_docs(
         arguments=arguments,
         timeout=360 if operation == "build" else 60,
     )
+
+
+def _gdls(
+    project: Path, args: argparse.Namespace
+) -> tuple[int, dict[str, Any], list[str]]:
+    operation = args.gdls_command
+    command = [sys.executable, str(_script(project, "tools", "gdls.py"))]
+    if operation == "start":
+        command.extend([
+            "--engine",
+            str(_selected_engine_path(project, operation="gdls start")),
+        ])
+    command.append(operation)
+    if operation in {"diagnose", "symbols", "refs"}:
+        command.append(str(getattr(args, "value", "")))
+    timeout = 120 if operation == "start" else 60
+    result = _run_process(
+        command,
+        cwd=project,
+        timeout=timeout,
+        allow_child_breakaway=operation == "start",
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    try:
+        parsed = json.loads(result.stdout or "")
+    except ValueError:
+        parsed = None
+    receipt = (
+        parsed
+        if isinstance(parsed, dict)
+        else _final_json_object(result.stdout or "")
+    )
+    ok = result.returncode == 0 and receipt is not None
+    payload = {
+        "ok": ok,
+        "command": "gdls",
+        "operation": operation,
+        "status": (
+            str(receipt.get("status") or "completed")
+            if ok and receipt is not None
+            else "failed"
+        ),
+        "project": str(project),
+        "result": receipt,
+        "process": _process_payload(result),
+    }
+    human = [f"gdls {operation}: {'completed' if ok else 'failed'}"]
+    human.extend("  " + line for line in _output_tail(output, limit=8))
+    return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
 def _friction(
@@ -899,30 +1549,27 @@ def _friction(
     )
 
 
-def _plan(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
-    plan_tool = _script(project, "tools", "plan_html.py")
-    retro_tool = _script(project, "tools", "retro_html.py")
+def _plan(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
     plan_file = project / "plan.html"
     retro_file = project / "retro.html"
-
-    # These pages are two views of the same review workflow. Generate both in
-    # one public operation and keep server startup in the explicit `serve`
-    # command, so a deterministic render never launches a background process.
-    jobs = (
-        ("plan", [sys.executable, str(plan_tool)]),
-        ("retro", [sys.executable, str(retro_tool), "--no-board"]),
+    snapshot_requested = getattr(args, "snapshot", None) is not None
+    snapshot = ""
+    if snapshot_requested:
+        requested = str(getattr(args, "snapshot", "") or "").strip()
+        snapshot = (
+            cockpit.snapshot_label(requested)
+            if requested
+            else cockpit.snapshot_name(project)
+        )
+    result = cockpit.regenerate_views(project, snapshot=snapshot)
+    processes = result.get("processes") if isinstance(result.get("processes"), dict) else {}
+    output = "".join(
+        str(process.get("stdout") or "") + str(process.get("stderr") or "")
+        for process in processes.values()
+        if isinstance(process, dict)
     )
-    processes: dict[str, dict[str, Any]] = {}
-    output_parts: list[str] = []
-    all_succeeded = True
-    for name, command in jobs:
-        result = _run_process(command, cwd=project, timeout=180)
-        processes[name] = _process_payload(result)
-        output_parts.extend((result.stdout or "", result.stderr or ""))
-        all_succeeded = all_succeeded and result.returncode == 0
-
-    output = "".join(output_parts)
-    ok = all_succeeded and plan_file.is_file() and retro_file.is_file()
+    ok = bool(result.get("ok"))
+    snapshot_file = project / "plan" / f"{snapshot}.html" if snapshot else None
     payload = {
         "ok": ok,
         "command": "plan",
@@ -931,34 +1578,65 @@ def _plan(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any]
         "path": str(plan_file),
         "paths": {"plan": str(plan_file), "retro": str(retro_file)},
         "processes": processes,
+        "review_uri": plan_file.resolve().as_uri() if ok else None,
+        "snapshot": str(snapshot_file) if snapshot_file and snapshot_file.is_file() else None,
     }
     human = [f"plan: {'regenerated' if ok else 'failed'}"]
     if ok:
         human.append(f"  {plan_file}")
         human.append(f"  {retro_file}")
+        if snapshot_file and snapshot_file.is_file():
+            human.append(f"  snapshot {snapshot_file}")
     else:
         human.extend("  " + line for line in _output_tail(output))
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
-def _serve(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
+def _serve(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
+    operation = str(getattr(args, "serve_command", "start") or "start")
+    regeneration: dict[str, Any] | None = None
+    if operation in ("start", "open"):
+        plan_args = argparse.Namespace(snapshot=None)
+        plan_code, regeneration, plan_human = _plan(project, plan_args)
+        if plan_code != EXIT_OK:
+            payload = dict(regeneration)
+            payload.update({"command": f"serve {operation}", "status": "render_failed"})
+            return plan_code, payload, plan_human
     tool = _script(project, "tools", "board.py")
+    switch = {
+        "start": "--ensure",
+        "status": "--status",
+        "open": "--open",
+        "stop": "--stop",
+    }[operation]
     result = _run_process(
-        [sys.executable, str(tool), "--ensure"], cwd=project, timeout=60
+        [sys.executable, str(tool), switch, "--json"],
+        cwd=project,
+        timeout=60,
+        allow_child_breakaway=operation in ("start", "open"),
     )
     output = (result.stdout or "") + (result.stderr or "")
-    match = re.search(r"http://127\.0\.0\.1:\d+/", output)
-    url = match.group(0) if match else ""
-    ok = result.returncode == 0 and bool(url)
+    state = _final_json_object(result.stdout or "")
+    url = str(state.get("url") or "") if isinstance(state, dict) else ""
+    review_url = str(state.get("review_url") or "") if isinstance(state, dict) else ""
+    ok = result.returncode == 0 and isinstance(state, dict) and bool(state.get("ok"))
     payload = {
         "ok": ok,
-        "command": "serve",
-        "status": "running" if ok else "failed",
+        "command": f"serve {operation}",
+        "status": str(state.get("status") or "failed") if isinstance(state, dict) else "failed",
         "project": str(project),
         "url": url or None,
+        "review_url": review_url or None,
+        "board": state,
+        "regeneration": regeneration,
         "process": _process_payload(result),
     }
-    human = [f"serve: {url}" if ok else "serve: failed"]
+    if ok and review_url:
+        human = [f"serve: {payload['status']}", f"  {review_url}"]
+    elif ok:
+        human = [f"serve: {payload['status']}"]
+    else:
+        human = [f"serve {operation}: failed"]
     if not ok:
         human.extend("  " + line for line in _output_tail(output))
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
@@ -983,10 +1661,42 @@ def _retro_status(project: Path, _args: argparse.Namespace) -> tuple[int, dict[s
         "process": _process_payload(result),
     }
     if ok:
+        unarchived = state.get("unarchived", 0)
+        threshold = state.get("threshold", 0)
+        remaining = state.get("remaining", max(threshold - unarchived, 0))
+        progress = state.get("progress")
+        percentage = (
+            f"; {round(progress * 100)}%"
+            if isinstance(progress, (int, float)) and not isinstance(progress, bool)
+            else ""
+        )
+        level = str(state.get("trigger_level") or "none")
+
+        def _codes(key: str) -> list[str]:
+            values = state.get(key)
+            if not isinstance(values, list):
+                return []
+            return sorted({
+                str(item.get("code"))
+                for item in values
+                if isinstance(item, dict) and item.get("code")
+            })
+
+        immediate = _codes("immediate_consequences")
+        prompt = _codes("prompt_triggers")
+        warnings = _codes("warnings")
         human = [
-            f"retro: {payload['status']} "
-            f"({state.get('unarchived', 0)}/{state.get('threshold', 0)} notes)"
+            f"retro: {payload['status']}",
+            f"  progress: {unarchived}/{threshold} notes "
+            f"({remaining} remaining{percentage})",
+            f"  urgency: {level}",
         ]
+        if immediate:
+            human.append("  immediate codes: " + ", ".join(immediate))
+        if prompt:
+            human.append("  prompt codes: " + ", ".join(prompt))
+        if warnings:
+            human.append("  status warnings: " + ", ".join(warnings))
     else:
         output = (result.stdout or "") + (result.stderr or "")
         human = ["retro status: failed"] + ["  " + line for line in _output_tail(output)]
@@ -1002,12 +1712,6 @@ def _retro_run(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, 
             code=EXIT_REFUSED,
             status="provider_invalid",
         ) from exc
-    if provider.automatic and not args.confirm_spend:
-        raise CliError(
-            "retrospective provider run refused; repeat with --confirm-spend",
-            code=EXIT_REFUSED,
-            status="confirmation_required",
-        )
     if provider.automatic:
         blockers = providers.preflight(provider)
         if blockers:
@@ -1016,10 +1720,27 @@ def _retro_run(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, 
                 code=EXIT_REFUSED,
                 status="provider_unavailable",
             )
+        if not args.confirm_spend:
+            raise CliError(
+                "retrospective provider run refused; repeat with --confirm-spend",
+                code=EXIT_REFUSED,
+                status="confirmation_required",
+            )
     tool = _script(project, "tools", "retro.py")
     mode = "--sdk" if provider.kind == "copilot-sdk" else "--print"
+    capture_window: list[str] = []
+    if args.since:
+        capture_window.extend(("--since", str(args.since)))
+    if args.limit is not None:
+        if args.limit < 1:
+            raise CliError(
+                "retrospective session --limit must be a positive integer",
+                code=EXIT_REFUSED,
+                status="invalid_capture_window",
+            )
+        capture_window.extend(("--limit", str(args.limit)))
     result = _run_process(
-        [sys.executable, str(tool), mode, "--force"],
+        [sys.executable, str(tool), mode, "--force", *capture_window],
         cwd=project,
         timeout=3600,
         allow_provider=provider.automatic and bool(args.confirm_spend),
@@ -1032,6 +1753,11 @@ def _retro_run(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, 
         "status": successful_status if ok else "failed",
         "project": str(project),
         "confirmed": bool(args.confirm_spend),
+        "capture_window": {
+            "since": args.since or None,
+            "limit": args.limit,
+            "explicit": bool(args.since or args.limit is not None),
+        },
         "provider": provider.status(),
         "process": _process_payload(result),
     }
@@ -1041,27 +1767,49 @@ def _retro_run(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, 
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
+def _resolve_retro_report(project: Path, raw_report: str | None) -> Path:
+    """Resolve one exact findings file before ranking mutates its bytes."""
+    retro_root = (project / "docs" / "retro").resolve()
+    if raw_report:
+        raw = Path(raw_report)
+        report_path = (raw if raw.is_absolute() else project / raw).resolve()
+    else:
+        reports = sorted(retro_root.glob("*-findings.md"))
+        if not reports:
+            raise CliError(
+                "no retrospective findings report exists under docs/retro",
+                code=EXIT_REFUSED,
+                status="report_unavailable",
+            )
+        report_path = reports[-1].resolve()
+    if not report_path.is_relative_to(retro_root):
+        raise CliError(
+            "retrospective findings must be under docs/retro",
+            code=EXIT_REFUSED,
+            status="report_outside_retro",
+        )
+    if not report_path.name.endswith("-findings.md"):
+        raise CliError(
+            "retrospective report name must end with -findings.md",
+            code=EXIT_REFUSED,
+            status="invalid_report_name",
+        )
+    if not report_path.is_file():
+        raise CliError(
+            "retrospective findings report does not exist",
+            code=EXIT_REFUSED,
+            status="report_unavailable",
+        )
+    return report_path
+
+
 def _retro_publish(
         project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
-    retro_root = (project / "docs" / "retro").resolve()
+    report_path = _resolve_retro_report(project, args.report)
     command = [sys.executable, str(_script(project, "tools", "retro_rank.py"))]
-    report_path: Path | None = None
-    if args.report:
-        raw = Path(args.report)
-        report_path = (raw if raw.is_absolute() else project / raw).resolve()
-        if not report_path.is_relative_to(retro_root):
-            raise CliError(
-                "retrospective findings must be under docs/retro",
-                code=EXIT_REFUSED,
-                status="report_outside_retro",
-            )
-        if not report_path.name.endswith("-findings.md"):
-            raise CliError(
-                "retrospective report name must end with -findings.md",
-                code=EXIT_REFUSED,
-                status="invalid_report_name",
-            )
-        command.append(str(report_path))
+    # Resolve the exact report before ranking. The same path is rendered and
+    # then bound back to its immutable evidence snapshot during completion.
+    command.append(str(report_path))
 
     ranked = _run_process(command, cwd=project, timeout=180)
     rank_output = (ranked.stdout or "") + (ranked.stderr or "")
@@ -1079,18 +1827,47 @@ def _retro_publish(
         return EXIT_FAILED, payload, human
 
     plan_code, plan_payload, _plan_human = _plan(project, args)
-    ok = plan_code == EXIT_OK
+    if plan_code != EXIT_OK:
+        payload = {
+            "ok": False,
+            "command": "retro publish",
+            "status": "render_failed",
+            "project": str(project),
+            "report": str(report_path),
+            "ranking": _process_payload(ranked),
+            "plan": plan_payload,
+        }
+        human = ["retro publish: render failed"]
+        human.extend("  " + line for line in _output_tail(rank_output, limit=5))
+        return EXIT_FAILED, payload, human
+
+    completion_tool = _script(project, "tools", "retro.py")
+    completed = _run_process(
+        [
+            sys.executable,
+            str(completion_tool),
+            "--complete-published",
+            str(report_path),
+        ],
+        cwd=project,
+        timeout=180,
+    )
+    completion_output = (completed.stdout or "") + (completed.stderr or "")
+    ok = completed.returncode == 0
     payload = {
         "ok": ok,
         "command": "retro publish",
-        "status": "published" if ok else "render_failed",
+        "status": "published" if ok else "completion_failed",
         "project": str(project),
-        "report": str(report_path) if report_path else None,
+        "report": str(report_path),
         "ranking": _process_payload(ranked),
         "plan": plan_payload,
+        "completion": _process_payload(completed),
     }
-    human = [f"retro publish: {'published' if ok else 'render failed'}"]
+    human = [f"retro publish: {'published' if ok else 'completion failed'}"]
     human.extend("  " + line for line in _output_tail(rank_output, limit=5))
+    if not ok:
+        human.extend("  " + line for line in _output_tail(completion_output, limit=8))
     if ok:
         human.append(f"  {project / 'retro.html'}")
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
@@ -1142,6 +1919,7 @@ _HANDLERS = {
     "sanitize": _sanitize,
     "schema_describe": _schema_describe,
     "godot_docs": _godot_docs,
+    "gdls": _gdls,
     "friction": _friction,
     "plan": _plan,
     "serve": _serve,
@@ -1196,6 +1974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(raw_argv)
     json_output = bool(getattr(args, "json_output", False))
+    project: Path | None = None
     try:
         project = _resolve_project(getattr(args, "project", None))
         handler = _HANDLERS[args.action]

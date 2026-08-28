@@ -20,8 +20,9 @@ kit doctor --json
 runs the setup detector in read-only, offline mode. It does not create a runtime
 directory, install or download anything, edit the game or editor, initialise Git,
 stage files, commit, import, format, call a model, or start the Godot executable.
-It reports the discovered engine path only; engine health/version is checked at
-the explicit native-engine boundary in full verification.
+It reports the discovered engine path only. Full verification and every
+explicit non-gate native operation independently authenticate the engine's own
+version output before doing project work.
 
 `complete: true` means continue to verification. Otherwise, each result has
 `name`, `state` (`OK`, `MISSING` or `MANUAL`), `detail` and `remedy`. A result is
@@ -90,9 +91,11 @@ Do not lecture them about PATH. Ask where the file is and handle it.
 the executable. If its official-style filename names an older patch and the exact
 supported binary is beside it or beside the project, the kit selects that exact
 binary for its child process and reports the stale variable. If no exact replacement
-exists, `doctor` blocks without launching the known-wrong executable. An unversioned
-command remains explicit input and `kit verify` confirms its version at the bounded
-native boundary.
+exists, `doctor` blocks without launching the known-wrong executable. An
+unversioned command is discovery input only. `kit setup import`, `kit godot-docs
+build`, and `kit gdls start` first run one shell-free bounded version probe and
+continue only when that exact resolved file reports Godot 4.7.2. A missing,
+ambiguous, mismatched, crashed, or timed-out probe fails closed.
 
 **`editor-settings` needs changes** → explain that this is a user-level edit,
 ask them to close Godot, then run `kit setup editor` only

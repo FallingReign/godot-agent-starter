@@ -15,11 +15,12 @@ Owns its own `--editor --headless` instance on port 6105, so it never contends
 with a human editor on 6005. A Godot instance holds `.godot/`, which the gate's
 own `--import` writes to, so `stop` before running the gate.
 
-    python tools/gdls.py start
-    python tools/gdls.py diagnose scripts/logic/foo.gd
-    python tools/gdls.py refs MyClass
-    python tools/gdls.py symbols scripts/logic/foo.gd
-    python tools/gdls.py stop
+    kit gdls start
+    kit gdls status
+    kit gdls diagnose scripts/logic/foo.gd
+    kit gdls refs MyClass
+    kit gdls symbols scripts/logic/foo.gd
+    kit gdls stop
 
 Staleness is impossible here: file text is pushed from disk on every request,
 so the server never serves a cached buffer.
@@ -27,31 +28,240 @@ so the server never serves a cached buffer.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from ctypes import wintypes
 from typing import Any, Dict, List, Optional
 
+import engine_discovery
+import native_engine
+import project_context
+
 ROOT = Path(__file__).resolve().parent.parent
+CONTEXT = project_context.load_configured_context(ROOT)
+GAME_ROOT = CONTEXT.game_root
 PORT = 6105
-PID_FILE = ROOT / ".checklogs" / "gdls.pid"
+PID_FILE = CONTEXT.runtime_root / "gdls.json"
 READY_TIMEOUT = 60.0
 
 
-def find_godot() -> Optional[str]:
-    env = os.environ.get("GODOT_BIN")
-    if env and (Path(env).is_file() or shutil.which(env)):
-        return env
-    for name in ("godot", "godot4", "Godot"):
-        hit = shutil.which(name)
-        if hit:
-            return hit
-    return None
+def find_godot(candidate: str | None = None) -> engine_discovery.AuthenticatedEngine:
+    """Select and authenticate the exact engine before language-server startup."""
+    if candidate:
+        return engine_discovery.authenticate_godot(
+            ROOT,
+            candidate=candidate,
+            operation="gdls-start",
+        )
+    return engine_discovery.authenticate_godot(
+        ROOT,
+        selection=engine_discovery.select_godot(ROOT),
+        operation="gdls-start",
+    )
+
+
+def _saved_owner() -> native_engine.BackgroundReceipt | None:
+    return native_engine.read_background_receipt(PID_FILE)
+
+
+def _saved_journal() -> native_engine.BackgroundJournal | None:
+    return native_engine.read_background_journal(PID_FILE)
+
+
+def _saved_schema() -> int | None:
+    try:
+        value = json.loads(PID_FILE.read_text(encoding="utf-8"))
+        return int(value.get("schema", 0)) if isinstance(value, dict) else None
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _warning(
+    code: str,
+    summary: str,
+    *,
+    failure_class: str = "native-safety",
+) -> dict[str, str]:
+    return {
+        "code": code,
+        "summary": summary,
+        "failure_class": failure_class,
+        "operation": "gdls-unexpected-exit",
+    }
+
+
+def inspect_status() -> dict[str, Any]:
+    """Inspect the retained server without launching, killing or rewriting state."""
+    listening = port_open()
+    if not PID_FILE.exists():
+        if listening:
+            return {
+                "status": "foreign_listener",
+                "port": PORT,
+                "owned": False,
+                "warning": _warning(
+                    "gdls-foreign-listener",
+                    f"port {PORT} is open without a kit ownership receipt",
+                ),
+            }
+        lock = native_engine.inspect_engine_lock(ROOT)
+        if lock.state == native_engine.LOCK_CLEAN:
+            return {"status": "not_running", "port": PORT, "owned": False}
+        return {
+            "status": f"engine_lock_{lock.state}",
+            "pid": lock.pid,
+            "port": PORT,
+            "owned": False,
+            "warning": _warning(
+                f"native-engine-lock-{lock.state}",
+                lock.detail,
+                failure_class=(
+                    "native-crash"
+                    if lock.state == native_engine.LOCK_ABANDONED
+                    else "native-safety"
+                ),
+            ),
+        }
+
+    receipt = _saved_owner()
+    if receipt is None:
+        return {
+            "status": "ownership_unreadable",
+            "port": PORT,
+            "owned": False,
+            "warning": _warning(
+                "gdls-ownership-unreadable",
+                "the retained language-server receipt is unreadable; no process is trusted",
+            ),
+        }
+    inspection = native_engine.inspect_background_owner(ROOT, receipt)
+    if inspection.state == native_engine.BACKGROUND_OWNER_VANISHED:
+        return {
+            "status": "owner_vanished",
+            "pid": receipt.pid,
+            "port": PORT,
+            "owned": False,
+            "warning": _warning(
+                "native-engine-disappeared",
+                "the exactly owned Godot language-server process disappeared unexpectedly",
+                failure_class="native-crash",
+            ),
+        }
+    if inspection.state != native_engine.BACKGROUND_OWNED_LIVE:
+        return {
+            "status": "ownership_mismatch",
+            "pid": receipt.pid,
+            "port": PORT,
+            "owned": False,
+            "warning": _warning(
+                "gdls-ownership-mismatch",
+                inspection.detail,
+            ),
+        }
+    journal = _saved_journal()
+    if _saved_schema() == 3 and journal is None:
+        return {
+            "status": "ownership_unreadable",
+            "pid": receipt.pid,
+            "port": PORT,
+            "owned": False,
+            "warning": _warning(
+                "gdls-journal-unreadable",
+                "the language-server lifecycle journal is malformed; no process is trusted",
+            ),
+        }
+    if journal is not None and journal.lifecycle == "starting":
+        return {
+            "status": "launch_incomplete",
+            "pid": receipt.pid,
+            "port": PORT,
+            "owned": True,
+            "warning": _warning(
+                "gdls-launch-incomplete",
+                "the exact language-server process is still in a recoverable startup handoff",
+            ),
+        }
+    if not listening:
+        return {
+            "status": "owned_not_listening",
+            "pid": receipt.pid,
+            "port": PORT,
+            "owned": True,
+            "warning": _warning(
+                "gdls-owned-not-listening",
+                "the exactly owned process is alive but its language-server port is closed",
+            ),
+        }
+    return {
+        "status": "running",
+        "pid": receipt.pid,
+        "port": PORT,
+        "owned": True,
+    }
+
+
+def _record_abandoned_owner(
+    owner: native_engine.BackgroundReceipt | None = None,
+) -> bool:
+    owner = owner or _saved_owner()
+    if owner is None:
+        return False
+    failure = native_engine.reconcile_abandoned_background(
+        ROOT,
+        owner,
+        executable=owner.process_identity.executable_name,
+        operation="gdls-unexpected-exit",
+    )
+    if failure is None:
+        return False
+    native_engine.remove_background_journal(
+        PID_FILE, expected_receipt=owner
+    )
+    return True
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    status = inspect_status()
+    print(json.dumps(status))
+    return 0 if status["status"] in {"running", "not_running"} else 1
+
+
+def _cleanup_started_process(
+    process: Any,
+    token: str,
+    receipt: native_engine.BackgroundReceipt | None,
+) -> bool:
+    """End only this launch and remove only its still-matching receipt."""
+    if receipt is not None:
+        stopped = native_engine.stop_owned_background(ROOT, receipt)
+    elif os.name == "nt":
+        try:
+            process.kill()
+            process.wait(timeout=10)
+            stopped = process.poll() is not None
+        except (OSError, subprocess.SubprocessError):
+            stopped = False
+    else:
+        stopped = bool(native_engine.terminate_owned_process_tree(process))
+    if not stopped:
+        return False
+    try:
+        process.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if receipt is None:
+        native_engine.release_engine_lock(ROOT, token)
+    if receipt is not None:
+        native_engine.remove_background_journal(
+            PID_FILE, expected_receipt=receipt
+        )
+    return True
 
 
 def port_open(port: int = PORT) -> bool:
@@ -60,11 +270,110 @@ def port_open(port: int = PORT) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+class _TcpOwnerRow(ctypes.Structure):
+    _fields_ = [
+        ("state", wintypes.DWORD),
+        ("local_address", wintypes.DWORD),
+        ("local_port", wintypes.DWORD),
+        ("remote_address", wintypes.DWORD),
+        ("remote_port", wintypes.DWORD),
+        ("owner_pid", wintypes.DWORD),
+    ]
+
+
+def _windows_listener_owned_by(pid: int, port: int) -> bool | None:
+    try:
+        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        iphlpapi.GetExtendedTcpTable.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+            wintypes.ULONG,
+            ctypes.c_int,
+            wintypes.ULONG,
+        ]
+        iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
+        size = wintypes.DWORD(0)
+        # AF_INET, TCP_TABLE_OWNER_PID_LISTENER.
+        first = int(
+            iphlpapi.GetExtendedTcpTable(
+                None, ctypes.byref(size), False, 2, 3, 0
+            )
+        )
+        if first not in {0, 122} or int(size.value) < ctypes.sizeof(wintypes.DWORD):
+            return None
+        buffer = ctypes.create_string_buffer(int(size.value))
+        if int(
+            iphlpapi.GetExtendedTcpTable(
+                buffer, ctypes.byref(size), False, 2, 3, 0
+            )
+        ) != 0:
+            return None
+        count = wintypes.DWORD.from_buffer_copy(buffer.raw[:4]).value
+        offset = ctypes.sizeof(wintypes.DWORD)
+        row_size = ctypes.sizeof(_TcpOwnerRow)
+        found_port = False
+        for index in range(int(count)):
+            start = offset + index * row_size
+            end = start + row_size
+            if end > len(buffer.raw):
+                return None
+            row = _TcpOwnerRow.from_buffer_copy(buffer.raw[start:end])
+            local_port = socket.ntohs(int(row.local_port) & 0xFFFF)
+            if local_port == port:
+                found_port = True
+                if int(row.owner_pid) == pid:
+                    return True
+        return False if found_port else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _linux_listener_owned_by(pid: int, port: int) -> bool | None:
+    sockets: set[str] = set()
+    try:
+        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+            if not table.is_file():
+                continue
+            for line in table.read_text(encoding="ascii").splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != "0A":
+                    continue
+                local = fields[1]
+                if ":" not in local:
+                    continue
+                if int(local.rsplit(":", 1)[1], 16) == port:
+                    sockets.add(fields[9])
+        if not sockets:
+            return None
+        for entry in (Path("/proc") / str(pid) / "fd").iterdir():
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in sockets:
+                return True
+        return False
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def listener_owned_by(pid: int, port: int = PORT) -> bool | None:
+    """Bind a listening socket to the retained owner where the OS exposes it."""
+    if os.name == "nt":
+        return _windows_listener_owned_by(pid, port)
+    if sys.platform.startswith("linux"):
+        return _linux_listener_owned_by(pid, port)
+    return None
+
+
 class Client:
     """Minimal LSP client over TCP. Enough for diagnostics and navigation."""
 
-    def __init__(self, port: int = PORT) -> None:
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=20)
+    def __init__(self, port: int = PORT, *, connect_timeout: float = 20.0) -> None:
+        self.sock = socket.create_connection(
+            ("127.0.0.1", port), timeout=connect_timeout
+        )
         self.buf = b""
         self.next_id = 1
 
@@ -121,13 +430,16 @@ class Client:
                 return None
             self.buf += chunk
 
-    def initialise(self) -> None:
-        self.request("initialize", {
+    def initialise(self, *, timeout: float = 20.0) -> bool:
+        response = self.request("initialize", {
             "processId": os.getpid(),
             "rootUri": ROOT.as_uri(),
             "capabilities": {},
-        })
+        }, timeout=timeout)
+        if not isinstance(response, dict) or not isinstance(response.get("result"), dict):
+            return False
         self.notify("initialized", {})
+        return True
 
     def open_fresh(self, rel: str) -> str:
         """Push current disk text so the server cannot serve a stale buffer."""
@@ -146,65 +458,319 @@ class Client:
         finally:
             self.sock.close()
 
+    def disconnect(self) -> None:
+        self.sock.close()
+
+
+def _probe_lsp_ready(pid: int) -> bool:
+    owner = listener_owned_by(pid)
+    if owner is False:
+        return False
+    client: Client | None = None
+    try:
+        client = Client(connect_timeout=1.0)
+        return client.initialise(timeout=2.0)
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.disconnect()
+            except OSError:
+                pass
+
 
 def cmd_start(args: argparse.Namespace) -> int:
-    if port_open():
-        print(json.dumps({"status": "already_running", "port": PORT}))
+    current = inspect_status()
+    if current["status"] == "running":
+        print(json.dumps({"status": "already_running", "pid": current["pid"],
+                          "port": PORT, "owned": True}))
         return 0
-    godot = find_godot()
-    if godot is None:
-        print(json.dumps({"status": "error",
-                          "detail": "godot not found; set GODOT_BIN"}))
-        return 2
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        [godot, "--path", str(ROOT), "--editor", "--headless",
-         f"--lsp-port={PORT}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    PID_FILE.write_text(str(proc.pid), encoding="utf-8")
-    deadline = time.time() + READY_TIMEOUT
-    while time.time() < deadline:
-        if port_open():
-            print(json.dumps({"status": "started", "pid": proc.pid,
-                              "port": PORT}))
-            return 0
-        if proc.poll() is not None:
-            print(json.dumps({"status": "error", "detail":
-                              f"godot exited {proc.returncode}"}))
+    if current["status"] == "owner_vanished":
+        if _record_abandoned_owner():
+            print(json.dumps({
+                "status": "native_warning",
+                "detail": current["warning"]["summary"],
+                "warning": current["warning"],
+            }))
             return 1
-        time.sleep(0.5)
-    print(json.dumps({"status": "error",
-                      "detail": f"no response on {PORT} after {READY_TIMEOUT}s"}))
-    return 1
+    elif current["status"] != "not_running":
+        print(json.dumps({
+            "status": "error",
+            "detail": current.get("warning", {}).get(
+                "summary", "language-server ownership could not be authenticated"
+            ),
+            "warning": current.get("warning"),
+        }))
+        return 1
+
+    candidate = getattr(args, "engine", None)
+    if not isinstance(candidate, str):
+        candidate = None
+    try:
+        authenticated = find_godot(candidate)
+        authenticated.assert_unchanged()
+    except engine_discovery.EngineAuthenticationError as exc:
+        print(json.dumps({
+            "status": "error",
+            "failure_class": exc.status,
+            "detail": str(exc),
+        }))
+        return 2
+    started = native_engine.start_godot(
+        authenticated.path,
+        ["--path", str(GAME_ROOT), "--editor", "--headless", f"--lsp-port={PORT}"],
+        root=ROOT,
+        cwd=ROOT,
+        capture_output=False,
+        operation="gdls-start",
+    )
+    if started.failure is not None:
+        native_engine.persist_native_failure(
+            ROOT, started.failure, operation="gdls-start"
+        )
+        print(json.dumps({
+            "status": "error",
+            "failure_class": started.failure.failure_class,
+            "detail": started.failure.output.strip(),
+        }))
+        return 1
+    proc = started.process
+    token = started.lock_token
+    process_identity = started.process_identity
+    assert proc is not None and token is not None and process_identity is not None
+    expected_receipt = native_engine.BackgroundReceipt(
+        int(proc.pid),
+        token,
+        process_identity,
+    )
+    operation_id = f"gdls-{int(proc.pid)}-{time.time_ns()}"
+    expected_journal: native_engine.BackgroundJournal | None = None
+    try:
+        try:
+            native_engine.write_background_journal(
+                PID_FILE,
+                receipt=expected_receipt,
+                operation_id=operation_id,
+            )
+            expected_journal = _saved_journal()
+            if (
+                expected_journal is None
+                or expected_journal.receipt != expected_receipt
+                or expected_journal.lifecycle != "starting"
+                or expected_journal.operation_id != operation_id
+            ):
+                raise OSError("language-server startup journal did not round trip")
+        except (OSError, ValueError) as exc:
+            cleaned = _cleanup_started_process(proc, token, None)
+            failure = native_engine.NativeResult(
+                exit_code=native_engine.START_FAILED_EXIT,
+                output=(
+                    "language-server ownership journal could not be written: "
+                    f"{type(exc).__name__}"
+                    + ("" if cleaned else "; owned process termination was not confirmed")
+                ),
+                executable=authenticated.path.name,
+                started=True,
+                failure_class="engine-start-failed",
+                failure_code="native-engine-start-failed",
+            )
+            native_engine.persist_native_failure(ROOT, failure, operation="gdls-start")
+            print(json.dumps({"status": "error", "failure_class": failure.failure_class,
+                              "detail": failure.output}))
+            return 1
+
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                code = int(proc.returncode if proc.returncode is not None else 1)
+                crashed, windows_status = native_engine.classify_crash_exit(code)
+                failure = native_engine.NativeResult(
+                    exit_code=code,
+                    output="language-server engine exited during startup",
+                    executable=authenticated.path.name,
+                    started=True,
+                    failure_class="native-crash" if crashed else "engine-start-failed",
+                    failure_code="native-crash" if crashed else "native-engine-start-failed",
+                    windows_status=windows_status,
+                )
+                native_engine.persist_native_failure(
+                    ROOT, failure, operation="gdls-start"
+                )
+                _cleanup_started_process(proc, token, expected_receipt)
+                print(json.dumps({"status": "error", "detail":
+                                  f"godot exited {code}",
+                                  "failure_class": failure.failure_class}))
+                return 1
+            if port_open():
+                receipt = _saved_owner()
+                inspection = (
+                    native_engine.inspect_background_owner(ROOT, receipt)
+                    if receipt is not None else None
+                )
+                owner_matches = bool(
+                    receipt == expected_receipt
+                    and inspection is not None
+                    and inspection.state == native_engine.BACKGROUND_OWNED_LIVE
+                )
+                listener_owner = listener_owned_by(int(proc.pid))
+                if not owner_matches or listener_owner is False:
+                    cleaned = _cleanup_started_process(
+                        proc, token, expected_receipt
+                    )
+                    failure = native_engine.NativeResult(
+                        exit_code=native_engine.START_FAILED_EXIT,
+                        output=(
+                            "language-server port opened without matching exact process ownership"
+                            + ("" if cleaned else "; owned process termination was not confirmed")
+                        ),
+                        executable=authenticated.path.name,
+                        started=True,
+                        failure_class="engine-start-failed",
+                        failure_code="native-engine-start-failed",
+                    )
+                    native_engine.persist_native_failure(
+                        ROOT, failure, operation="gdls-start"
+                    )
+                    print(json.dumps({"status": "error",
+                                      "failure_class": failure.failure_class,
+                                      "detail": failure.output}))
+                    return 1
+                if _probe_lsp_ready(int(proc.pid)):
+                    assert expected_journal is not None
+                    if not native_engine.mark_background_ready(
+                        PID_FILE, expected=expected_journal
+                    ):
+                        cleaned = _cleanup_started_process(
+                            proc, token, expected_receipt
+                        )
+                        failure = native_engine.NativeResult(
+                            exit_code=native_engine.START_FAILED_EXIT,
+                            output=(
+                                "language-server ready handoff could not be committed"
+                                + ("" if cleaned else "; owned process termination was not confirmed")
+                            ),
+                            executable=authenticated.path.name,
+                            started=True,
+                            failure_class="engine-start-failed",
+                            failure_code="native-engine-start-failed",
+                        )
+                        native_engine.persist_native_failure(
+                            ROOT, failure, operation="gdls-start"
+                        )
+                        print(json.dumps({"status": "error",
+                                          "failure_class": failure.failure_class,
+                                          "detail": failure.output}))
+                        return 1
+                    print(json.dumps({"status": "started", "pid": proc.pid,
+                                      "port": PORT, "owned": True,
+                                      "engine_version": authenticated.version}))
+                    return 0
+            time.sleep(0.2)
+        cleaned = _cleanup_started_process(proc, token, expected_receipt)
+        failure = native_engine.NativeResult(
+            exit_code=native_engine.TIMEOUT_EXIT,
+            output=(
+                f"no authenticated language-server response after {READY_TIMEOUT}s; "
+                + (
+                    "owned process tree terminated"
+                    if cleaned else "owned process termination was not confirmed"
+                )
+            ),
+            executable=authenticated.path.name,
+            started=True,
+            failure_class="engine-timeout",
+            failure_code="native-engine-timeout",
+            timeout_seconds=int(READY_TIMEOUT),
+        )
+        native_engine.persist_native_failure(ROOT, failure, operation="gdls-start")
+        print(json.dumps({"status": "error",
+                          "detail": failure.output,
+                          "failure_class": failure.failure_class}))
+        return 1
+    except BaseException:
+        cleaned = _cleanup_started_process(proc, token, expected_receipt)
+        if not cleaned:
+            failure = native_engine.NativeResult(
+                exit_code=native_engine.START_FAILED_EXIT,
+                output="language-server startup was interrupted and owned termination was not confirmed",
+                executable=authenticated.path.name,
+                started=True,
+                failure_class="engine-start-failed",
+                failure_code="native-engine-start-failed",
+            )
+            try:
+                native_engine.persist_native_failure(
+                    ROOT, failure, operation="gdls-start-interrupted"
+                )
+            except (OSError, ValueError):
+                pass
+        raise
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
     if not PID_FILE.is_file():
-        print(json.dumps({"status": "not_running"}))
-        return 0
-    pid = int(PID_FILE.read_text(encoding="utf-8").strip() or 0)
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, check=False)
-        else:
-            os.kill(pid, 15)
-    except (ProcessLookupError, ValueError, OSError):
-        pass
-    PID_FILE.unlink(missing_ok=True)
+        status = inspect_status()
+        print(json.dumps(status))
+        return 0 if status["status"] == "not_running" else 1
+    owner = _saved_owner()
+    if owner is None:
+        print(json.dumps({"status": "error", "detail":
+                          "language-server ownership state is unreadable; refusing to kill a process"}))
+        return 1
+    pid = owner.pid
+    if _record_abandoned_owner(owner):
+        print(json.dumps({"status": "not_running", "pid": pid,
+                          "warning": "the retained Godot process ended unexpectedly"}))
+        return 1
+    inspection = native_engine.inspect_background_owner(ROOT, owner)
+    if (
+        inspection.state != native_engine.BACKGROUND_OWNED_LIVE
+        or not native_engine.stop_owned_background(ROOT, owner)
+    ):
+        print(json.dumps({"status": "error", "detail":
+                          "language-server ownership does not match the native lock; refusing to kill a process"}))
+        return 1
+    if not native_engine.remove_background_journal(
+        PID_FILE, expected_receipt=owner
+    ) and PID_FILE.exists():
+        print(json.dumps({"status": "error", "detail":
+                          "language-server stopped but its exact lifecycle journal changed; it was preserved"}))
+        return 1
     print(json.dumps({"status": "stopped", "pid": pid}))
     return 0
 
 
 def _connect() -> Optional[Client]:
-    if not port_open():
-        print(json.dumps({"status": "error", "detail":
-                          "not running; python tools/gdls.py start"}))
+    status = inspect_status()
+    if status["status"] != "running":
+        print(json.dumps({
+            "status": "error",
+            "detail": status.get("warning", {}).get(
+                "summary", "not running; use kit gdls start"
+            ),
+            "server_status": status["status"],
+        }))
         return None
-    c = Client()
+    try:
+        c = Client()
+    except OSError as exc:
+        print(json.dumps({
+            "status": "error",
+            "detail": f"owned language server became unavailable: {type(exc).__name__}",
+        }))
+        return None
     c.diagnostics = []
-    c.initialise()
+    if not c.initialise():
+        try:
+            c.disconnect()
+        except OSError:
+            pass
+        print(json.dumps({
+            "status": "error",
+            "detail": "owned language server did not complete LSP initialization",
+        }))
+        return None
     return c
 
 
@@ -264,7 +830,8 @@ def _text_scan(symbol: str) -> List[Dict[str, Any]]:
 def cmd_refs(args: argparse.Namespace) -> int:
     """Symbol search. Works without a server: falls back to a text scan."""
     result = None
-    if port_open():
+    server_status = inspect_status()
+    if server_status["status"] == "running":
         c = _connect()
         if c is not None:
             resp = c.request("workspace/symbol", {"query": args.symbol})
@@ -282,8 +849,10 @@ def cmd_refs(args: argparse.Namespace) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--engine", help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("start").set_defaults(fn=cmd_start)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("stop").set_defaults(fn=cmd_stop)
     p = sub.add_parser("diagnose")
     p.add_argument("file")

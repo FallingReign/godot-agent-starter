@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "tools"))
+import gd_signature  # noqa: E402
 import project_context  # noqa: E402
 
 CONTEXT = project_context.load_configured_context(ROOT)
@@ -89,12 +90,6 @@ def res_to_rel(res_path: str) -> Optional[Path]:
     return Path(res_path[len("res://"):])
 
 
-RE_FUNC = re.compile(
-    r"^\s*(?:@\w+(?:\([^)]*\))?\s*\n\s*)*"      # decorators on preceding lines
-    r"(static\s+)?func\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(->\s*[^:]+)?:",
-    re.MULTILINE)
-
-
 def file_tree() -> Dict[str, Any]:
     """Every source file under the configured game root, with its functions.
 
@@ -113,21 +108,30 @@ def file_tree() -> Dict[str, Any]:
         if EXCLUDED_DIRS.intersection(rel.parts):
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise gd_signature.SignatureError(
+                f"{rel.as_posix()}: source could not be read: {exc}"
+            ) from exc
         clean = strip_noise(text)
-        funcs = []
-        for m in RE_FUNC.finditer(clean):
-            is_static = bool(m.group(1))
-            name = m.group(2)
-            args = " ".join(m.group(3).split())
-            ret = (m.group(4) or "").strip()
-            sig = f"{'static ' if is_static else ''}func {name}({args})"
-            if ret:
-                sig += f" {ret}"
-            funcs.append({"name": name, "signature": sig,
-                          "private": name.startswith("_")})
+        try:
+            parsed = gd_signature.parse_source_functions(text)
+        except gd_signature.SignatureError as exc:
+            raise gd_signature.SignatureError(
+                f"{rel.as_posix()}: {exc}"
+            ) from exc
+        funcs = [
+            {
+                "name": function.name,
+                "identity": function.identity,
+                "class_scope": ".".join(function.scope),
+                "signature": function.signature,
+                "private": function.name.startswith("_"),
+                "annotations": list(function.annotations),
+                "abstract": function.is_abstract,
+            }
+            for function in parsed.values()
+        ]
         cls = RE_CLASS_NAME.search(clean)
         out[str(rel).replace("\\", "/")] = {
             "class_name": cls.group(1) if cls else "",
@@ -297,6 +301,16 @@ def main() -> int:
     group.add_argument("--json", dest="do_json", action="store_true")
     args = parser.parse_args()
 
+    try:
+        tree = file_tree()
+    except gd_signature.SignatureError as exc:
+        message = f"architecture source error: {exc}"
+        if args.do_json:
+            print(json.dumps({"errors": [message]}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
     rules = load_rules()
     depth = int(rules.get("module_depth", 2))
     edges, classes, autoloads, autoload_users = build_graph(depth)
@@ -315,7 +329,7 @@ def main() -> int:
             "mermaid": mermaid(edges, rules, fenced=False),
             # File and function detail: the module graph cannot show whether an
             # approved file or signature actually exists yet.
-            "tree": file_tree(),
+            "tree": tree,
         }, indent=2))
         return 1 if violations else 0
 

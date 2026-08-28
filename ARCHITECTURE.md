@@ -23,7 +23,7 @@ kit architecture update
 graph TD
     scripts_logic["scripts/logic<br/><i>pure rules, no engine deps</i>"]
     tests["tests<br/><i>harnesses</i>"]
-    tests_fixtures["tests/fixtures"]
+    tests_fixtures["tests/fixtures<br/><i>kit verification scenes used only by the canonical source repository</i>"]
     tests_unit["tests/unit<br/><i>logic tests</i>"]
     tools["tools<br/><i>headless validators run by the gate, not shipped in the game</i>"]
 

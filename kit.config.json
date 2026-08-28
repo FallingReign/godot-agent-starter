@@ -20,6 +20,7 @@
     "owned": [
       ".agents",
       ".github/agents",
+      ".github/copilot-instructions.md",
       "docs",
       "tools",
       "AGENTS.md",
@@ -42,6 +43,7 @@
       ".agents",
       ".gate.sha256",
       ".github/agents",
+      ".github/copilot-instructions.md",
       ".github/workflows",
       ".kit",
       "AGENTS.md",
