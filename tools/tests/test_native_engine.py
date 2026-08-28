@@ -81,6 +81,26 @@ class SharedNativeBoundary(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
+    def test_package_import_works_from_public_gate_context(self) -> None:
+        script = (
+            "import sys; "
+            f"sys.path.insert(0, {str(ROOT)!r}); "
+            "from tools import native_engine; "
+            "print(native_engine.LOCK_NAME)"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", script],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout)
+        self.assertEqual(native_engine.LOCK_NAME, completed.stdout.strip())
+
     def test_only_one_live_process_can_hold_the_repository_lock(self) -> None:
         with _project() as root:
             first, problem = native_engine.acquire_engine_lock(root)

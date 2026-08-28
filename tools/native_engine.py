@@ -41,8 +41,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-import project_context
-import process_supervisor
+if __package__:
+    from . import project_context, process_supervisor
+else:
+    import project_context
+    import process_supervisor
 
 LOCK_NAME = "godot-process.lock"
 WARNING_NAME = "native-warning.json"
