@@ -39,6 +39,7 @@ MOCK = ROOT / "tools" / "tests" / "mock_board.py"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "tools"))
 import page_parts  # noqa: E402
+import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
 BROWSERS = [
@@ -288,7 +289,11 @@ def browser_fixture():
                 ):
             rendered = retro_html.render([findings])
         (fixture_root / "retro.html").write_text(rendered, encoding="utf-8")
-        shutil.copyfile(ROOT / "plan.html", fixture_root / "plan.html")
+        rendered_plan = plan_html.render(
+            {}, {}, [], "", set(), [], [], [], "",
+            cockpit_state={"verification": {"status": "not-run"}},
+        )
+        (fixture_root / "plan.html").write_text(rendered_plan, encoding="utf-8")
         (fixture_root / "fixture-items.json").write_text(
             json.dumps(items, indent=2) + "\n", encoding="utf-8"
         )
@@ -357,7 +362,12 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
 
         plan = dump_dom(browser, f"http://127.0.0.1:{port}/plan.html", profile)
         s = "live/plan-banner"
-        check(s, "body is board-live", "board-live" in body_class(plan))
+        check(
+            s,
+            "body is board-live",
+            "board-live" in body_class(plan),
+            repr(plan[:240]),
+        )
         check(s, "the cockpit banner is quiet while live",
               banner(plan, "board-banner").strip() == "")
         rb = banner(plan, "retro-banner")
@@ -422,10 +432,6 @@ def main() -> int:
     if not browser:
         print("no Chromium-based browser found; browser check skipped")
         return 0
-    for page in ("retro.html", "plan.html"):
-        if not (ROOT / page).exists():
-            print(f"{page} not generated; run tools/{page.split('.')[0]}_html.py first")
-            return 1
     with browser_fixture() as fixture_root:
         return _run_browser_scenarios(browser, fixture_root)
 

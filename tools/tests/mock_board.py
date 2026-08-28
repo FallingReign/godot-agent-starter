@@ -17,8 +17,9 @@ Scenarios:
     garbage   /api/health ok but every POST answers HTML instead of JSON
     dead      nothing listens (the process exits immediately)
 
-It serves the real generated plan.html and retro.html from the repo root, so
-what a browser loads from it is the artefact being shipped, not a fixture.
+It serves plan.html and retro.html generated from current source into an
+isolated fixture root, so the real browser cannot accidentally validate stale
+ignored output against the current board protocol.
 
 Its payloads are held to the real board's by `test_integration.py`: a mock
 that drifts from `board.py` is a test suite that passes while the product is

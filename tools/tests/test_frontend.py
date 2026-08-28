@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import page_parts  # noqa: E402
 import board_client  # noqa: E402
+import browser_check  # noqa: E402
 import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
@@ -398,6 +399,17 @@ class PlanPageBytes(unittest.TestCase):
     def test_repository_observation_is_not_presented_as_verification(self) -> None:
         self.assertIn("Repository change scope is context", self.html)
         self.assertIn("Latest verification", self.html)
+
+    def test_real_browser_fixture_renders_current_plan_protocol(self) -> None:
+        with mock.patch.object(
+            browser_check.shutil,
+            "copyfile",
+            side_effect=AssertionError("browser fixture copied stale generated output"),
+        ):
+            with browser_check.browser_fixture() as fixture_root:
+                plan = (fixture_root / "plan.html").read_text(encoding="utf-8")
+
+        self.assertIn(json.dumps(board_client.protocol_version()), plan)
 
     def test_agent_provisional_disclosure_is_visible_before_the_full_record(self) -> None:
         page = plan_html.render(
