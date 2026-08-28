@@ -147,6 +147,15 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
                 return_value=(0, "README.md\nscripts/player.gd\n"),
             ):
                 baseline_files = plan_html.files_at_baseline("a" * 40)
+            with mock.patch.object(
+                plan_html,
+                "git",
+                side_effect=[
+                    (0, "scripts/player.gd\n"),
+                    (1, "fatal: untracked enumeration failed\n"),
+                ],
+            ):
+                failed_untracked = plan_html.touched_since("a" * 40)
 
         self.assertEqual(
             {"content/item.json", "scripts/player.gd", "tools/internal.py"},
@@ -154,6 +163,7 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
         )
         self.assertEqual({"content/new.json", "scripts/player.gd"}, touched)
         self.assertEqual({"scripts/player.gd"}, baseline_files)
+        self.assertIsNone(failed_untracked)
 
     def test_conformance_maps_git_paths_for_both_supported_layouts(self) -> None:
         with mock.patch.object(gate, "GAME_LAYOUT", "src"):

@@ -290,9 +290,11 @@ def touched_since(baseline: str) -> set | None:
     code, tracked = git("diff", "--name-only", baseline, "--", pathspec)
     if code != 0:
         return None
-    _, untracked = git(
+    untracked_code, untracked = git(
         "ls-files", "--others", "--exclude-standard", "--", pathspec
     )
+    if untracked_code != 0:
+        return None
     out = set()
     for line in (tracked + "\n" + untracked).splitlines():
         line = line.strip().replace("\\", "/")
@@ -1289,9 +1291,14 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     recorded_decision_available = bool(
         cockpit_state.get("recorded_decision_available", False)
     )
+    scope_unavailable = (
+        status in ("approved", "recorded", "recorded-stale")
+        and changed is None
+    )
     decision_count = (1 if approval_required else 0) + len(front_questions)
     decision_count += 1 if needs_design_decision else 0
     decision_count += 1 if status in ("approved", "recorded", "recorded-stale") and extra_paths else 0
+    decision_count += 1 if scope_unavailable else 0
     exp = prop.get("experience")
     player_does = (str(exp.get("player_does", "") or "").strip()
                    if isinstance(exp, dict) else "")
@@ -1356,7 +1363,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         a(f'<div class="t">Compared with <code>{esc(baseline[:12])}</code></div>')
     if changed is None:
         a('<div class="empty">Change scope is unavailable because the proposal has no '
-          'usable Git baseline.</div>')
+          'usable Git baseline or Git could not verify it.</div>')
     else:
         a(f'<div class="m">{len(changed)} authored game file'
           f'{("" if len(changed) == 1 else "s")} changed since baseline.</div>')
@@ -1468,6 +1475,11 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         if len(extra_paths) > 4:
             a(f' and {len(extra_paths) - 4} more')
         a('</div></div>')
+    if scope_unavailable:
+        a('<div class="decision-card"><div class="ask">Repository change scope could '
+          'not be verified.</div><div class="answer">Do not continue implementation '
+          'until the proposal baseline and Git comparison can be read successfully.'
+          '</div></div>')
     if decision_count == 0:
         remaining = (f' {len(missing_paths)} approved file'
                      f'{(" remains" if len(missing_paths) == 1 else "s remain")} to be observed.'

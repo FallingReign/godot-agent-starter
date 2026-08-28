@@ -489,6 +489,7 @@ class PlanPageBytes(unittest.TestCase):
         }
         page = plan_html.render(
             {"questions": questions}, proposal, [], "", set(), [], [], [], "",
+            changed=set(),
             cockpit_state={
                 "status": "recorded",
                 "approval_required": False,
@@ -511,6 +512,7 @@ class PlanPageBytes(unittest.TestCase):
             {},
             {"status": "approved", "experience": {}},
             [], "", set(), [], [], [], "",
+            changed=set(),
             cockpit_state={
                 "status": "approved",
                 "approval_required": False,
@@ -536,6 +538,7 @@ class PlanPageBytes(unittest.TestCase):
             {"name": "Recorded fixture", "involvement": "hands-off"},
             {"status": "recorded", "experience": {}},
             [], "", set(), [], [], [], "",
+            changed=set(),
             cockpit_state={
                 "status": "recorded",
                 "approval_required": False,
@@ -561,6 +564,7 @@ class PlanPageBytes(unittest.TestCase):
             {"name": "Recorded fixture", "involvement": "hands-off"},
             {"status": "recorded", "experience": {}},
             [], "", set(), [], [], [], "immutable-slice",
+            changed=set(),
             cockpit_state={
                 "status": "recorded",
                 "approval_required": False,
@@ -577,6 +581,8 @@ class PlanPageBytes(unittest.TestCase):
         )
         self.assertNotIn("unapproved change", without_baseline)
         self.assertIn("Change scope is unavailable", without_baseline)
+        self.assertIn("Repository change scope could not be verified", without_baseline)
+        self.assertNotIn("No decision is waiting", without_baseline)
 
         with_baseline = plan_html.render(
             {}, {"status": "approved", "baseline_sha": "a" * 40},
