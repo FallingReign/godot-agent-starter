@@ -90,11 +90,11 @@ def record(name, state, detail, remedy="", advisory=False):
                     "remedy": remedy, "advisory": advisory})
 
 
-def run(cmd, timeout=60):
+def run(cmd, timeout=60, environment=None):
     """Run a command, return (rc, combined output). Never raises."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, cwd=str(ROOT))
+                           timeout=timeout, cwd=str(ROOT), env=environment)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except FileNotFoundError:
         return 127, "not found"
@@ -391,7 +391,9 @@ def _install_gdtoolkit(lock):
         return
     try:
         staging.parent.mkdir(parents=True, exist_ok=True)
-        rc, out = run([sys.executable, "-m", "venv", str(staging)], timeout=180)
+        rc, out = run(
+            [sys.executable, "-I", "-m", "venv", str(staging)], timeout=180
+        )
         if rc != 0:
             raise RuntimeError("private environment creation failed: "
                                + " | ".join(out.strip().splitlines()[-3:]))
@@ -403,11 +405,17 @@ def _install_gdtoolkit(lock):
         if not QUIET:
             print(f"  {DIM}downloading locked gdtoolkit {version} from canonical PyPI...{RST}")
         _atomic_write_bytes(wheel, _download_locked(artifact, "gdtoolkit"))
+        pip_environment = {
+            key: value for key, value in os.environ.items()
+            if not key.upper().startswith("PIP_")
+        }
+        pip_environment["PIP_CONFIG_FILE"] = os.devnull
         rc, out = run([
-            str(private_python), "-m", "pip", "install",
-            "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
+            str(private_python), "-I", "-m", "pip", "--isolated", "install",
+            "--disable-pip-version-check", "--no-input", "--no-cache-dir",
+            "--only-binary=:all:",
             "--index-url", "https://pypi.org/simple", str(wheel),
-        ], timeout=600)
+        ], timeout=600, environment=pip_environment)
         if rc != 0:
             raise RuntimeError("canonical PyPI install failed: "
                                + " | ".join(out.strip().splitlines()[-5:]))

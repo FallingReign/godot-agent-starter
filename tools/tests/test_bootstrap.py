@@ -411,6 +411,93 @@ class PrivateToolResolution(unittest.TestCase):
         self.assertEqual([str(tool)], resolved)
         run.assert_called_once()
 
+    def test_gdtoolkit_transitives_resolve_only_from_canonical_pypi(self) -> None:
+        with _temporary_directory() as temp:
+            root = Path(temp)
+            target = root / "gdtoolkit-4.5.0"
+            bindir = target / ("Scripts" if os.name == "nt" else "bin")
+            suffix = ".exe" if os.name == "nt" else ""
+            lock = {
+                "tools": {
+                    "gdtoolkit": {
+                        "version": "4.5.0",
+                        "filename": "gdtoolkit-4.5.0-py3-none-any.whl",
+                    }
+                }
+            }
+            bootstrap.results.clear()
+            with mock.patch.object(
+                bootstrap,
+                "_gdtoolkit_environment",
+                return_value=(
+                    target,
+                    bindir / f"gdlint{suffix}",
+                    bindir / f"python{suffix}",
+                ),
+            ), mock.patch.object(
+                bootstrap,
+                "_download_locked",
+                return_value=b"authenticated direct wheel",
+            ), mock.patch.object(
+                bootstrap,
+                "run",
+                side_effect=((0, ""), (0, ""), (0, "gdlint 4.5.0\n")),
+            ) as run, mock.patch.object(
+                bootstrap.os, "replace"
+            ), mock.patch.object(
+                bootstrap, "QUIET", True
+            ), mock.patch.dict(
+                bootstrap.os.environ,
+                {
+                    "PIP_EXTRA_INDEX_URL": "https://untrusted.example/simple",
+                    "PIP_INDEX_URL": "https://untrusted.example/simple",
+                },
+            ):
+                bootstrap._install_gdtoolkit(lock)
+
+        self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
+        self.assertEqual(
+            [sys.executable, "-I", "-m", "venv"],
+            run.call_args_list[0].args[0][:-1],
+        )
+        pip_call = run.call_args_list[1]
+        self.assertEqual(
+            [
+                str(
+                    target.with_name(
+                        f".{target.name}.bootstrap-{os.getpid()}.tmp"
+                    )
+                    / ("Scripts" if os.name == "nt" else "bin")
+                    / f"python{suffix}"
+                ),
+                "-I",
+                "-m",
+                "pip",
+                "--isolated",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--no-cache-dir",
+                "--only-binary=:all:",
+                "--index-url",
+                "https://pypi.org/simple",
+                str(
+                    target.with_name(
+                        f".{target.name}.bootstrap-{os.getpid()}.tmp"
+                    )
+                    / "gdtoolkit-4.5.0-py3-none-any.whl"
+                ),
+            ],
+            pip_call.args[0],
+        )
+        self.assertEqual(600, pip_call.kwargs["timeout"])
+        environment = pip_call.kwargs["environment"]
+        self.assertEqual(os.devnull, environment["PIP_CONFIG_FILE"])
+        self.assertEqual(
+            ["PIP_CONFIG_FILE"],
+            sorted(key for key in environment if key.upper().startswith("PIP_")),
+        )
+
 
 class DependencyProvenance(unittest.TestCase):
     def test_regular_tree_digest_has_a_stable_cross_platform_fixture(self) -> None:

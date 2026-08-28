@@ -54,6 +54,25 @@ jobs:
           python-version: 3.10.21
           check-latest: false
 
+      - name: Bind the public launcher to the declared Python
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import platform
+          import sys
+
+          sys.dont_write_bytecode = True
+          expected = "3.10.21"
+          actual = platform.python_version()
+          if actual != expected:
+              raise SystemExit(f"setup-python selected {actual}; expected {expected}")
+          executable = pathlib.Path(sys.executable).resolve(strict=True)
+          if not executable.is_file():
+              raise SystemExit(f"setup-python executable is not a file: {executable}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8", newline="\n") as github_env:
+              github_env.write(f"KIT_PYTHON={executable}\n")
+
       # https://github.com/actions/setup-node/releases/tag/v7.0.0
       - name: Set up current Node LTS for the DOM harness
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -174,6 +193,43 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8", newline="\n") as github_env:
               github_env.write(f"GODOT_BIN={executable}\n")
 
+      - name: Build the fresh Godot import cache through the public kit launcher
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh ./kit setup import
+
+      - name: Build the fresh Godot import cache through the Windows launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\kit.cmd setup import
+
+      - name: Prove the public launcher uses the declared Python
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+
+          command = (
+              ["cmd.exe", "/d", "/c", r".\kit.cmd", "doctor", "--json"]
+              if os.name == "nt"
+              else ["sh", "./kit", "doctor", "--json"]
+          )
+          result = subprocess.run(command, capture_output=True, text=True, check=False)
+          if result.returncode != 0:
+              raise SystemExit(
+                  "public launcher doctor failed after setup: "
+                  + (result.stderr.strip() or result.stdout.strip())
+              )
+          payload = json.loads(result.stdout)
+          versions = [
+              item.get("detail")
+              for item in payload["bootstrap"]["results"]
+              if item.get("name") == "python"
+          ]
+          if versions != ["3.10.21"]:
+              raise SystemExit(f"public launcher used {versions!r}; expected Python 3.10.21")
+
       - name: Run strict production verification through the public kit launcher
         if: runner.os != 'Windows'
         shell: bash
@@ -192,11 +248,22 @@ jobs:
         if: ${{ always() }}
         shell: python
         run: |
+          import json
           import pathlib
-          root = pathlib.Path(".kit/runtime/verification")
+          import sys
+
+          sys.dont_write_bytecode = True
+          sys.path.insert(0, str(pathlib.Path(".").resolve()))
+          from tools import runtime_paths
+
+          root = runtime_paths.resolve(pathlib.Path(".")).runtime / "verification"
           if not root.is_dir():
               raise SystemExit("strict verification produced no evidence directory")
           for path in sorted(root.rglob("*")):
               if path.is_file() and path.suffix in {".json", ".log"}:
                   print(f"\n===== {path.as_posix()} =====")
                   print(path.read_text(encoding="utf-8", errors="replace"), end="")
+          report = json.loads((root / "strict-report.json").read_text(encoding="utf-8"))
+          actual = report.get("environment", {}).get("python")
+          if actual != "3.10.21":
+              raise SystemExit(f"strict verification used Python {actual!r}; expected 3.10.21")

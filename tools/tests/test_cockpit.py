@@ -226,11 +226,10 @@ class TestCockpitDecision(unittest.TestCase):
             json.dumps(proposal, indent=2) + "\n", encoding="utf-8"
         )
 
-    @unittest.skipUnless(os.name == "nt", "Windows sharing violation behavior")
     def test_atomic_replace_retries_only_bounded_windows_sharing_violation(self) -> None:
         sharing = PermissionError("sharing violation")
         sharing.winerror = 5
-        with mock.patch.object(
+        with mock.patch.object(cockpit.os, "name", "nt"), mock.patch.object(
             cockpit.os, "replace", side_effect=[sharing, None]
         ) as replace, mock.patch.object(cockpit.time, "sleep") as sleep:
             cockpit._replace_file(self.root / "temporary", self.root / "destination")

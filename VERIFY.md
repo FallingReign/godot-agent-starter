@@ -305,14 +305,17 @@ For each platform it:
 1. checks out without retained credentials using an official action pinned to an
    immutable commit;
 2. provisions the declared Python minimum and current Node line with pinned
-   official actions;
+   official actions, binds the public launcher to that exact interpreter and
+   proves both doctor and the retained strict report used it;
 3. runs `kit self-test` before any engine download;
 4. authenticates every canonical third-party lock source without publishing it;
 5. acquires the optional locked GDScript style adapter through the public launcher;
 6. downloads the official Godot archive and authenticates it against the
    release's official SHA-512 list before safe extraction;
-7. runs `kit verify --strict --json` through the platform launcher;
-8. prints retained JSON/log evidence on every outcome.
+7. explicitly runs `kit setup import` through the platform launcher to build
+   the release-excluded cache a fresh checkout cannot contain;
+8. runs `kit verify --strict --json` through the platform launcher;
+9. prints retained JSON/log evidence on every outcome.
 
 All three jobs are required evidence for a cross-platform release claim. A local
 Windows pass alone is not one.

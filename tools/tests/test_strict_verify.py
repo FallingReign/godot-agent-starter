@@ -8,6 +8,7 @@ to keep serialized.
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -527,6 +528,30 @@ class StrictCliTests(unittest.TestCase):
 
 
 class StrictCiContractTests(unittest.TestCase):
+    def test_ci_suite_has_no_decorated_skips_hidden_by_the_local_platform(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        offenders: list[str] = []
+        for path in sorted((root / "tools" / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                decorators = getattr(node, "decorator_list", [])
+                for decorator in decorators:
+                    function = decorator.func if isinstance(decorator, ast.Call) else decorator
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "unittest"
+                        and function.attr in ("skip", "skipIf", "skipUnless")
+                    ):
+                        offenders.append(
+                            f"{path.relative_to(root).as_posix()}:{node.lineno}"
+                        )
+        self.assertEqual(
+            [], offenders,
+            "strict rejects every unittest skip; platform-decorated tests would make "
+            "another CI leg fail even when the local leg passes",
+        )
+
     def test_ci_uses_only_pinned_official_actions_and_authenticated_builds(self) -> None:
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
@@ -547,20 +572,77 @@ class StrictCiContractTests(unittest.TestCase):
         self.assertIn("kit setup audit-dependencies", workflow)
         self.assertIn("node-version: 24.19.0", workflow)
         self.assertIn("python-version: 3.10.21", workflow)
+        self.assertIn("KIT_PYTHON={executable}", workflow)
+        self.assertIn("Prove the public launcher uses the declared Python", workflow)
+        self.assertIn('if versions != ["3.10.21"]', workflow)
+        self.assertLess(
+            workflow.index("Bind the public launcher to the declared Python"),
+            workflow.index("kit self-test"),
+        )
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("github.com/godotengine/godot-builds/releases/download", workflow)
         self.assertIn("SHA512-SUMS.txt", workflow)
         self.assertIn("hashlib.sha512", workflow)
         self.assertIn("kit self-test", workflow)
+        self.assertEqual(2, workflow.count("setup import"))
+        self.assertIn("sh ./kit setup import", workflow)
+        self.assertIn(r".\kit.cmd setup import", workflow)
         self.assertIn("kit verify --strict --json", workflow)
         self.assertLess(
             workflow.index("kit self-test"),
             workflow.index("Download and authenticate the official Godot build"),
         )
+        self.assertLess(
+            workflow.index("Download and authenticate the official Godot build"),
+            workflow.index("setup import"),
+        )
+        self.assertLess(
+            workflow.index("setup import"),
+            workflow.index("kit verify --strict --json"),
+        )
         self.assertNotIn("pip install", workflow)
         self.assertNotIn("python tools/strict_verify.py", workflow)
         self.assertNotIn("upload-artifact", workflow)
+        self.assertIn("sys.dont_write_bytecode = True", workflow)
+        self.assertIn('sys.path.insert(0, str(pathlib.Path(".").resolve()))', workflow)
+        self.assertIn("from tools import runtime_paths", workflow)
+        self.assertLess(
+            workflow.index("sys.dont_write_bytecode = True"),
+            workflow.index("from tools import runtime_paths"),
+        )
+        self.assertLess(
+            workflow.index('sys.path.insert(0, str(pathlib.Path(".").resolve()))'),
+            workflow.index("from tools import runtime_paths"),
+        )
+        self.assertIn(
+            'runtime_paths.resolve(pathlib.Path(".")).runtime / "verification"',
+            workflow,
+        )
+        self.assertNotIn('pathlib.Path(".kit/runtime/verification")', workflow)
+        self.assertIn('(root / "strict-report.json").read_text', workflow)
+        self.assertIn('actual != "3.10.21"', workflow)
+
+    def test_public_launchers_fail_closed_on_an_explicit_python_override(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        windows = (root / "kit.cmd").read_text(encoding="utf-8")
+        posix = (root / "kit").read_text(encoding="utf-8")
+
+        self.assertLess(
+            windows.index("if defined KIT_PYTHON"),
+            windows.index("where py"),
+        )
+        self.assertIn('"%KIT_PYTHON%" "%KIT_ROOT%kit.py" %*', windows)
+        self.assertIn("KIT_PYTHON must name one absolute interpreter file", windows)
+        self.assertIn("KIT_PYTHON does not name an existing interpreter file", windows)
+        self.assertIn("KIT_PYTHON must name a file, not a directory", windows)
+        self.assertLess(
+            posix.index('if [ -n "${KIT_PYTHON:-}" ]'),
+            posix.index("command -v python3"),
+        )
+        self.assertIn('exec "$KIT_PYTHON" "$KIT_ROOT/kit.py" "$@"', posix)
+        self.assertIn("KIT_PYTHON must name one absolute interpreter file", posix)
+        self.assertIn("KIT_PYTHON does not name an executable interpreter file", posix)
 
     def test_ci_covers_all_three_desktop_operating_systems(self) -> None:
         root = Path(__file__).resolve().parents[2]

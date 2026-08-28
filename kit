@@ -5,6 +5,21 @@ export PYTHONDONTWRITEBYTECODE=1
 
 KIT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+if [ -n "${KIT_PYTHON:-}" ]; then
+    case "$KIT_PYTHON" in
+        /*) ;;
+        *)
+            echo "kit: KIT_PYTHON must name one absolute interpreter file." >&2
+            exit 3
+            ;;
+    esac
+    if [ ! -f "$KIT_PYTHON" ] || [ ! -x "$KIT_PYTHON" ]; then
+        echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
+        exit 3
+    fi
+    exec "$KIT_PYTHON" "$KIT_ROOT/kit.py" "$@"
+fi
+
 if command -v python3 >/dev/null 2>&1; then
     exec python3 "$KIT_ROOT/kit.py" "$@"
 fi

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import os
 import shutil
 import sys
 import unittest
@@ -124,11 +123,10 @@ class DecisionLedgerTests(unittest.TestCase):
         self.assertEqual(self.accepted.read_bytes(), before)
         self.assertEqual(list(self.scratch.glob(".*.tmp")), [])
 
-    @unittest.skipUnless(os.name == "nt", "Windows sharing violation behavior")
     def test_atomic_replace_retries_only_bounded_windows_sharing_violation(self) -> None:
         sharing = PermissionError("sharing violation")
         sharing.winerror = 5
-        with mock.patch.object(
+        with mock.patch.object(retro_ledger.os, "name", "nt"), mock.patch.object(
             retro_ledger.os, "replace", side_effect=[sharing, None]
         ) as replace, mock.patch.object(retro_ledger.time, "sleep") as sleep:
             retro_ledger._replace_file(

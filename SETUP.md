@@ -7,6 +7,12 @@ examples below shorten either form to `kit`. The launcher owns its internal
 runtime, so the developer workflow is the same in PowerShell, `cmd`, Bash and
 zsh and requires no shell-specific chaining.
 
+Automation that must bind the launcher to one already-provisioned interpreter may
+set process-local `KIT_PYTHON` to its absolute executable path. When present, both
+launchers use only that file and fail closed if it is relative, missing or not a
+file; they never fall back to another Python. It is runtime input, not kit
+configuration. Ordinary developer setup should leave it unset.
+
 ---
 
 ## 1. Detect
