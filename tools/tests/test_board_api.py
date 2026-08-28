@@ -1423,6 +1423,31 @@ class TestLiveness(BoardTestCase):
         self.assertEqual("1", environment["KIT_HOST_FINALIZES"])
 
 
+class TestHTTPRejectionDrain(unittest.TestCase):
+    def test_bounded_rejected_body_is_consumed_before_socket_close(self) -> None:
+        handler = mock.Mock()
+        handler.headers.get.return_value = None
+        handler.headers.get_all.return_value = ["2"]
+        handler.rfile.read.return_value = b"{}"
+        handler.close_connection = False
+
+        board._discard_rejected_request_body(handler)
+
+        handler.rfile.read.assert_called_once_with(2)
+        self.assertTrue(handler.close_connection)
+
+    def test_unbounded_rejected_body_is_never_consumed(self) -> None:
+        handler = mock.Mock()
+        handler.headers.get.return_value = None
+        handler.headers.get_all.return_value = [str(board.MAX_REQUEST_BODY + 4097)]
+        handler.close_connection = False
+
+        board._discard_rejected_request_body(handler)
+
+        handler.rfile.read.assert_not_called()
+        self.assertTrue(handler.close_connection)
+
+
 class TestOverHTTP(BoardTestCase):
     """The bytes the server really returns, not what the handler meant to."""
 

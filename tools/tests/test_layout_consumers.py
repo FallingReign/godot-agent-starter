@@ -141,12 +141,19 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
                 ],
             ):
                 touched = plan_html.touched_since("a" * 40)
+            with mock.patch.object(
+                plan_html,
+                "git",
+                return_value=(0, "README.md\nscripts/player.gd\n"),
+            ):
+                baseline_files = plan_html.files_at_baseline("a" * 40)
 
         self.assertEqual(
             {"content/item.json", "scripts/player.gd", "tools/internal.py"},
             files,
         )
         self.assertEqual({"content/new.json", "scripts/player.gd"}, touched)
+        self.assertEqual({"scripts/player.gd"}, baseline_files)
 
     def test_conformance_maps_git_paths_for_both_supported_layouts(self) -> None:
         with mock.patch.object(gate, "GAME_LAYOUT", "src"):

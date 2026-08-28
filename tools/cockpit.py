@@ -763,7 +763,34 @@ def record_verification(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(previous_resolution, dict):
             pointer["resolved_failure"] = dict(previous_resolution)
 
+        preserve_complete_pointer = bool(
+            passed
+            and scope in ("static", "targeted", "fast")
+            and current_failure is None
+            and unresolved is None
+            and trusted_gate
+            and warning_snapshot_stable
+            and start_warning_state == "clean"
+            and fingerprint.get("available")
+            and previous.get("schema") == SCHEMA
+            and previous.get("status") == "fresh"
+            and previous.get("scope") in ("full", "strict")
+            and previous.get("passed") is True
+            and previous.get("gate_receipt") == "trusted"
+            and previous.get("native_warning_snapshot") == "stable"
+            and previous.get("failure_class") is None
+            and not previous.get("unresolved_failure")
+            and isinstance(previous.get("repository"), dict)
+            and previous["repository"].get("available")
+            and previous["repository"].get("digest")
+            == fingerprint.get("digest")
+        )
+
         # This conservative pointer must exist before native state is mutated.
+        # A passing limited diagnostic is still retained as an immutable run,
+        # but it must not obscure unchanged, fresh full/strict completion proof.
+        if preserve_complete_pointer:
+            return pointer
         _durable_json_write(paths.verification_latest, pointer)
         if not resolution_candidate:
             return pointer

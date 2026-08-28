@@ -2970,6 +2970,34 @@ def _validate_mutation(handler: http.server.BaseHTTPRequestHandler) -> tuple[int
     return None
 
 
+def _discard_rejected_request_body(
+    handler: http.server.BaseHTTPRequestHandler,
+) -> None:
+    """Drain one bounded body before closing an early-rejected Windows socket.
+
+    Winsock may reset a connection when the server closes it with unread request
+    bytes, hiding the structured JSON rejection from the cockpit.  Only an
+    ordinary, narrowly bounded Content-Length is consumed; streamed, malformed
+    or arbitrarily large bodies remain rejected without unbounded reads.
+    """
+    handler.close_connection = True
+    if handler.headers.get("Transfer-Encoding"):
+        return
+    lengths = handler.headers.get_all("Content-Length") or []
+    if len(lengths) != 1:
+        return
+    try:
+        length = int(lengths[0])
+    except (TypeError, ValueError):
+        return
+    if length < 0 or length > MAX_REQUEST_BODY + 4096:
+        return
+    try:
+        handler.rfile.read(length)
+    except OSError:
+        pass
+
+
 def _read_json_body(handler: http.server.BaseHTTPRequestHandler) -> tuple[dict | None,
                                                                            tuple[int, dict] | None]:
     lengths = handler.headers.get_all("Content-Length") or []
@@ -3069,12 +3097,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, _, _query = self.path.partition("?")
         rejected = _validate_host(self)
         if rejected is not None:
+            if method == "POST":
+                _discard_rejected_request_body(self)
             _json(self, rejected[0], rejected[1])
             return
         body = {}
         if method == "POST":
             rejected = _validate_mutation(self)
             if rejected is not None:
+                _discard_rejected_request_body(self)
                 _json(self, rejected[0], rejected[1])
                 return
             body, rejected = _read_json_body(self)

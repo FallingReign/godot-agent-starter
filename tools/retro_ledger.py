@@ -13,6 +13,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -205,6 +206,22 @@ def _encoded_entries(entries: list[dict], label: str) -> bytes:
     return content
 
 
+def _replace_file(temporary: Path, destination: Path) -> None:
+    """Bound the short Windows sharing-violation window around ledger replace."""
+    for attempt in range(5):
+        try:
+            os.replace(temporary, destination)
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in (5, 32)
+                or attempt == 4
+            ):
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
 def _replace_unlocked(path: Path, entries: list[dict], label: str,
                       original: bytes | None) -> LedgerEntries:
     content = _encoded_entries(entries, label)
@@ -225,7 +242,7 @@ def _replace_unlocked(path: Path, entries: list[dict], label: str,
             os.fsync(destination.fileno())
         if _stable_bytes(path, label) != original:
             raise LedgerError(f"{label} changed during write; no decision was changed")
-        os.replace(temporary, path)
+        _replace_file(temporary, path)
         if _stable_bytes(path, label) != content:
             raise LedgerError(f"{label} could not be verified after atomic replacement")
     finally:

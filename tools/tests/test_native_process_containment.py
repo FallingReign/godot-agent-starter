@@ -120,7 +120,10 @@ class OuterProcessSupervisor(unittest.TestCase):
             result = process_supervisor.run_supervised(
                 _real_tree_command(pid_file),
                 cwd=root,
-                timeout=0.5,
+                # Prove containment, not sub-second interpreter startup. Under
+                # a full Windows suite the child and its grandchild can need
+                # more than 500 ms before they publish their identities.
+                timeout=5.0,
             )
             child_pid, grandchild_pid = _wait_for_pid_file(pid_file)
         self.assertTrue(result.timed_out)

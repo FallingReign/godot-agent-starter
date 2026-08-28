@@ -236,6 +236,26 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(gate["status"], "passed")
         self.assertIn("canonical maintainer", gate["reason"])
 
+    def test_crlf_maintainer_skips_are_classified(self) -> None:
+        self.enable_maintainer_fixture()
+        runner = FakeRunner(
+            gate=strict_verify.ProcessOutcome(
+                0,
+                "PASS  integrity\r\n"
+                "SKIP  shape (absent)\r\n"
+                "SKIP  design\r\n"
+                "SKIP  conformance\r\n"
+                "GATE PASSED\r\n",
+            )
+        )
+
+        report, code = self.run_with(runner)
+
+        self.assertEqual(code, strict_verify.EXIT_OK)
+        gate = next(item for item in report["stages"] if item["name"] == "gate")
+        self.assertEqual(gate["status"], "passed")
+        self.assertIn("SKIP design", gate["reason"])
+
     def test_only_the_authoritative_gate_receives_the_public_nonce(self) -> None:
         runner = FakeRunner()
         with mock.patch.dict(
@@ -280,6 +300,20 @@ class StrictFailureTests(StrictFixture):
         stage = next(item for item in report["stages"] if item["name"] == "gate")
         self.assertEqual(stage["status"], "failed")
         self.assertIn("SKIP", stage["reason"])
+
+    def test_crlf_gate_skip_is_a_failure_even_when_gate_exits_zero(self) -> None:
+        runner = FakeRunner(
+            gate=strict_verify.ProcessOutcome(
+                0, "PASS  integrity\r\nSKIP  format\r\nGATE PASSED\r\n"
+            )
+        )
+
+        report, code = self.run_with(runner)
+
+        self.assertEqual(code, strict_verify.EXIT_FAILED)
+        stage = next(item for item in report["stages"] if item["name"] == "gate")
+        self.assertEqual(stage["status"], "failed")
+        self.assertIn("SKIP format", stage["reason"])
 
     def test_maintainer_fixture_does_not_allow_any_other_skip(self) -> None:
         self.enable_maintainer_fixture()

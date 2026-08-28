@@ -45,7 +45,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_BLOCKED = 3
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-GATE_SKIP = re.compile(r"(?m)^\s*SKIP\s{1,}[^\r\n]+$")
+GATE_SKIP = re.compile(r"^\s*SKIP(?:\s+|$)")
 UNITTEST_RAN = re.compile(r"(?m)^Ran\s+(\d+)\s+tests?\s+in\s+")
 UNITTEST_SKIP = re.compile(
     r"(?im)(?:\bskipped\s*=\s*[1-9]\d*|\.\.\.\s+skipped\s+['\"]|^skipped\s+)"
@@ -309,7 +309,11 @@ def _classify_gate(
     if outcome.launch_error:
         return "blocked", f"verification gate could not start: {outcome.launch_error}"
     output = ANSI_ESCAPE.sub("", outcome.stdout + "\n" + outcome.stderr)
-    skips = [re.sub(r"\s+", " ", line.strip()) for line in GATE_SKIP.findall(output)]
+    skips = [
+        re.sub(r"\s+", " ", line.strip())
+        for line in output.splitlines()
+        if GATE_SKIP.match(line)
+    ]
     unsupported = [line for line in skips if line not in allowed_skips]
     if unsupported:
         return "failed", "strict verification rejects gate SKIP: " + "; ".join(

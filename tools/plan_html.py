@@ -304,6 +304,29 @@ def touched_since(baseline: str) -> set | None:
     return out
 
 
+def files_at_baseline(baseline: str) -> set | None:
+    """Authored game files present at the proposal baseline.
+
+    The hands-off cockpit must classify each changed path as new, modified or
+    deleted using the same baseline comparison as conformance.  Containment
+    alone is not implementation authority because scope boundaries own an
+    exact action as well as a path.
+    """
+    if not baseline or not shutil.which("git"):
+        return None
+    code, listing = git(
+        "ls-tree", "-r", "--name-only", baseline, "--", CONTEXT.git_pathspec
+    )
+    if code != 0:
+        return None
+    files: set[str] = set()
+    for line in listing.splitlines():
+        relative = CONTEXT.game_relative(line.strip().replace("\\", "/"))
+        if relative is not None and is_authored_game_file(relative):
+            files.add(relative)
+    return files
+
+
 def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     """Real modules and a mermaid diagram, from arch.py. Never hand-derived:
     arch.py already owns the definition of a module and the gate already fails
@@ -344,8 +367,7 @@ def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
 
 
 def recent(limit: int = 12) -> List[Dict[str, str]]:
-    """Recent commits with the files they touched, so a human can jump from a
-    plan item to the code that implements it."""
+    """Recent commits with repository-relative paths shown as inert references."""
     code, out = git("log", f"-{limit}", "--pretty=format:%h%x1f%ad%x1f%s",
                     "--date=short", "--name-only")
     if code != 0 or not out.strip():
@@ -1127,7 +1149,8 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
            doc_targets: Dict[str, str] | None = None,
            changed: set | None = None,
            deleted: set | None = None,
-           cockpit_state: Dict[str, Any] | None = None) -> str:
+           cockpit_state: Dict[str, Any] | None = None,
+           changed_actions: Dict[str, str] | None = None) -> str:
     level = str(shape.get("involvement", "") or "").strip()
     depth = DEPTH.get(level, 3)
     cockpit_state = cockpit_state if isinstance(cockpit_state, dict) else {}
@@ -1218,17 +1241,37 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     changed_paths = set(changed or ())
     if depth == 0:
         scope_rows = rows(prop, "scope")
+
+        def scope_contains(boundary: Dict[str, Any], path: str) -> bool:
+            raw = str(boundary.get("path") or "").strip().replace("\\", "/")
+            if boundary.get("kind") == "file":
+                return path == raw
+            if raw == "(root)":
+                return True
+            return path == raw or path.startswith(raw.rstrip("/") + "/")
+
+        def scope_specificity(boundary: Dict[str, Any]) -> Tuple[int, int]:
+            raw = str(boundary.get("path") or "").strip().replace("\\", "/")
+            if boundary.get("kind") == "file":
+                return (2, len(raw.split("/")))
+            if raw == "(root)":
+                return (0, 0)
+            return (1, len(raw.split("/")))
+
         def inside_scope(path: str) -> bool:
-            for boundary in scope_rows:
-                raw = str(boundary.get("path") or "")
-                if boundary.get("kind") == "file" and path == raw:
-                    return True
-                if boundary.get("kind") == "directory" and (
-                    path == raw or path.startswith(raw.rstrip("/") + "/")
-                ):
-                    return True
-            return False
-        extra_paths = sorted(path for path in changed_paths if not inside_scope(path))
+            matching = [
+                boundary for boundary in scope_rows
+                if scope_contains(boundary, path)
+            ]
+            if not matching or changed_actions is None:
+                return False
+            owner = max(matching, key=scope_specificity)
+            declared = str(owner.get("action") or "").strip().lower()
+            return declared == str(changed_actions.get(path) or "").lower()
+
+        extra_paths = sorted(
+            path for path in changed_paths if not inside_scope(path)
+        )
     elif depth == 1:
         declared_modules = {
             str(item.get("path") or "").rstrip("/") for item in rows(prop, "modules")
@@ -1826,14 +1869,14 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
           " this is stale, so it cannot drift from reality.</p>")
         a(f'<div class="mermaid">{esc(mermaid)}</div>')
 
-    # ---- recent work, with links into the tree
+    # ---- recent work, with honest repository-relative references
     if commits:
         a("<h2>Recent changes</h2>")
+        a('<p class="legend">Repository-relative paths are references only; the '
+          'bounded cockpit does not serve source files.</p>')
         for c in commits[:8]:
             files = c.get("files") or []
-            links = " ".join(
-                f'<a href="{esc(f)}"><code>{esc(f)}</code></a>'
-                for f in files[:4])
+            links = " ".join(f'<code>{esc(f)}</code>' for f in files[:4])
             more = f' <span class="m">+{len(files) - 4} more</span>' if len(files) > 4 else ""
             a(f'<div class="card"><div class="t">{esc(c.get("subject"))}</div>'
               f'<div class="m mono">{esc(c.get("date"))} · {esc(c.get("sha"))}</div>'
@@ -1980,9 +2023,23 @@ def main() -> int:
         dependency_by_module.get(module, {"path": module, "depends_on": []})
         for module in sorted(authored_modules(present) | set(dependency_by_module))
     ]
-    scoped = touched_since(str(prop.get("baseline_sha", "") or "").strip())
+    baseline = str(prop.get("baseline_sha", "") or "").strip()
+    scoped = touched_since(baseline)
+    baseline_files = files_at_baseline(baseline)
     built = present if scoped is None else present & scoped
     deleted = set() if scoped is None else scoped - present
+    changed_actions = (
+        None
+        if scoped is None or baseline_files is None
+        else {
+            path: (
+                "delete" if path in deleted
+                else "modify" if path in baseline_files
+                else "new"
+            )
+            for path in scoped
+        }
+    )
     referenced: set[str] = set()
     for ref in rows(prop, "design_refs"):
         section = str(ref.get("section") or "").split("#", 1)[0].strip().replace("\\", "/")
@@ -2002,9 +2059,11 @@ def main() -> int:
     )
 
     def build(depth: int, snapshot_label: str = "") -> str:
-        return render(shape, prop, mods, mermaid, built, recent(),
-                      kit_docs, design_docs, snapshot_label, mermaid_src(depth),
-                      tree, history, doc_targets, scoped, deleted, cockpit_state)
+        return render(
+            shape, prop, mods, mermaid, built, recent(), kit_docs, design_docs,
+            snapshot_label, mermaid_src(depth), tree, history, doc_targets,
+            scoped, deleted, cockpit_state, changed_actions,
+        )
 
     doc = build(0)
 

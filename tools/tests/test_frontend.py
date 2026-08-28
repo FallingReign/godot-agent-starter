@@ -602,6 +602,84 @@ class PlanPageBytes(unittest.TestCase):
         self.assertIn("differs from the recorded plan", page)
         self.assertNotIn("No decision is waiting", page)
 
+    def test_hands_off_root_scope_honours_exact_action(self) -> None:
+        proposal = {
+            "status": "recorded",
+            "baseline_sha": "a" * 40,
+            "scope": [{
+                "kind": "directory",
+                "path": "(root)",
+                "action": "new",
+                "why": "The reversible slice may add authored game files.",
+            }],
+        }
+        state = {
+            "status": "recorded",
+            "approval_required": False,
+            "verification": {"status": "not-run"},
+        }
+
+        matching = plan_html.render(
+            {"involvement": "hands-off"}, proposal,
+            [], "", {"scripts/new_logic.gd"}, [], [], [], "",
+            changed={"scripts/new_logic.gd"}, cockpit_state=state,
+            changed_actions={"scripts/new_logic.gd": "new"},
+        )
+        wrong_action = plan_html.render(
+            {"involvement": "hands-off"}, proposal,
+            [], "", {"scripts/new_logic.gd"}, [], [], [], "",
+            changed={"scripts/new_logic.gd"}, cockpit_state=state,
+            changed_actions={"scripts/new_logic.gd": "modify"},
+        )
+
+        self.assertNotIn("unapproved change", matching)
+        self.assertIn("1 unapproved change", wrong_action)
+
+    def test_hands_off_scope_uses_the_most_specific_action_owner(self) -> None:
+        page = plan_html.render(
+            {"involvement": "hands-off"},
+            {
+                "status": "recorded",
+                "baseline_sha": "a" * 40,
+                "scope": [
+                    {
+                        "kind": "directory",
+                        "path": "(root)",
+                        "action": "new",
+                        "why": "New files are reversible anywhere in the game root.",
+                    },
+                    {
+                        "kind": "directory",
+                        "path": "scripts/logic",
+                        "action": "modify",
+                        "why": "This existing module may only be modified.",
+                    },
+                ],
+            },
+            [], "", {"scripts/logic/new_file.gd"}, [], [], [], "",
+            changed={"scripts/logic/new_file.gd"},
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "verification": {"status": "not-run"},
+            },
+            changed_actions={"scripts/logic/new_file.gd": "new"},
+        )
+
+        self.assertIn("1 unapproved change", page)
+
+    def test_recent_change_paths_are_inert_in_the_bounded_cockpit(self) -> None:
+        path = "scripts/logic/recent_target.gd"
+        page = plan_html.render(
+            {}, {}, [], "", set(),
+            [{"sha": "abc123", "date": "2026-08-28", "subject": "Change", "files": [path]}],
+            [], [], "",
+        )
+
+        self.assertIn(f"<code>{path}</code>", page)
+        self.assertNotIn(f'href="{path}"', page)
+        self.assertIn("bounded cockpit does not serve source files", page)
+
     def test_recorded_stale_copy_names_the_blocker_without_migration_advice(self) -> None:
         page = plan_html.render(
             {"involvement": "hands-off"}, {"status": "recorded"},

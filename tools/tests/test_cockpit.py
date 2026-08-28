@@ -950,6 +950,70 @@ class TestCockpitDecision(unittest.TestCase):
         finally:
             retro_due.ROOT = saved_root
 
+    def test_unchanged_static_diagnostic_preserves_fresh_complete_pointer(self) -> None:
+        fingerprint = {
+            "available": True,
+            "digest": "f" * 64,
+            "head": "a" * 40,
+            "untracked": 0,
+        }
+        with mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=fingerprint
+        ):
+            complete = cockpit.record_verification(
+                self.root, _passing_gate_payload()
+            )
+            diagnostic = cockpit.record_verification(
+                self.root, _passing_gate_payload(static=True)
+            )
+            view = cockpit.verification_view(self.root)
+
+        paths = cockpit.runtime_paths.resolve(self.root)
+        latest = json.loads(paths.verification_latest.read_text(encoding="utf-8"))
+        run_records = [
+            path for path in paths.verification_runs.glob("*.json")
+            if not path.name.endswith("-resolution.json")
+        ]
+        self.assertEqual(2, len(run_records))
+        self.assertEqual("fresh", complete["status"])
+        self.assertEqual("insufficient", diagnostic["status"])
+        self.assertEqual(complete["id"], latest["id"])
+        self.assertEqual(complete["record"], view["record"])
+        self.assertEqual("fresh", view["status"])
+        self.assertEqual("full", view["scope"])
+
+    def test_changed_static_diagnostic_replaces_stale_complete_pointer(self) -> None:
+        original = {
+            "available": True,
+            "digest": "f" * 64,
+            "head": "a" * 40,
+            "untracked": 0,
+        }
+        changed = {
+            "available": True,
+            "digest": "e" * 64,
+            "head": "b" * 40,
+            "untracked": 1,
+        }
+        with mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=original
+        ):
+            complete = cockpit.record_verification(
+                self.root, _passing_gate_payload()
+            )
+        with mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=changed
+        ):
+            diagnostic = cockpit.record_verification(
+                self.root, _passing_gate_payload(static=True)
+            )
+
+        paths = cockpit.runtime_paths.resolve(self.root)
+        latest = json.loads(paths.verification_latest.read_text(encoding="utf-8"))
+        self.assertNotEqual(complete["id"], diagnostic["id"])
+        self.assertEqual(diagnostic["id"], latest["id"])
+        self.assertEqual("insufficient", latest["status"])
+
     def test_gate_receipt_requires_authenticated_stable_repository_binding(self) -> None:
         payload = _passing_gate_payload()
         self.assertTrue(cockpit._trusted_gate_receipt(payload))
