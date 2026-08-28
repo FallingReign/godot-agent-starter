@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Contract tests for the unified public kit CLI.
 
-The tests deliberately use the checked-out repository as their fixture and
-replace every delegated process. They need no writable temporary directory
-and cannot accidentally run a provider, installer, gate, or server.
+The tests deliberately use the checked-out repository as their content fixture
+and replace every delegated process. Verification locks use a private test
+root, so this suite can run inside strict verification without contending with
+the parent verifier. Tests cannot accidentally run a provider, installer, gate,
+or server.
 """
 from __future__ import annotations
 
@@ -13,9 +15,11 @@ import hmac
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +31,28 @@ import kit  # noqa: E402
 
 
 class KitCliTest(unittest.TestCase):
+    def setUp(self) -> None:
+        lock_root = (
+            ROOT / ".checklogs" / "tests" / f"kit-cli-lock-{uuid.uuid4().hex}"
+        )
+        lock_root.mkdir(parents=True)
+        shutil.copyfile(ROOT / ".agent-kit.json", lock_root / ".agent-kit.json")
+        shutil.copyfile(ROOT / "kit.config.json", lock_root / "kit.config.json")
+        self.addCleanup(shutil.rmtree, lock_root, True)
+
+        real_lock = kit._verification_run_lock
+
+        @contextlib.contextmanager
+        def isolated_verification_lock(_project: Path):
+            with real_lock(lock_root):
+                yield
+
+        lock_patch = mock.patch.object(
+            kit, "_verification_run_lock", isolated_verification_lock
+        )
+        lock_patch.start()
+        self.addCleanup(lock_patch.stop)
+
     @staticmethod
     def completed(
         returncode: int = 0, stdout: str = "", stderr: str = ""

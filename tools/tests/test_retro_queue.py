@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS))
@@ -419,14 +421,15 @@ class TestLoadingAndStaleness(QueueTestCase):
     def test_artifact_symlink_is_not_a_queue_item(self) -> None:
         item = self.build()[0]
         path = self.queue / f"{item['slug']}.json"
-        target = self.queue / "target.json"
-        target.write_bytes(path.read_bytes())
-        path.unlink()
-        try:
-            path.symlink_to(target)
-        except OSError as exc:
-            self.skipTest(f"symlink creation is unavailable: {exc}")
-        self.assertIsNone(retro_queue.load_item(item["slug"], self.queue))
+        real_lstat = Path.lstat
+
+        def lstat(candidate: Path):
+            if candidate == path:
+                return mock.Mock(st_mode=stat.S_IFLNK | 0o777)
+            return real_lstat(candidate)
+
+        with mock.patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+            self.assertIsNone(retro_queue.load_item(item["slug"], self.queue))
 
     def test_findings_source_must_be_a_direct_regular_retro_file(self) -> None:
         item = self.build()[0]
