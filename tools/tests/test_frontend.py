@@ -95,6 +95,23 @@ class FileModeReviewHint(unittest.TestCase):
 
 
 class BrowserReadinessProbe(unittest.TestCase):
+    def test_dump_uses_current_headless_mode_and_browser_capture_bound(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="<html></html>", stderr=""
+        )
+        with mock.patch.object(
+            browser_check.subprocess, "run", return_value=completed
+        ) as run:
+            browser_check.dump_dom(
+                "chrome", "http://127.0.0.1:12345/plan.html", Path("profile")
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--headless", command)
+        self.assertNotIn("--headless=new", command)
+        self.assertIn("--timeout=15000", command)
+        self.assertEqual(45, run.call_args.kwargs["timeout"])
+
     def test_readiness_requires_only_a_direct_loopback_listener(self) -> None:
         with browser_check.socket.socket(
             browser_check.socket.AF_INET,

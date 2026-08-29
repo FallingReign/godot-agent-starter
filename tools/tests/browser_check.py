@@ -104,11 +104,12 @@ def free_port() -> int:
 
 def dump_dom(browser: str, url: str, profile: Path) -> str:
     proc = subprocess.run(
-        [browser, "--headless=new", "--disable-gpu", "--no-sandbox",
+        [browser, "--headless", "--disable-gpu", "--no-sandbox",
          "--no-proxy-server",
          f"--user-data-dir={profile}", "--virtual-time-budget=6000",
+         "--timeout=15000",
          "--dump-dom", url],
-        capture_output=True, text=True, errors="replace", timeout=180,
+        capture_output=True, text=True, errors="replace", timeout=45,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
         detail = (proc.stderr or "browser returned an empty document").strip()[:500]
