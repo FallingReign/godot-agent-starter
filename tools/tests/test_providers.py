@@ -157,7 +157,7 @@ class ProviderTests(unittest.TestCase):
         def which(name: str) -> str | None:
             return "C:/node/node.exe" if name in ("node.exe", "node") else None
 
-        with mock.patch("tools.providers.os.name", "nt"), \
+        with mock.patch("tools.providers._is_windows", return_value=True), \
                 mock.patch("tools.providers._copilot_executable",
                            return_value="C:/npm/copilot.cmd"), \
                 mock.patch("tools.providers._copilot_package_root", return_value=root), \

@@ -277,7 +277,7 @@ class SharedNativeBoundary(unittest.TestCase):
 
     def test_public_bounded_start_surfaces_containment_failure_without_fallback(self) -> None:
         with _project() as root, mock.patch.object(
-            native_engine, "_is_windows", return_value=True
+            native_engine, "_use_windows_process_boundary", return_value=True
         ), mock.patch.object(
             native_engine,
             "_start_bounded_windows_process",
@@ -329,7 +329,7 @@ class SharedNativeBoundary(unittest.TestCase):
 
             process.wait.side_effect = wait
             with mock.patch.object(
-                native_engine, "_is_windows", return_value=True
+                native_engine, "_use_windows_process_boundary", return_value=True
             ), mock.patch.object(
                 native_engine, "_create_windows_job", return_value=job
             ), mock.patch.object(
@@ -349,7 +349,9 @@ class SharedNativeBoundary(unittest.TestCase):
             identity = native_engine.ProcessIdentity(
                 process.pid, "test", "retained", "c" * 64, "Godot.exe"
             )
-            with mock.patch.object(native_engine, "_is_windows", return_value=True), \
+            with mock.patch.object(
+                    native_engine, "_use_windows_process_boundary", return_value=True
+            ), \
                     mock.patch.object(
                         native_engine, "_create_windows_job"
                     ) as create_job, mock.patch.object(
@@ -490,7 +492,7 @@ class BootstrapImportBoundary(unittest.TestCase):
                 return True
 
             with mock.patch.object(
-                native_engine, "_is_windows", return_value=True
+                native_engine, "_use_windows_process_boundary", return_value=True
             ), mock.patch.object(
                 native_engine, "_start_process", return_value=process
             ), mock.patch.object(
@@ -528,7 +530,7 @@ class BootstrapImportBoundary(unittest.TestCase):
     def test_start_oserror_is_structured_and_never_raises(self) -> None:
         job = _windows_job()
         with _project() as root, mock.patch.object(
-            native_engine, "_is_windows", return_value=True
+            native_engine, "_use_windows_process_boundary", return_value=True
         ), mock.patch.object(
             native_engine, "_create_windows_job", return_value=job
         ), mock.patch.object(

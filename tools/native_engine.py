@@ -107,6 +107,11 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _use_windows_process_boundary() -> bool:
+    """Select job-object containment without spoofing other host primitives."""
+    return _is_windows()
+
+
 _SAFE_NATIVE_ENVIRONMENT = frozenset(
     {
         "APPDATA",
@@ -1543,7 +1548,7 @@ def start_godot(
     process: subprocess.Popen[bytes] | None = None
     command = [str(engine), *[str(value) for value in arguments]]
     try:
-        if _is_windows() and capture_output:
+        if _use_windows_process_boundary() and capture_output:
             process, windows_job = _start_bounded_windows_process(
                 command,
                 cwd=cwd,
@@ -1556,12 +1561,12 @@ def start_godot(
                 capture_output=capture_output,
                 extra_creation_flags=(
                     CREATE_BREAKAWAY_FROM_JOB
-                    if _is_windows() and not capture_output
+                    if _use_windows_process_boundary() and not capture_output
                     else 0
                 ),
                 parent_lifeline=capture_output,
             )
-            if not _is_windows() and capture_output:
+            if not _use_windows_process_boundary() and capture_output:
                 posix_guard = process_supervisor.PosixGroupGuard.start(
                     int(process.pid)
                 )

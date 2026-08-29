@@ -372,7 +372,8 @@ def _install_gdtoolkit(lock):
     The direct package bytes are fetched from the locked canonical PyPI URL and
     verified before pip sees them. Dependencies resolve only from the canonical
     PyPI index and must have wheels; no source checkout or global environment is
-    used. A failed attempt removes only its unique private staging directory.
+    used. The virtual environment is built at its final path because Python
+    entry-point launchers embed that path and are not safely relocatable.
     """
     artifact = lock["tools"]["gdtoolkit"]
     version = artifact["version"]
@@ -384,24 +385,31 @@ def _install_gdtoolkit(lock):
             f"Review {target}; setup will not replace it automatically",
         )
         return
-    staging = target.with_name(f".{target.name}.bootstrap-{os.getpid()}.tmp")
-    if staging.exists():
-        record("gdtoolkit", MANUAL, f"staging path already exists: {staging}",
-               "Review the private runtime staging path before retrying")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.mkdir()
+    except FileExistsError:
+        record(
+            "gdtoolkit", MANUAL,
+            f"private tool path was claimed concurrently: {target}",
+            "Wait for the other setup operation, then run kit doctor",
+        )
+        return
+    except OSError as exc:
+        record("gdtoolkit", MANUAL, f"cannot create private tool path: {exc}")
         return
     try:
-        staging.parent.mkdir(parents=True, exist_ok=True)
         rc, out = run(
-            [sys.executable, "-I", "-m", "venv", str(staging)], timeout=180
+            [sys.executable, "-I", "-m", "venv", str(target)], timeout=180
         )
         if rc != 0:
             raise RuntimeError("private environment creation failed: "
                                + " | ".join(out.strip().splitlines()[-3:]))
-        bindir = staging / ("Scripts" if WIN else "bin")
+        bindir = target / ("Scripts" if WIN else "bin")
         suffix = ".exe" if WIN else ""
         private_python = bindir / f"python{suffix}"
         private_gdlint = bindir / f"gdlint{suffix}"
-        wheel = staging / artifact["filename"]
+        wheel = target / artifact["filename"]
         if not QUIET:
             print(f"  {DIM}downloading locked gdtoolkit {version} from canonical PyPI...{RST}")
         _atomic_write_bytes(wheel, _download_locked(artifact, "gdtoolkit"))
@@ -425,12 +433,11 @@ def _install_gdtoolkit(lock):
             raise RuntimeError(
                 f"installed tool reported {_version_in(out) or 'no version'}; expected {version}"
             )
-        os.replace(staging, target)
         record("gdtoolkit", OK,
                f"locked {version} installed in project-private runtime")
     except Exception as exc:                                  # noqa: BLE001
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
         record("gdtoolkit", MANUAL, f"verified installation failed: {exc}",
                "Check approved network access and canonical PyPI availability; no global install was changed")
 

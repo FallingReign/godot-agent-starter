@@ -443,8 +443,6 @@ class PrivateToolResolution(unittest.TestCase):
                 "run",
                 side_effect=((0, ""), (0, ""), (0, "gdlint 4.5.0\n")),
             ) as run, mock.patch.object(
-                bootstrap.os, "replace"
-            ), mock.patch.object(
                 bootstrap, "QUIET", True
             ), mock.patch.dict(
                 bootstrap.os.environ,
@@ -460,16 +458,12 @@ class PrivateToolResolution(unittest.TestCase):
             [sys.executable, "-I", "-m", "venv"],
             run.call_args_list[0].args[0][:-1],
         )
+        self.assertEqual(str(target), run.call_args_list[0].args[0][-1])
         pip_call = run.call_args_list[1]
         self.assertEqual(
             [
-                str(
-                    target.with_name(
-                        f".{target.name}.bootstrap-{os.getpid()}.tmp"
-                    )
-                    / ("Scripts" if os.name == "nt" else "bin")
-                    / f"python{suffix}"
-                ),
+                str(target / ("Scripts" if os.name == "nt" else "bin")
+                    / f"python{suffix}"),
                 "-I",
                 "-m",
                 "pip",
@@ -481,12 +475,7 @@ class PrivateToolResolution(unittest.TestCase):
                 "--only-binary=:all:",
                 "--index-url",
                 "https://pypi.org/simple",
-                str(
-                    target.with_name(
-                        f".{target.name}.bootstrap-{os.getpid()}.tmp"
-                    )
-                    / "gdtoolkit-4.5.0-py3-none-any.whl"
-                ),
+                str(target / "gdtoolkit-4.5.0-py3-none-any.whl"),
             ],
             pip_call.args[0],
         )

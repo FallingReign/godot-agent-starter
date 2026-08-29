@@ -45,6 +45,11 @@ _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}\Z")
 _PERSONA_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
+def _is_windows() -> bool:
+    """Report the host branch without mutating Python's global OS state in tests."""
+    return os.name == "nt"
+
+
 class ProviderConfigError(ValueError):
     """Provider configuration is malformed or unsafe."""
 
@@ -229,7 +234,7 @@ def _copilot_launcher() -> list[str] | None:
     suffix = Path(executable).suffix.lower()
     if suffix == ".exe":
         return [executable]
-    if os.name != "nt":
+    if not _is_windows():
         return [executable]
     package_root = _copilot_package_root(executable)
     entry = _copilot_bin_entry(package_root) if package_root is not None else None
