@@ -9,10 +9,10 @@ worker silent for half an hour and a worker that exited non-zero.
 
     python tools/tests/browser_check.py
 
-It starts `mock_board.py` on a spare port, renders each page with headless
-Chrome or Edge (`--dump-dom` runs the page's JavaScript first), and checks the
-resulting DOM. Skips with exit 0 if no Chromium-based browser is installed --
-a browser is not a dependency of this kit.
+It starts the mock board on a spare port, renders each page with headless Chrome
+or Edge (`--dump-dom` runs the page's JavaScript first), and checks the resulting
+DOM. Skips with exit 0 if no Chromium-based browser is installed -- a browser is
+not a dependency of this kit.
 
 States covered: healthy, board-unreachable, file:// read-only, and per-item
 working/stalled, failed, done, queued.
@@ -27,15 +27,17 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-MOCK = ROOT / "tools" / "tests" / "mock_board.py"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "tools"))
+import mock_board  # noqa: E402
 import page_parts  # noqa: E402
 import plan_html  # noqa: E402
 import retro_html  # noqa: E402
@@ -53,6 +55,18 @@ BROWSERS = [
 
 failures: list[str] = []
 checks = 0
+
+
+@dataclass
+class RunningBoard:
+    server: mock_board.board.BoardHTTPServer
+    thread: threading.Thread
+    previous_root: Path
+    previous_scenario: str
+    previous_items: list[dict] | None
+
+    def poll(self) -> int | None:
+        return None if self.thread.is_alive() else 0
 
 
 def check(scenario: str, name: str, cond: bool, extra: str = "") -> None:
@@ -169,7 +183,7 @@ def _states_ascend(html: str) -> bool:
 def wait_for(
     port: int,
     timeout: float = 10.0,
-    process: subprocess.Popen | None = None,
+    process: RunningBoard | None = None,
 ) -> bool:
     end = time.time() + timeout
     while time.time() < end:
@@ -187,48 +201,61 @@ def wait_for(
     return False
 
 
-def start_board(port: int, scenario: str, fixture_root: Path) -> subprocess.Popen:
-    stdout_path = fixture_root / f"mock-board-{scenario}-{port}.stdout.log"
-    stderr_path = fixture_root / f"mock-board-{scenario}-{port}.stderr.log"
-    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-        proc = subprocess.Popen(
-            [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario,
-             "--fixture-root", str(fixture_root)],
-            cwd=ROOT, stdout=stdout, stderr=stderr,
-        )
-    if not wait_for(port, timeout=30.0, process=proc):
-        stop_board(proc)
-        try:
-            stdout_detail = stdout_path.read_text(
-                encoding="utf-8", errors="replace"
-            )[-1000:].strip()
-        except OSError:
-            stdout_detail = ""
-        try:
-            stderr_detail = stderr_path.read_text(
-                encoding="utf-8", errors="replace"
-            )[-2000:].strip()
-        except OSError:
-            stderr_detail = ""
-        detail = " | ".join(
-            part for part in (stdout_detail, stderr_detail) if part
-        )
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            f"mock board did not become ready for scenario {scenario}{suffix}"
-        )
-    return proc
-
-
-def stop_board(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
+def start_board(port: int, scenario: str, fixture_root: Path) -> RunningBoard:
+    fixture_items = json.loads(
+        (fixture_root / "fixture-items.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(fixture_items, list) or not all(
+        isinstance(item, dict) for item in fixture_items
+    ):
+        raise RuntimeError("fixture-items.json must contain an array of objects")
+    previous_root = mock_board.board.ROOT
+    previous_scenario = mock_board.SCENARIO
+    previous_items = mock_board.FIXTURE_ITEMS
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        mock_board.SCENARIO = scenario
+        mock_board.FIXTURE_ITEMS = fixture_items
+        mock_board.board.ROOT = fixture_root
+        server = mock_board.board.BoardHTTPServer(
+            ("127.0.0.1", port), mock_board.Handler
+        )
+    except BaseException:
+        mock_board.board.ROOT = previous_root
+        mock_board.SCENARIO = previous_scenario
+        mock_board.FIXTURE_ITEMS = previous_items
+        raise
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name=f"browser-check-board-{scenario}",
+        daemon=True,
+    )
+    running = RunningBoard(
+        server,
+        thread,
+        previous_root,
+        previous_scenario,
+        previous_items,
+    )
+    thread.start()
+    if not wait_for(port, timeout=5.0, process=running):
+        stop_board(running)
+        raise RuntimeError(
+            f"mock board did not become ready for scenario {scenario}"
+        )
+    return running
+
+
+def stop_board(running: RunningBoard) -> None:
+    try:
+        running.server.shutdown()
+        running.server.server_close()
+        running.thread.join(timeout=5)
+        if running.thread.is_alive():
+            raise RuntimeError("mock board thread did not stop")
+    finally:
+        mock_board.board.ROOT = running.previous_root
+        mock_board.SCENARIO = running.previous_scenario
+        mock_board.FIXTURE_ITEMS = running.previous_items
 
 
 def _fixture_items() -> list[dict]:

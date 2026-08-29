@@ -107,6 +107,26 @@ class BrowserReadinessProbe(unittest.TestCase):
                 browser_check.wait_for(listener.getsockname()[1], timeout=0.5)
             )
 
+    def test_mock_board_needs_no_nested_process(self) -> None:
+        previous_root = browser_check.mock_board.board.ROOT
+        previous_scenario = browser_check.mock_board.SCENARIO
+        previous_items = browser_check.mock_board.FIXTURE_ITEMS
+        with browser_check.browser_fixture() as fixture_root:
+            port = browser_check.free_port()
+            with mock.patch.object(
+                browser_check.subprocess,
+                "Popen",
+                side_effect=AssertionError("browser fixture spawned a child process"),
+            ):
+                running = browser_check.start_board(port, "healthy", fixture_root)
+                try:
+                    self.assertTrue(browser_check.wait_for(port, timeout=0.5))
+                finally:
+                    browser_check.stop_board(running)
+        self.assertEqual(previous_root, browser_check.mock_board.board.ROOT)
+        self.assertEqual(previous_scenario, browser_check.mock_board.SCENARIO)
+        self.assertIs(previous_items, browser_check.mock_board.FIXTURE_ITEMS)
+
 
 class RetroPageBytes(unittest.TestCase):
     @classmethod
