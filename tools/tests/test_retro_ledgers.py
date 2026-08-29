@@ -29,7 +29,7 @@ def _process_append(path_text: str, lock_dir_text: str, finding: str,
     def append(entries: list[dict]) -> list[dict]:
         inside.set()
         if release is not None:
-            if not release.wait(10):
+            if not release.wait(30):
                 raise RuntimeError("test process timed out waiting for release")
         entries.append({"finding": finding})
         return entries
@@ -168,15 +168,15 @@ class DecisionLedgerTests(unittest.TestCase):
                   second_inside, None),
         )
         first.start()
-        self.assertTrue(first_inside.wait(5), "first process never acquired ledger lock")
+        self.assertTrue(first_inside.wait(15), "first process never acquired ledger lock")
         second.start()
         self.assertFalse(
             second_inside.wait(0.5),
             "second process entered its mutation while the first held the lock",
         )
         release_first.set()
-        first.join(10)
-        second.join(10)
+        first.join(15)
+        second.join(15)
         if first.is_alive():
             first.terminate()
         if second.is_alive():

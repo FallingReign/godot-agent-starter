@@ -63,6 +63,11 @@ PID_DEAD = "dead"
 PID_UNKNOWN = "unknown"
 
 
+def _is_windows() -> bool:
+    """Report the host branch without making tests mutate Python's global OS state."""
+    return os.name == "nt"
+
+
 class Cancellation(Protocol):
     def is_set(self) -> bool: ...
 
@@ -99,7 +104,7 @@ def exclusive_file_lock(path: Path, *, label: str) -> Iterator[None]:
             os.fsync(handle.fileno())
         handle.seek(0)
         try:
-            if os.name == "nt":
+            if _is_windows():
                 import msvcrt
 
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -122,7 +127,7 @@ def exclusive_file_lock(path: Path, *, label: str) -> Iterator[None]:
         if locked:
             try:
                 handle.seek(0)
-                if os.name == "nt":
+                if _is_windows():
                     import msvcrt
 
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -843,7 +848,7 @@ def run_supervised(
     termination_verified = False
     try:
         try:
-            if os.name == "nt":
+            if _is_windows():
                 process, windows_job = _start_windows(
                     command,
                     cwd=cwd,
@@ -883,7 +888,7 @@ def run_supervised(
                 process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 continue
-        if os.name == "nt":
+        if _is_windows():
             assert windows_job is not None
             termination_verified = _terminate_windows(process, windows_job)
             windows_job = None
@@ -933,7 +938,7 @@ def pid_liveness(pid: int) -> str:
         return PID_DEAD
     if pid == os.getpid():
         return PID_ALIVE
-    if os.name == "nt":
+    if _is_windows():
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.OpenProcess.argtypes = [

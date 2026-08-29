@@ -101,6 +101,12 @@ _FAILURE_PRIORITY = {
     "native-crash": 4,
 }
 
+
+def _is_windows() -> bool:
+    """Report the host branch without making tests mutate Python's global OS state."""
+    return os.name == "nt"
+
+
 _SAFE_NATIVE_ENVIRONMENT = frozenset(
     {
         "APPDATA",
@@ -579,7 +585,7 @@ def _exclusive_path_guard(path: Path) -> Iterator[None]:
         while not locked:
             try:
                 handle.seek(0)
-                if os.name == "nt":
+                if _is_windows():
                     import msvcrt
 
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -597,7 +603,7 @@ def _exclusive_path_guard(path: Path) -> Iterator[None]:
         if locked:
             try:
                 handle.seek(0)
-                if os.name == "nt":
+                if _is_windows():
                     import msvcrt
 
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -754,7 +760,7 @@ def capture_process_identity(pid: int) -> ProcessIdentity | None:
     """Capture creation and executable identity for one currently live PID."""
     if pid <= 0:
         return None
-    if os.name == "nt":
+    if _is_windows():
         return _capture_windows_process_identity(pid)
     identity = _capture_proc_process_identity(pid)
     return identity if identity is not None else _capture_ps_process_identity(pid)
@@ -767,9 +773,9 @@ def _capture_expected_process_identity(
     timeout: float = 3.0,
 ) -> ProcessIdentity | None:
     """Wait through the Linux parent-death wrapper until the engine is exec'd."""
-    if os.name == "nt" or not sys.platform.startswith("linux"):
+    if _is_windows() or not sys.platform.startswith("linux"):
         return capture_process_identity(pid)
-    expected_digest = _executable_digest(str(executable), windows=os.name == "nt")
+    expected_digest = _executable_digest(str(executable), windows=_is_windows())
     expected_name = Path(str(executable)).name
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
@@ -778,7 +784,7 @@ def _capture_expected_process_identity(
             observed is not None
             and observed.executable_sha256 == expected_digest
             and (
-                os.name != "nt"
+                not _is_windows()
                 or observed.executable_name.casefold() == expected_name.casefold()
             )
         ):
@@ -1265,7 +1271,7 @@ class _BoundedOutputCollector:
 
 def classify_crash_exit(code: int, *, system_name: str | None = None) -> tuple[bool, str | None]:
     """Classify an access violation/NTSTATUS or POSIX signal exit."""
-    current = system_name or ("Windows" if os.name == "nt" else "POSIX")
+    current = system_name or ("Windows" if _is_windows() else "POSIX")
     if current == "Windows":
         unsigned = code & 0xFFFFFFFF
         crashed = 0xC0000000 <= unsigned <= 0xCFFFFFFF
@@ -1302,10 +1308,10 @@ def _start_process(
 ) -> subprocess.Popen[bytes]:
     """Create one isolated child while suppressing Windows native error UI."""
     creation_flags = extra_creation_flags
-    start_new_session = os.name != "nt"
+    start_new_session = not _is_windows()
     kernel32 = None
     previous_error_mode = None
-    if os.name == "nt":
+    if _is_windows():
         creation_flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             import ctypes
@@ -1320,7 +1326,7 @@ def _start_process(
             kernel32 = None
             previous_error_mode = None
     child_command = [str(value) for value in command]
-    if os.name != "nt" and parent_lifeline:
+    if not _is_windows() and parent_lifeline:
         child_command = process_supervisor.posix_parent_death_command(child_command)
     try:
         return subprocess.Popen(
@@ -1537,7 +1543,7 @@ def start_godot(
     process: subprocess.Popen[bytes] | None = None
     command = [str(engine), *[str(value) for value in arguments]]
     try:
-        if os.name == "nt" and capture_output:
+        if _is_windows() and capture_output:
             process, windows_job = _start_bounded_windows_process(
                 command,
                 cwd=cwd,
@@ -1550,12 +1556,12 @@ def start_godot(
                 capture_output=capture_output,
                 extra_creation_flags=(
                     CREATE_BREAKAWAY_FROM_JOB
-                    if os.name == "nt" and not capture_output
+                    if _is_windows() and not capture_output
                     else 0
                 ),
                 parent_lifeline=capture_output,
             )
-            if os.name != "nt" and capture_output:
+            if not _is_windows() and capture_output:
                 posix_guard = process_supervisor.PosixGroupGuard.start(
                     int(process.pid)
                 )
@@ -1640,7 +1646,7 @@ def start_godot(
 def _terminate_pid_tree(pid: int) -> None:
     if pid <= 0:
         return
-    if os.name == "nt":
+    if _is_windows():
         try:
             subprocess.run(
                 ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
@@ -1684,7 +1690,7 @@ def terminate_owned_process_tree(
         windows_job.close()
     elif posix_guard is not None:
         termination_verified = posix_guard.kill()
-    elif os.name == "nt":
+    elif _is_windows():
         _terminate_pid_tree(int(process.pid))
         termination_verified = process.poll() is not None
     else:
@@ -1874,7 +1880,7 @@ def _terminate_exact_posix_process(receipt: BackgroundReceipt) -> bool:
 
 def terminate_exact_background_owner(receipt: BackgroundReceipt) -> bool:
     """Terminate only an identity-bound retained owner, never a bare PID."""
-    if os.name == "nt":
+    if _is_windows():
         return _terminate_exact_windows_process(receipt)
     return _terminate_exact_posix_process(receipt)
 

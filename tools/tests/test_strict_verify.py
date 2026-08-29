@@ -622,6 +622,10 @@ class StrictCiContractTests(unittest.TestCase):
             'runtime_paths.resolve(pathlib.Path(".")).runtime / "verification"',
             workflow,
         )
+        evidence_step = workflow.split(
+            "- name: Print retained strict evidence", 1
+        )[1]
+        self.assertIn("import os", evidence_step)
         self.assertNotIn('pathlib.Path(".kit/runtime/verification")', workflow)
         self.assertIn('(root / "strict-report.json").read_text', workflow)
         self.assertIn("if actual != expected", workflow)

@@ -375,9 +375,14 @@ class ProcessLivenessTriState(unittest.TestCase):
         kernel = mock.Mock()
         kernel.OpenProcess.return_value = 123
         kernel.WaitForSingleObject.return_value = process_supervisor.WAIT_FAILED
-        with mock.patch.object(process_supervisor.os, "name", "nt"), \
+        with mock.patch.object(
+                process_supervisor, "_is_windows", return_value=True
+        ), \
                 mock.patch.object(
-                    process_supervisor.ctypes, "WinDLL", return_value=kernel
+                    process_supervisor.ctypes,
+                    "WinDLL",
+                    return_value=kernel,
+                    create=True,
                 ):
             state = process_supervisor.pid_liveness(4242)
         self.assertEqual(process_supervisor.PID_UNKNOWN, state)
@@ -390,13 +395,19 @@ class ProcessLivenessTriState(unittest.TestCase):
     def test_windows_access_denied_is_unknown_not_assumed_alive_or_dead(self) -> None:
         kernel = mock.Mock()
         kernel.OpenProcess.return_value = 0
-        with mock.patch.object(process_supervisor.os, "name", "nt"), \
+        with mock.patch.object(
+                process_supervisor, "_is_windows", return_value=True
+        ), \
                 mock.patch.object(
-                    process_supervisor.ctypes, "WinDLL", return_value=kernel
+                    process_supervisor.ctypes,
+                    "WinDLL",
+                    return_value=kernel,
+                    create=True,
                 ), mock.patch.object(
                     process_supervisor.ctypes,
                     "get_last_error",
                     return_value=process_supervisor.ERROR_ACCESS_DENIED,
+                    create=True,
                 ):
             state = process_supervisor.pid_liveness(4242)
         self.assertEqual(process_supervisor.PID_UNKNOWN, state)

@@ -137,6 +137,8 @@ def _fixture_repository(base: Path, *, license_file: bool = True,
     _git(root, "config", "user.email", "release-test@example.invalid")
     _git(root, "config", "user.name", "Release Test")
     _git(root, "config", "core.autocrlf", "false")
+    _git(root, "config", "gc.auto", "0")
+    _git(root, "config", "maintenance.auto", "false")
     _git(root, "add", "--all")
     _git(root, "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
     return root, _git(root, "rev-parse", "HEAD")

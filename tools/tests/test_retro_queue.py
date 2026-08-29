@@ -89,7 +89,7 @@ class QueueTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = (TOOLS.parent / ".checklogs"
                      / f"retro-queue-test-{uuid.uuid4().hex}")
-        self.root.mkdir()
+        self.root.mkdir(parents=True)
         self.retro = self.root / "docs" / "retro"
         self.retro.mkdir(parents=True)
         self.session_evidence = self.root / ".kit" / "runtime" / "evidence" / "sessions"

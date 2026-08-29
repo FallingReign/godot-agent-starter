@@ -200,7 +200,7 @@ class BoardTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = (TOOLS.parent / ".checklogs"
                     / f"board-api-test-{uuid.uuid4().hex}")
-        self.dir.mkdir()
+        self.dir.mkdir(parents=True)
         self.retro = self.dir / "docs" / "retro"
         self.retro.mkdir(parents=True)
         self.runtime = self.dir / ".kit" / "runtime"
