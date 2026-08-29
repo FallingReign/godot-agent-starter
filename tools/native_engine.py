@@ -778,7 +778,7 @@ def _capture_expected_process_identity(
     timeout: float = 3.0,
 ) -> ProcessIdentity | None:
     """Wait through the Linux parent-death wrapper until the engine is exec'd."""
-    if _is_windows() or not sys.platform.startswith("linux"):
+    if _use_windows_process_boundary() or not sys.platform.startswith("linux"):
         return capture_process_identity(pid)
     expected_digest = _executable_digest(str(executable), windows=_is_windows())
     expected_name = Path(str(executable)).name
@@ -1554,6 +1554,14 @@ def start_godot(
                 cwd=cwd,
                 capture_output=capture_output,
             )
+        elif capture_output:
+            process, posix_guard = process_supervisor.start_posix_guarded(
+                command,
+                cwd=cwd,
+                environment=native_child_environment(),
+                capture_output=True,
+                merge_stderr=True,
+            )
         else:
             process = _start_process(
                 command,
@@ -1566,10 +1574,6 @@ def start_godot(
                 ),
                 parent_lifeline=capture_output,
             )
-            if not _use_windows_process_boundary() and capture_output:
-                posix_guard = process_supervisor.PosixGroupGuard.start(
-                    int(process.pid)
-                )
     except OSError as exc:
         if process is not None:
             try:

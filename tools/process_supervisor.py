@@ -574,6 +574,44 @@ def posix_parent_death_command(command: Sequence[str]) -> list[str]:
     ]
 
 
+def _guarded_posix_command(
+    command: Sequence[str], release_fd: int, expected_parent: int
+) -> list[str]:
+    """Hold a new process group until its independent lifeline is ready."""
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--exec-after-lifeline",
+        str(int(release_fd)),
+        str(int(expected_parent)),
+        *[str(part) for part in command],
+    ]
+
+
+def _exec_after_lifeline(
+    release_fd: int, expected_parent: int, command: Sequence[str]
+) -> int:
+    try:
+        released = os.read(int(release_fd), 1)
+    except OSError:
+        released = b""
+    finally:
+        try:
+            os.close(int(release_fd))
+        except OSError:
+            pass
+    if released != b"R" or os.getppid() != int(expected_parent):
+        return 127
+    _linux_parent_death_signal(int(expected_parent))
+    if os.getppid() != int(expected_parent):
+        return 127
+    try:
+        os.execvpe(str(command[0]), [str(part) for part in command], os.environ)
+    except (IndexError, OSError):
+        return 127
+    return 127
+
+
 def _group_liveness(pgid: int) -> str:
     if pgid <= 0:
         return PID_DEAD
@@ -738,27 +776,76 @@ def _start_posix(
     cwd: Path,
     environment: Mapping[str, str] | None,
     capture_output: bool,
+    merge_stderr: bool = False,
 ) -> tuple[subprocess.Popen[bytes], PosixGroupGuard]:
-    process = subprocess.Popen(
-        posix_parent_death_command(command),
-        cwd=str(cwd),
-        env=dict(environment) if environment is not None else None,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE if capture_output else None,
-        stderr=subprocess.PIPE if capture_output else None,
-        shell=False,
-        start_new_session=True,
-    )
+    release_read, release_write = os.pipe()
+    os.set_inheritable(release_read, True)
+    process: subprocess.Popen[bytes] | None = None
+    guard: PosixGroupGuard | None = None
     try:
-        guard = PosixGroupGuard.start(int(process.pid))
-    except BaseException:
-        _signal_group(int(process.pid), signal.SIGKILL)
         try:
-            process.wait(timeout=HARD_KILL_SECONDS)
-        except (OSError, subprocess.SubprocessError):
-            pass
+            process = subprocess.Popen(
+                _guarded_posix_command(command, release_read, os.getpid()),
+                cwd=str(cwd),
+                env=dict(environment) if environment is not None else None,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if capture_output else None,
+                stderr=(
+                    subprocess.STDOUT
+                    if capture_output and merge_stderr
+                    else subprocess.PIPE if capture_output else None
+                ),
+                shell=False,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=(release_read,),
+            )
+        finally:
+            os.close(release_read)
+        guard = PosixGroupGuard.start(int(process.pid))
+        if os.write(release_write, b"R") != 1:
+            raise ProcessContainmentError(
+                1, "POSIX child release handshake was not delivered"
+            )
+    except BaseException:
+        if process is not None:
+            if guard is not None:
+                guard.kill()
+            else:
+                _signal_group(int(process.pid), signal.SIGKILL)
+            try:
+                process.wait(timeout=HARD_KILL_SECONDS)
+            except (OSError, subprocess.SubprocessError):
+                pass
         raise
+    finally:
+        try:
+            os.close(release_write)
+        except OSError:
+            pass
+    assert process is not None
+    assert guard is not None
     return process, guard
+
+
+def start_posix_guarded(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str] | None,
+    capture_output: bool,
+    merge_stderr: bool = False,
+) -> tuple[subprocess.Popen[bytes], PosixGroupGuard]:
+    """Start one POSIX group only after its owner-death lifeline is armed."""
+    if _is_windows():
+        raise OSError("POSIX guarded launch is unavailable on Windows")
+    return _start_posix(
+        command,
+        cwd=cwd,
+        environment=environment,
+        capture_output=capture_output,
+        merge_stderr=merge_stderr,
+    )
 
 
 def _terminate_windows(
@@ -985,6 +1072,13 @@ def pid_liveness(pid: int) -> str:
 def _main(argv: Sequence[str]) -> int:
     if len(argv) == 4 and argv[0] == "--watch-posix-group":
         return _watch_posix_group(int(argv[1]), int(argv[2]), int(argv[3]))
+    if len(argv) >= 4 and argv[0] == "--exec-after-lifeline":
+        try:
+            release_fd = int(argv[1])
+            expected_parent = int(argv[2])
+        except ValueError:
+            return 127
+        return _exec_after_lifeline(release_fd, expected_parent, argv[3:])
     if len(argv) >= 3 and argv[0] == "--exec-with-parent-death":
         try:
             expected_parent = int(argv[1])

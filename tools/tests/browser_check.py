@@ -167,9 +167,15 @@ def _states_ascend(html: str) -> bool:
     return all(ranks[i - 1] <= ranks[i] for i in range(1, len(ranks)))
 
 
-def wait_for(port: int, timeout: float = 10.0) -> bool:
+def wait_for(
+    port: int,
+    timeout: float = 10.0,
+    process: subprocess.Popen | None = None,
+) -> bool:
     end = time.time() + timeout
     while time.time() < end:
+        if process is not None and process.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1):
                 return True
@@ -183,14 +189,23 @@ def wait_for(port: int, timeout: float = 10.0) -> bool:
 
 
 def start_board(port: int, scenario: str, fixture_root: Path) -> subprocess.Popen:
-    proc = subprocess.Popen(
-        [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario,
-         "--fixture-root", str(fixture_root)],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if not wait_for(port):
+    stderr_path = fixture_root / f"mock-board-{scenario}-{port}.stderr.log"
+    with stderr_path.open("wb") as stderr:
+        proc = subprocess.Popen(
+            [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario,
+             "--fixture-root", str(fixture_root)],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+    if not wait_for(port, timeout=30.0, process=proc):
         stop_board(proc)
-        raise RuntimeError(f"mock board did not become ready for scenario {scenario}")
+        try:
+            detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:].strip()
+        except OSError:
+            detail = ""
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"mock board did not become ready for scenario {scenario}{suffix}"
+        )
     return proc
 
 
