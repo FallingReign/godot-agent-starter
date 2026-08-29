@@ -221,6 +221,7 @@ jobs:
         shell: python
         env:
           EXPECTED_PYTHON: ${{ matrix.python }}
+          EXPECT_SETUP_COMPLETE: ${{ matrix.strict }}
         run: |
           import json
           import os
@@ -232,12 +233,24 @@ jobs:
               else ["sh", "./kit", "doctor", "--json"]
           )
           result = subprocess.run(command, capture_output=True, text=True, check=False)
-          if result.returncode != 0:
+          if result.returncode not in (0, 3):
               raise SystemExit(
                   "public launcher doctor failed after setup: "
                   + (result.stderr.strip() or result.stdout.strip())
               )
           payload = json.loads(result.stdout)
+          status = payload.get("status")
+          expected_code = {"ready": 0, "needs_setup": 3}.get(status)
+          if expected_code is None or result.returncode != expected_code:
+              raise SystemExit(
+                  f"public launcher doctor returned inconsistent status {status!r} "
+                  f"and exit code {result.returncode}"
+              )
+          expects_complete = os.environ["EXPECT_SETUP_COMPLETE"].lower() == "true"
+          if expects_complete and status != "ready":
+              raise SystemExit(
+                  "strict job remained setup-incomplete after its explicit setup steps"
+              )
           versions = [
               item.get("detail")
               for item in payload["bootstrap"]["results"]

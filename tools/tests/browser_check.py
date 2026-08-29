@@ -93,6 +93,7 @@ def free_port() -> int:
 def dump_dom(browser: str, url: str, profile: Path) -> str:
     proc = subprocess.run(
         [browser, "--headless=new", "--disable-gpu", "--no-sandbox",
+         "--no-proxy-server",
          f"--user-data-dir={profile}", "--virtual-time-budget=6000",
          "--dump-dom", url],
         capture_output=True, text=True, errors="replace", timeout=180,
@@ -172,12 +173,13 @@ def wait_for(
     timeout: float = 10.0,
     process: subprocess.Popen | None = None,
 ) -> bool:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     end = time.time() + timeout
     while time.time() < end:
         if process is not None and process.poll() is not None:
             return False
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1):
+            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=1):
                 return True
         except urllib.error.HTTPError:
             # A deliberate non-2xx health scenario is still a listening,
@@ -189,19 +191,31 @@ def wait_for(
 
 
 def start_board(port: int, scenario: str, fixture_root: Path) -> subprocess.Popen:
+    stdout_path = fixture_root / f"mock-board-{scenario}-{port}.stdout.log"
     stderr_path = fixture_root / f"mock-board-{scenario}-{port}.stderr.log"
-    with stderr_path.open("wb") as stderr:
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         proc = subprocess.Popen(
             [sys.executable, str(MOCK), "--port", str(port), "--scenario", scenario,
              "--fixture-root", str(fixture_root)],
-            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=stderr,
+            cwd=ROOT, stdout=stdout, stderr=stderr,
         )
     if not wait_for(port, timeout=30.0, process=proc):
         stop_board(proc)
         try:
-            detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:].strip()
+            stdout_detail = stdout_path.read_text(
+                encoding="utf-8", errors="replace"
+            )[-1000:].strip()
         except OSError:
-            detail = ""
+            stdout_detail = ""
+        try:
+            stderr_detail = stderr_path.read_text(
+                encoding="utf-8", errors="replace"
+            )[-2000:].strip()
+        except OSError:
+            stderr_detail = ""
+        detail = " | ".join(
+            part for part in (stdout_detail, stderr_detail) if part
+        )
         suffix = f": {detail}" if detail else ""
         raise RuntimeError(
             f"mock board did not become ready for scenario {scenario}{suffix}"

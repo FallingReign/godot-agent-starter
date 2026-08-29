@@ -576,6 +576,14 @@ class StrictCiContractTests(unittest.TestCase):
         self.assertIn("python-version: ${{ matrix.python }}", workflow)
         self.assertIn("KIT_PYTHON={executable}", workflow)
         self.assertIn("Prove the public launcher uses the declared Python", workflow)
+        self.assertIn("EXPECT_SETUP_COMPLETE: ${{ matrix.strict }}", workflow)
+        self.assertIn(
+            'expected_code = {"ready": 0, "needs_setup": 3}.get(status)',
+            workflow,
+        )
+        self.assertIn(
+            'expects_complete = os.environ["EXPECT_SETUP_COMPLETE"]', workflow
+        )
         self.assertIn('expected = os.environ["EXPECTED_PYTHON"]', workflow)
         self.assertIn("if versions != [expected]", workflow)
         self.assertLess(
