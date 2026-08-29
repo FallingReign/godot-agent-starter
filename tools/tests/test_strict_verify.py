@@ -571,10 +571,13 @@ class StrictCiContractTests(unittest.TestCase):
         self.assertIn("kit setup dependency gdtoolkit", workflow)
         self.assertIn("kit setup audit-dependencies", workflow)
         self.assertIn("node-version: 24.19.0", workflow)
-        self.assertIn("python-version: 3.10.21", workflow)
+        self.assertIn("python: 3.10.21", workflow)
+        self.assertEqual(3, workflow.count("python: 3.14.7"))
+        self.assertIn("python-version: ${{ matrix.python }}", workflow)
         self.assertIn("KIT_PYTHON={executable}", workflow)
         self.assertIn("Prove the public launcher uses the declared Python", workflow)
-        self.assertIn('if versions != ["3.10.21"]', workflow)
+        self.assertIn('expected = os.environ["EXPECTED_PYTHON"]', workflow)
+        self.assertIn("if versions != [expected]", workflow)
         self.assertLess(
             workflow.index("Bind the public launcher to the declared Python"),
             workflow.index("kit self-test"),
@@ -621,7 +624,9 @@ class StrictCiContractTests(unittest.TestCase):
         )
         self.assertNotIn('pathlib.Path(".kit/runtime/verification")', workflow)
         self.assertIn('(root / "strict-report.json").read_text', workflow)
-        self.assertIn('actual != "3.10.21"', workflow)
+        self.assertIn("if actual != expected", workflow)
+        self.assertIn("if: matrix.strict", workflow)
+        self.assertIn("if: ${{ always() && matrix.strict }}", workflow)
 
     def test_public_launchers_fail_closed_on_an_explicit_python_override(self) -> None:
         root = Path(__file__).resolve().parents[2]

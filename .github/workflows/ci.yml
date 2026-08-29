@@ -15,26 +15,37 @@ concurrency:
 
 jobs:
   strict:
-    name: ${{ matrix.name }} / Python 3.10.21
+    name: ${{ matrix.name }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         include:
+          - name: Linux minimum-runtime
+            key: linux-python-minimum
+            os: ubuntu-24.04
+            python: 3.10.21
+            strict: false
           - name: Linux x64
             key: linux-x64
             os: ubuntu-24.04
+            python: 3.14.7
+            strict: true
             godot_archive: Godot_v4.7.2-stable_linux.x86_64.zip
             godot_executable: Godot_v4.7.2-stable_linux.x86_64
           - name: Windows x64
             key: windows-x64
             os: windows-2025
+            python: 3.14.7
+            strict: true
             godot_archive: Godot_v4.7.2-stable_win64.exe.zip
             godot_executable: Godot_v4.7.2-stable_win64_console.exe
           - name: macOS universal
             key: macos-universal
             os: macos-15
+            python: 3.14.7
+            strict: true
             godot_archive: Godot_v4.7.2-stable_macos.universal.zip
             godot_executable: Godot.app/Contents/MacOS/Godot
 
@@ -48,14 +59,16 @@ jobs:
           persist-credentials: false
 
       # https://github.com/actions/setup-python/releases/tag/v7.0.0
-      - name: Set up the declared minimum Python line
+      - name: Set up the declared Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: 3.10.21
+          python-version: ${{ matrix.python }}
           check-latest: false
 
       - name: Bind the public launcher to the declared Python
         shell: python
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python }}
         run: |
           import os
           import pathlib
@@ -63,7 +76,7 @@ jobs:
           import sys
 
           sys.dont_write_bytecode = True
-          expected = "3.10.21"
+          expected = os.environ["EXPECTED_PYTHON"]
           actual = platform.python_version()
           if actual != expected:
               raise SystemExit(f"setup-python selected {actual}; expected {expected}")
@@ -91,26 +104,27 @@ jobs:
         run: .\kit.cmd self-test
 
       - name: Authenticate every canonical third-party lock source
-        if: runner.os != 'Windows'
+        if: matrix.strict && runner.os != 'Windows'
         shell: bash
         run: sh ./kit setup audit-dependencies
 
       - name: Authenticate every canonical third-party lock source on Windows
-        if: runner.os == 'Windows'
+        if: matrix.strict && runner.os == 'Windows'
         shell: pwsh
         run: .\kit.cmd setup audit-dependencies
 
       - name: Install the locked GDScript tool through the public kit launcher
-        if: runner.os != 'Windows'
+        if: matrix.strict && runner.os != 'Windows'
         shell: bash
         run: sh ./kit setup dependency gdtoolkit
 
       - name: Install the locked GDScript tool through the Windows launcher
-        if: runner.os == 'Windows'
+        if: matrix.strict && runner.os == 'Windows'
         shell: pwsh
         run: .\kit.cmd setup dependency gdtoolkit
 
       - name: Download and authenticate the official Godot build
+        if: matrix.strict
         shell: python
         env:
           GODOT_ARCHIVE: ${{ matrix.godot_archive }}
@@ -194,17 +208,19 @@ jobs:
               github_env.write(f"GODOT_BIN={executable}\n")
 
       - name: Build the fresh Godot import cache through the public kit launcher
-        if: runner.os != 'Windows'
+        if: matrix.strict && runner.os != 'Windows'
         shell: bash
         run: sh ./kit setup import
 
       - name: Build the fresh Godot import cache through the Windows launcher
-        if: runner.os == 'Windows'
+        if: matrix.strict && runner.os == 'Windows'
         shell: pwsh
         run: .\kit.cmd setup import
 
       - name: Prove the public launcher uses the declared Python
         shell: python
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python }}
         run: |
           import json
           import os
@@ -227,16 +243,17 @@ jobs:
               for item in payload["bootstrap"]["results"]
               if item.get("name") == "python"
           ]
-          if versions != ["3.10.21"]:
-              raise SystemExit(f"public launcher used {versions!r}; expected Python 3.10.21")
+          expected = os.environ["EXPECTED_PYTHON"]
+          if versions != [expected]:
+              raise SystemExit(f"public launcher used {versions!r}; expected Python {expected}")
 
       - name: Run strict production verification through the public kit launcher
-        if: runner.os != 'Windows'
+        if: matrix.strict && runner.os != 'Windows'
         shell: bash
         run: sh ./kit verify --strict --json
 
       - name: Run strict production verification through the Windows launcher
-        if: runner.os == 'Windows'
+        if: matrix.strict && runner.os == 'Windows'
         shell: pwsh
         run: .\kit.cmd verify --strict --json
 
@@ -245,8 +262,10 @@ jobs:
       # outcome so the immutable job log preserves the evidence without an
       # artifact-upload dependency.
       - name: Print retained strict evidence
-        if: ${{ always() }}
+        if: ${{ always() && matrix.strict }}
         shell: python
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python }}
         run: |
           import json
           import pathlib
@@ -265,5 +284,6 @@ jobs:
                   print(path.read_text(encoding="utf-8", errors="replace"), end="")
           report = json.loads((root / "strict-report.json").read_text(encoding="utf-8"))
           actual = report.get("environment", {}).get("python")
-          if actual != "3.10.21":
-              raise SystemExit(f"strict verification used Python {actual!r}; expected 3.10.21")
+          expected = os.environ["EXPECTED_PYTHON"]
+          if actual != expected:
+              raise SystemExit(f"strict verification used Python {actual!r}; expected {expected}")

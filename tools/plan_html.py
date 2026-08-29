@@ -1924,7 +1924,8 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
             if idx.get("undesigned"):
                 warn.append(f"{idx['undesigned']} tunable(s) in code no section declares")
             if warn:
-                a(f'<p class="m">{esc(" \u00b7 ".join(warn))}</p>')
+                warning_text = " \u00b7 ".join(warn)
+                a(f'<p class="m">{esc(warning_text)}</p>')
             a("</div>")
 
         for d in design:
