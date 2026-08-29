@@ -462,9 +462,14 @@ window.Board = (function(){
   }
 
   function start(){
-    if(isFile){ setMode('file'); return; }
+    function ready(){ document.body.setAttribute('data-board-ready', 'true'); }
+    if(isFile){ setMode('file'); ready(); return; }
     setMode('down');            // pessimistic until /api/health says otherwise
-    tick();
+    probe().then(function(alive){
+      backoff = alive ? POLL_MS : Math.min(backoff * 2, POLL_MAX_MS);
+      schedule();
+      ready();
+    });
   }
   if(document.readyState === 'loading'){
     document.addEventListener('DOMContentLoaded', start);

@@ -10,9 +10,10 @@ worker silent for half an hour and a worker that exited non-zero.
     python tools/tests/browser_check.py
 
 It starts the mock board on a spare port, renders each page with headless Chrome
-or Edge (`--dump-dom` runs the page's JavaScript first), and checks the resulting
-DOM. Skips with exit 0 if no Chromium-based browser is installed -- a browser is
-not a dependency of this kit.
+or Edge, and checks the resulting DOM. Direct Chromium binaries use `--dump-dom`;
+the macOS automation build uses an already-installed ChromeDriver (hosted
+runners provide the paired build). Skips with exit 0 if no Chromium-based
+browser is installed -- a browser is not a dependency of this kit.
 
 States covered: healthy, board-unreachable, file:// read-only, and per-item
 working/stalled, failed, done, queued.
@@ -23,12 +24,15 @@ import contextlib
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +46,13 @@ import page_parts  # noqa: E402
 import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
+MAC_TEST_BROWSER = (
+    "/Applications/Google Chrome for Testing.app/Contents/MacOS/"
+    "Google Chrome for Testing"
+)
+PROCESS_SIGTERM = getattr(signal, "SIGTERM", 15)
+PROCESS_SIGKILL = getattr(signal, "SIGKILL", 9)
+
 BROWSERS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -49,9 +60,8 @@ BROWSERS = [
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
     # GitHub's hosted macOS images install the automation-specific binary
-    # alongside consumer Chrome. Prefer it so a bounded CLI invocation owns
-    # the complete browser lifecycle.
-    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    # alongside consumer Chrome. Prefer the browser built for automation.
+    MAC_TEST_BROWSER,
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
@@ -100,25 +110,261 @@ def find_browser() -> str:
     return ""
 
 
+def find_chromedriver() -> str:
+    configured = os.environ.get("CHROMEDRIVER_BIN", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        found = shutil.which(configured)
+        if found:
+            return found
+    driver_root = os.environ.get("CHROMEWEBDRIVER", "").strip()
+    if driver_root:
+        name = "chromedriver.exe" if os.name == "nt" else "chromedriver"
+        candidate = Path(driver_root).expanduser() / name
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return shutil.which("chromedriver") or ""
+
+
+def _is_mac_test_browser(browser: str) -> bool:
+    candidate = Path(browser).expanduser()
+    target = Path(MAC_TEST_BROWSER)
+    try:
+        return candidate.resolve(strict=True) == target.resolve(strict=True)
+    except OSError:
+        return str(candidate) == str(target)
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def dump_dom(browser: str, url: str, profile: Path) -> str:
-    proc = subprocess.run(
-        [browser, "--headless", "--disable-gpu", "--no-sandbox",
-         "--no-proxy-server",
-         f"--user-data-dir={profile}", "--virtual-time-budget=6000",
-         "--timeout=15000",
-         "--dump-dom", url],
-        capture_output=True, text=True, errors="replace", timeout=45,
-    )
+def _dump_dom_direct(browser: str, url: str, profile: Path) -> str:
+    try:
+        proc = subprocess.run(
+            [browser, "--headless", "--disable-gpu", "--no-sandbox",
+             "--no-proxy-server",
+             f"--user-data-dir={profile}", "--virtual-time-budget=6000",
+             "--timeout=15000",
+             "--dump-dom", url],
+            capture_output=True, text=True, errors="replace", timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"browser dump timed out for {url}", file=sys.stderr)
+        return ""
     if proc.returncode != 0 or not proc.stdout.strip():
         detail = (proc.stderr or "browser returned an empty document").strip()[:500]
         print(f"browser dump failed for {url}: {detail}", file=sys.stderr)
     return proc.stdout
+
+
+def _webdriver_json(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"WebDriver HTTP {exc.code}: {detail}") from exc
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("WebDriver returned a non-object response")
+    return parsed
+
+
+def _webdriver_capabilities(browser: str, profile: Path) -> dict:
+    return {
+        "capabilities": {
+            "alwaysMatch": {
+                "browserName": "chrome",
+                "goog:chromeOptions": {
+                    "binary": browser,
+                    "args": [
+                        "--headless",
+                        "--disable-gpu",
+                        "--no-sandbox",
+                        "--no-proxy-server",
+                        f"--user-data-dir={profile}",
+                    ],
+                },
+            },
+        },
+    }
+
+
+def _signal_driver_tree(
+    process: subprocess.Popen[str],
+    force: bool,
+) -> None:
+    if os.name == "posix":
+        selected = PROCESS_SIGKILL if force else PROCESS_SIGTERM
+        try:
+            os.killpg(process.pid, selected)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return
+    if force:
+        process.kill()
+    else:
+        process.terminate()
+
+
+def _process_group_exited(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    return False
+
+
+def _stop_driver_tree(process: subprocess.Popen[str]) -> None:
+    if os.name == "posix":
+        _signal_driver_tree(process, force=False)
+        leader_reaped = True
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            leader_reaped = False
+        if not _process_group_exited(process.pid, timeout=5.0):
+            _signal_driver_tree(process, force=True)
+            if not _process_group_exited(process.pid, timeout=5.0):
+                print(
+                    "ChromeDriver process group survived SIGKILL",
+                    file=sys.stderr,
+                )
+        if not leader_reaped:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print("ChromeDriver leader was not reaped", file=sys.stderr)
+        return
+    _signal_driver_tree(process, force=False)
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_driver_tree(process, force=True)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        print("ChromeDriver process did not stop after termination", file=sys.stderr)
+
+
+def _dump_dom_with_webdriver(
+    driver: str,
+    browser: str,
+    url: str,
+    profile: Path,
+) -> str:
+    port = free_port()
+    session_id = ""
+    try:
+        process = subprocess.Popen(
+            [driver, f"--port={port}", "--allowed-ips=127.0.0.1",
+             "--log-level=SEVERE"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        print(f"ChromeDriver could not start: {exc}", file=sys.stderr)
+        return ""
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        if not wait_for(port, timeout=10.0, process=process):
+            raise RuntimeError("ChromeDriver did not open its loopback endpoint")
+        request_profile = profile / f"webdriver-{uuid.uuid4().hex}"
+        request_profile.mkdir(parents=True)
+        created = _webdriver_json(
+            "POST",
+            f"{base_url}/session",
+            _webdriver_capabilities(browser, request_profile),
+            timeout=30.0,
+        )
+        value = created.get("value")
+        if isinstance(value, dict):
+            session_id = str(value.get("sessionId", ""))
+        if not session_id:
+            session_id = str(created.get("sessionId", ""))
+        if not session_id:
+            raise RuntimeError("ChromeDriver did not return a session id")
+        session_url = f"{base_url}/session/{session_id}"
+        _webdriver_json(
+            "POST",
+            f"{session_url}/timeouts",
+            {"implicit": 0, "pageLoad": 15000, "script": 15000},
+        )
+        _webdriver_json("POST", f"{session_url}/url", {"url": url}, timeout=20.0)
+        deadline = time.monotonic() + 20.0
+        html = ""
+        while time.monotonic() < deadline:
+            rendered = _webdriver_json(
+                "POST",
+                f"{session_url}/execute/sync",
+                {
+                    "script": "return document.documentElement.outerHTML;",
+                    "args": [],
+                },
+            )
+            current = rendered.get("value")
+            html = current if isinstance(current, str) else ""
+            if 'data-board-ready="true"' in html:
+                return html
+            time.sleep(0.2)
+        return html
+    except Exception as exc:
+        print(f"WebDriver dump failed for {url}: {exc}", file=sys.stderr)
+        return ""
+    finally:
+        if session_id:
+            try:
+                _webdriver_json(
+                    "DELETE",
+                    f"{base_url}/session/{session_id}",
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+        _stop_driver_tree(process)
+
+
+def dump_dom(browser: str, url: str, profile: Path) -> str:
+    driver = find_chromedriver()
+    if _is_mac_test_browser(browser) and driver:
+        return _dump_dom_with_webdriver(driver, browser, url, profile)
+    return _dump_dom_direct(browser, url, profile)
 
 
 def body_class(html: str) -> str:
@@ -188,7 +434,7 @@ def _states_ascend(html: str) -> bool:
 def wait_for(
     port: int,
     timeout: float = 10.0,
-    process: RunningBoard | None = None,
+    process: RunningBoard | subprocess.Popen[str] | None = None,
 ) -> bool:
     end = time.time() + timeout
     while time.time() < end:
@@ -371,6 +617,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
     try:
         html = dump_dom(browser, f"http://127.0.0.1:{port}/retro.html", profile)
         s = "live/healthy"
+        check(s, "the initial board probe settled", 'data-board-ready="true"' in html)
         check(s, "body is board-live", "board-live" in body_class(html), body_class(html))
         check(s, "no banner is shown when the board is live", banner(html, "board-banner").strip() == "")
         check(s, "a silent worker is rendered as stalled", "status-slot stalled" in html)
@@ -420,6 +667,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
 
         plan = dump_dom(browser, f"http://127.0.0.1:{port}/plan.html", profile)
         s = "live/plan-banner"
+        check(s, "the initial board probe settled", 'data-board-ready="true"' in plan)
         check(
             s,
             "body is board-live",
@@ -441,6 +689,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
     try:
         html = dump_dom(browser, f"http://127.0.0.1:{port}/retro.html", profile)
         s = "live/board-down"
+        check(s, "the initial board probe settled", 'data-board-ready="true"' in html)
         b = banner(html, "board-banner")
         check(s, "body is board-down", "board-down" in body_class(html), body_class(html))
         check(s, "the page says the board is not reachable", "not reachable" in b, b[:80])
@@ -453,6 +702,8 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
 
         plan = dump_dom(browser, f"http://127.0.0.1:{port}/plan.html", profile)
         plan_banner = banner(plan, "board-banner")
+        check("live/board-down", "the plan probe settled",
+              'data-board-ready="true"' in plan)
         check("live/board-down", "the plan shows the same cockpit outage",
               "not reachable" in plan_banner and "kit serve" in plan_banner,
               plan_banner[:80])
@@ -466,6 +717,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         url = (fixture_root / page).as_uri()
         html = dump_dom(browser, url, profile)
         s = f"file/{page}"
+        check(s, "the file-mode probe settled", 'data-board-ready="true"' in html)
         check(s, "body is board-file", "board-file" in body_class(html), body_class(html))
         b = banner(html, "board-banner")
         check(s, "the page says it is read-only because it is a file",

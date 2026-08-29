@@ -124,6 +124,158 @@ class BrowserReadinessProbe(unittest.TestCase):
         self.assertIn("--timeout=15000", command)
         self.assertEqual(45, run.call_args.kwargs["timeout"])
 
+    def test_direct_browser_timeout_returns_a_bounded_failure(self) -> None:
+        with mock.patch.object(
+            browser_check.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["chrome"], 45),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    "",
+                    browser_check.dump_dom(
+                        "chrome",
+                        "http://127.0.0.1:12345/plan.html",
+                        Path("profile"),
+                    ),
+                )
+
+    def test_mac_testing_browser_uses_the_selected_existing_driver(self) -> None:
+        with mock.patch.object(
+            browser_check,
+            "find_chromedriver",
+            return_value="chromedriver",
+        ):
+            with mock.patch.object(
+                browser_check,
+                "_dump_dom_with_webdriver",
+                return_value="<html></html>",
+            ) as webdriver_dump:
+                with mock.patch.object(
+                    browser_check.subprocess,
+                    "run",
+                    side_effect=AssertionError("direct browser CLI was used"),
+                ):
+                    result = browser_check.dump_dom(
+                        browser_check.MAC_TEST_BROWSER,
+                        "http://127.0.0.1:12345/plan.html",
+                        Path("profile"),
+                    )
+
+        self.assertEqual("<html></html>", result)
+        webdriver_dump.assert_called_once_with(
+            "chromedriver",
+            browser_check.MAC_TEST_BROWSER,
+            "http://127.0.0.1:12345/plan.html",
+            Path("profile"),
+        )
+
+    def test_webdriver_uses_a_private_profile_and_reads_the_rendered_dom(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        transient_down = '<html><body class="board-down"></body></html>'
+        transient_live = '<html><body class="board-live"></body></html>'
+        rendered = (
+            '<html><body class="board-live" data-board-ready="true">'
+            '<div class="status-slot stalled"></div></body></html>'
+        )
+        responses = [
+            {"value": {"sessionId": "session-1"}},
+            {"value": None},
+            {"value": None},
+            {"value": transient_down},
+            {"value": transient_live},
+            {"value": rendered},
+            {"value": None},
+        ]
+        with browser_check.browser_fixture() as fixture_root:
+            profile = fixture_root / "profile"
+            with mock.patch.object(browser_check, "_stop_driver_tree") as stop:
+                with mock.patch.object(
+                    browser_check.subprocess,
+                    "Popen",
+                    return_value=process,
+                ) as popen:
+                    with mock.patch.object(browser_check, "free_port", return_value=9515):
+                        with mock.patch.object(browser_check, "wait_for", return_value=True):
+                            with mock.patch.object(
+                                browser_check,
+                                "_webdriver_json",
+                                side_effect=responses,
+                            ) as request:
+                                result = browser_check._dump_dom_with_webdriver(
+                                    "chromedriver",
+                                    browser_check.MAC_TEST_BROWSER,
+                                    "http://127.0.0.1:12345/plan.html",
+                                    profile,
+                                )
+
+        self.assertEqual(rendered, result)
+        self.assertIn("--port=9515", popen.call_args.args[0])
+        capabilities = request.call_args_list[0].args[2]
+        chrome = capabilities["capabilities"]["alwaysMatch"]["goog:chromeOptions"]
+        self.assertEqual(browser_check.MAC_TEST_BROWSER, chrome["binary"])
+        self.assertIn("--headless", chrome["args"])
+        self.assertIn("--no-proxy-server", chrome["args"])
+        profiles = [
+            value
+            for value in chrome["args"]
+            if value.startswith("--user-data-dir=")
+        ]
+        self.assertEqual(1, len(profiles))
+        self.assertIn("webdriver-", profiles[0])
+        self.assertEqual("DELETE", request.call_args_list[-1].args[0])
+        stop.assert_called_once_with(process)
+        self.assertFalse(fixture_root.exists())
+
+    def test_driver_cleanup_kills_a_group_after_its_leader_exits(self) -> None:
+        process = mock.Mock(pid=7654)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch.object(browser_check.os, "name", "posix"):
+            with mock.patch.object(browser_check.os, "killpg", create=True) as killpg:
+                with mock.patch.object(
+                    browser_check,
+                    "_process_group_exited",
+                    side_effect=[False, True],
+                ) as group_exited:
+                    browser_check._stop_driver_tree(process)
+
+        self.assertEqual(
+            [
+                mock.call(7654, browser_check.PROCESS_SIGTERM),
+                mock.call(7654, browser_check.PROCESS_SIGKILL),
+            ],
+            killpg.call_args_list,
+        )
+        self.assertEqual(2, group_exited.call_count)
+
+    def test_runner_driver_root_precedes_an_unrelated_path_driver(self) -> None:
+        with browser_check.browser_fixture() as fixture_root:
+            root = fixture_root / "driver-root"
+            root.mkdir()
+            name = "chromedriver.exe" if browser_check.os.name == "nt" else "chromedriver"
+            paired = root / name
+            paired.write_bytes(b"")
+            with mock.patch.dict(
+                browser_check.os.environ,
+                {
+                    "CHROMEDRIVER_BIN": "",
+                    "CHROMEWEBDRIVER": str(root),
+                },
+            ):
+                with mock.patch.object(
+                    browser_check.shutil,
+                    "which",
+                    return_value="unrelated-driver",
+                ):
+                    self.assertEqual(
+                        str(paired.resolve()),
+                        browser_check.find_chromedriver(),
+                    )
+        self.assertFalse(fixture_root.exists())
+
     def test_readiness_requires_only_a_direct_loopback_listener(self) -> None:
         with browser_check.socket.socket(
             browser_check.socket.AF_INET,
