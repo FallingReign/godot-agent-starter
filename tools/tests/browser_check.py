@@ -28,8 +28,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -173,19 +171,18 @@ def wait_for(
     timeout: float = 10.0,
     process: subprocess.Popen | None = None,
 ) -> bool:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     end = time.time() + timeout
     while time.time() < end:
         if process is not None and process.poll() is not None:
             return False
         try:
-            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=1):
+            # Readiness is only "the child owns a listening loopback socket".
+            # A direct TCP probe cannot be redirected by a host HTTP proxy,
+            # which matters on hosted macOS runners. The browser scenarios
+            # exercise the actual health response immediately afterwards.
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
                 return True
-        except urllib.error.HTTPError:
-            # A deliberate non-2xx health scenario is still a listening,
-            # ready server; the page itself must exercise that response.
-            return True
-        except (urllib.error.URLError, OSError):
+        except OSError:
             time.sleep(0.2)
     return False
 

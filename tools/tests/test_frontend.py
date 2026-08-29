@@ -94,6 +94,20 @@ class FileModeReviewHint(unittest.TestCase):
         self.assertEqual(1, script.count("</script>"))
 
 
+class BrowserReadinessProbe(unittest.TestCase):
+    def test_readiness_requires_only_a_direct_loopback_listener(self) -> None:
+        with browser_check.socket.socket(
+            browser_check.socket.AF_INET,
+            browser_check.socket.SOCK_STREAM,
+        ) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+
+            self.assertTrue(
+                browser_check.wait_for(listener.getsockname()[1], timeout=0.5)
+            )
+
+
 class RetroPageBytes(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
