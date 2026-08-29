@@ -48,6 +48,10 @@ BROWSERS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
+    # GitHub's hosted macOS images install the automation-specific binary
+    # alongside consumer Chrome. Prefer it so a bounded CLI invocation owns
+    # the complete browser lifecycle.
+    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",

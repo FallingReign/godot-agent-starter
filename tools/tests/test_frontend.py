@@ -95,6 +95,18 @@ class FileModeReviewHint(unittest.TestCase):
 
 
 class BrowserReadinessProbe(unittest.TestCase):
+    def test_mac_prefers_the_preinstalled_automation_browser(self) -> None:
+        testing = (
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/"
+            "Google Chrome for Testing"
+        )
+        consumer = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+        self.assertLess(
+            browser_check.BROWSERS.index(testing),
+            browser_check.BROWSERS.index(consumer),
+        )
+
     def test_dump_uses_current_headless_mode_and_browser_capture_bound(self) -> None:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="<html></html>", stderr=""
