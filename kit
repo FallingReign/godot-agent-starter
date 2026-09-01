@@ -5,6 +5,20 @@ export PYTHONDONTWRITEBYTECODE=1
 
 KIT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+if [ -f "$KIT_ROOT/.agent-kit/launcher.py" ]; then
+    KIT_ENTRY="$KIT_ROOT/.agent-kit/launcher.py"
+elif [ -e "$KIT_ROOT/.agent-kit" ]; then
+    echo "kit: the managed kit launcher is missing; restore or roll back the interrupted kit change." >&2
+    exit 3
+else
+    KIT_ENTRY="$KIT_ROOT/tools/managed_launcher.py"
+fi
+
+if [ ! -f "$KIT_ENTRY" ]; then
+    echo "kit: the kit launcher is missing." >&2
+    exit 3
+fi
+
 if [ -n "${KIT_PYTHON:-}" ]; then
     case "$KIT_PYTHON" in
         /*) ;;
@@ -17,14 +31,14 @@ if [ -n "${KIT_PYTHON:-}" ]; then
         echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
         exit 3
     fi
-    exec "$KIT_PYTHON" "$KIT_ROOT/kit.py" "$@"
+    exec "$KIT_PYTHON" "$KIT_ENTRY" "$@"
 fi
 
 if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$KIT_ROOT/kit.py" "$@"
+    exec python3 "$KIT_ENTRY" "$@"
 fi
 if command -v python >/dev/null 2>&1; then
-    exec python "$KIT_ROOT/kit.py" "$@"
+    exec python "$KIT_ENTRY" "$@"
 fi
 
 echo "kit: its internal runtime is unavailable; Python 3.10 or newer is required." >&2
