@@ -340,7 +340,8 @@ def _dump_dom_with_webdriver(
             )
             current = rendered.get("value")
             html = current if isinstance(current, str) else ""
-            if 'data-board-ready="true"' in html:
+            if ('data-board-ready="true"' in html
+                    and 'data-browser-probe-pending="true"' not in html):
                 return html
             time.sleep(0.2)
         return html
@@ -405,6 +406,24 @@ def banner(html: str, elid: str) -> str:
 def controls(html: str) -> tuple[int, int]:
     tags = re.findall(r"<(?:button|textarea|input)[^>]*data-board-control[^>]*>", html)
     return len(tags), len([t for t in tags if "disabled" in t])
+
+
+def element_tag(html: str, element_id: str) -> str:
+    """Return one rendered opening tag by id for visibility assertions."""
+    match = re.search(
+        r'<[^>]+\bid="' + re.escape(element_id) + r'"[^>]*>',
+        html,
+    )
+    return match.group(0) if match else ""
+
+
+def body_attribute(html: str, name: str) -> str:
+    """Read a fixture probe value serialized onto the rendered body."""
+    match = re.search(
+        r'<body[^>]*\b' + re.escape(name) + r'="([^"]*)"',
+        html,
+    )
+    return match.group(1) if match else ""
 
 
 def _costs_descend(cards: list[dict[str, str]]) -> bool:
@@ -593,11 +612,467 @@ def browser_fixture():
                 ):
             rendered = retro_html.render([findings])
         (fixture_root / "retro.html").write_text(rendered, encoding="utf-8")
-        rendered_plan = plan_html.render(
-            {}, {}, [], "", set(), [], [], [], "",
-            cockpit_state={"verification": {"status": "not-run"}},
+        shape = {
+            "name": "Architecture browser fixture",
+            "pitch": "A deterministic real-browser architecture-map fixture.",
+            "involvement": "function",
+        }
+        proposal = {
+            "slice": "browser-architecture-map",
+            "status": "draft",
+            "experience": {
+                "player_does": "Submits one action.",
+                "feels_like": "The result is immediate and understandable.",
+                "not_this": "A silent action with an unexplained result.",
+            },
+            "design_refs": [{
+                "section": "docs/design/experience/action-feedback.md",
+                "why": "Every accepted action explains its result immediately.",
+                "sha256": "a" * 64,
+            }],
+            "design_authority": {
+                "authority": "human-confirmed",
+                "authored_by": "Fixture author",
+                "confidence": "very-high",
+            },
+            "reversibility": {
+                "state": "reversible",
+                "veto_scope": "Remove the new feedback file and restore the old return type.",
+                "hard_to_undo": "Other systems begin consuming the new feedback value.",
+                "next_go_no_go": "Before a second system consumes FeedbackEvent.",
+            },
+            "considered_existing": [{
+                "path": "scripts/logic/action_service.gd",
+                "why_not": "It owns action rules, not the typed result shared with presentation.",
+            }],
+            "modules": [{
+                "path": "scripts/logic",
+                "role": "Engine-independent gameplay decisions and typed results.",
+                "why": "The action result needs one explicit typed boundary.",
+                "action": "modify",
+                "may_depend_on": [],
+                "boundary_data": "PlayerAction enters; FeedbackEvent leaves.",
+            }],
+            "files": [{
+                "path": "scripts/logic/action_service.gd",
+                "action": "modify",
+                "why": "Return an explicit result that presentation can understand.",
+                "module": "scripts/logic",
+            }, {
+                "path": "scripts/logic/feedback_event.gd",
+                "action": "new",
+                "why": "Carry the action result without coupling logic to a scene.",
+                "module": "scripts/logic",
+            }],
+            "functions": [{
+                "file": "scripts/logic/action_service.gd",
+                "signature": "func submit_action(action: PlayerAction) -> FeedbackEvent",
+                "why": "Return the typed feedback value from the existing action boundary.",
+                "action": "modify",
+                "module": "scripts/logic",
+            }, {
+                "file": "scripts/logic/feedback_event.gd",
+                "signature": "func create(summary: String) -> FeedbackEvent",
+                "why": "Construct one complete result at the typed boundary.",
+                "action": "new",
+                "module": "scripts/logic",
+            }],
+        }
+        tree = {
+            "scripts/logic/action_service.gd": {
+                "class_name": "ActionService",
+                "functions": [{
+                    "name": "submit_action",
+                    "identity": "submit_action",
+                    "class_scope": "",
+                    "signature": "func submit_action(action: PlayerAction) -> FeedbackEvent",
+                    "private": False,
+                }],
+            },
+            "scripts/logic/unchanged_helper.gd": {
+                "class_name": "UnchangedHelper",
+                "functions": [{
+                    "name": "describe",
+                    "identity": "describe",
+                    "class_scope": "",
+                    "signature": "func describe() -> String",
+                    "private": False,
+                }],
+            },
+        }
+
+        def render_architecture_fixture(
+            involvement: str,
+            fixture_proposal: dict,
+            fixture_tree: dict,
+            fixture_mods: list[dict],
+            fixture_built: set[str] | None = None,
+            fixture_actions: dict[str, str] | None = None,
+        ) -> str:
+            fixture_shape = {**shape, "involvement": involvement}
+            return plan_html.render(
+                fixture_shape,
+                fixture_proposal,
+                fixture_mods,
+                "",
+                fixture_built or set(),
+                [],
+                [],
+                [],
+                "",
+                tree=fixture_tree,
+                changed_actions=fixture_actions or {},
+                cockpit_state={
+                    "status": "draft",
+                    "verification": {
+                        "status": "passed",
+                        "summary": "Static verification passed for the browser fixture.",
+                    },
+                },
+            )
+
+        rendered_plan = render_architecture_fixture(
+            "function",
+            proposal,
+            tree,
+            [{"path": "scripts/logic", "depends_on": []}],
+            {"scripts/logic/action_service.gd"},
+            {"scripts/logic/action_service.gd": "modify"},
         )
-        (fixture_root / "plan.html").write_text(rendered_plan, encoding="utf-8")
+
+        map_marker = '<script>window.__KIT_ARCHITECTURE_MAP__='
+        if map_marker not in rendered_plan:
+            raise RuntimeError("architecture fixture did not render the map script")
+        force_svg_failure = (
+            '<script>window.__fixtureSvgFailureCalls=0;'
+            'document.createElementNS=function(){'
+            'window.__fixtureSvgFailureCalls+=1;'
+            'throw new Error("fixture forced SVG construction failure");};</script>'
+        )
+        probe = """
+<script>
+(function(){
+  try {
+    var root=document.getElementById("architecture-map");
+    var search=document.getElementById("arch-search");
+    var complete=root.querySelector('[data-arch-view="complete"]');
+    var changes=root.querySelector('[data-arch-view="changes"]');
+    var renderedCount=function(){
+      if(root.getAttribute("data-render-mode")==="graph")return root.querySelectorAll(".arch-node").length;
+      return Array.from(root.querySelectorAll("[data-arch-item]")).filter(function(item){return !item.hidden;}).length;
+    };
+    var completeCount=renderedCount();
+    document.body.setAttribute("data-arch-probe-complete-default",String(
+      complete.getAttribute("aria-pressed")==="true" && changes.getAttribute("aria-pressed")==="false"));
+    changes.click();
+    var changesCount=renderedCount();
+    document.body.setAttribute("data-arch-probe-changes-pressed",String(
+      changes.getAttribute("aria-pressed")==="true" && complete.getAttribute("aria-pressed")==="false"));
+    complete.click();
+    var restoredCount=renderedCount();
+    document.body.setAttribute("data-arch-probe-complete-restored",String(
+      complete.getAttribute("aria-pressed")==="true" && changes.getAttribute("aria-pressed")==="false"));
+    document.body.setAttribute("data-arch-probe-complete-count",String(completeCount));
+    document.body.setAttribute("data-arch-probe-changes-count",String(changesCount));
+    document.body.setAttribute("data-arch-probe-restored-count",String(restoredCount));
+    if(root.getAttribute("data-render-mode")==="fallback"){
+      root.querySelector('[data-arch-depth="file"]').click();
+      root.querySelector('[data-arch-depth="module"]').click();
+      root.querySelector('[data-arch-depth="function"]').click();
+      document.body.setAttribute("data-arch-probe-svg-failure-calls",String(
+        window.__fixtureSvgFailureCalls||0));
+    }
+    var roving=root.querySelectorAll('.arch-node[tabindex="0"]');
+    var before=roving.length===1 ? roving[0].getAttribute("data-node-id") : "";
+    if(roving.length===1)roving[0].dispatchEvent(new KeyboardEvent("keydown",{
+      key:"ArrowRight",bubbles:true,cancelable:true}));
+    var moved=root.querySelectorAll('.arch-node[tabindex="0"]');
+    var after=moved.length===1 ? moved[0].getAttribute("data-node-id") : "";
+    document.body.setAttribute("data-arch-probe-roving-count",String(moved.length));
+    document.body.setAttribute("data-arch-probe-arrow-moved",String(
+      Boolean(before && after && before!==after)));
+    document.body.setAttribute("data-arch-probe-arrow-focused",String(
+      moved.length===1 && document.activeElement===moved[0]));
+    search.value="feedback_event";
+    search.dispatchEvent(new Event("input",{bubbles:true}));
+    search.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+    document.body.setAttribute("data-arch-probe-ran","true");
+    document.body.setAttribute("data-arch-probe-mode",root.getAttribute("data-render-mode")||"");
+    document.body.setAttribute("data-arch-probe-selected",
+      (document.getElementById("arch-selected-title").textContent||"").trim());
+    document.body.setAttribute("data-arch-probe-count",
+      (document.getElementById("arch-search-count").textContent||"").trim());
+  } catch(error) {
+    document.body.setAttribute("data-arch-probe-error",String(error));
+  }
+})();
+</script>
+"""
+
+        normal_plan = rendered_plan.replace("</body>", probe + "</body>", 1)
+        fallback_plan = rendered_plan.replace(
+            map_marker,
+            force_svg_failure + map_marker,
+            1,
+        ).replace("</body>", probe + "</body>", 1)
+        (fixture_root / "plan.html").write_text(normal_plan, encoding="utf-8")
+        (fixture_root / "plan-fallback.html").write_text(
+            fallback_plan,
+            encoding="utf-8",
+        )
+
+        unchanged_tree = {
+            "scripts/logic/stable.gd": {
+                "class_name": "Stable",
+                "functions": [{
+                    "name": "read",
+                    "identity": "read",
+                    "class_scope": "",
+                    "signature": "func read() -> String",
+                    "private": False,
+                }],
+            },
+        }
+        unchanged_proposal = {
+            "slice": "browser-no-changes",
+            "status": "draft",
+            "experience": proposal["experience"],
+        }
+        no_changes_probe = """
+<script>
+(function(){
+  try {
+    document.body.setAttribute("data-browser-probe-pending","true");
+    var root=document.getElementById("architecture-map");
+    var completeCount=root.querySelectorAll(".arch-node").length;
+    root.querySelector('[data-arch-view="changes"]').click();
+    var firstCount=root.querySelectorAll(".arch-node").length;
+    window.dispatchEvent(new Event("resize"));
+    setTimeout(function(){
+      document.body.setAttribute("data-zero-complete-count",String(completeCount));
+      document.body.setAttribute("data-zero-changes-count",String(firstCount));
+      document.body.setAttribute("data-zero-stable-count",String(root.querySelectorAll(".arch-node").length));
+      document.body.setAttribute("data-zero-mode",root.getAttribute("data-render-mode")||"");
+      document.body.setAttribute("data-zero-fallback-hidden",String(document.getElementById("arch-fallback").hidden));
+      document.body.removeAttribute("data-browser-probe-pending");
+    },180);
+  } catch(error) {
+    document.body.setAttribute("data-zero-error",String(error));
+    document.body.removeAttribute("data-browser-probe-pending");
+  }
+})();
+</script>
+"""
+        no_changes_page = render_architecture_fixture(
+            "function",
+            unchanged_proposal,
+            unchanged_tree,
+            [{"path": "scripts/logic", "depends_on": []}],
+        ).replace("</body>", no_changes_probe + "</body>", 1)
+        (fixture_root / "plan-no-changes.html").write_text(
+            no_changes_page,
+            encoding="utf-8",
+        )
+
+        involvement_probe = """
+<script>
+(function(){
+  var root=document.getElementById("architecture-map");
+  document.body.setAttribute("data-involvement-mode",root.getAttribute("data-render-mode")||"");
+  document.body.setAttribute("data-involvement-max",root.getAttribute("data-max-depth")||"");
+  document.body.setAttribute("data-involvement-eyebrow",
+    (root.querySelector(".arch-intro .arch-eyebrow").textContent||"").trim());
+  var involvementCopy=(root.querySelector(".arch-intro-copy").textContent||"").trim();
+  document.body.setAttribute("data-involvement-copy",involvementCopy
+    .split(String.fromCharCode(8594)).join("to"));
+  document.body.setAttribute("data-involvement-placeholder",
+    document.getElementById("arch-search").getAttribute("placeholder")||"");
+  document.body.setAttribute("data-involvement-heading",
+    (root.querySelector(".arch-map-heading h3").textContent||"").trim());
+  document.body.setAttribute("data-involvement-depths",Array.from(
+    root.querySelectorAll("[data-arch-depth]:not([disabled])")).map(function(button){
+      return button.getAttribute("data-arch-depth");
+    }).join("|"));
+  document.body.setAttribute("data-involvement-node-ids",Array.from(
+    root.querySelectorAll(".arch-node")).map(function(node){
+      return node.getAttribute("data-node-id");
+    }).join("|"));
+})();
+</script>
+"""
+        for involvement in ("module", "file", "function"):
+            involvement_page = render_architecture_fixture(
+                involvement,
+                proposal,
+                tree,
+                [{"path": "scripts/logic", "depends_on": []}],
+                {"scripts/logic/action_service.gd"},
+                {"scripts/logic/action_service.gd": "modify"},
+            ).replace("</body>", involvement_probe + "</body>", 1)
+            (fixture_root / f"plan-{involvement}.html").write_text(
+                involvement_page,
+                encoding="utf-8",
+            )
+
+        large_tree = {}
+        for index in range(180):
+            stem = f"item_{index:03d}"
+            large_tree[f"scripts/logic/generated/{stem}.gd"] = {
+                "class_name": f"Generated{index:03d}",
+                "functions": [{
+                    "name": "first",
+                    "identity": "first",
+                    "class_scope": "",
+                    "signature": "func first() -> int",
+                    "private": False,
+                }, {
+                    "name": "second",
+                    "identity": "second",
+                    "class_scope": "",
+                    "signature": "func second() -> int",
+                    "private": False,
+                }],
+            }
+        async_graph_probe = """
+<script>
+(function(){
+  document.body.setAttribute("data-browser-probe-pending","true");
+  var root=document.getElementById("architecture-map"),attempts=0;
+  function finish(){
+    var mode=root.getAttribute("data-render-mode")||"";
+    if((mode!=="graph" && mode!=="fallback") && attempts<240){
+      attempts+=1;setTimeout(finish,25);return;
+    }
+    document.body.setAttribute("data-large-mode",mode);
+    document.body.setAttribute("data-large-nodes",String(root.querySelectorAll(".arch-node").length));
+    document.body.setAttribute("data-large-edges",String(root.querySelectorAll(".arch-edge").length));
+    document.body.setAttribute("data-large-fallback-hidden",String(document.getElementById("arch-fallback").hidden));
+    document.body.setAttribute("data-large-busy",document.getElementById("arch-graph").getAttribute("aria-busy")||"");
+    document.body.removeAttribute("data-browser-probe-pending");
+  }
+  finish();
+})();
+</script>
+"""
+        large_page = render_architecture_fixture(
+            "function",
+            unchanged_proposal,
+            large_tree,
+            [{"path": "scripts/logic", "depends_on": []}],
+        ).replace("</body>", async_graph_probe + "</body>", 1)
+        (fixture_root / "plan-large.html").write_text(large_page, encoding="utf-8")
+
+        map_data_end = rendered_plan.find(";</script>", rendered_plan.find(map_marker))
+        if map_data_end < 0:
+            raise RuntimeError("architecture fixture did not expose its data boundary")
+        map_data_end += len(";</script>")
+        over_budget_injection = """
+<script>
+(function(){
+  var original=document.createElementNS.bind(document);
+  window.__fixtureSvgCalls=0;
+  document.createElementNS=function(){
+    window.__fixtureSvgCalls+=1;
+    return original.apply(document,arguments);
+  };
+  for(var index=0;index<2001;index+=1){
+    window.__KIT_ARCHITECTURE_MAP__.nodes.push({
+      id:"fixture-over-budget-"+index,
+      kind:"function",
+      state:"existing",
+      label:"fixture over budget "+index,
+      path:"fixture/over-budget/"+index,
+      signature:"func fixture_"+index+"() -> void"
+    });
+  }
+})();
+</script>
+"""
+        over_budget_probe = """
+<script>
+(function(){
+  var root=document.getElementById("architecture-map");
+  document.body.setAttribute("data-budget-mode",root.getAttribute("data-render-mode")||"");
+  document.body.setAttribute("data-budget-svg-calls",String(window.__fixtureSvgCalls));
+  document.body.setAttribute("data-budget-svg-children",String(
+    document.getElementById("arch-graph").childElementCount));
+  document.body.setAttribute("data-budget-fallback-hidden",String(
+    document.getElementById("arch-fallback").hidden));
+  document.body.setAttribute("data-budget-fallback-open",String(
+    document.getElementById("arch-fallback").open));
+  document.body.setAttribute("data-budget-settled-hidden",String(
+    document.getElementById("arch-settled").hidden));
+  document.body.setAttribute("data-budget-recoverable",
+    root.getAttribute("data-recoverable-fallback")||"");
+  var files=root.querySelector('[data-arch-depth="file"]');
+  var modules=root.querySelector('[data-arch-depth="module"]');
+  var functions=root.querySelector('[data-arch-depth="function"]');
+  var changes=root.querySelector('[data-arch-view="changes"]');
+  files.click();
+  document.body.setAttribute("data-budget-files-recovered",String(
+    root.getAttribute("data-render-mode")==="graph"));
+  functions.click();
+  document.body.setAttribute("data-budget-functions-refallback",String(
+    root.getAttribute("data-render-mode")==="fallback"));
+  modules.click();
+  document.body.setAttribute("data-budget-modules-recovered",String(
+    root.getAttribute("data-render-mode")==="graph"));
+  functions.click();
+  changes.click();
+  document.body.setAttribute("data-budget-changes-recovered",String(
+    root.getAttribute("data-render-mode")==="graph"));
+  document.body.setAttribute("data-budget-final-fallback-hidden",String(
+    document.getElementById("arch-fallback").hidden));
+  document.body.setAttribute("data-budget-final-settled-hidden",String(
+    document.getElementById("arch-settled").hidden));
+  document.body.setAttribute("data-budget-final-svg-calls",String(
+    window.__fixtureSvgCalls));
+})();
+</script>
+"""
+        over_budget_page = (
+            rendered_plan[:map_data_end]
+            + over_budget_injection
+            + rendered_plan[map_data_end:]
+        ).replace("</body>", over_budget_probe + "</body>", 1)
+        (fixture_root / "plan-over-budget.html").write_text(
+            over_budget_page,
+            encoding="utf-8",
+        )
+
+        hide_map = (
+            '<script>document.getElementById("architecture-map").style.display="none";'
+            '</script>'
+        )
+        hidden_probe = """
+<script>
+(function(){
+  document.body.setAttribute("data-browser-probe-pending","true");
+  var root=document.getElementById("architecture-map"),attempts=0;
+  document.body.setAttribute("data-hidden-initial-mode",root.getAttribute("data-render-mode")||"");
+  setTimeout(function(){
+    root.style.display="";window.dispatchEvent(new Event("resize"));
+    function finish(){
+      var mode=root.getAttribute("data-render-mode")||"";
+      if(mode!=="graph" && mode!=="fallback" && attempts<240){
+        attempts+=1;setTimeout(finish,25);return;
+      }
+      document.body.setAttribute("data-hidden-final-mode",mode);
+      document.body.setAttribute("data-hidden-fallback-hidden",String(document.getElementById("arch-fallback").hidden));
+      document.body.setAttribute("data-hidden-nodes",String(root.querySelectorAll(".arch-node").length));
+      document.body.removeAttribute("data-browser-probe-pending");
+    }
+    finish();
+  },120);
+})();
+</script>
+"""
+        hidden_page = rendered_plan.replace(
+            map_marker,
+            hide_map + map_marker,
+            1,
+        ).replace("</body>", hidden_probe + "</body>", 1)
+        (fixture_root / "plan-hidden.html").write_text(hidden_page, encoding="utf-8")
         (fixture_root / "fixture-items.json").write_text(
             json.dumps(items, indent=2) + "\n", encoding="utf-8"
         )
@@ -681,6 +1156,310 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         check(s, "the plan says findings are awaiting a decision",
               "awaiting your decision" in rb)
         check(s, "the plan links into the retro board", 'href="/retro.html"' in rb)
+
+        s = "live/architecture-map"
+        architecture = element_tag(plan, "architecture-map")
+        fallback = element_tag(plan, "arch-fallback")
+        graph_only = [
+            element_tag(plan, "arch-graph-shell"),
+            element_tag(plan, "arch-legend"),
+            element_tag(plan, "arch-camera-controls"),
+        ]
+        check(s, "the architecture map reaches graph mode",
+              'data-render-mode="graph"' in architecture, architecture)
+        check(s, "the graph renders architecture nodes",
+              len(re.findall(r'<g[^>]*class="arch-node"', plan)) > 0)
+        check(s, "the fallback list stays hidden during normal rendering",
+              bool(fallback) and " hidden" in fallback, fallback)
+        check(s, "graph-only surfaces remain visible during normal rendering",
+              all(tag and " hidden" not in tag for tag in graph_only), str(graph_only))
+        settled = element_tag(plan, "arch-settled")
+        check(s, "the settled badge appears only after the graph settles",
+              bool(settled) and " hidden" not in settled
+              and "Layout settled" in plan,
+              settled)
+        complete_count = int(body_attribute(plan, "data-arch-probe-complete-count") or 0)
+        changes_count = int(body_attribute(plan, "data-arch-probe-changes-count") or 0)
+        restored_count = int(body_attribute(plan, "data-arch-probe-restored-count") or 0)
+        check(s, "Complete is the working default",
+              body_attribute(plan, "data-arch-probe-complete-default") == "true"
+              and complete_count > 0,
+              f"complete={complete_count} body={body_class(plan)}")
+        check(s, "Changes filters unaffected items and Complete restores them",
+              body_attribute(plan, "data-arch-probe-changes-pressed") == "true"
+              and body_attribute(plan, "data-arch-probe-complete-restored") == "true"
+              and 0 < changes_count < complete_count
+              and restored_count == complete_count,
+              f"complete={complete_count} changes={changes_count} restored={restored_count}")
+        check(s, "exactly one rendered node is in the keyboard tab order",
+              body_attribute(plan, "data-arch-probe-roving-count") == "1"
+              and len(re.findall(r'<g[^>]*class="arch-node"[^>]*tabindex="0"', plan)) == 1,
+              body_class(plan))
+        check(s, "an arrow key moves selection and keyboard focus",
+              body_attribute(plan, "data-arch-probe-arrow-moved") == "true"
+              and body_attribute(plan, "data-arch-probe-arrow-focused") == "true",
+              body_class(plan))
+        check(s, "search and Enter select the planned feedback file",
+              body_attribute(plan, "data-arch-probe-ran") == "true"
+              and "feedback_event.gd" in body_attribute(
+                  plan, "data-arch-probe-selected"
+              )
+              and body_attribute(plan, "data-arch-probe-count") != "0",
+              body_class(plan))
+
+        fallback_page = dump_dom(
+            browser,
+            (fixture_root / "plan-fallback.html").as_uri(),
+            profile,
+        )
+        s = "fallback/architecture-map"
+        architecture = element_tag(fallback_page, "architecture-map")
+        fallback = element_tag(fallback_page, "arch-fallback")
+        graph_only = [
+            element_tag(fallback_page, "arch-graph-shell"),
+            element_tag(fallback_page, "arch-legend"),
+            element_tag(fallback_page, "arch-camera-controls"),
+        ]
+        check(s, "an SVG construction error reaches fallback mode",
+              'data-render-mode="fallback"' in architecture, architecture)
+        check(s, "the readable fallback list is visible and open",
+              bool(fallback) and " hidden" not in fallback and " open" in fallback,
+              fallback)
+        check(s, "graph-only surfaces are hidden in fallback mode",
+              all(tag and " hidden" in tag for tag in graph_only), str(graph_only))
+        settled = element_tag(fallback_page, "arch-settled")
+        check(s, "the settled badge stays hidden when rendering falls back",
+              bool(settled) and " hidden" in settled, settled)
+        check(s, "fallback mode is list-only",
+              len(re.findall(r'<g[^>]*class="arch-node"', fallback_page)) == 0)
+        check(s, "search and Enter still select the planned feedback file",
+              body_attribute(fallback_page, "data-arch-probe-ran") == "true"
+              and body_attribute(fallback_page, "data-arch-probe-mode") == "fallback"
+              and body_attribute(
+                  fallback_page, "data-arch-probe-svg-failure-calls"
+              ) == "1"
+              and "feedback_event.gd" in body_attribute(
+                  fallback_page, "data-arch-probe-selected"
+              )
+              and body_attribute(fallback_page, "data-arch-probe-count") != "0",
+              body_class(fallback_page))
+
+        no_changes_page = dump_dom(
+            browser,
+            (fixture_root / "plan-no-changes.html").as_uri(),
+            profile,
+        )
+        s = "views/no-changes"
+        zero_complete = int(body_attribute(
+            no_changes_page, "data-zero-complete-count"
+        ) or 0)
+        zero_changes = int(body_attribute(
+            no_changes_page, "data-zero-changes-count"
+        ) or -1)
+        zero_stable = int(body_attribute(
+            no_changes_page, "data-zero-stable-count"
+        ) or -1)
+        check(s, "Complete still shows the unchanged architecture",
+              zero_complete > 0, f"complete={zero_complete}")
+        check(s, "Changes with no changes stays empty without falling back",
+              zero_changes == 0 and zero_stable == 0
+              and body_attribute(no_changes_page, "data-zero-mode") == "graph"
+              and body_attribute(
+                  no_changes_page, "data-zero-fallback-hidden"
+              ) == "true",
+              f"first={zero_changes} stable={zero_stable} body={body_class(no_changes_page)}")
+
+        module_page = dump_dom(
+            browser,
+            (fixture_root / "plan-module.html").as_uri(),
+            profile,
+        )
+        module_ids = [item for item in body_attribute(
+            module_page, "data-involvement-node-ids"
+        ).split("|") if item]
+        s = "involvement/module"
+        check(s, "module involvement renders architecture modules only",
+              body_attribute(module_page, "data-involvement-mode") == "graph"
+              and bool(module_ids)
+              and all(item.startswith("folder:") for item in module_ids),
+              str(module_ids[:12]))
+        check(s, "module copy and search match the module cap",
+              body_attribute(module_page, "data-involvement-max") == "module"
+              and body_attribute(
+                  module_page, "data-involvement-eyebrow"
+              ) == "Module-level review"
+              and body_attribute(
+                  module_page, "data-involvement-copy"
+              ) == (
+                  "Start with the coloured changes. The architecture modules and "
+                  "their dependencies stay still while you inspect them."
+              )
+              and body_attribute(
+                  module_page, "data-involvement-placeholder"
+              ) == "Module"
+              and body_attribute(
+                  module_page, "data-involvement-heading"
+              ) == "Architecture modules"
+              and body_attribute(
+                  module_page, "data-involvement-depths"
+              ) == "module",
+              body_class(module_page))
+
+        file_page = dump_dom(
+            browser,
+            (fixture_root / "plan-file.html").as_uri(),
+            profile,
+        )
+        file_ids = [item for item in body_attribute(
+            file_page, "data-involvement-node-ids"
+        ).split("|") if item]
+        s = "involvement/file"
+        check(s, "file involvement excludes classes and functions",
+              body_attribute(file_page, "data-involvement-mode") == "graph"
+              and any(item.startswith("file:") for item in file_ids)
+              and not any(item.startswith(("class:", "function:")) for item in file_ids),
+              str(file_ids[:12]))
+        check(s, "file copy and search match the file cap",
+              body_attribute(file_page, "data-involvement-max") == "file"
+              and body_attribute(
+                  file_page, "data-involvement-eyebrow"
+              ) == "File-level review"
+              and body_attribute(
+                  file_page, "data-involvement-copy"
+              ) == (
+                  "Start with the coloured changes. The complete folder to file "
+                  "structure stays still while you inspect it."
+              )
+              and body_attribute(
+                  file_page, "data-involvement-placeholder"
+              ) == "Folder or file"
+              and body_attribute(
+                  file_page, "data-involvement-heading"
+              ) == "Folder and file structure"
+              and body_attribute(
+                  file_page, "data-involvement-depths"
+              ) == "module|file",
+              body_class(file_page))
+
+        function_page = dump_dom(
+            browser,
+            (fixture_root / "plan-function.html").as_uri(),
+            profile,
+        )
+        function_ids = [item for item in body_attribute(
+            function_page, "data-involvement-node-ids"
+        ).split("|") if item]
+        s = "involvement/function"
+        check(s, "function copy and search match the function cap",
+              body_attribute(function_page, "data-involvement-mode") == "graph"
+              and body_attribute(
+                  function_page, "data-involvement-max"
+              ) == "function"
+              and body_attribute(
+                  function_page, "data-involvement-eyebrow"
+              ) == "Function-level review"
+              and body_attribute(
+                  function_page, "data-involvement-copy"
+              ) == (
+                  "Start with the coloured changes. The complete folder to file to "
+                  "class to function structure stays still while you inspect it."
+              )
+              and body_attribute(
+                  function_page, "data-involvement-placeholder"
+              ) == "Folder, file, class or function"
+              and body_attribute(
+                  function_page, "data-involvement-heading"
+              ) == "Complete structure"
+              and body_attribute(
+                  function_page, "data-involvement-depths"
+              ) == "module|file|function"
+              and any(item.startswith("function:") for item in function_ids),
+              body_class(function_page))
+
+        large_page = dump_dom(
+            browser,
+            (fixture_root / "plan-large.html").as_uri(),
+            profile,
+        )
+        large_nodes = int(body_attribute(large_page, "data-large-nodes") or 0)
+        large_edges = int(body_attribute(large_page, "data-large-edges") or 0)
+        s = "rendering/large-map"
+        check(s, "the fixture crosses the chunked-render threshold",
+              large_nodes + large_edges > 500,
+              f"nodes={large_nodes} edges={large_edges}")
+        check(s, "chunked rendering completes in graph mode without fallback",
+              body_attribute(large_page, "data-large-mode") == "graph"
+              and body_attribute(large_page, "data-large-fallback-hidden") == "true"
+              and body_attribute(large_page, "data-large-busy") == "false",
+              body_class(large_page))
+
+        over_budget_page = dump_dom(
+            browser,
+            (fixture_root / "plan-over-budget.html").as_uri(),
+            profile,
+        )
+        s = "rendering/over-budget"
+        check(s, "an over-budget map falls back before any SVG work",
+              body_attribute(over_budget_page, "data-budget-mode") == "fallback"
+              and body_attribute(
+                  over_budget_page, "data-budget-svg-calls"
+              ) == "0"
+              and body_attribute(
+                  over_budget_page, "data-budget-svg-children"
+              ) == "0"
+              and body_attribute(
+                  over_budget_page, "data-budget-fallback-hidden"
+              ) == "false"
+              and body_attribute(
+                  over_budget_page, "data-budget-fallback-open"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-settled-hidden"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-recoverable"
+              ) == "true",
+              body_class(over_budget_page))
+        check(s, "Files and Modules recover a size-only fallback",
+              body_attribute(
+                  over_budget_page, "data-budget-files-recovered"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-functions-refallback"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-modules-recovered"
+              ) == "true",
+              body_class(over_budget_page))
+        check(s, "Changes recovers the size fallback to a settled graph",
+              body_attribute(
+                  over_budget_page, "data-budget-changes-recovered"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-final-fallback-hidden"
+              ) == "true"
+              and body_attribute(
+                  over_budget_page, "data-budget-final-settled-hidden"
+              ) == "false"
+              and int(body_attribute(
+                  over_budget_page, "data-budget-final-svg-calls"
+              ) or 0) > 0,
+              body_class(over_budget_page))
+
+        hidden_page = dump_dom(
+            browser,
+            (fixture_root / "plan-hidden.html").as_uri(),
+            profile,
+        )
+        s = "rendering/zero-size"
+        check(s, "a hidden map waits rather than latching fallback",
+              body_attribute(hidden_page, "data-hidden-initial-mode") == "waiting",
+              body_class(hidden_page))
+        check(s, "the revealed map recovers to graph mode",
+              body_attribute(hidden_page, "data-hidden-final-mode") == "graph"
+              and body_attribute(hidden_page, "data-hidden-fallback-hidden") == "true"
+              and int(body_attribute(hidden_page, "data-hidden-nodes") or 0) > 0,
+              body_class(hidden_page))
     finally:
         stop_board(proc)
 

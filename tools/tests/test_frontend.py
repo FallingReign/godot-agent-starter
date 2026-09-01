@@ -41,6 +41,9 @@ import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
 
+_DEFAULT_FUNCTION_CHANGES = object()
+
+
 def generated(name: str, build) -> str:
     # Generator entry points use argparse. Discovery's argv belongs to
     # unittest, not to those entry points. Always exercise current source;
@@ -53,6 +56,140 @@ def generated(name: str, build) -> str:
     if result not in (None, 0):
         raise AssertionError(f"{name} generator returned {result}")
     return output.getvalue()
+
+
+def architecture_fixture(involvement: str = "function") -> dict:
+    """A complete, deterministic source tree for architecture UI tests."""
+    return {
+        "shape": {
+            "name": "Architecture browser fixture",
+            "pitch": "One existing path and one planned addition.",
+            "involvement": involvement,
+        },
+        "proposal": {
+            "slice": "show one architecture change",
+            "status": "draft",
+            "experience": {
+                "player_does": "Chooses an action and immediately understands its result."
+            },
+            "design_refs": [{
+                "section": "docs/design/action-feedback.md",
+                "why": "Every accepted action must explain its result immediately.",
+                "sha256": "d" * 64,
+            }],
+            "reversibility": {
+                "state": "reversible",
+                "hard_to_undo": "No hard-to-undo point is inside this fixture.",
+                "veto_scope": "Remove the isolated feedback addition.",
+            },
+            "modules": [{
+                "path": "scripts/logic",
+                "action": "modify",
+                "role": "Keeps gameplay decisions independent of scenes.",
+                "why": "The new result belongs beside the action decision.",
+                "may_depend_on": [],
+                "boundary_data": "Typed action and feedback values.",
+            }],
+            "files": [{
+                "path": "scripts/logic/feedback_event.gd",
+                "module": "scripts/logic",
+                "action": "new",
+                "why": "Give an accepted action one plain-language result value.",
+            }],
+            "functions": [{
+                "file": "scripts/logic/feedback_event.gd",
+                "class_scope": "FeedbackEvent",
+                "signature": "func describe_feedback() -> String",
+                "action": "new",
+                "why": "Expose the short result the interface must show.",
+            }],
+            "considered_existing": [{
+                "path": "scripts/logic/action_service.gd",
+                "why_not": "It decides actions; making it own display wording would mix responsibilities.",
+            }],
+        },
+        "modules": [{"path": "scripts/logic", "depends_on": []}],
+        "tree": {
+            "scripts/logic/action_service.gd": {
+                "class_name": "ActionService",
+                "functions": [{
+                    "name": "submit_action",
+                    "identity": "ActionService.submit_action",
+                    "class_scope": "ActionService",
+                    "signature": (
+                        "func submit_action(action: PlayerAction) -> FeedbackEvent"
+                    ),
+                    "private": False,
+                }],
+            }
+        },
+        "built": {"scripts/logic/action_service.gd"},
+        "present": {"scripts/logic/action_service.gd"},
+        "baseline_files": {"scripts/logic/action_service.gd"},
+        # An empty mapping is positive evidence that baseline comparison ran
+        # and found no function-level changes.  None has the distinct meaning
+        # "comparison unavailable" and is covered by the deletion regressions.
+        "function_changes": {},
+        "cockpit_state": {
+            "verification": {
+                "status": "passed",
+                "summary": "Static checks passed for the deterministic fixture.",
+            }
+        },
+    }
+
+
+def architecture_fixture_html(involvement: str = "function") -> str:
+    fixture = architecture_fixture(involvement)
+    return plan_html.render(
+        fixture["shape"],
+        fixture["proposal"],
+        fixture["modules"],
+        "",
+        fixture["built"],
+        [],
+        [],
+        [],
+        "",
+        tree=fixture["tree"],
+        cockpit_state=fixture["cockpit_state"],
+        present_files=fixture["present"],
+        baseline_files=fixture["baseline_files"],
+        function_changes=fixture["function_changes"],
+    )
+
+
+def unchanged_architecture_fixture_html() -> str:
+    """One complete source tree whose Changes focus must be genuinely empty."""
+    fixture = architecture_fixture()
+    fixture["shape"] = {
+        **fixture["shape"],
+        "name": "Architecture unchanged fixture",
+        "pitch": "A stable source tree with no observed or planned changes.",
+    }
+    fixture["proposal"] = {
+        "slice": "inspect unchanged architecture",
+        "status": "draft",
+        "experience": fixture["proposal"]["experience"],
+        "reversibility": fixture["proposal"]["reversibility"],
+    }
+    return plan_html.render(
+        fixture["shape"],
+        fixture["proposal"],
+        fixture["modules"],
+        "",
+        set(),
+        [],
+        [],
+        [],
+        "",
+        tree=fixture["tree"],
+        cockpit_state=fixture["cockpit_state"],
+        changed_actions={},
+        present_files=fixture["present"],
+        baseline_files=fixture["baseline_files"],
+        function_changes={},
+    )
 
 
 class FileModeReviewHint(unittest.TestCase):
@@ -575,6 +712,696 @@ class PlanPageBytes(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.html = generated("plan.html", lambda: plan_html.main())
+        fixture = architecture_fixture()
+        cls.architecture_model = plan_html.architecture_map_model(
+            fixture["proposal"],
+            fixture["tree"],
+            fixture["built"],
+            fixture["modules"],
+            cockpit_state=fixture["cockpit_state"],
+            present=fixture["present"],
+            baseline_files=fixture["baseline_files"],
+            involvement=fixture["shape"]["involvement"],
+            function_changes=fixture["function_changes"],
+        )
+        cls.architecture_html = architecture_fixture_html()
+
+    @staticmethod
+    def _architecture_test_model(
+        proposal: dict,
+        *,
+        tree: dict | None = None,
+        present: set[str] | None = None,
+        baseline_files: set[str] | None = None,
+        changed_actions: dict[str, str] | None = None,
+        modules: list[dict] | None = None,
+        cockpit_state: dict | None = None,
+        involvement: str = "function",
+        function_changes: object = _DEFAULT_FUNCTION_CHANGES,
+    ) -> dict:
+        current = set() if present is None else set(present)
+        baseline = set() if baseline_files is None else set(baseline_files)
+        return plan_html.architecture_map_model(
+            proposal,
+            tree or {},
+            current,
+            modules or [],
+            {} if changed_actions is None else changed_actions,
+            cockpit_state or {},
+            current,
+            baseline,
+            involvement,
+            (
+                {}
+                if function_changes is _DEFAULT_FUNCTION_CHANGES
+                else function_changes
+            ),
+        )
+
+    def test_architecture_payload_contains_the_complete_source_tree(self) -> None:
+        by_id = {
+            str(node.get("id")): node
+            for node in self.architecture_model["nodes"]
+        }
+        expected = {
+            "folder:scripts",
+            "folder:scripts/logic",
+            "file:scripts/logic/action_service.gd",
+            "class:scripts/logic/action_service.gd::ActionService",
+            "function:scripts/logic/action_service.gd::ActionService.submit_action",
+            "file:scripts/logic/feedback_event.gd",
+            "class:scripts/logic/feedback_event.gd::FeedbackEvent",
+            "function:scripts/logic/feedback_event.gd::FeedbackEvent.describe_feedback",
+        }
+        self.assertTrue(expected.issubset(by_id), sorted(by_id))
+        self.assertEqual(
+            "file:scripts/logic/action_service.gd",
+            by_id[
+                "class:scripts/logic/action_service.gd::ActionService"
+            ]["parent"],
+        )
+        self.assertEqual(
+            "class:scripts/logic/action_service.gd::ActionService",
+            by_id[
+                "function:scripts/logic/action_service.gd::ActionService.submit_action"
+            ]["parent"],
+        )
+        planned = by_id[
+            "function:scripts/logic/feedback_event.gd::FeedbackEvent.describe_feedback"
+        ]
+        self.assertEqual("adding", planned["state"])
+        self.assertEqual("func describe_feedback() -> String", planned["signature"])
+        self.assertEqual(
+            "scripts/logic/action_service.gd",
+            planned["options"][0]["name"],
+        )
+        self.assertIn("window.__KIT_ARCHITECTURE_MAP__", self.architecture_html)
+
+    def test_complete_map_includes_present_authored_non_gdscript_files(self) -> None:
+        path = "data/player_actions.json"
+        model = self._architecture_test_model(
+            {}, present={path}, baseline_files={path}
+        )
+        node = next(
+            item for item in model["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertEqual("file", node["kind"])
+        self.assertEqual("existing", node["state"])
+        self.assertEqual(f"The authored game file {path}.", node["what"])
+
+    def test_tree_entries_absent_from_present_files_are_excluded(self) -> None:
+        ghost = "scripts/logic/ghost.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "draft",
+            },
+            tree={
+                ghost: {
+                    "class_name": "Ghost",
+                    "functions": [{
+                        "name": "haunt",
+                        "identity": "Ghost.haunt",
+                        "class_scope": "Ghost",
+                        "signature": "func haunt() -> void",
+                    }],
+                }
+            },
+            present=set(),
+            baseline_files=set(),
+        )
+        ids = {str(item["id"]) for item in model["nodes"]}
+        self.assertNotIn(f"file:{ghost}", ids)
+        self.assertFalse(any(ghost in item for item in ids), ids)
+
+    def test_declared_and_observed_action_mismatch_is_a_conflict(self) -> None:
+        path = "scripts/logic/conflicted.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "recorded",
+                "files": [{
+                    "path": path,
+                    "action": "new",
+                    "why": "Add one isolated result.",
+                }],
+            },
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+        )
+        node = next(
+            item for item in model["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertEqual("conflict", node["state"])
+        self.assertIn("plan says new", node["changing"])
+        self.assertIn("Git reports modify", node["changing"])
+
+    def test_unplanned_observed_file_never_reads_as_planned(self) -> None:
+        path = "scripts/logic/unplanned.gd"
+        model = self._architecture_test_model(
+            {"status": "approved"},
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            cockpit_state={
+                "status": "approved",
+                "approval_required": False,
+                "design_authority": {"authority": "human-confirmed"},
+            },
+        )
+        node = next(
+            item for item in model["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertEqual("unplanned", node["state"])
+        self.assertIn("unplanned new", node["changing"])
+        self.assertNotIn("planned addition", node["changing"].lower())
+        self.assertTrue(node["design"].startswith("No."), node["design"])
+
+    def test_design_alignment_never_says_yes_without_exact_authority(self) -> None:
+        path = "scripts/logic/proposed.gd"
+        proposal = {
+            "status": "draft",
+            "design_refs": [{
+                "section": "docs/design/outcome.md",
+                "why": "The player must understand an accepted action.",
+            }],
+            "files": [{"path": path, "action": "new", "why": "Show it."}],
+        }
+
+        draft = self._architecture_test_model(
+            proposal,
+            present=set(),
+            baseline_files=set(),
+            cockpit_state={
+                "status": "draft",
+                "approval_required": True,
+                "design_authority": {"authority": "human-confirmed"},
+            },
+        )
+        provisional = self._architecture_test_model(
+            proposal,
+            present=set(),
+            baseline_files=set(),
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+                "design_authority": {"authority": "agent-provisional"},
+            },
+        )
+        unplanned = self._architecture_test_model(
+            {"status": "approved", "design_refs": proposal["design_refs"]},
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            cockpit_state={
+                "status": "approved",
+                "approval_required": False,
+                "design_authority": {"authority": "human-confirmed"},
+            },
+        )
+        for name, model in (
+            ("draft", draft),
+            ("provisional", provisional),
+            ("unplanned", unplanned),
+        ):
+            with self.subTest(state=name):
+                node = next(
+                    item for item in model["nodes"] if item["id"] == f"file:{path}"
+                )
+                self.assertFalse(node["design"].startswith("Yes"), node["design"])
+
+    def test_go_no_go_reversibility_tells_the_agent_to_stop(self) -> None:
+        path = "scripts/logic/commitment.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "recorded",
+                "reversibility": {
+                    "state": "go-no-go",
+                    "hard_to_undo": "Authored content will depend on this format.",
+                    "veto_scope": "Only the isolated draft can be removed.",
+                },
+                "files": [{"path": path, "action": "new", "why": "Add it."}],
+            },
+            present=set(),
+            baseline_files=set(),
+        )
+        node = next(
+            item for item in model["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertIn("go/no-go point", node["undo"])
+        self.assertIn("Stop for explicit approval", node["undo"])
+
+    def test_top_level_function_without_scope_parents_to_source_class(self) -> None:
+        path = "main.gd"
+        model = self._architecture_test_model(
+            {},
+            tree={
+                path: {
+                    "class_name": "Main",
+                    "functions": [{
+                        "name": "run",
+                        "identity": "run",
+                        "signature": "func run() -> void",
+                    }],
+                }
+            },
+            present={path},
+            baseline_files={path},
+        )
+        function = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == "function:main.gd::run"
+        )
+        self.assertEqual("class:main.gd::Main", function["parent"])
+
+    def test_missing_planned_modify_function_says_it_is_not_present(self) -> None:
+        path = "scripts/logic/service.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "recorded",
+                "files": [{"path": path, "action": "modify", "why": "Refine it."}],
+                "functions": [{
+                    "file": path,
+                    "class_scope": "Service",
+                    "signature": "func refresh(value: int) -> void",
+                    "action": "modify",
+                    "why": "Accept the typed value.",
+                }],
+            },
+            tree={path: {"class_name": "Service", "functions": []}},
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+        )
+        node = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == f"function:{path}::Service.refresh"
+        )
+        self.assertEqual("conflict", node["state"])
+        self.assertIn("absent", node["changing"])
+        self.assertIn("nothing to modify", node["changing"].lower())
+
+    def test_module_involvement_inherits_the_declared_module_state(self) -> None:
+        path = "scripts/logic/action_service.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "recorded",
+                "modules": [{
+                    "path": "scripts/logic",
+                    "action": "modify",
+                    "role": "Owns action decisions.",
+                    "why": "Adjust the module as one boundary.",
+                }],
+            },
+            tree={path: {"class_name": "ActionService", "functions": []}},
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+            modules=[{"path": "scripts/logic", "depends_on": []}],
+            involvement="module",
+        )
+        by_id = {str(item["id"]): item for item in model["nodes"]}
+        for node_id in (
+            f"file:{path}",
+            f"class:{path}::ActionService",
+        ):
+            with self.subTest(node=node_id):
+                self.assertEqual("changing", by_id[node_id]["state"])
+                self.assertEqual("modify", by_id[node_id]["action"])
+
+    def test_observed_function_changes_mark_unplanned_new_and_modify(self) -> None:
+        path = "scripts/logic/service.gd"
+        signature = "func run(value: int) -> void"
+        tree = {
+            path: {
+                "class_name": "Service",
+                "functions": [{
+                    "name": "run",
+                    "identity": "Service.run",
+                    "class_scope": "Service",
+                    "signature": signature,
+                }],
+            }
+        }
+        evidence_by_action = {
+            "new": {
+                "action": "new",
+                "signature": signature,
+                "baseline_signature": "",
+                "current_signature": signature,
+            },
+            "modify": {
+                "action": "modify",
+                "signature": signature,
+                "baseline_signature": "func run(value: String) -> void",
+                "current_signature": signature,
+            },
+        }
+
+        for action, evidence in evidence_by_action.items():
+            with self.subTest(action=action):
+                model = self._architecture_test_model(
+                    {"status": "recorded"},
+                    tree=tree,
+                    present={path},
+                    baseline_files=(set() if action == "new" else {path}),
+                    changed_actions={path: action},
+                    function_changes={(path, "Service.run"): evidence},
+                )
+                node = next(
+                    item
+                    for item in model["nodes"]
+                    if item["id"] == f"function:{path}::Service.run"
+                )
+                self.assertEqual("unplanned", node["state"])
+                self.assertEqual(action, node["action"])
+                self.assertIn(f"unplanned {action}", node["changing"])
+                self.assertNotIn("No change is proposed", node["changing"])
+
+    def test_unplanned_function_delete_remains_visible_as_a_tombstone(self) -> None:
+        path = "scripts/logic/service.gd"
+        signature = "func obsolete() -> void"
+        model = self._architecture_test_model(
+            {"status": "recorded"},
+            tree={path: {"class_name": "Service", "functions": []}},
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+            function_changes={
+                (path, "Service.obsolete"): {
+                    "action": "delete",
+                    "signature": signature,
+                    "baseline_signature": signature,
+                    "current_signature": "",
+                }
+            },
+        )
+        node = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == f"function:{path}::Service.obsolete::deleted"
+        )
+        self.assertEqual("unplanned", node["state"])
+        self.assertEqual("delete", node["action"])
+        self.assertIn("unplanned delete", node["changing"])
+        self.assertIn("deleted function", node["what"])
+
+    def test_planned_function_delete_requires_proven_baseline_comparison(self) -> None:
+        path = "scripts/logic/service.gd"
+        signature = "func obsolete() -> void"
+        proposal = {
+            "status": "recorded",
+            "files": [{"path": path, "action": "modify", "why": "Retire it."}],
+            "functions": [{
+                "file": path,
+                "class_scope": "Service",
+                "signature": signature,
+                "action": "delete",
+                "why": "The responsibility no longer exists.",
+            }],
+        }
+        common = {
+            "tree": {path: {"class_name": "Service", "functions": []}},
+            "present": {path},
+            "baseline_files": {path},
+            "changed_actions": {path: "modify"},
+        }
+        proven = self._architecture_test_model(
+            proposal,
+            **common,
+            function_changes={
+                (path, "Service.obsolete"): {
+                    "action": "delete",
+                    "signature": signature,
+                    "baseline_signature": signature,
+                    "current_signature": "",
+                }
+            },
+        )
+        unproven = self._architecture_test_model(
+            proposal,
+            **common,
+            function_changes={},
+        )
+        unknown = self._architecture_test_model(
+            proposal,
+            **common,
+            function_changes=None,
+        )
+
+        node_id = f"function:{path}::Service.obsolete"
+        proven_node = next(item for item in proven["nodes"] if item["id"] == node_id)
+        unproven_node = next(
+            item for item in unproven["nodes"] if item["id"] == node_id
+        )
+        unknown_node = next(
+            item for item in unknown["nodes"] if item["id"] == node_id
+        )
+        self.assertEqual("removing", proven_node["state"])
+        self.assertIn("removal is complete", proven_node["changing"])
+        self.assertEqual("conflict", unproven_node["state"])
+        self.assertNotIn("complete", unproven_node["changing"].lower())
+        self.assertEqual("removing", unknown_node["state"])
+        self.assertIn("comparison is unavailable", unknown_node["changing"])
+        self.assertIn("not proven", unknown_node["changing"])
+        self.assertNotIn("complete", unknown_node["changing"].lower())
+
+    def test_file_and_class_dependencies_name_containing_module_evidence(self) -> None:
+        path = "scripts/logic/service.gd"
+        model = self._architecture_test_model(
+            {},
+            tree={path: {"class_name": "Service", "functions": []}},
+            present={path},
+            baseline_files={path},
+            modules=[
+                {"path": "scripts/logic", "depends_on": []},
+                {"path": "scripts/ui", "depends_on": ["scripts/logic"]},
+            ],
+        )
+        by_id = {str(item["id"]): item for item in model["nodes"]}
+        for node_id in (f"file:{path}", f"class:{path}::Service"):
+            with self.subTest(node=node_id):
+                evidence = by_id[node_id]["depends"].lower()
+                self.assertIn("module-level dependency evidence", evidence)
+                self.assertIn("containing module scripts/logic", evidence)
+                self.assertIn("scripts/ui", evidence)
+
+    def test_no_javascript_list_is_server_filtered_by_involvement(self) -> None:
+        fixture = architecture_fixture()
+        for involvement, allowed in (
+            ("module", {"folder"}),
+            ("file", {"folder", "file"}),
+            ("function", {"folder", "file", "module", "function"}),
+        ):
+            with self.subTest(involvement=involvement):
+                model = plan_html.architecture_map_model(
+                    fixture["proposal"],
+                    fixture["tree"],
+                    fixture["built"],
+                    fixture["modules"],
+                    {},
+                    fixture["cockpit_state"],
+                    fixture["present"],
+                    fixture["baseline_files"],
+                    involvement,
+                    fixture["function_changes"],
+                )
+                page = plan_html.architecture_map_html(model, involvement)
+                block = re.search(r"<noscript>([\s\S]*?)</noscript>", page)
+                self.assertIsNotNone(block)
+                kinds = set(re.findall(r'data-arch-kind="([^"]+)"', block.group(1)))
+                self.assertTrue(kinds, block.group(1))
+                self.assertTrue(kinds.issubset(allowed), kinds)
+                if involvement == "module":
+                    self.assertIn('data-arch-item="folder:scripts/logic"', block.group(1))
+                    self.assertNotIn('data-arch-item="folder:scripts"', block.group(1))
+                if involvement == "file":
+                    self.assertIn('data-arch-kind="file"', block.group(1))
+                if involvement == "function":
+                    self.assertIn('data-arch-kind="module"', block.group(1))
+                    self.assertIn('data-arch-kind="function"', block.group(1))
+
+    def test_no_javascript_css_hides_dead_graph_interface(self) -> None:
+        block = re.search(r"<noscript>([\s\S]*?)</noscript>", self.architecture_html)
+        self.assertIsNotNone(block)
+        styles = "".join(re.findall(r"<style>([\s\S]*?)</style>", block.group(1)))
+        hidden_selectors: set[str] = set()
+        for selectors, declarations in re.findall(
+            r"([^{}]+)\{([^{}]+)\}", styles
+        ):
+            if re.search(r"display\s*:\s*none", declarations):
+                hidden_selectors.update(
+                    selector.strip() for selector in selectors.split(",")
+                )
+        for target in (
+            ".arch-controls",
+            ".arch-graph-shell",
+            ".arch-legend",
+            ".arch-inspector",
+            ".arch-settled",
+        ):
+            with self.subTest(selector=target):
+                self.assertTrue(
+                    any(selector.endswith(target) for selector in hidden_selectors),
+                    hidden_selectors,
+                )
+
+    def test_involvement_copy_promises_only_the_detail_it_can_show(self) -> None:
+        def intro(page: str) -> str:
+            match = re.search(
+                r'<p class="arch-intro-copy">([\s\S]*?)</p>', page
+            )
+            self.assertIsNotNone(match)
+            return match.group(1)
+
+        def search_tag(page: str) -> str:
+            match = re.search(r'<input\b[^>]*id="arch-search"[^>]*>', page)
+            self.assertIsNotNone(match)
+            return match.group(0)
+
+        module = architecture_fixture_html("module")
+        file_level = architecture_fixture_html("file")
+        function = architecture_fixture_html("function")
+
+        module_intro = intro(module).lower()
+        self.assertIn("architecture modules", module_intro)
+        self.assertIn("dependencies", module_intro)
+        self.assertNotIn("class", module_intro)
+        self.assertNotIn("function", module_intro)
+        self.assertIn('placeholder="Module"', search_tag(module))
+        self.assertIn("<h3>Architecture modules</h3>", module)
+
+        file_intro = intro(file_level).lower()
+        self.assertIn("folder → file", file_intro)
+        self.assertNotIn("class", file_intro)
+        self.assertNotIn("function", file_intro)
+        self.assertIn('placeholder="Folder or file"', search_tag(file_level))
+        self.assertIn("<h3>Folder and file structure</h3>", file_level)
+
+        function_intro = intro(function).lower()
+        self.assertIn("folder → file → class → function", function_intro)
+        self.assertIn(
+            'placeholder="Folder, file, class or function"',
+            search_tag(function),
+        )
+        self.assertIn("<h3>Complete structure</h3>", function)
+
+    def test_settled_badge_starts_hidden_until_graph_finishes(self) -> None:
+        badge = re.search(
+            r'<span\b[^>]*id="arch-settled"[^>]*>', self.architecture_html
+        )
+        self.assertIsNotNone(badge)
+        self.assertRegex(badge.group(0), r"\bhidden\b")
+
+    def test_architecture_layout_has_explicit_responsive_work_budgets(self) -> None:
+        script = plan_html.ARCHITECTURE_MAP_JS
+        self.assertIn("var maximumGraphNodes = 2000;", script)
+        self.assertIn("var maximumGraphLinks = 12000;", script)
+
+        node_guard = script.index(
+            "renderedNodes.length>maximumGraphNodes"
+        )
+        link_guard = script.index(
+            "renderedLinks.length>maximumGraphLinks"
+        )
+        layout_call = script.index("positions=layout(renderedNodes", node_guard)
+        self.assertLess(node_guard, link_guard)
+        self.assertLess(link_guard, layout_call)
+
+        layout = re.search(
+            r"function layout\([\s\S]*?(?=  function svgElement\()",
+            script,
+        )
+        self.assertIsNotNone(layout)
+        layout_source = layout.group(0)
+        self.assertIn("queueIndex", layout_source)
+        self.assertNotIn("queue.shift(", layout_source)
+        self.assertIn("var ringIndex=0,ringStart=0,ring=42;", layout_source)
+        self.assertIn(
+            "while(childIndex-ringStart>=ringCapacity)", layout_source
+        )
+        self.assertIn("ring=42+ringIndex*30", layout_source)
+
+    def test_architecture_fallback_starts_hidden_behind_the_graph(self) -> None:
+        fallback = re.search(
+            r'<details\b[^>]*id="arch-fallback"[^>]*>', self.architecture_html
+        )
+        shell = re.search(
+            r'<div\b[^>]*id="arch-graph-shell"[^>]*>', self.architecture_html
+        )
+        legend = re.search(
+            r'<div\b[^>]*id="arch-legend"[^>]*>', self.architecture_html
+        )
+        camera = re.search(
+            r'<div\b[^>]*id="arch-camera-controls"[^>]*>', self.architecture_html
+        )
+        self.assertIsNotNone(fallback)
+        self.assertIn("hidden", fallback.group(0))
+        for visible in (shell, legend, camera):
+            self.assertIsNotNone(visible)
+            self.assertNotIn("hidden", visible.group(0))
+
+    def test_architecture_focus_defaults_complete_without_false_time_travel(self) -> None:
+        self.assertIn(
+            'data-arch-view="complete" aria-pressed="true">Complete',
+            self.architecture_html,
+        )
+        self.assertIn(
+            'data-arch-view="changes" aria-pressed="false">Changes',
+            self.architecture_html,
+        )
+        self.assertNotIn("data-arch-time", self.architecture_html)
+
+    def test_architecture_inspector_uses_plain_decision_language(self) -> None:
+        for label in (
+            "What is this?",
+            "What is changing?",
+            "Why are we changing it?",
+            "Why not extend existing code?",
+            "Does this match the approved design?",
+            "What depends on it?",
+            "What could break?",
+            "Can it be safely undone?",
+            "How will we check it?",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, self.architecture_html)
+        self.assertNotIn("Design source", self.architecture_html)
+
+    def test_architecture_detail_is_capped_by_involvement(self) -> None:
+        hands_off = architecture_fixture_html("hands-off")
+        module = architecture_fixture_html("module")
+        file_level = architecture_fixture_html("file")
+        function = architecture_fixture_html("function")
+
+        self.assertNotIn('id="architecture-map"', hands_off)
+        self.assertIn('data-max-depth="module"', module)
+        self.assertIn(
+            'data-arch-depth="module" aria-pressed="true">Modules', module
+        )
+        self.assertIn(
+            'data-arch-depth="file" aria-pressed="false" disabled>Files', module
+        )
+        self.assertIn(
+            'data-arch-depth="function" aria-pressed="false" disabled>Functions',
+            module,
+        )
+        self.assertIn('data-max-depth="file"', file_level)
+        self.assertIn(
+            'data-arch-depth="file" aria-pressed="true">Files', file_level
+        )
+        self.assertIn(
+            'data-arch-depth="function" aria-pressed="false" disabled>Functions',
+            file_level,
+        )
+        self.assertIn('data-max-depth="function"', function)
+        self.assertIn(
+            'data-arch-depth="function" aria-pressed="true">Functions', function
+        )
+        self.assertNotIn(
+            'data-arch-depth="function" aria-pressed="true" disabled', function
+        )
 
     def test_banner_element_exists_and_starts_empty(self) -> None:
         self.assertIn('<div id="retro-banner"></div>', self.html)
@@ -592,10 +1419,16 @@ class PlanPageBytes(unittest.TestCase):
         summary = self.html.index('aria-label="Plan summary"')
         decisions = self.html.index("Needs your decision")
         record = self.html.index("Review full plan and project record")
-        architecture = self.html.index("Actual architecture")
         self.assertLess(summary, decisions)
         self.assertLess(decisions, record)
-        self.assertLess(record, architecture)
+        architecture = self.architecture_html.index('id="architecture-map"')
+        architecture_record = self.architecture_html.index(
+            "Review full plan and project record"
+        )
+        self.assertLess(
+            self.architecture_html.index("Needs your decision"), architecture
+        )
+        self.assertLess(architecture, architecture_record)
         self.assertIn('<details class="record"><summary>', self.html)
         self.assertNotIn('<details class="record" open', self.html)
         self.assertIn('id="plan-live-state"', self.html)
@@ -1026,23 +1859,29 @@ class Harness(unittest.TestCase):
 
     @staticmethod
     def _plan_fixture() -> Path:
-        """Generate a private plan page without relying on ignored root output."""
+        """Render a private plan with a complete architecture map."""
         target = ROOT / ".checklogs" / "tests" / "plan-harness.html"
         target.parent.mkdir(parents=True, exist_ok=True)
-        output = io.StringIO()
-        with mock.patch.object(plan_html, "OUT", target), \
-                mock.patch.object(
-                    board_client,
-                    "last_known_board_url",
-                    return_value="http://127.0.0.1:54321/",
-                ), \
-                mock.patch.object(sys, "argv", ["plan_html.py"]), \
-                contextlib.redirect_stdout(output):
-            result = plan_html.main()
-        if result != 0 or not target.is_file():
-            raise RuntimeError(
-                "could not generate the deterministic plan harness fixture: "
-                + output.getvalue().strip()
+        with mock.patch.object(
+            board_client,
+            "last_known_board_url",
+            return_value="http://127.0.0.1:54321/",
+        ):
+            target.write_text(architecture_fixture_html(), encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _unchanged_plan_fixture() -> Path:
+        """Render a complete architecture whose Changes focus has no nodes."""
+        target = ROOT / ".checklogs" / "tests" / "plan-unchanged-harness.html"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(
+            board_client,
+            "last_known_board_url",
+            return_value="http://127.0.0.1:54321/",
+        ):
+            target.write_text(
+                unchanged_architecture_fixture_html(), encoding="utf-8"
             )
         return target
 
@@ -1083,6 +1922,8 @@ class Harness(unittest.TestCase):
             target = self._retro_fixture()
         elif page == "plan-recorded.html":
             target = self._recorded_plan_fixture()
+        elif page == "plan-unchanged.html":
+            target = self._unchanged_plan_fixture()
         else:
             target = self._plan_fixture()
         proc = subprocess.run([node, str(HARNESS), str(target)], cwd=ROOT,
@@ -1109,6 +1950,11 @@ class Harness(unittest.TestCase):
 
     def test_plan_html_behaves_in_every_state(self) -> None:
         self._run("plan.html")
+
+    def test_unchanged_changes_focus_is_an_explicit_empty_state(self) -> None:
+        data = self._run("plan-unchanged.html")
+        scenarios = {result["scenario"] for result in data["results"]}
+        self.assertIn("architecture-no-changes", scenarios)
 
     def test_recorded_plan_controls_post_exact_reasoned_actions(self) -> None:
         data = self._run("plan-recorded.html")

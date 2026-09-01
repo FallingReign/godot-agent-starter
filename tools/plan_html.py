@@ -329,6 +329,74 @@ def files_at_baseline(baseline: str) -> set | None:
     return files
 
 
+def function_changes_since(
+    baseline: str,
+    changed_files: set[str] | None,
+    baseline_files: set[str] | None,
+    present_files: set[str],
+) -> Dict[Tuple[str, str], Dict[str, str]] | None:
+    """Return exact baseline/current function evidence, including body-only edits.
+
+    File status cannot establish which function changed.  The architecture map
+    therefore uses the same baseline/current comparison as conformance instead
+    of colouring every function in a modified file or, worse, calling all of
+    them unchanged.  ``None`` means the comparison could not be proven.
+    """
+    if not baseline or changed_files is None or baseline_files is None:
+        return None
+    changes: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for relative in sorted(
+        path for path in changed_files if path.lower().endswith(".gd")
+    ):
+        before: Dict[str, gd_signature.SourceFunction] = {}
+        current: Dict[str, gd_signature.SourceFunction] = {}
+        if relative in baseline_files:
+            repository_path = (
+                relative
+                if CONTEXT.game_layout == "."
+                else f"{CONTEXT.game_layout}/{relative}"
+            )
+            code, source = git("show", f"{baseline}:{repository_path}")
+            if code != 0:
+                return None
+            try:
+                before = gd_signature.parse_source_functions(source)
+            except gd_signature.SignatureError:
+                return None
+        if relative in present_files:
+            try:
+                source = (GAME_ROOT / relative).read_text(encoding="utf-8")
+                current = gd_signature.parse_source_functions(source)
+            except (OSError, UnicodeError, gd_signature.SignatureError):
+                return None
+        for identity in sorted(set(before) | set(current)):
+            old = before.get(identity)
+            new = current.get(identity)
+            action = ""
+            if old is None and new is not None:
+                action = "new"
+            elif old is not None and new is None:
+                action = "delete"
+            elif (
+                old is not None
+                and new is not None
+                and (
+                    old.signature != new.signature
+                    or old.body_sha256 != new.body_sha256
+                )
+            ):
+                action = "modify"
+            changes[(relative, identity)] = {
+                "action": action,
+                "signature": (
+                    new.signature if new is not None else old.signature if old else ""
+                ),
+                "baseline_signature": old.signature if old is not None else "",
+                "current_signature": new.signature if new is not None else "",
+            }
+    return changes
+
+
 def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     """Real modules and a mermaid diagram, from arch.py. Never hand-derived:
     arch.py already owns the definition of a module and the gate already fails
@@ -360,8 +428,6 @@ def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     mods: List[Dict[str, Any]] = []
     if isinstance(raw, dict):
         for path, deps in sorted(raw.items()):
-            if path.startswith(("tests", "addons", "tools")):
-                continue
             mods.append({"path": path,
                          "depends_on": deps if isinstance(deps, list) else []})
     tree = data.get("tree")
@@ -683,7 +749,113 @@ letter-spacing:.05em;margin-right:5px}
 .record>summary::before{content:"▸";color:var(--dim);font-size:11px;margin-right:8px}
 .record[open]>summary::before{content:"▾"}
 .record>.record-body{padding:0 16px 18px;border-top:1px solid var(--line)}
+.architecture-map{--arch-existing:#d9ddd7;--arch-adding:#ff7a35;
+--arch-changing:#9b7cff;--arch-removing:#ff5d6c;--arch-unplanned:#ffbd2e;
+--arch-conflict:#ff4d5e;
+margin:24px 0;border:1px solid var(--line);border-radius:10px;background:#11141b;
+overflow:hidden}
+.arch-intro{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;
+padding:17px 18px;border-bottom:1px solid var(--line)}
+.arch-eyebrow{margin:0 0 2px;color:var(--acc);font-size:10.5px;font-weight:700;
+letter-spacing:.09em;text-transform:uppercase}
+.arch-intro h2{margin:0;padding:0;border:0;color:var(--fg);font-size:18px;
+letter-spacing:0;text-transform:none}
+.arch-intro-copy{margin:5px 0 0;color:#b9c2cc;font-size:12.5px;max-width:680px}
+.arch-settled{flex:0 0 auto;border:1px solid #315f42;border-radius:999px;
+padding:3px 9px;color:var(--ok);font-size:11px}
+.arch-read-path{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1px solid var(--line)}
+.arch-read-step{display:grid;grid-template-columns:24px 1fr;gap:8px;padding:10px 13px;
+color:#aeb7c3;font-size:11.5px;border-right:1px solid var(--line)}
+.arch-read-step:last-child{border-right:0}
+.arch-step-number{display:grid;place-items:center;width:21px;height:21px;border-radius:50%;
+background:#263142;color:#dce8f7;font-weight:700}
+.arch-read-step strong{display:block;color:var(--fg);font-size:12px}
+.arch-controls{display:grid;grid-template-columns:auto auto minmax(180px,1fr) auto;
+gap:14px;padding:12px 14px;border-bottom:1px solid var(--line);align-items:end}
+.arch-control{display:grid;gap:5px;min-width:0}
+.arch-control-label{color:var(--dim);font-size:10px;font-weight:700;text-transform:uppercase;
+letter-spacing:.07em}
+.arch-buttons{display:flex;gap:5px;flex-wrap:wrap}
+.arch-buttons button,.arch-search,.arch-list-button,.arch-primary{border:1px solid var(--line);
+border-radius:6px;background:#181d27;color:var(--fg);font:inherit}
+.arch-buttons button{padding:5px 8px;cursor:pointer;font-size:11.5px}
+.arch-buttons button[aria-pressed="true"]{background:#26384f;border-color:#4777ac;color:#fff}
+.arch-buttons button[disabled]{opacity:.38;cursor:not-allowed}
+.arch-search-wrap{display:flex;align-items:center;gap:7px}
+.arch-search{width:100%;min-width:0;padding:6px 8px;font-size:12px}
+.arch-search-count{color:var(--dim);font-size:11px;min-width:22px}
+.arch-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(270px,340px)}
+.arch-map-panel{min-width:0;border-right:1px solid var(--line)}
+.arch-map-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+padding:10px 14px;border-bottom:1px solid var(--line)}
+.arch-map-heading h3{margin:0;font-size:12.5px}.arch-map-status{color:var(--dim);font-size:11px}
+.arch-graph-shell{position:relative;height:500px;overflow:hidden;background:#0d1016}
+.arch-graph{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+.arch-graph:active{cursor:grabbing}.arch-edge{stroke:#747b86;stroke-width:1;opacity:.48}
+.arch-edge[data-relation="uses"]{stroke:#5884ad;stroke-dasharray:3 4;opacity:.3}
+.arch-edge[data-provenance="planned"]{stroke:#b78cff;stroke-dasharray:2 5}
+.arch-edge[data-connected="true"]{opacity:.95;stroke-width:1.8}
+.arch-viewport[data-focus="true"] .arch-edge[data-connected="false"]{opacity:.09}
+.arch-node{cursor:pointer;outline:none}.arch-node-hit{fill:transparent}
+.arch-node-dot{fill:var(--arch-existing);stroke:#0b0d11;stroke-width:1.5}
+.arch-node[data-state="adding"] .arch-node-dot{fill:var(--arch-adding)}
+.arch-node[data-state="changing"] .arch-node-dot{fill:var(--arch-changing)}
+.arch-node[data-state="removing"] .arch-node-dot{fill:#0d1016;stroke:var(--arch-removing);stroke-width:2.5}
+.arch-node[data-state="unplanned"] .arch-node-dot{fill:var(--arch-unplanned)}
+.arch-node[data-state="conflict"] .arch-node-dot{fill:var(--arch-conflict);stroke:#fff;stroke-width:2}
+.arch-node-halo{fill:none;stroke:var(--acc);stroke-width:2;opacity:0}
+.arch-node:hover .arch-node-halo,.arch-node:focus-visible .arch-node-halo,
+.arch-node[data-selected="true"] .arch-node-halo{opacity:1}
+.arch-node[data-match="true"] .arch-node-halo{opacity:1;stroke:#fff;stroke-dasharray:2 2}
+.arch-node[data-dimmed="true"]{opacity:.22}
+.arch-zoom-hint{position:absolute;right:9px;bottom:7px;margin:0;color:#6f7885;
+font-size:10.5px;pointer-events:none}
+.arch-legend{display:flex;gap:14px;flex-wrap:wrap;padding:9px 14px;border-top:1px solid var(--line);
+color:#aeb7c3;font-size:11px}.arch-key{display:flex;align-items:center;gap:6px}
+.arch-key-mark{width:9px;height:9px;border-radius:50%;background:currentColor}
+.arch-key.existing{color:var(--arch-existing)}.arch-key.adding{color:var(--arch-adding)}
+.arch-key.changing{color:var(--arch-changing)}.arch-key.removing{color:var(--arch-removing)}
+.arch-key.removing .arch-key-mark{background:transparent;border:2px solid currentColor}
+.arch-key.unplanned{color:var(--arch-unplanned)}
+.arch-key.conflict{color:var(--arch-conflict)}
+.arch-inspector{min-width:0;background:#141821}.arch-inspector-header{padding:14px 15px;
+border-bottom:1px solid var(--line)}.arch-inspector-header h3{margin:2px 0 7px;
+font-size:14px;overflow-wrap:anywhere}.arch-tags{display:flex;gap:6px;flex-wrap:wrap}
+.arch-tag{border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--dim);
+font-size:10.5px}.arch-tag[data-state="adding"]{color:var(--arch-adding)}
+.arch-tag[data-state="changing"]{color:var(--arch-changing)}
+.arch-tag[data-state="removing"]{color:var(--arch-removing)}
+.arch-tag[data-state="unplanned"]{color:var(--arch-unplanned)}
+.arch-tag[data-state="conflict"]{color:var(--arch-conflict)}
+.arch-inspector-body{max-height:500px;overflow:auto;padding:4px 15px 15px}
+.arch-inspector-body dl{margin:0}.arch-inspector-body dl>div{padding:9px 0;
+border-bottom:1px solid rgba(255,255,255,.06)}.arch-inspector-body dt{color:var(--dim);
+font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+.arch-inspector-body dd{margin:3px 0 0;color:#d8dee7;font-size:12px;line-height:1.45}
+.arch-special{margin:10px 0 0;padding:10px 11px;border:1px solid #3a414d;
+border-radius:7px;background:#10141b}.arch-special h4{margin:0 0 5px;font-size:12px}
+.arch-option{padding:6px 0;border-top:1px solid var(--line);font-size:11.5px}
+.arch-option:first-of-type{border-top:0}.arch-option strong{display:block;color:#e8edf3}
+.arch-option span{color:#aeb7c3}.arch-primary{margin-top:11px;padding:6px 9px;cursor:pointer;
+font-size:11.5px}.arch-rule-note{display:flex;gap:9px;padding:10px 14px;border-top:1px solid var(--line);
+color:var(--dim);font-size:11.5px}.arch-rule-note strong{color:#dce3ec;white-space:nowrap}
+.arch-fallback{margin:0;border-top:1px solid var(--line)}
+.arch-fallback summary{cursor:pointer;padding:10px 14px;font-weight:650}
+.arch-fallback-list{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+.arch-fallback-list li[hidden]{display:none}.arch-list-button{display:grid;width:100%;
+grid-template-columns:18px minmax(0,1fr) auto;gap:7px;text-align:left;padding:7px 12px;
+border:0;border-bottom:1px solid var(--line);border-radius:0;cursor:pointer;font-size:11.5px}
+.arch-list-button:hover,.arch-list-button:focus-visible{background:#202633}
+.arch-list-state{color:var(--dim);font-size:10.5px}.arch-noscript{padding:10px 14px;color:var(--warn)}
+.arch-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:760px){.front-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.arch-controls{grid-template-columns:1fr 1fr}.arch-workspace{grid-template-columns:1fr}
+.arch-map-panel{border-right:0;border-bottom:1px solid var(--line)}.arch-inspector-body{max-height:none}}
+@media(max-width:600px){.arch-intro{display:grid}.arch-settled{justify-self:start}
+.arch-read-path{grid-template-columns:1fr}.arch-read-step{border-right:0;border-bottom:1px solid var(--line)}
+.arch-read-step:last-child{border-bottom:0}.arch-controls{grid-template-columns:1fr}
+.arch-graph-shell{height:390px}.arch-rule-note{display:grid}.arch-rule-note strong{white-space:normal}}
 #retro-banner{margin:14px 0}
 #retro-banner .rb{padding:10px 14px;border-radius:7px;font-size:13px;
 border:1px solid var(--line);background:var(--card);margin-bottom:8px}
@@ -1141,6 +1313,1704 @@ def hierarchy(prop: Dict[str, Any], tree: Dict[str, Any], built: set,
     return "\n".join(lines)
 
 
+def architecture_map_model(
+    prop: Dict[str, Any],
+    tree: Dict[str, Any],
+    built: set,
+    mods: List[Dict[str, Any]],
+    changed_actions: Dict[str, str] | None = None,
+    cockpit_state: Dict[str, Any] | None = None,
+    present: set[str] | None = None,
+    baseline_files: set[str] | None = None,
+    involvement: str = "function",
+    function_changes: Dict[Tuple[str, str], Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    """Build the complete source map without turning observation into intent."""
+
+    def normalise(value: Any) -> str:
+        return str(value or "").strip().replace("\\", "/")
+
+    proposal_files = {
+        normalise(item.get("path")): item
+        for item in rows(prop, "files")
+        if normalise(item.get("path"))
+    }
+    proposal_modules = {
+        normalise(item.get("path")).rstrip("/"): item
+        for item in rows(prop, "modules")
+        if normalise(item.get("path"))
+    }
+    observed_actions = {
+        normalise(path): str(action or "").strip().lower()
+        for path, action in (changed_actions or {}).items()
+        if normalise(path)
+    }
+    comparison_known = changed_actions is not None
+    baseline_known = baseline_files is not None
+    function_comparison_known = function_changes is not None
+    observed_function_changes = function_changes or {}
+    baseline_set = {
+        normalise(path) for path in (baseline_files or set()) if normalise(path)
+    }
+    inferred_present = {
+        normalise(path) for path in tree if normalise(path)
+    } | {
+        normalise(path) for path in built if normalise(path)
+    }
+    current_files = (
+        {normalise(path) for path in present if normalise(path)}
+        if present is not None
+        else inferred_present
+    )
+    observed_tree = {
+        normalise(path): value
+        for path, value in tree.items()
+        if (
+            normalise(path)
+            and isinstance(value, dict)
+            and (present is None or normalise(path) in current_files)
+        )
+    }
+    all_files = (
+        current_files
+        | set(proposal_files)
+        | set(observed_actions)
+    )
+
+    design_reasons = [
+        str(item.get("why") or "").strip()
+        for item in rows(prop, "design_refs")
+        if str(item.get("why") or "").strip()
+    ]
+    view_state = cockpit_state or {}
+    plan_status = str(view_state.get("status") or prop.get("status") or "").strip()
+    authority = view_state.get("design_authority")
+    if not isinstance(authority, dict):
+        authority = prop.get("design_authority")
+    if not isinstance(authority, dict):
+        authority = {}
+    authority_value = str(
+        authority.get("authority") or authority.get("status") or ""
+    ).strip()
+    approval_required = bool(view_state.get("approval_required", plan_status == "draft"))
+
+    reversibility = prop.get("reversibility")
+    if not isinstance(reversibility, dict):
+        reversibility = {}
+    reversibility_state = str(reversibility.get("state") or "").strip()
+    hard_to_undo = str(reversibility.get("hard_to_undo") or "").strip()
+    veto_scope = str(reversibility.get("veto_scope") or "").strip()
+
+    verification = view_state.get("verification")
+    if not isinstance(verification, dict):
+        verification = {}
+    check_text = str(verification.get("summary") or "").strip()
+    if not check_text:
+        verification_status = str(verification.get("status") or "not run").strip()
+        check_text = (
+            f"The cockpit reports verification as {verification_status}. "
+            "No item-specific check is recorded in the proposal."
+        )
+
+    considered = [
+        {
+            "name": normalise(item.get("path")),
+            "answer": str(item.get("why_not") or "").strip(),
+        }
+        for item in rows(prop, "considered_existing")
+        if normalise(item.get("path"))
+    ]
+    action_states = {
+        "new": "adding",
+        "modify": "changing",
+        "delete": "removing",
+    }
+
+    def under(folder: str, path: str) -> bool:
+        if folder == "(root)":
+            return "/" not in path
+        return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+    def state_for(
+        declared: str,
+        observed: str,
+        before_exists: bool | None = None,
+        known: bool | None = None,
+    ) -> str:
+        evidence_known = comparison_known if known is None else known
+        if declared in action_states:
+            if observed in action_states and observed != declared:
+                return "conflict"
+            if evidence_known:
+                if declared == "new" and before_exists is True:
+                    return "conflict"
+                if declared in ("modify", "delete") and before_exists is False:
+                    return "conflict"
+            return action_states[declared]
+        if observed in action_states:
+            return "unplanned"
+        return "existing"
+
+    def change_text(
+        label: str,
+        kind: str,
+        state: str,
+        declared: str,
+        observed: str,
+        exists: bool,
+        known: bool,
+    ) -> str:
+        if state == "existing":
+            if not known:
+                return (
+                    "No change is proposed here, but Git comparison is unavailable, "
+                    "so whether this item changed is unknown."
+                )
+            return (
+                "No change is proposed or observed here; it is shown to keep the "
+                "surrounding structure clear."
+            )
+        if state == "conflict":
+            if declared == "new" and not observed and exists:
+                return (
+                    "The plan says new, but the item already existed at the baseline. "
+                    "This is not a new addition."
+                )
+            if declared == "modify" and not observed and not exists:
+                return (
+                    "The plan says modify, but the item was absent at the baseline "
+                    "and is absent now. There is nothing to modify."
+                )
+            if declared == "delete" and not observed and not exists:
+                return (
+                    "The plan says delete, but the item was absent at the baseline "
+                    "and is absent now. Git does not show a removal to perform."
+                )
+            return (
+                f"The plan says {declared}, but Git reports {observed}. "
+                "This mismatch must be resolved before work continues."
+            )
+        if state == "unplanned":
+            return (
+                f"Git reports an unplanned {observed} to this {kind}: {label}. "
+                "It is outside the recorded plan."
+            )
+        if not known:
+            return (
+                f"The plan says {declared}, but Git comparison is unavailable, "
+                "so implementation progress is unknown."
+            )
+        if declared == "new":
+            if observed == "new" and exists:
+                return "The planned addition is present in the working tree."
+            return "The planned addition has not been observed since the baseline."
+        if declared == "modify":
+            if observed == "modify" and exists:
+                return "The planned change is present in the working tree."
+            return "The planned change has not been observed since the baseline."
+        if declared == "delete":
+            if observed == "delete" and not exists:
+                return "The planned removal is complete."
+            if not exists:
+                return (
+                    "The item is absent now, but Git does not show a deletion from "
+                    "the baseline. The planned removal is not proven."
+                )
+            return "The item is planned for removal and is still present."
+        return "No implementation claim is available."
+
+    def design_text(state: str) -> str:
+        if state in ("unplanned", "conflict"):
+            return (
+                "No. This item is outside, or conflicts with, the reviewed plan; "
+                "design alignment is not established."
+            )
+        if state == "existing":
+            return (
+                "This is context outside the active change. The map makes no "
+                "design-alignment claim for it."
+            )
+        if not design_reasons:
+            return "No design reference is recorded for this slice."
+        reason = " ".join(design_reasons[:3])
+        if (
+            plan_status == "approved"
+            and authority_value == "human-confirmed"
+            and not approval_required
+        ):
+            return "Yes. The approved plan cites this player outcome: " + reason
+        if authority_value == "human-confirmed":
+            return (
+                "The cited design is human-confirmed, but this exact plan is not "
+                "currently approved. It serves: " + reason
+            )
+        if authority_value == "agent-provisional":
+            return (
+                "Not yet. The cited design is agent-provisional and serves: " + reason
+            )
+        return (
+            "The proposal cites this outcome, but validated design authority is "
+            "not available: " + reason
+        )
+
+    def risk_text(state: str) -> str:
+        if state == "existing":
+            return "No change is planned for this item."
+        if state in ("unplanned", "conflict"):
+            return (
+                "The implementation does not match the reviewed boundary and "
+                "must be resolved before work continues."
+            )
+        if hard_to_undo:
+            return "The slice-level hard-to-undo point is: " + hard_to_undo
+        return "The proposal does not record an item-specific risk."
+
+    def undo_text(state: str) -> str:
+        if state == "existing":
+            return "Not applicable; this item is outside the planned change."
+        if state in ("unplanned", "conflict"):
+            return (
+                "No. This item is not safely inside the reviewed reversibility "
+                "envelope."
+            )
+        if reversibility_state == "go-no-go":
+            return (
+                "No. The proposal has reached its go/no-go point. Stop for "
+                "explicit approval."
+            )
+        if reversibility_state == "reversible" and veto_scope:
+            return "Yes, within this slice-level veto scope: " + veto_scope
+        return "No safe undo boundary is recorded in the proposal."
+
+    observed_dependencies = {
+        normalise(item.get("path")).rstrip("/"): {
+            normalise(dep).rstrip("/")
+            for dep in (item.get("depends_on") or [])
+            if normalise(dep)
+        }
+        for item in mods
+        if normalise(item.get("path"))
+    }
+    planned_dependencies = {
+        path: {
+            normalise(dep).rstrip("/")
+            for dep in (meta.get("may_depend_on") or [])
+            if normalise(dep)
+        }
+        for path, meta in proposal_modules.items()
+    }
+    module_paths = set(observed_dependencies) | set(proposal_modules)
+    folder_paths: set[str] = set(module_paths)
+    for path in all_files:
+        parts = path.split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            folder_paths.add("/".join(parts[:index]))
+    if any("/" not in path for path in all_files):
+        folder_paths.add("(root)")
+    allowed_dependency_targets = folder_paths | module_paths
+    for dependencies in list(observed_dependencies.values()) + list(
+        planned_dependencies.values()
+    ):
+        for dependency in dependencies:
+            if dependency in allowed_dependency_targets:
+                folder_paths.add(dependency)
+
+    def module_existed_at_baseline(folder: str) -> bool | None:
+        if not baseline_known:
+            return None
+        return any(under(folder, path) for path in baseline_set)
+
+    def aggregate_module_action(folder: str) -> str:
+        if not comparison_known:
+            return ""
+        touched = [
+            action
+            for path, action in observed_actions.items()
+            if under(folder, path)
+        ]
+        if not touched:
+            return ""
+        before_exists = module_existed_at_baseline(folder)
+        after_exists = any(under(folder, path) for path in current_files)
+        if before_exists is False and after_exists:
+            return "new"
+        if before_exists and not after_exists:
+            return "delete"
+        return "modify"
+
+    incoming_observed: Dict[str, set[str]] = {}
+    incoming_planned: Dict[str, set[str]] = {}
+    for source, dependencies in observed_dependencies.items():
+        for target in dependencies:
+            incoming_observed.setdefault(target, set()).add(source)
+    for source, dependencies in planned_dependencies.items():
+        for target in dependencies:
+            incoming_planned.setdefault(target, set()).add(source)
+
+    def dependency_text(module: str, containing: bool = False) -> str:
+        if not module:
+            return (
+                "No owning module is recorded, so reverse dependencies cannot "
+                "be attributed."
+            )
+        current = sorted(incoming_observed.get(module, set()))
+        planned = sorted(incoming_planned.get(module, set()))
+        parts: List[str] = []
+        subject = f"the containing module {module}" if containing else "it"
+        if containing:
+            parts.append(
+                f"Only module-level dependency evidence is available; this item is inside {module}."
+            )
+        if current:
+            parts.append(
+                "Current modules that depend on "
+                + subject
+                + ": "
+                + ", ".join(current)
+                + "."
+            )
+        if planned:
+            parts.append(
+                "Planned modules allowed to depend on "
+                + subject
+                + ": "
+                + ", ".join(planned)
+                + "."
+            )
+        if len(parts) == (1 if containing else 0):
+            parts.append(f"No mapped module is recorded as depending on {subject}.")
+        return " ".join(parts)
+
+    module_info: Dict[str, Dict[str, str]] = {}
+    for folder in module_paths:
+        meta = proposal_modules.get(folder)
+        declared = str((meta or {}).get("action") or "").strip().lower()
+        observed = aggregate_module_action(folder)
+        state = state_for(
+            declared,
+            observed,
+            before_exists=module_existed_at_baseline(folder),
+        )
+        module_info[folder] = {
+            "declared": declared,
+            "observed": observed,
+            "state": state,
+        }
+
+    def owning_module(path: str, explicit: str = "") -> str:
+        if explicit:
+            return explicit
+        matches = [module for module in module_paths if under(module, path)]
+        return max(matches, key=lambda item: (item.count("/"), len(item))) if matches else ""
+
+    nodes: List[Dict[str, Any]] = []
+    node_ids: set[str] = set()
+
+    def add_node(node: Dict[str, Any]) -> None:
+        node_id = str(node.get("id") or "")
+        if not node_id or node_id in node_ids:
+            return
+        node_ids.add(node_id)
+        nodes.append(node)
+
+    for folder in sorted(folder_paths, key=lambda item: (item.count("/"), item)):
+        meta = proposal_modules.get(folder)
+        info = module_info.get(
+            folder,
+            {"declared": "", "observed": "", "state": "existing"},
+        )
+        declared = info["declared"]
+        observed = info["observed"]
+        state = info["state"]
+        parent_path = folder.rsplit("/", 1)[0] if "/" in folder else ""
+        parent = (
+            f"folder:{parent_path}"
+            if parent_path in folder_paths
+            else None
+        )
+        exists = any(under(folder, path) for path in current_files)
+        role = str((meta or {}).get("role") or "").strip()
+        why = str((meta or {}).get("why") or "").strip()
+        add_node({
+            "id": f"folder:{folder}",
+            "label": "res://" if folder == "(root)" else folder,
+            "path": folder,
+            "kind": "folder",
+            "architecture_module": folder in module_paths,
+            "state": state,
+            "action": declared or observed,
+            "parent": parent,
+            "what": role or f"A source folder in the game architecture: {folder}.",
+            "changing": change_text(
+                folder,
+                "module",
+                state,
+                declared,
+                observed,
+                exists,
+                comparison_known,
+            ),
+            "why": why or (
+                "No change is proposed for this folder."
+                if state == "existing"
+                else "No reason is recorded for this module change."
+            ),
+            "design": design_text(state),
+            "depends": dependency_text(folder),
+            "risk": risk_text(state),
+            "undo": undo_text(state),
+            "check": check_text,
+            "options": considered if state == "adding" and considered else [],
+            "responsibility": "" if state == "removing" else None,
+        })
+
+    proposal_functions: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for item in rows(prop, "functions"):
+        file_path = normalise(item.get("file"))
+        raw_signature = str(item.get("signature") or "")
+        try:
+            parsed = gd_signature.parse_proposal_signature(raw_signature)
+        except gd_signature.SignatureError:
+            continue
+        class_scope = str(item.get("class_scope") or "").strip()
+        identity = f"{class_scope}.{parsed.name}" if class_scope else parsed.name
+        proposal_functions[(file_path, identity)] = {
+            **item,
+            "canonical": parsed.canonical,
+            "identity": identity,
+            "class_scope": class_scope,
+        }
+
+    for file_path in sorted(all_files):
+        direct_meta = proposal_files.get(file_path)
+        explicit_module = normalise((direct_meta or {}).get("module")).rstrip("/")
+        owner = owning_module(file_path, explicit_module)
+        inherited_module = (
+            proposal_modules.get(owner)
+            if involvement == "module" and direct_meta is None
+            else None
+        )
+        meta = direct_meta or inherited_module
+        if inherited_module is not None:
+            info = module_info.get(
+                owner,
+                {"declared": "", "observed": "", "state": "existing"},
+            )
+            declared = info["declared"]
+            observed = info["observed"]
+            state = info["state"]
+            change_known = comparison_known
+        else:
+            declared = str((meta or {}).get("action") or "").strip().lower()
+            observed = observed_actions.get(file_path, "")
+            state = state_for(
+                declared,
+                observed,
+                before_exists=(file_path in baseline_set if baseline_known else None),
+            )
+            change_known = comparison_known
+        exists = file_path in current_files
+        parent_path = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+        parent = (
+            f"folder:{parent_path}"
+            if parent_path in folder_paths
+            else f"folder:(root)"
+            if "(root)" in folder_paths
+            else None
+        )
+        why = str((meta or {}).get("why") or "").strip()
+        add_node({
+            "id": f"file:{file_path}",
+            "label": Path(file_path).name,
+            "path": file_path,
+            "kind": "file",
+            "state": state,
+            "action": declared or observed,
+            "parent": parent,
+            "what": f"The authored game file {file_path}.",
+            "changing": change_text(
+                file_path,
+                "file",
+                state,
+                declared,
+                observed,
+                exists,
+                change_known,
+            ),
+            "why": why or (
+                "No change is proposed for this file."
+                if state == "existing"
+                else "This file changed without a recorded plan reason."
+            ),
+            "design": design_text(state),
+            "depends": dependency_text(owner, containing=True),
+            "risk": risk_text(state),
+            "undo": undo_text(state),
+            "check": check_text,
+            "options": considered if state == "adding" and considered else [],
+            "responsibility": "" if state == "removing" else None,
+        })
+
+        source = observed_tree.get(file_path, {})
+        source_functions = source.get("functions") or []
+        class_names: set[str] = set()
+        source_class = str(source.get("class_name") or "").strip()
+        if source_class:
+            class_names.add(source_class)
+        for function in source_functions:
+            if isinstance(function, dict):
+                scope = str(function.get("class_scope") or "").strip()
+                if scope:
+                    class_names.add(scope)
+        for (function_file, _identity), function in proposal_functions.items():
+            if function_file == file_path and function.get("class_scope"):
+                class_names.add(str(function["class_scope"]))
+
+        for class_name in sorted(class_names):
+            add_node({
+                "id": f"class:{file_path}::{class_name}",
+                "label": class_name,
+                "path": file_path,
+                "kind": "module",
+                "state": state,
+                "action": declared or observed,
+                "parent": f"file:{file_path}",
+                "what": f"The GDScript class {class_name}, declared in {file_path}.",
+                "changing": change_text(
+                    file_path,
+                    "class",
+                    state,
+                    declared,
+                    observed,
+                    exists,
+                    change_known,
+                ),
+                "why": why or (
+                    "No change is proposed for this class."
+                    if state == "existing"
+                    else "The proposal records the enclosing boundary reason."
+                ),
+                "design": design_text(state),
+                "depends": dependency_text(owner, containing=True),
+                "risk": risk_text(state),
+                "undo": undo_text(state),
+                "check": check_text,
+                "options": considered if state == "adding" and considered else [],
+                "responsibility": "" if state == "removing" else None,
+            })
+
+        observed_identities: set[str] = set()
+        for function in source_functions:
+            if not isinstance(function, dict):
+                continue
+            identity = str(
+                function.get("identity") or function.get("name") or ""
+            ).strip()
+            raw_signature = str(function.get("signature") or "").strip()
+            if not identity or not raw_signature:
+                continue
+            planned = proposal_functions.get((file_path, identity))
+            evidence = observed_function_changes.get((file_path, identity), {})
+            actual_action = str(evidence.get("action") or "").strip().lower()
+            baseline_signature = str(
+                evidence.get("baseline_signature") or ""
+            ).strip()
+            function_action = str(
+                (planned or {}).get("action") or ""
+            ).strip().lower()
+            canonical = ""
+            try:
+                canonical = gd_signature.parse_proposal_signature(
+                    raw_signature
+                ).canonical
+            except gd_signature.SignatureError:
+                pass
+            planned_matches = bool(
+                planned
+                and canonical
+                and canonical == str(planned.get("canonical") or "")
+            )
+            signature_mismatch = bool(
+                planned
+                and function_action in ("new", "modify")
+                and not planned_matches
+            )
+            if planned:
+                function_state = state_for(
+                    function_action,
+                    actual_action,
+                    before_exists=bool(baseline_signature),
+                    known=function_comparison_known,
+                )
+            elif actual_action in action_states:
+                function_state = "unplanned"
+            elif not function_comparison_known and observed_actions.get(file_path):
+                function_state = "unplanned"
+            else:
+                function_state = "existing"
+            if signature_mismatch:
+                function_state = "conflict"
+                changing = (
+                    "The observed signature does not match the planned signature: "
+                    + str(planned.get("canonical") or "")
+                )
+            elif function_state == "conflict":
+                changing = change_text(
+                    raw_signature,
+                    "function",
+                    function_state,
+                    function_action,
+                    actual_action,
+                    True,
+                    function_comparison_known,
+                )
+            elif function_action == "delete":
+                changing = "The function is planned for removal and is still present."
+            elif planned_matches:
+                if actual_action == "new":
+                    changing = "The exact planned function addition is present in source."
+                elif actual_action == "modify":
+                    changing = "The exact planned function change is present in source."
+                elif function_comparison_known:
+                    changing = (
+                        "The exact planned signature is present, but no function body "
+                        "or signature change is observed from the baseline."
+                    )
+                else:
+                    changing = (
+                        "The exact planned signature is present, but baseline function "
+                        "comparison is unavailable."
+                    )
+            elif function_state == "unplanned" and actual_action:
+                changing = (
+                    f"Git reports an unplanned {actual_action} to this function. "
+                    "It is outside the recorded function-level plan."
+                )
+            elif function_state == "unplanned":
+                changing = (
+                    "The containing file changed, but exact function comparison is "
+                    "unavailable. This function may or may not have changed."
+                )
+            else:
+                changing = "No change is proposed for this function."
+            if planned and not signature_mismatch:
+                observed_identities.add(identity)
+            class_scope = str(function.get("class_scope") or "").strip()
+            parent_class = class_scope or source_class
+            parent_id = (
+                f"class:{file_path}::{parent_class}"
+                if parent_class in class_names
+                else f"file:{file_path}"
+            )
+            function_why = str((planned or {}).get("why") or "").strip()
+            observed_node_id = f"function:{file_path}::{identity}"
+            if signature_mismatch:
+                observed_node_id += "::observed"
+            add_node({
+                "id": observed_node_id,
+                "label": str(function.get("name") or identity),
+                "signature": raw_signature,
+                "path": file_path,
+                "kind": "function",
+                "state": function_state,
+                "action": function_action or actual_action,
+                "parent": parent_id,
+                "what": f"The typed function {raw_signature} in {file_path}.",
+                "changing": changing,
+                "why": (
+                    "This observed function does not satisfy the exact function-level plan."
+                    if signature_mismatch or function_state == "conflict"
+                    else function_why
+                    or (
+                        "This function changed without a recorded function-level reason."
+                        if function_state == "unplanned"
+                        else "No change is proposed for this function."
+                    )
+                ),
+                "design": design_text(function_state),
+                "depends": (
+                    "Function-level callers are not available from the "
+                    "architecture index."
+                ),
+                "risk": risk_text(function_state),
+                "undo": undo_text(function_state),
+                "check": check_text,
+                "options": (
+                    considered
+                    if function_state == "adding" and considered
+                    else []
+                ),
+                "responsibility": "" if function_state == "removing" else None,
+            })
+
+        for (function_file, identity), planned in sorted(
+            proposal_functions.items()
+        ):
+            if function_file != file_path or identity in observed_identities:
+                continue
+            action = str(planned.get("action") or "").strip().lower()
+            evidence = observed_function_changes.get((file_path, identity), {})
+            actual_action = str(evidence.get("action") or "").strip().lower()
+            baseline_signature = str(
+                evidence.get("baseline_signature") or ""
+            ).strip()
+            state = state_for(
+                action,
+                actual_action,
+                before_exists=(
+                    bool(baseline_signature)
+                    if function_comparison_known
+                    else None
+                ),
+                known=function_comparison_known,
+            )
+            class_scope = str(planned.get("class_scope") or "").strip()
+            parent_id = (
+                f"class:{file_path}::{class_scope}"
+                if class_scope in class_names
+                else f"file:{file_path}"
+            )
+            signature = str(
+                planned.get("canonical") or planned.get("signature") or ""
+            )
+            why = str(planned.get("why") or "").strip()
+            if action == "delete":
+                if actual_action == "delete" and function_comparison_known:
+                    changing = "The planned function removal is complete."
+                elif state == "conflict":
+                    changing = change_text(
+                        signature,
+                        "function",
+                        state,
+                        action,
+                        actual_action,
+                        False,
+                        function_comparison_known,
+                    )
+                else:
+                    changing = (
+                        "The function is absent, but baseline function comparison is "
+                        "unavailable, so the planned removal is not proven."
+                    )
+            elif action == "new":
+                changing = (
+                    change_text(
+                        signature,
+                        "function",
+                        state,
+                        action,
+                        actual_action,
+                        False,
+                        function_comparison_known,
+                    )
+                    if state == "conflict"
+                    else "The planned function is not present in source yet."
+                )
+            elif action == "modify":
+                changing = (
+                    change_text(
+                        signature,
+                        "function",
+                        state,
+                        action,
+                        actual_action,
+                        False,
+                        function_comparison_known,
+                    )
+                    if state == "conflict"
+                    else "The planned function signature is not present in source yet."
+                )
+            else:
+                changing = "No implementation claim is available."
+            add_node({
+                "id": f"function:{file_path}::{identity}",
+                "label": identity.rsplit(".", 1)[-1],
+                "signature": signature,
+                "path": file_path,
+                "kind": "function",
+                "state": state,
+                "action": action,
+                "parent": parent_id,
+                "what": f"The typed function {signature} in {file_path}.",
+                "changing": changing,
+                "why": why or "No function-level reason is recorded.",
+                "design": design_text(state),
+                "depends": (
+                    "Function-level callers are not available from the "
+                    "architecture index."
+                ),
+                "risk": risk_text(state),
+                "undo": undo_text(state),
+                "check": check_text,
+                "options": considered if state == "adding" and considered else [],
+                "responsibility": "" if state == "removing" else None,
+            })
+
+        current_identities = {
+            str(function.get("identity") or function.get("name") or "").strip()
+            for function in source_functions
+            if isinstance(function, dict)
+        }
+        for (changed_file, identity), evidence in sorted(
+            observed_function_changes.items()
+        ):
+            if (
+                changed_file != file_path
+                or identity in current_identities
+                or (file_path, identity) in proposal_functions
+                or str(evidence.get("action") or "") != "delete"
+            ):
+                continue
+            signature = str(
+                evidence.get("baseline_signature")
+                or evidence.get("signature")
+                or ""
+            )
+            add_node({
+                "id": f"function:{file_path}::{identity}::deleted",
+                "label": identity.rsplit(".", 1)[-1],
+                "signature": signature,
+                "path": file_path,
+                "kind": "function",
+                "state": "unplanned",
+                "action": "delete",
+                "parent": f"file:{file_path}",
+                "what": f"The deleted function {signature} from {file_path}.",
+                "changing": (
+                    "Git reports an unplanned delete of this function. It is "
+                    "outside the recorded function-level plan."
+                ),
+                "why": "No function-level reason is recorded for this deletion.",
+                "design": design_text("unplanned"),
+                "depends": (
+                    "Function-level callers are not available from the "
+                    "architecture index."
+                ),
+                "risk": risk_text("unplanned"),
+                "undo": undo_text("unplanned"),
+                "check": check_text,
+                "options": [],
+                "responsibility": "",
+            })
+
+    link_index: Dict[Tuple[str, str], set[str]] = {}
+    for provenance, dependency_map in (
+        ("observed", observed_dependencies),
+        ("planned", planned_dependencies),
+    ):
+        for module_path, dependencies in dependency_map.items():
+            for dependency in dependencies:
+                source = f"folder:{module_path}"
+                target = f"folder:{dependency}"
+                if (
+                    source in node_ids
+                    and target in node_ids
+                    and target != source
+                ):
+                    link_index.setdefault((source, target), set()).add(provenance)
+    links = [
+        {
+            "source": source,
+            "target": target,
+            "relation": "uses",
+            "provenance": "+".join(sorted(provenance)),
+        }
+        for (source, target), provenance in sorted(link_index.items())
+    ]
+
+    kind_order = {"folder": 0, "file": 1, "module": 2, "function": 3}
+    nodes.sort(key=lambda item: (
+        str(item.get("path") or ""),
+        kind_order.get(str(item.get("kind") or ""), 9),
+        str(item.get("id") or ""),
+    ))
+    return {
+        "nodes": nodes,
+        "links": links,
+        "comparison_known": comparison_known,
+        "function_comparison_known": function_comparison_known,
+    }
+def _script_json(value: Any) -> str:
+    """JSON safe inside an executable script element."""
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _architecture_list(nodes: List[Dict[str, Any]], interactive: bool = True) -> str:
+    state_names = {
+        "existing": "Not affected",
+        "adding": "Being added",
+        "changing": "Being changed",
+        "removing": "Being removed",
+        "unplanned": "Not in plan",
+        "conflict": "Plan mismatch",
+    }
+    state_marks = {
+        "existing": "•",
+        "adding": "+",
+        "changing": "Δ",
+        "removing": "×",
+        "unplanned": "!",
+        "conflict": "!",
+    }
+    items: List[str] = []
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        label = str(node.get("signature") or node.get("path") or node.get("label") or "")
+        state = str(node.get("state") or "existing")
+        content = (
+            f'<span aria-hidden="true">{esc(state_marks.get(state, "•"))}</span>'
+            f'<span>{esc(label)}</span>'
+            f'<span class="arch-list-state">{esc(state_names.get(state, state))}</span>'
+        )
+        if interactive:
+            content = (
+                f'<button type="button" class="arch-list-button" '
+                f'data-arch-node="{esc(node_id)}">{content}</button>'
+            )
+        items.append(
+            f'<li data-arch-item="{esc(node_id)}" '
+            f'data-arch-kind="{esc(node.get("kind"))}">{content}</li>'
+        )
+    return '<ul class="arch-fallback-list">' + "".join(items) + "</ul>"
+
+
+def _architecture_nodes_for_involvement(
+    nodes: List[Dict[str, Any]], involvement: str
+) -> List[Dict[str, Any]]:
+    """Keep the rendered hierarchy at the depth the human chose to review."""
+    if involvement == "module":
+        return [
+            node
+            for node in nodes
+            if node.get("kind") == "folder" and node.get("architecture_module")
+        ]
+    if involvement == "file":
+        return [node for node in nodes if node.get("kind") in ("folder", "file")]
+    return list(nodes)
+
+
+def architecture_map_html(model: Dict[str, Any], involvement: str) -> str:
+    all_nodes = model.get("nodes") if isinstance(model.get("nodes"), list) else []
+    maximum = involvement if involvement in ("module", "file", "function") else "function"
+    nodes = _architecture_nodes_for_involvement(all_nodes, maximum)
+    if not nodes:
+        return ""
+    default = maximum
+    node_ids = {str(node.get("id") or "") for node in nodes}
+    rendered_model = {
+        **model,
+        "nodes": nodes,
+        "links": [
+            link
+            for link in (model.get("links") or [])
+            if isinstance(link, dict)
+            and str(link.get("source") or "") in node_ids
+            and str(link.get("target") or "") in node_ids
+        ],
+    }
+
+    def depth_button(value: str, label: str) -> str:
+        order = {"module": 1, "file": 2, "function": 3}
+        disabled = order[value] > order[maximum]
+        return (
+            f'<button type="button" data-arch-depth="{value}" '
+            f'aria-pressed="{str(value == default).lower()}"'
+            + (" disabled" if disabled else "")
+            + f'>{label}</button>'
+        )
+
+    level_label = {
+        "module": "Module-level review",
+        "file": "File-level review",
+        "function": "Function-level review",
+    }.get(maximum, "Architecture review")
+    structure_copy = {
+        "module": (
+            "Start with the coloured changes. The architecture modules and their "
+            "dependencies stay still while you inspect them."
+        ),
+        "file": (
+            "Start with the coloured changes. The complete folder → file structure "
+            "stays still while you inspect it."
+        ),
+        "function": (
+            "Start with the coloured changes. The complete folder → file → class → "
+            "function structure stays still while you inspect it."
+        ),
+    }[maximum]
+    search_placeholder = {
+        "module": "Module",
+        "file": "Folder or file",
+        "function": "Folder, file, class or function",
+    }[maximum]
+    map_heading = {
+        "module": "Architecture modules",
+        "file": "Folder and file structure",
+        "function": "Complete structure",
+    }[maximum]
+    fallback = _architecture_list(nodes)
+    noscript = _architecture_list(nodes, interactive=False)
+    return "".join([
+        '<section class="architecture-map" id="architecture-map" '
+        f'data-max-depth="{esc(maximum)}" aria-label="Architecture change map">',
+        '<div class="arch-intro"><div>',
+        f'<p class="arch-eyebrow">{esc(level_label)}</p>',
+        '<h2>Architecture change map</h2>',
+        f'<p class="arch-intro-copy">{esc(structure_copy)}</p>',
+        '</div><span class="arch-settled" id="arch-settled" hidden>'
+        'Layout settled — it will not keep moving</span></div>',
+        '<div class="arch-read-path" aria-label="How to read this map">',
+        '<div class="arch-read-step"><span class="arch-step-number">1</span><span>'
+        '<strong>Find the change</strong>Colour shows what is affected.</span></div>',
+        '<div class="arch-read-step"><span class="arch-step-number">2</span><span>'
+        '<strong>Click one item</strong>Read why it changes and what could break.</span></div>',
+        '<div class="arch-read-step"><span class="arch-step-number">3</span><span>'
+        '<strong>Check additions</strong>See what existing code was considered first.</span></div>',
+        '</div>',
+        '<div class="arch-controls" aria-label="Architecture map controls">',
+        '<div class="arch-control"><span class="arch-control-label">Detail shown</span>'
+        '<div class="arch-buttons" role="group" aria-label="Detail shown">',
+        depth_button("module", "Modules"),
+        depth_button("file", "Files"),
+        depth_button("function", "Functions"),
+        '</div></div>',
+        '<div class="arch-control"><span class="arch-control-label">Map focus</span>'
+        '<div class="arch-buttons" role="group" aria-label="Map focus">'
+        '<button type="button" data-arch-view="complete" aria-pressed="true">Complete</button>'
+        '<button type="button" data-arch-view="changes" aria-pressed="false">Changes</button>'
+        '</div></div>',
+        '<label class="arch-control"><span class="arch-control-label">Find an item</span>'
+        '<span class="arch-search-wrap"><input class="arch-search" id="arch-search" '
+        f'type="search" placeholder="{esc(search_placeholder)}" autocomplete="off">'
+        '<span class="arch-search-count" id="arch-search-count"></span></span></label>',
+        '<div class="arch-control" id="arch-camera-controls"><span class="arch-control-label">Camera</span>'
+        '<div class="arch-buttons"><button type="button" id="arch-fit-changes">Fit changes</button>'
+        '<button type="button" id="arch-fit-all">Fit all</button>'
+        '<button type="button" id="arch-back" hidden>Back</button></div></div>',
+        '</div>',
+        '<div class="arch-workspace"><div class="arch-map-panel">',
+        f'<div class="arch-map-heading"><h3>{esc(map_heading)}</h3>'
+        '<span class="arch-map-status" id="arch-map-status">Preparing map…</span></div>',
+        '<div class="arch-graph-shell" id="arch-graph-shell">'
+        '<p class="arch-sr">A stable, zoomable source map. Select a coloured node to read '
+        'its name, change and rationale.</p>'
+        '<svg class="arch-graph" id="arch-graph" role="group" '
+        'aria-label="Keyboard-selectable architecture items"></svg>'
+        '<p class="arch-zoom-hint">Scroll or pinch to zoom · drag empty space to move</p></div>',
+        '<div class="arch-legend" id="arch-legend" aria-label="Change legend">'
+        '<span class="arch-key existing"><span class="arch-key-mark"></span>Not affected</span>'
+        '<span class="arch-key adding"><span class="arch-key-mark"></span>Being added</span>'
+        '<span class="arch-key changing"><span class="arch-key-mark"></span>Being changed</span>'
+        '<span class="arch-key removing"><span class="arch-key-mark"></span>Being removed</span>'
+        '<span class="arch-key unplanned"><span class="arch-key-mark"></span>Not in plan</span>'
+        '<span class="arch-key conflict"><span class="arch-key-mark"></span>Plan mismatch</span></div>',
+        '<details class="arch-fallback" id="arch-fallback" hidden>'
+        '<summary>Graph unavailable — item list</summary>', fallback, '</details>',
+        '<noscript><style>.architecture-map .arch-controls,.architecture-map .arch-read-path,'
+        '.architecture-map .arch-map-heading,.architecture-map .arch-graph-shell,'
+        '.architecture-map .arch-legend,.architecture-map .arch-fallback,'
+        '.architecture-map .arch-inspector,.architecture-map .arch-rule-note,'
+        '.architecture-map .arch-settled{display:none!important}'
+        '.architecture-map .arch-workspace{display:block!important}</style>'
+        '<div class="arch-noscript"><b>Graph unavailable — item list</b>'
+        '<p>JavaScript is off, so the readable source list is shown instead.</p>',
+        noscript, '</div></noscript>',
+        '</div><aside class="arch-inspector" aria-labelledby="arch-selected-title">',
+        '<header class="arch-inspector-header"><p class="arch-eyebrow">Selected item</p>'
+        '<h3 id="arch-selected-title">Select a coloured item</h3><div class="arch-tags">'
+        '<span class="arch-tag" id="arch-kind-tag">Item</span>'
+        '<span class="arch-tag" id="arch-state-tag">Not affected</span></div></header>',
+        '<div class="arch-inspector-body" id="arch-inspector-body" aria-live="polite"></div>',
+        '</aside></div>',
+        '<p class="arch-rule-note"><strong>This is a decision aid, not the decision itself.</strong>'
+        '<span>The player outcome and approval actions remain above it.</span></p>',
+        '</section>',
+        '<script>window.__KIT_ARCHITECTURE_MAP__=', _script_json(rendered_model), ';</script>',
+        ARCHITECTURE_MAP_JS,
+    ])
+
+
+ARCHITECTURE_MAP_JS = r"""
+<script>
+(function(){
+  "use strict";
+  var root = document.getElementById("architecture-map");
+  var model = window.__KIT_ARCHITECTURE_MAP__;
+  if (!root || !model || !Array.isArray(model.nodes) || !model.nodes.length) return;
+  try { delete window.__KIT_ARCHITECTURE_MAP__; } catch (_ignored) {}
+
+  var shell = document.getElementById("arch-graph-shell");
+  var graph = document.getElementById("arch-graph");
+  var legend = document.getElementById("arch-legend");
+  var camera = document.getElementById("arch-camera-controls");
+  var fallback = document.getElementById("arch-fallback");
+  var status = document.getElementById("arch-map-status");
+  var search = document.getElementById("arch-search");
+  var searchCount = document.getElementById("arch-search-count");
+  var selectedTitle = document.getElementById("arch-selected-title");
+  var kindTag = document.getElementById("arch-kind-tag");
+  var stateTag = document.getElementById("arch-state-tag");
+  var inspector = document.getElementById("arch-inspector-body");
+  var back = document.getElementById("arch-back");
+  var settled = document.getElementById("arch-settled");
+  var stateNames = {existing:"Not affected",adding:"Being added",changing:"Being changed",
+                    removing:"Being removed",unplanned:"Not in plan",conflict:"Plan mismatch"};
+  var kindNames = {folder:"Folder / module",file:"File",module:"GDScript class",function:"Function"};
+  var kindDepth = {folder:0,file:1,module:2,function:3};
+  var maxDepth = {module:0,file:1,function:3};
+  var activeDepth = root.getAttribute("data-max-depth") || "function";
+  var activeView = "complete";
+  var graphFailed = false;
+  var recoverableFallback = false;
+  var focusId = null;
+  var selectedId = (model.nodes.find(function(node){return node.state !== "existing";}) || model.nodes[0]).id;
+  var renderedNodes = [];
+  var renderedLinks = [];
+  var positions = new Map();
+  var nodeElements = new Map();
+  var edgeElements = [];
+  var viewport = null;
+  var transform = {x:0,y:0,k:1};
+  var panning = null;
+  var graphFocus = false;
+  var zeroSizeSince = 0;
+  var zeroSizeTimer = null;
+  var renderGeneration = 0;
+  var maximumGraphNodes = 2000;
+  var maximumGraphLinks = 12000;
+  var svgNS = "http://www.w3.org/2000/svg";
+  var byId = new Map(model.nodes.map(function(node){ return [node.id,node]; }));
+
+  function escapeHtml(value){
+    return String(value || "").replace(/&/g,"&amp;").replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;").replace(/\"/g,"&quot;");
+  }
+  function descendantsOf(id){
+    var result = new Set([id]);
+    var changed = true;
+    while (changed) {
+      changed = false;
+      model.nodes.forEach(function(node){
+        if (node.parent && result.has(node.parent) && !result.has(node.id)) {
+          result.add(node.id); changed = true;
+        }
+      });
+    }
+    return result;
+  }
+  function focusSet(){
+    if (!focusId) return null;
+    var result = descendantsOf(focusId);
+    var current = byId.get(focusId);
+    while (current && current.parent) {
+      result.add(current.parent); current = byId.get(current.parent);
+    }
+    return result;
+  }
+  function changedSet(){
+    if (activeView !== "changes") return null;
+    var result = new Set();
+    model.nodes.forEach(function(node){
+      if (node.state === "existing") return;
+      result.add(node.id);
+      var current = node;
+      while (current && current.parent) {
+        result.add(current.parent); current = byId.get(current.parent);
+      }
+    });
+    return result;
+  }
+  function visibleNodes(){
+    var allowed = focusSet();
+    var changed = changedSet();
+    return model.nodes.filter(function(node){
+      if ((kindDepth[node.kind] || 0) > maxDepth[activeDepth]) return false;
+      if (activeDepth === "module" &&
+          (node.kind !== "folder" || !node.architecture_module)) return false;
+      if (allowed && !allowed.has(node.id)) return false;
+      return !changed || changed.has(node.id);
+    });
+  }
+  function nearestParent(node, visibleIds){
+    var parent = node.parent;
+    while (parent) {
+      if (visibleIds.has(parent)) return parent;
+      parent = (byId.get(parent) || {}).parent || null;
+    }
+    return null;
+  }
+  function sourceLinks(visible){
+    var ids = new Set(visible.map(function(node){return node.id;}));
+    var links = [];
+    visible.forEach(function(node){
+      var parent = nearestParent(node, ids);
+      if (parent) links.push({source:parent,target:node.id,relation:"contains"});
+    });
+    (model.links || []).forEach(function(link){
+      if (ids.has(link.source) && ids.has(link.target)) links.push(link);
+    });
+    return links;
+  }
+  function renderInspector(){
+    var visible = visibleNodes();
+    var node = byId.get(selectedId);
+    if (!node || !visible.some(function(item){return item.id === node.id;})) {
+      node = visible.find(function(item){return item.state !== "existing";}) || visible[0];
+      if (!node) {
+        selectedTitle.textContent = "No items in this view";
+        kindTag.textContent = "Item"; stateTag.textContent = "Not affected";
+        inspector.innerHTML = '<p class="empty">Choose Complete to restore the full structure.</p>';
+        return;
+      }
+      selectedId = node.id;
+    }
+    selectedTitle.textContent = node.signature || node.path || node.label;
+    kindTag.textContent = kindNames[node.kind] || node.kind;
+    stateTag.textContent = stateNames[node.state] || node.state;
+    stateTag.setAttribute("data-state", node.state);
+    var options = "";
+    if (Array.isArray(node.options) && node.options.length) {
+      options = '<section class="arch-special"><h4>Why not extend existing code?</h4>'
+        + '<p class="m">These are slice-level considerations. The current proposal does not link '
+        + 'each one to this exact addition.</p>'
+        + node.options.map(function(option){
+          return '<div class="arch-option"><strong>' + escapeHtml(option.name) + '</strong><span>'
+            + escapeHtml(option.answer) + '</span></div>';
+        }).join("") + '</section>';
+    }
+    var responsibility = "";
+    if (node.state === "removing") {
+      responsibility = '<section class="arch-special"><h4>Where does this responsibility go?</h4><p>'
+        + escapeHtml(node.responsibility || "The proposal does not record a responsibility transfer. Resolve this before approving the removal.")
+        + '</p></section>';
+    }
+    inspector.innerHTML = '<dl>'
+      + '<div><dt>What is this?</dt><dd>' + escapeHtml(node.what) + '</dd></div>'
+      + '<div><dt>What is changing?</dt><dd>' + escapeHtml(node.changing) + '</dd></div>'
+      + '<div><dt>Why are we changing it?</dt><dd>' + escapeHtml(node.why) + '</dd></div>'
+      + '</dl>' + options + responsibility + '<dl class="arch-special">'
+      + '<div><dt>Does this match the approved design?</dt><dd>' + escapeHtml(node.design) + '</dd></div>'
+      + '<div><dt>What depends on it?</dt><dd>' + escapeHtml(node.depends) + '</dd></div>'
+      + '<div><dt>What could break?</dt><dd>' + escapeHtml(node.risk) + '</dd></div>'
+      + '<div><dt>Can it be safely undone?</dt><dd>' + escapeHtml(node.undo) + '</dd></div>'
+      + '<div><dt>How will we check it?</dt><dd>' + escapeHtml(node.check) + '</dd></div>'
+      + '</dl>' + (graphFailed ? '' : '<button type="button" class="arch-primary" id="arch-focus">Focus this branch</button>');
+    var focus = document.getElementById("arch-focus");
+    if (focus) focus.addEventListener("click", guarded(function(){
+      focusId = node.id; graphFocus = false; back.hidden = false; renderGraph(true);
+    }));
+    updateGraphFocus();
+  }
+  function syncRovingTabIndex(){
+    nodeElements.forEach(function(element,id){
+      element.setAttribute("tabindex",id===selectedId ? "0" : "-1");
+    });
+  }
+  function selectNode(id, moveCamera){
+    if (!byId.has(id)) return;
+    selectedId = id; graphFocus = true; renderInspector(); updateGraphFocus();
+    if (moveCamera && !graphFailed) fitNodes([id], 2.2);
+  }
+  function renderFallbackList(){
+    var visible = new Set(visibleNodes().map(function(node){return node.id;}));
+    var query = search.value.trim().toLowerCase();
+    var matches = 0;
+    root.querySelectorAll("[data-arch-item]").forEach(function(item){
+      var id = item.getAttribute("data-arch-item");
+      var node = byId.get(id);
+      var match = !query || (node && ((node.path || "") + " " + (node.signature || "")
+        + " " + (node.label || "")).toLowerCase().indexOf(query) >= 0);
+      item.hidden = !visible.has(id) || !match;
+      if (!item.hidden) matches += 1;
+    });
+    searchCount.textContent = query ? String(matches) : "";
+  }
+  function showFallback(error,recoverable){
+    graphFailed = true;
+    recoverableFallback = Boolean(recoverable);
+    renderGeneration += 1; clearTimeout(zeroSizeTimer);
+    if(settled)settled.hidden=true;
+    focusId = null; graphFocus = false; back.hidden = true;
+    root.setAttribute("data-render-mode", "fallback");
+    root.setAttribute("data-recoverable-fallback",String(recoverableFallback));
+    shell.hidden = true; legend.hidden = true; camera.hidden = true;
+    fallback.hidden = false; fallback.open = true;
+    status.textContent = recoverableFallback
+      ? "This view is too large for a responsive graph · readable item list shown"
+      : "Graph unavailable · readable item list shown";
+    renderFallbackList(); renderInspector();
+    if (error && window.console) {
+      if(recoverableFallback && console.warn)console.warn("Architecture graph used its responsive list fallback.",error);
+      else if(console.error)console.error("Architecture graph could not render.", error);
+    }
+  }
+  function guarded(callback){
+    return function(){
+      try { return callback.apply(this, arguments); }
+      catch (error) { showFallback(error); }
+    };
+  }
+  function radius(node){
+    return node.kind === "folder" ? 8 : node.kind === "file" ? 7 : node.kind === "module" ? 6 : 4.5;
+  }
+  function hash(value){
+    var result = 2166136261;
+    for (var i=0;i<value.length;i+=1) { result ^= value.charCodeAt(i); result = Math.imul(result,16777619); }
+    return result >>> 0;
+  }
+  function layout(visible,width,height){
+    var visibleIds = new Set(visible.map(function(node){return node.id;}));
+    function rootOf(node){
+      var current = node;
+      while (current.parent && visibleIds.has(current.parent)) current = byId.get(current.parent);
+      return current.id;
+    }
+    var roots = Array.from(new Set(visible.map(rootOf))).sort();
+    var ratio = Math.max(.6, width / Math.max(1,height));
+    var columns = Math.max(1, Math.ceil(Math.sqrt(roots.length * ratio)));
+    var rowsCount = Math.max(1, Math.ceil(roots.length / columns));
+    var cellWidth = width / columns;
+    var cellHeight = height / rowsCount;
+    var result = new Map();
+    var children = new Map();
+    visible.forEach(function(node){
+      var parent = nearestParent(node,visibleIds);
+      if (!parent) return;
+      if (!children.has(parent)) children.set(parent,[]);
+      children.get(parent).push(node);
+    });
+    children.forEach(function(list){list.sort(function(a,b){return a.id.localeCompare(b.id);});});
+    roots.forEach(function(rootId,index){
+      var column = index % columns;
+      var row = Math.floor(index / columns);
+      result.set(rootId,{x:(column+.5)*cellWidth,y:(row+.5)*cellHeight});
+      var queue = [rootId], queueIndex = 0;
+      while (queueIndex < queue.length) {
+        var parentId = queue[queueIndex]; queueIndex += 1;
+        var parentPos = result.get(parentId);
+        var list = children.get(parentId) || [];
+        var offset = (hash(parentId)%360)*Math.PI/180;
+        var ringIndex=0,ringStart=0,ring=42;
+        var ringCapacity=Math.max(6,Math.floor(Math.PI*2*ring/26));
+        list.forEach(function(child,childIndex){
+          while(childIndex-ringStart>=ringCapacity){
+            ringStart+=ringCapacity;ringIndex+=1;ring=42+ringIndex*30;
+            ringCapacity=Math.max(6,Math.floor(Math.PI*2*ring/26));
+          }
+          var slot=childIndex-ringStart;
+          var angle=offset+slot*Math.PI*2/ringCapacity;
+          result.set(child.id,{x:parentPos.x+Math.cos(angle)*ring,
+                               y:parentPos.y+Math.sin(angle)*ring});
+          queue.push(child.id);
+        });
+      }
+    });
+    var iterations = visible.length > 1000 ? 2 : visible.length > 400 ? 5 : 10;
+    var cellSize = 28;
+    for (var tick=0;tick<iterations;tick+=1) {
+      var buckets = new Map();
+      for (var i=0;i<visible.length;i+=1) {
+        var nodeA=visible[i], a=result.get(nodeA.id);
+        var cellX=Math.floor(a.x/cellSize), cellY=Math.floor(a.y/cellSize);
+        for (var offsetX=-1;offsetX<=1;offsetX+=1) {
+          for (var offsetY=-1;offsetY<=1;offsetY+=1) {
+            var nearby=buckets.get((cellX+offsetX)+":"+(cellY+offsetY)) || [];
+            nearby.forEach(function(nodeB){
+              var b=result.get(nodeB.id);
+              var dx=b.x-a.x,dy=b.y-a.y,distance=Math.sqrt(dx*dx+dy*dy)||.01;
+              var minimum=radius(nodeA)+radius(nodeB)+6;
+              if(distance>=minimum)return;
+              var shift=(minimum-distance)/2,ux=dx/distance,uy=dy/distance;
+              a.x-=ux*shift;a.y-=uy*shift;b.x+=ux*shift;b.y+=uy*shift;
+            });
+          }
+        }
+        var key=cellX+":"+cellY;
+        if(!buckets.has(key))buckets.set(key,[]);
+        buckets.get(key).push(nodeA);
+      }
+    }
+    return result;
+  }
+  function svgElement(tag,attrs){
+    if (!document.createElementNS) throw new Error("SVG creation is unavailable");
+    var element=document.createElementNS(svgNS,tag);
+    Object.keys(attrs || {}).forEach(function(name){element.setAttribute(name,String(attrs[name]));});
+    return element;
+  }
+  function applyTransform(){
+    if (viewport) viewport.setAttribute("transform","translate("+transform.x+" "+transform.y+") scale("+transform.k+")");
+  }
+  function fitNodes(ids,maximum){
+    if (!viewport || !ids.length) return;
+    var points=ids.map(function(id){return positions.get(id);}).filter(Boolean);
+    if (!points.length) return;
+    var width=shell.clientWidth || 800, height=shell.clientHeight || 500;
+    var minX=Math.min.apply(null,points.map(function(p){return p.x;}))-32;
+    var maxX=Math.max.apply(null,points.map(function(p){return p.x;}))+32;
+    var minY=Math.min.apply(null,points.map(function(p){return p.y;}))-32;
+    var maxY=Math.max.apply(null,points.map(function(p){return p.y;}))+32;
+    var scale=Math.min(maximum || 1.5,.88/Math.max((maxX-minX)/width,(maxY-minY)/height));
+    if (!isFinite(scale) || scale<=0) scale=1;
+    transform={x:width/2-scale*(minX+maxX)/2,y:height/2-scale*(minY+maxY)/2,k:scale};
+    applyTransform();
+  }
+  function changeContextIds(){
+    var result=new Set();
+    renderedNodes.forEach(function(node){
+      if (node.state === "existing") return;
+      result.add(node.id); var current=node;
+      while (current && current.parent) { result.add(current.parent); current=byId.get(current.parent); }
+    });
+    return Array.from(result);
+  }
+  function updateGraphFocus(){
+    if (!viewport) return;
+    viewport.setAttribute("data-focus",String(graphFocus));
+    var related=new Set([selectedId]);
+    renderedLinks.forEach(function(link){
+      if (link.source===selectedId) related.add(link.target);
+      if (link.target===selectedId) related.add(link.source);
+    });
+    nodeElements.forEach(function(element,id){
+      element.setAttribute("data-selected",String(id===selectedId));
+      element.setAttribute("data-dimmed",String(graphFocus && !related.has(id)));
+    });
+    edgeElements.forEach(function(pair){
+      pair.element.setAttribute("data-connected",String(graphFocus &&
+        (pair.link.source===selectedId || pair.link.target===selectedId)));
+    });
+    syncRovingTabIndex();
+  }
+  function updateSearch(){
+    var query=search.value.trim().toLowerCase(), matches=[];
+    renderedNodes.forEach(function(node){
+      if (query && ((node.path||"")+" "+(node.signature||"")+" "+(node.label||""))
+          .toLowerCase().indexOf(query)>=0) matches.push(node);
+    });
+    searchCount.textContent=query ? String(matches.length) : "";
+    var matchIds=new Set(matches.map(function(node){return node.id;}));
+    nodeElements.forEach(function(element,id){
+      element.setAttribute("data-match",String(matchIds.has(id)));
+    });
+    if (graphFailed) renderFallbackList();
+    return matches;
+  }
+  function hasVisibleLayout(){
+    if (document.hidden === true) return false;
+    if (root.getClientRects) {
+      try { return root.getClientRects().length > 0; }
+      catch (_ignored) { return true; }
+    }
+    return true;
+  }
+  function scheduleFrame(callback){
+    // Animation frames can stop entirely in a background cockpit tab.  A
+    // bounded timer task keeps the progressive renderer moving without doing
+    // all SVG work in one blocking turn.
+    setTimeout(callback,0);
+  }
+  function drawGraph(fit){
+    renderGeneration += 1;
+    var generation=renderGeneration;
+    if(settled)settled.hidden=true;
+    var width=shell.clientWidth || (shell.getBoundingClientRect && shell.getBoundingClientRect().width) || 0;
+    var height=shell.clientHeight || (shell.getBoundingClientRect && shell.getBoundingClientRect().height) || 0;
+    if (width<=0 || height<=0) {
+      status.textContent="Waiting for graph space…";
+      if (!hasVisibleLayout()) { zeroSizeSince=0; return "waiting"; }
+      if (!zeroSizeSince) zeroSizeSince=Date.now();
+      if(Date.now()-zeroSizeSince>2500)throw new Error("Architecture graph never received visible space");
+      clearTimeout(zeroSizeTimer);
+      zeroSizeTimer=setTimeout(function(){
+        if(generation===renderGeneration && !graphFailed)renderGraph(true);
+      },100);
+      return "waiting";
+    }
+    zeroSizeSince=0; clearTimeout(zeroSizeTimer);
+    renderedNodes=visibleNodes();
+    if(renderedNodes.length>maximumGraphNodes){
+      var nodeBudgetError=new Error("Architecture map exceeds the responsive node budget");
+      nodeBudgetError.recoverable=true;throw nodeBudgetError;
+    }
+    renderedLinks=sourceLinks(renderedNodes);
+    if(renderedLinks.length>maximumGraphLinks){
+      var linkBudgetError=new Error("Architecture map exceeds the responsive link budget");
+      linkBudgetError.recoverable=true;throw linkBudgetError;
+    }
+    positions=layout(renderedNodes,width,height); nodeElements=new Map(); edgeElements=[];
+    while (graph.firstChild) graph.removeChild(graph.firstChild);
+    graph.setAttribute("viewBox","0 0 "+width+" "+height);
+    graph.setAttribute("aria-busy","true");
+    viewport=svgElement("g",{"class":"arch-viewport","data-focus":"false"});
+    var edgeLayer=svgElement("g"), nodeLayer=svgElement("g");
+    viewport.appendChild(edgeLayer); viewport.appendChild(nodeLayer); graph.appendChild(viewport);
+
+    function appendEdge(link){
+      var source=positions.get(link.source), target=positions.get(link.target);
+      if (!source || !target) return;
+      var line=svgElement("line",{"class":"arch-edge","data-relation":link.relation,
+        "data-provenance":link.provenance||"observed","data-connected":"false",
+        x1:source.x,y1:source.y,x2:target.x,y2:target.y});
+      edgeLayer.appendChild(line); edgeElements.push({element:line,link:link});
+    }
+    function appendNode(node){
+      var point=positions.get(node.id), group=svgElement("g",{"class":"arch-node",tabindex:"-1",
+        role:"button","aria-label":(node.signature||node.path||node.label)+", "+stateNames[node.state],
+        "data-node-id":node.id,"data-state":node.state,"data-selected":String(node.id===selectedId),
+        "data-match":"false",transform:"translate("+point.x+" "+point.y+")"});
+      group.appendChild(svgElement("circle",{"class":"arch-node-hit",r:18}));
+      group.appendChild(svgElement("circle",{"class":"arch-node-halo",r:radius(node)+5}));
+      group.appendChild(svgElement("circle",{"class":"arch-node-dot",r:radius(node)}));
+      var title=svgElement("title"); title.textContent=node.signature||node.path||node.label; group.appendChild(title);
+      group.addEventListener("click",guarded(function(event){if(event.stopPropagation)event.stopPropagation();selectNode(node.id,false);}));
+      group.addEventListener("keydown",guarded(function(event){
+        if (event.key==="Enter" || event.key===" ") {
+          if(event.preventDefault)event.preventDefault(); selectNode(node.id,true); return;
+        }
+        if (["ArrowLeft","ArrowUp","ArrowRight","ArrowDown"].indexOf(event.key)<0) return;
+        if(event.preventDefault)event.preventDefault();
+        var available=renderedNodes.filter(function(item){return nodeElements.has(item.id);});
+        if (!available.length) return;
+        var current=available.findIndex(function(item){return item.id===node.id;});
+        var direction=(event.key==="ArrowLeft" || event.key==="ArrowUp") ? -1 : 1;
+        var next=available[(current+direction+available.length)%available.length];
+        selectNode(next.id,true);
+        var target=nodeElements.get(next.id); if(target && target.focus)target.focus();
+      }));
+      nodeLayer.appendChild(group); nodeElements.set(node.id,group);
+    }
+    function finishDraw(){
+      if(generation!==renderGeneration || graphFailed)return;
+      if (nodeElements.size!==renderedNodes.length) throw new Error("Architecture nodes were not rendered");
+      transform={x:0,y:0,k:1}; applyTransform();
+      var changes=renderedNodes.filter(function(node){return node.state!=="existing";}).length;
+      status.textContent=renderedNodes.length
+        ? renderedNodes.length+" items · "+changes+" changes · settled"
+        : "No items in this view · choose Complete";
+      renderInspector(); updateSearch(); updateGraphFocus(); syncRovingTabIndex();
+      if (fit) {
+        var ids=changeContextIds(); fitNodes(ids.length ? ids : renderedNodes.map(function(node){return node.id;}),1.5);
+      }
+      graph.setAttribute("aria-busy","false");
+      shell.hidden=false; legend.hidden=false; camera.hidden=false; fallback.hidden=true; fallback.open=false;
+      graphFailed=false;recoverableFallback=false;root.removeAttribute("data-recoverable-fallback");
+      if(settled)settled.hidden=false;
+      root.setAttribute("data-render-mode","graph");
+    }
+
+    var total=renderedLinks.length+renderedNodes.length;
+    if(total>500){
+      var edgeIndex=0,nodeIndex=0;
+      status.textContent="Drawing "+renderedNodes.length+" items…";
+      function drawChunk(){
+        if(generation!==renderGeneration || graphFailed)return;
+        try {
+          var budget=160;
+          while(edgeIndex<renderedLinks.length && budget>0){appendEdge(renderedLinks[edgeIndex]);edgeIndex+=1;budget-=1;}
+          while(nodeIndex<renderedNodes.length && budget>0){appendNode(renderedNodes[nodeIndex]);nodeIndex+=1;budget-=1;}
+          if(edgeIndex<renderedLinks.length || nodeIndex<renderedNodes.length)scheduleFrame(drawChunk);
+          else finishDraw();
+        } catch(error){showFallback(error,Boolean(error && error.recoverable));}
+      }
+      scheduleFrame(drawChunk);
+      return "drawing";
+    }
+    renderedLinks.forEach(appendEdge); renderedNodes.forEach(appendNode); finishDraw();
+    return "done";
+  }
+  function renderGraph(fit){
+    if (graphFailed) { renderFallbackList(); renderInspector(); return; }
+    try {
+      var result=drawGraph(fit);
+      if (result==="waiting") { root.setAttribute("data-render-mode","waiting"); return; }
+      if (result==="drawing") {
+        shell.hidden=false; legend.hidden=false; camera.hidden=false; fallback.hidden=true;
+        root.setAttribute("data-render-mode","drawing");
+      }
+    } catch (error) { showFallback(error,Boolean(error && error.recoverable)); }
+  }
+  function retryResponsiveFallback(){
+    if(!recoverableFallback)return;
+    graphFailed=false;recoverableFallback=false;
+    root.removeAttribute("data-recoverable-fallback");
+    fallback.hidden=true;fallback.open=false;
+    shell.hidden=false;legend.hidden=false;camera.hidden=false;
+  }
+
+  try {
+  root.querySelectorAll("[data-arch-depth]").forEach(function(button){
+    button.addEventListener("click",guarded(function(){
+      if (button.disabled) return;
+      activeDepth=button.getAttribute("data-arch-depth"); graphFocus=false;
+      root.querySelectorAll("[data-arch-depth]").forEach(function(peer){
+        peer.setAttribute("aria-pressed",String(peer===button));
+      });
+      retryResponsiveFallback();
+      renderGraph(true);
+    }));
+  });
+  root.querySelectorAll("[data-arch-view]").forEach(function(button){
+    button.addEventListener("click",guarded(function(){
+      activeView=button.getAttribute("data-arch-view"); graphFocus=false;
+      root.querySelectorAll("[data-arch-view]").forEach(function(peer){
+        peer.setAttribute("aria-pressed",String(peer===button));
+      });
+      retryResponsiveFallback();
+      renderGraph(true);
+    }));
+  });
+  root.querySelectorAll("[data-arch-node]").forEach(function(button){
+    button.addEventListener("click",guarded(function(){selectNode(button.getAttribute("data-arch-node"),false);}));
+  });
+  document.getElementById("arch-fit-changes").addEventListener("click",guarded(function(){
+    var ids=changeContextIds(); fitNodes(ids.length?ids:renderedNodes.map(function(node){return node.id;}),1.5);
+  }));
+  document.getElementById("arch-fit-all").addEventListener("click",guarded(function(){
+    fitNodes(renderedNodes.map(function(node){return node.id;}),1.15);
+  }));
+  back.addEventListener("click",guarded(function(){focusId=null;graphFocus=false;back.hidden=true;renderGraph(true);}));
+  search.addEventListener("input",guarded(updateSearch));
+  search.addEventListener("keydown",guarded(function(event){
+    if(event.key!=="Enter")return;
+    var matches=updateSearch(); if(matches.length)selectNode(matches[0].id,!graphFailed);
+  }));
+  graph.addEventListener("wheel",guarded(function(event){
+    if(event.preventDefault)event.preventDefault();
+    var next=Math.max(.35,Math.min(3.2,transform.k*Math.exp(-event.deltaY*.001)));
+    transform.k=next;applyTransform();
+  }),{passive:false});
+  graph.addEventListener("pointerdown",guarded(function(event){panning={x:event.clientX,y:event.clientY,tx:transform.x,ty:transform.y};}));
+  graph.addEventListener("pointermove",guarded(function(event){
+    if(!panning)return;transform.x=panning.tx+event.clientX-panning.x;transform.y=panning.ty+event.clientY-panning.y;applyTransform();
+  }));
+  graph.addEventListener("pointerup",guarded(function(){panning=null;}));
+  graph.addEventListener("pointercancel",guarded(function(){panning=null;}));
+
+  var resizeTimer=null;
+  function scheduleRender(){clearTimeout(resizeTimer);resizeTimer=setTimeout(function(){renderGraph(true);},80);}
+  if(window.ResizeObserver)new ResizeObserver(guarded(scheduleRender)).observe(shell);
+  if(window.addEventListener)window.addEventListener("resize",guarded(scheduleRender));
+  var ancestor=root.parentNode;
+  while(ancestor){
+    if(ancestor.tagName==="DETAILS")ancestor.addEventListener("toggle",guarded(scheduleRender));
+    ancestor=ancestor.parentNode;
+  }
+  if(document.addEventListener)document.addEventListener("visibilitychange",guarded(scheduleRender));
+  renderGraph(true);
+  } catch (error) { showFallback(error); }
+})();
+</script>
+"""
+
+
 def render(shape: Dict[str, Any], prop: Dict[str, Any],
            mods: List[Dict[str, Any]], mermaid: str,
            built: set, commits: List[Dict[str, str]],
@@ -1152,7 +3022,11 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
            changed: set | None = None,
            deleted: set | None = None,
            cockpit_state: Dict[str, Any] | None = None,
-           changed_actions: Dict[str, str] | None = None) -> str:
+           changed_actions: Dict[str, str] | None = None,
+           present_files: set[str] | None = None,
+           baseline_files: set[str] | None = None,
+           function_changes: Dict[Tuple[str, str], Dict[str, str]] | None = None,
+           ) -> str:
     level = str(shape.get("involvement", "") or "").strip()
     depth = DEPTH.get(level, 3)
     cockpit_state = cockpit_state if isinstance(cockpit_state, dict) else {}
@@ -1532,6 +3406,28 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
               'data-board-control>Request changes</button>'
               '<button type="button" class="veto" data-plan-action="veto" '
               'data-board-control>Veto design and plan</button></div></div></div></details>')
+
+    # Architecture is a decision aid, so it belongs after the decision and
+    # before the audit record. Hands-off work intentionally keeps only its
+    # coarse reversible scope; deeper involvement gets the complete source map
+    # with detail capped at the level the human chose to review.
+    if depth > 0:
+        architecture = architecture_map_model(
+            prop,
+            tree or {},
+            built,
+            mods,
+            changed_actions,
+            cockpit_state,
+            present_files,
+            baseline_files,
+            level,
+            function_changes,
+        )
+        rendered_architecture = architecture_map_html(architecture, level)
+        if rendered_architecture:
+            a(rendered_architecture)
+
     a('<details class="record"><summary>Review full plan and project record</summary>'
       '<div class="record-body">')
     a('<p class="legend">Implementation detail, design ancestry, history, architecture and '
@@ -1652,33 +3548,6 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     if not prop_mods and not prop_files and depth > 0:
         a('<p class="empty">Nothing approved yet. The agent proposes the'
           " structure, you approve it, and it lands here before any code.</p>")
-
-    a('<p class="legend">'
-      + state_tag("built") + " as approved &nbsp; "
-      + state_tag("missing") + " approved, not written &nbsp; "
-      + state_tag("new") + " new file &nbsp; "
-      + state_tag("modified") + " changed &nbsp; "
-      + state_tag("deleted") + " completed deletion &nbsp; "
-      + state_tag("existing") + " approved earlier &nbsp; "
-      + state_tag("extra") + " exists without approval</p>")
-
-    hier = hierarchy(prop, tree or {}, built, depth, history)
-    considered = rows(prop, "considered_existing")
-    if considered:
-        # Above the diagram: extend-before-create is the decision a reviewer
-        # most needs to check, and below the hierarchy it was easy to miss.
-        a("<h2>Existing code considered first</h2>")
-        for c in considered:
-            a(f'<div class="card"><div class="t mono">{esc(c.get("path"))}</div>'
-              f'<div class="m">{esc(c.get("why_not"))}</div></div>')
-
-    if hier:
-        a('<p class="legend">Every folder, file'
-          + (" and function" if depth >= 3 else "")
-          + " in this slice, from <code>res://</code> down."
-            " Green is built as approved, dashed amber is approved but not"
-            " written, red exists without approval.</p>")
-        a(f'<div class="mermaid">{esc(hier)}</div>')
 
     funcs_by_file: Dict[str, List[Dict[str, Any]]] = {}
     for fn in rows(prop, "functions"):
@@ -1874,13 +3743,6 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
           f' {esc(d.get("decided_by"))}'
           + (" · superseded" if dead else "") + "</div></div>")
 
-    # ---- real architecture, derived
-    if mermaid:
-        a("<h2>Actual architecture</h2>")
-        a('<p class="legend">Derived from code by arch.py. The gate fails when'
-          " this is stale, so it cannot drift from reality.</p>")
-        a(f'<div class="mermaid">{esc(mermaid)}</div>')
-
     # ---- recent work, with honest repository-relative references
     if commits:
         a("<h2>Recent changes</h2>")
@@ -2034,7 +3896,7 @@ def main() -> int:
     }
     mods = [
         dependency_by_module.get(module, {"path": module, "depends_on": []})
-        for module in sorted(authored_modules(present) | set(dependency_by_module))
+        for module in sorted(authored_modules(present))
     ]
     baseline = str(prop.get("baseline_sha", "") or "").strip()
     scoped = touched_since(baseline)
@@ -2052,6 +3914,17 @@ def main() -> int:
             )
             for path in scoped
         }
+    )
+    function_files = set(scoped or set())
+    for item in rows(prop, "functions"):
+        file_path = str(item.get("file") or "").strip().replace("\\", "/")
+        if file_path:
+            function_files.add(file_path)
+    function_evidence = function_changes_since(
+        baseline,
+        function_files if scoped is not None else None,
+        baseline_files,
+        present,
     )
     referenced: set[str] = set()
     for ref in rows(prop, "design_refs"):
@@ -2075,7 +3948,8 @@ def main() -> int:
         return render(
             shape, prop, mods, mermaid, built, recent(), kit_docs, design_docs,
             snapshot_label, mermaid_src(depth), tree, history, doc_targets,
-            scoped, deleted, cockpit_state, changed_actions,
+            scoped, deleted, cockpit_state, changed_actions, present,
+            baseline_files, function_evidence,
         )
 
     doc = build(0)

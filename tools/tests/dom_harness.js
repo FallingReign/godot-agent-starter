@@ -19,7 +19,7 @@ const vm = require('vm');
 
 /* ------------------------------------------------------------------ parser */
 const VOID = new Set(['meta', 'link', 'br', 'hr', 'img', 'input', 'source', 'area', 'base', 'col']);
-const RAW = new Set(['script', 'style', 'textarea']);
+const RAW = new Set(['script', 'style', 'textarea', 'noscript']);
 
 function decode(s) {
   return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -42,6 +42,10 @@ class El {
     this.disabled = false;
     this.hidden = false;
     this.open = false;
+    this.value = '';
+    this.clientWidth = 800;
+    this.clientHeight = 500;
+    this.ownerDocument = null;
     const self = this;
     this.classList = {
       contains(c) { return self._classes().indexOf(c) >= 0; },
@@ -61,9 +65,11 @@ class El {
   get id() { return this.attrs['id'] || ''; }
   getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
   setAttribute(name, v) { this.attrs[name] = String(v); }
+  removeAttribute(name) { delete this.attrs[name]; }
   appendChild(child) {
     if (child.parentNode) { child.parentNode.removeChild(child); }
     child.parentNode = this;
+    if (this.ownerDocument) { adoptTree(child, this.ownerDocument); }
     this.children.push(child);
     return child;
   }
@@ -73,9 +79,45 @@ class El {
     return child;
   }
   remove() { if (this.parentNode) { this.parentNode.removeChild(this); } }
-  focus() {}
+  get firstChild() { return this.children[0] || null; }
+  getBoundingClientRect() {
+    return {left: 0, top: 0, right: this.clientWidth, bottom: this.clientHeight,
+            width: this.clientWidth, height: this.clientHeight};
+  }
+  getClientRects() {
+    return this._isRendered() && this.clientWidth > 0 && this.clientHeight > 0
+      ? [this.getBoundingClientRect()] : [];
+  }
+  get offsetWidth() { return this.clientWidth; }
+  get offsetHeight() { return this.clientHeight; }
+  get offsetParent() { return this._isRendered() ? this.parentNode : null; }
+  get isConnected() {
+    let current = this;
+    while (current) {
+      if (current.tag === '#document') { return true; }
+      current = current.parentNode;
+    }
+    return false;
+  }
+  _isRendered() {
+    let current = this;
+    while (current) {
+      if (current.hidden || current.style.display === 'none') { return false; }
+      current = current.parentNode;
+    }
+    return true;
+  }
+  focus() {
+    if (this.ownerDocument) { this.ownerDocument.activeElement = this; }
+  }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
-  fire(type) { (this._listeners[type] || []).forEach(fn => fn({type: type, target: this})); }
+  fire(type, props) {
+    const event = Object.assign({
+      type: type, target: this, currentTarget: this,
+      preventDefault() {}, stopPropagation() {}
+    }, props || {});
+    (this._listeners[type] || []).forEach(fn => fn(event));
+  }
   get textContent() {
     if (RAW.has(this.tag)) { return this._text; }
     return this.children.map(c => (c instanceof El ? c.textContent : c.text)).join('') + this._text;
@@ -102,6 +144,12 @@ class El {
   }
   querySelectorAll(sel) { return this._all([]).filter(el => matches(el, sel)); }
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+}
+
+function adoptTree(el, doc) {
+  if (!(el instanceof El)) { return; }
+  el.ownerDocument = doc;
+  el.children.forEach(child => adoptTree(child, doc));
 }
 
 /* One compound simple selector: tag, .class, #id, [attr], [attr="v"], and
@@ -210,22 +258,38 @@ function findTagEnd(html, from) {
 }
 
 /* ---------------------------------------------------------------- document */
-function buildDocument(html) {
+function buildDocument(html, opts) {
   const docRoot = new El('#document');
   parseInto(html, docRoot);
   const body = docRoot.querySelector('body') || docRoot;
   const doc = {
     readyState: 'complete',
     hidden: false,
+    visibilityState: 'visible',
+    activeElement: null,
     body: body,
     _listeners: {},
     getElementById(id) { return docRoot.querySelector('#' + id); },
     querySelector(sel) { return docRoot.querySelector(sel); },
     querySelectorAll(sel) { return docRoot.querySelectorAll(sel); },
-    createElement(tag) { return new El(tag); },
+    createElement(tag) {
+      const element = new El(tag);
+      adoptTree(element, doc);
+      return element;
+    },
+    createElementNS(_namespace, tag) {
+      if (opts && opts.failCreateElementNS) {
+        throw new Error('forced SVG construction failure');
+      }
+      const element = new El(tag);
+      adoptTree(element, doc);
+      return element;
+    },
     addEventListener(type, fn) { (doc._listeners[type] = doc._listeners[type] || []).push(fn); },
     fire(type) { (doc._listeners[type] || []).forEach(fn => fn({type: type})); }
   };
+  adoptTree(docRoot, doc);
+  doc.activeElement = body;
   return {doc: doc, root: docRoot};
 }
 
@@ -258,7 +322,18 @@ function makeFetch(routes, log) {
 }
 
 function run(html, opts) {
-  const built = buildDocument(html);
+  opts = opts || {};
+  const built = buildDocument(html, opts);
+  const architectureRoot = built.doc.getElementById('architecture-map');
+  const architectureShell = built.doc.getElementById('arch-graph-shell');
+  if (architectureShell && opts.architectureZeroSize) {
+    architectureShell.clientWidth = 0;
+    architectureShell.clientHeight = 0;
+  }
+  if (architectureShell && opts.architectureHidden) {
+    if (architectureRoot) { architectureRoot.hidden = true; }
+    architectureShell.hidden = true;
+  }
   if ((opts.protocol || 'http:') !== 'file:') {
     const capability = new El('meta');
     capability.setAttribute('name', 'kit-board-token');
@@ -267,6 +342,17 @@ function run(html, opts) {
   }
   const log = [];
   const timers = [];
+  const resizeObservers = [];
+  const windowListeners = {};
+  let nextTimerId = 1;
+  let nowMs = Date.now();
+  function HarnessDate() {
+    return Reflect.construct(Date, Array.from(arguments));
+  }
+  HarnessDate.now = () => nowMs;
+  HarnessDate.parse = Date.parse;
+  HarnessDate.UTC = Date.UTC;
+  HarnessDate.prototype = Date.prototype;
   const ctx = {
     console: {log() {}, warn() {}, error() {}},
     document: built.doc,
@@ -275,21 +361,51 @@ function run(html, opts) {
       reloads: 0, reload() { this.reloads += 1; }
     },
     fetch: makeFetch(opts.routes || {}, log),
-    setTimeout(fn, ms) { timers.push({fn: fn, ms: ms}); return timers.length; },
-    clearTimeout() {},
+    setTimeout(fn, ms) {
+      const timer = {id: nextTimerId++, fn: fn, ms: ms, cancelled: false, fired: false};
+      timers.push(timer);
+      return timer.id;
+    },
+    clearTimeout(id) {
+      const timer = timers.find(item => item.id === id);
+      if (timer) { timer.cancelled = true; }
+    },
     setInterval() { return 0; },
-    encodeURIComponent: encodeURIComponent
+    encodeURIComponent: encodeURIComponent,
+    getComputedStyle(element) {
+      const visible = element && element._isRendered();
+      return {display: visible ? 'block' : 'none', visibility: visible ? 'visible' : 'hidden'};
+    },
+    ResizeObserver: function ResizeObserver(callback) {
+      this.callback = callback;
+      this.targets = [];
+      this.observe = target => { this.targets.push(target); };
+      this.disconnect = () => { this.targets = []; };
+      resizeObservers.push(this);
+    },
+    Date: HarnessDate
   };
   ctx.window = ctx;
   ctx.globalThis = ctx;
-  ctx.addEventListener = function () {};      // plan.html's hashchange handler
-  ctx.removeEventListener = function () {};
+  ctx.addEventListener = function (type, fn) {
+    (windowListeners[type] = windowListeners[type] || []).push(fn);
+  };
+  ctx.removeEventListener = function (type, fn) {
+    windowListeners[type] = (windowListeners[type] || []).filter(item => item !== fn);
+  };
   vm.createContext(ctx);
   for (const src of scriptsOf(html)) {
     try { vm.runInContext(src, ctx); }
     catch (e) { return Promise.reject(new Error('script threw: ' + e.message)); }
+    if (opts.architectureModelOverride
+        && src.indexOf('window.__KIT_ARCHITECTURE_MAP__=') >= 0) {
+      ctx.window.__KIT_ARCHITECTURE_MAP__ = opts.architectureModelOverride;
+    }
   }
-  return settle().then(() => ({ctx: ctx, doc: built.doc, log: log, timers: timers}));
+  return settle().then(() => ({ctx: ctx, doc: built.doc, log: log, timers: timers,
+                               resizeObservers: resizeObservers,
+                               windowListeners: windowListeners,
+                               advanceTime(ms) { nowMs += Math.max(0, Number(ms) || 0); }}));
 }
 
 function settle(n) {
@@ -303,6 +419,209 @@ function settle(n) {
 const results = [];
 function check(scenario, name, cond, detail) {
   results.push({scenario: scenario, name: name, pass: !!cond, detail: detail || ''});
+}
+
+async function drainShortTimers(env, maximum) {
+  let count = 0;
+  while (count < maximum) {
+    const timer = env.timers.find(item => !item.cancelled && !item.fired && item.ms <= 250);
+    if (!timer) { break; }
+    timer.fired = true;
+    env.advanceTime(timer.ms);
+    timer.fn();
+    count += 1;
+    await settle();
+  }
+  return count;
+}
+
+async function notifyArchitectureResize(env) {
+  const shell = env.doc.getElementById('arch-graph-shell');
+  env.resizeObservers.forEach(observer => {
+    if (observer.targets.indexOf(shell) >= 0) {
+      observer.callback([{target: shell, contentRect: shell.getBoundingClientRect()}]);
+    }
+  });
+  (env.windowListeners.resize || []).forEach(listener => listener({type: 'resize'}));
+  await settle();
+}
+
+function exerciseArchitecture(env, scenario, expectedMode) {
+  const doc = env.doc;
+  const root = doc.getElementById('architecture-map');
+  const shell = doc.getElementById('arch-graph-shell');
+  const graph = doc.getElementById('arch-graph');
+  const legend = doc.getElementById('arch-legend');
+  const camera = doc.getElementById('arch-camera-controls');
+  const fallback = doc.getElementById('arch-fallback');
+  const settled = doc.getElementById('arch-settled');
+  check(scenario, 'architecture map exists', !!root);
+  if (!root) { return; }
+  check(scenario, 'render mode is explicit',
+        root.getAttribute('data-render-mode') === expectedMode,
+        String(root.getAttribute('data-render-mode')));
+  if (expectedMode === 'graph') {
+    const nodes = graph ? graph.querySelectorAll('.arch-node') : [];
+    check(scenario, 'native SVG contains architecture nodes', nodes.length > 0,
+          String(nodes.length));
+    check(scenario, 'fallback list stays hidden after a successful render',
+          fallback && fallback.hidden === true && fallback.open === false);
+    check(scenario, 'graph, legend and camera stay visible',
+          shell && !shell.hidden && legend && !legend.hidden && camera && !camera.hidden);
+    check(scenario, 'settled badge appears only after the graph finishes',
+          settled && settled.hidden === false);
+  } else {
+    check(scenario, 'fallback list is visible and open',
+          fallback && fallback.hidden === false && fallback.open === true);
+    check(scenario, 'failed graph, legend and camera are hidden',
+          shell && shell.hidden && legend && legend.hidden && camera && camera.hidden);
+    check(scenario, 'settled badge stays hidden in fallback mode',
+          settled && settled.hidden === true);
+  }
+
+  const search = doc.getElementById('arch-search');
+  const count = doc.getElementById('arch-search-count');
+  const title = doc.getElementById('arch-selected-title');
+  search.value = 'describe_feedback';
+  search.fire('input');
+  check(scenario, 'search finds the planned function', count.textContent === '1',
+        count.textContent);
+  search.fire('keydown', {key: 'Enter'});
+  check(scenario, 'Enter selects the first search result',
+        title.textContent === 'func describe_feedback() -> String', title.textContent);
+  search.value = '';
+  search.fire('input');
+
+  const changesButton = doc.querySelector('[data-arch-view="changes"]');
+  const completeButton = doc.querySelector('[data-arch-view="complete"]');
+  check(scenario, 'complete is the initial map focus',
+        completeButton && completeButton.getAttribute('aria-pressed') === 'true'
+        && changesButton && changesButton.getAttribute('aria-pressed') === 'false');
+  const existingId =
+    'function:scripts/logic/action_service.gd::ActionService.submit_action';
+  const visibleIds = () => expectedMode === 'graph'
+    ? graph.querySelectorAll('.arch-node').map(node => node.getAttribute('data-node-id'))
+    : doc.querySelectorAll('[data-arch-item]').filter(item => !item.hidden)
+      .map(item => item.getAttribute('data-arch-item'));
+  const visibleCount = () => expectedMode === 'graph'
+    ? graph.querySelectorAll('.arch-node').length
+    : visibleIds().length;
+  const itemVisible = id => expectedMode === 'graph'
+    ? !!doc.querySelector('[data-node-id="' + id + '"]')
+    : !!doc.querySelector('[data-arch-item="' + id + '"]')
+      && !doc.querySelector('[data-arch-item="' + id + '"]').hidden;
+  const completeCount = visibleCount();
+  const existingInComplete = itemVisible(existingId);
+  changesButton.fire('click');
+  const changesCount = visibleCount();
+  const existingInChanges = itemVisible(existingId);
+  check(scenario, 'changes focus is an optional filter',
+        changesButton.getAttribute('aria-pressed') === 'true'
+        && completeButton.getAttribute('aria-pressed') === 'false');
+  completeButton.fire('click');
+  check(scenario, 'complete expands unaffected context',
+        !existingInChanges && existingInComplete && completeCount > changesCount,
+        JSON.stringify({changes: changesCount, complete: completeCount,
+                        before: existingInChanges, after: existingInComplete}));
+
+  const moduleButton = doc.querySelector('[data-arch-depth="module"]');
+  moduleButton.fire('click');
+  check(scenario, 'detail control switches to modules',
+        moduleButton.getAttribute('aria-pressed') === 'true');
+  const moduleIds = visibleIds();
+  check(scenario, 'module detail renders only declared architecture-module folders',
+        moduleIds.length > 0
+        && moduleIds.every(id => id.indexOf('folder:') === 0)
+        && moduleIds.indexOf('folder:scripts/logic') >= 0
+        && moduleIds.indexOf('folder:scripts') < 0,
+        JSON.stringify(moduleIds));
+  const functionId =
+    'function:scripts/logic/feedback_event.gd::FeedbackEvent.describe_feedback';
+  const functionNode = doc.querySelector('[data-node-id="' + functionId + '"]');
+  const functionItem = doc.querySelector('[data-arch-item="' + functionId + '"]');
+  check(scenario, 'module detail hides function rows',
+        expectedMode === 'graph' ? !functionNode : functionItem && functionItem.hidden);
+
+  const fileButton = doc.querySelector('[data-arch-depth="file"]');
+  fileButton.fire('click');
+  const fileIds = visibleIds();
+  check(scenario, 'file detail renders folders and files only',
+        fileIds.some(id => id.indexOf('file:') === 0)
+        && fileIds.every(id => id.indexOf('folder:') === 0 || id.indexOf('file:') === 0),
+        JSON.stringify(fileIds));
+
+  const functionButton = doc.querySelector('[data-arch-depth="function"]');
+  functionButton.fire('click');
+  const functionIds = visibleIds();
+  check(scenario, 'function detail includes classes and functions',
+        functionIds.some(id => id.indexOf('class:') === 0)
+        && functionIds.some(id => id.indexOf('function:') === 0),
+        JSON.stringify(functionIds));
+
+  if (expectedMode === 'graph') {
+    const graphNodes = graph.querySelectorAll('.arch-node');
+    const tabStops = graphNodes.filter(node => node.getAttribute('tabindex') === '0');
+    check(scenario, 'the SVG node set has exactly one keyboard tab stop',
+          tabStops.length === 1
+          && graphNodes.every(node => node === tabStops[0]
+            || node.getAttribute('tabindex') === '-1'),
+          JSON.stringify(graphNodes.map(node => [node.getAttribute('data-node-id'),
+                                                 node.getAttribute('tabindex')])));
+    if (tabStops.length === 1 && graphNodes.length > 1) {
+      const beforeId = tabStops[0].getAttribute('data-node-id');
+      const beforeTitle = title.textContent;
+      tabStops[0].focus();
+      tabStops[0].fire('keydown', {key: 'ArrowRight'});
+      const afterStops = graph.querySelectorAll('.arch-node')
+        .filter(node => node.getAttribute('tabindex') === '0');
+      const after = afterStops[0] || null;
+      check(scenario, 'ArrowRight moves selection and keyboard focus to one other node',
+            afterStops.length === 1 && after
+            && after.getAttribute('data-node-id') !== beforeId
+            && doc.activeElement === after
+            && title.textContent !== beforeTitle,
+            JSON.stringify({before: beforeId,
+                            after: after && after.getAttribute('data-node-id'),
+                            active: doc.activeElement
+                              && doc.activeElement.getAttribute('data-node-id'),
+                            title: title.textContent}));
+    }
+  }
+}
+
+function exerciseArchitectureNoChanges(env) {
+  const scenario = 'architecture-no-changes';
+  const doc = env.doc;
+  const root = doc.getElementById('architecture-map');
+  const graph = doc.getElementById('arch-graph');
+  const status = doc.getElementById('arch-map-status');
+  const title = doc.getElementById('arch-selected-title');
+  const changes = doc.querySelector('[data-arch-view="changes"]');
+  const complete = doc.querySelector('[data-arch-view="complete"]');
+  const settled = doc.getElementById('arch-settled');
+  const completeCount = graph ? graph.querySelectorAll('.arch-node').length : 0;
+  check(scenario, 'unchanged architecture starts as a non-empty Complete graph',
+        root && root.getAttribute('data-render-mode') === 'graph'
+        && completeCount > 0 && settled && !settled.hidden,
+        JSON.stringify({mode: root && root.getAttribute('data-render-mode'),
+                        count: completeCount,
+                        settledHidden: settled && settled.hidden}));
+  if (!changes || !complete || !graph) { return; }
+  changes.fire('click');
+  check(scenario, 'Changes with no changes renders zero SVG nodes',
+        graph.querySelectorAll('.arch-node').length === 0,
+        String(graph.querySelectorAll('.arch-node').length));
+  check(scenario, 'the empty Changes view explains how to restore context',
+        /No items in this view/.test(status.textContent)
+        && /choose Complete/.test(status.textContent)
+        && title.textContent === 'No items in this view',
+        JSON.stringify({status: status.textContent, title: title.textContent}));
+  complete.fire('click');
+  check(scenario, 'Complete restores every unchanged architecture node',
+        graph.querySelectorAll('.arch-node').length === completeCount
+        && complete.getAttribute('aria-pressed') === 'true',
+        JSON.stringify({before: completeCount,
+                        after: graph.querySelectorAll('.arch-node').length}));
 }
 
 let ACTIVE_BOARD_VERSION = '';
@@ -339,6 +658,8 @@ async function main() {
   /* The retro page is identified by the element, not by the string: plan.html
      renders docs inline and can quite legitimately *mention* #list-toaction. */
   const isRetro = /<div id="list-toaction"/.test(html);
+  const hasArchitecture = /id="architecture-map"/.test(html);
+  const unchangedArchitecture = /Architecture unchanged fixture/.test(html);
 
   /* ---------------------------------------------------- 1. healthy board */
   {
@@ -578,10 +899,195 @@ async function main() {
             blockedBanner && blockedBanner.innerHTML.indexOf(blocker) >= 0
             && /local evidence remains available/.test(blockedBanner.innerHTML),
             blockedBanner ? blockedBanner.innerHTML : 'missing');
+      if (hasArchitecture) {
+        if (unchangedArchitecture) {
+          exerciseArchitectureNoChanges(env);
+        } else {
+          exerciseArchitecture(env, 'architecture-graph', 'graph');
+        }
+      }
     }
   }
 
-  /* ------------------------- 1a. recorded reversible operator controls */
+  /* ---------------------- 1a. native SVG construction fails safely */
+  if (!isRetro && hasArchitecture && !unchangedArchitecture) {
+    const fallbackEnv = await run(html, {
+      failCreateElementNS: true,
+      routes: {
+        '/api/health': HEALTH_OK(),
+        '/api/state': response(200, stateBody())
+      }
+    });
+    exerciseArchitecture(fallbackEnv, 'architecture-fallback', 'fallback');
+  }
+
+  /* ------ 1b. zero-sized hidden panels wait; visible zero-size is bounded */
+  if (!isRetro && hasArchitecture && !unchangedArchitecture) {
+    const routes = {
+      '/api/health': HEALTH_OK(),
+      '/api/state': response(200, stateBody())
+    };
+    const hiddenEnv = await run(html, {
+      architectureZeroSize: true,
+      architectureHidden: true,
+      routes: routes
+    });
+    await drainShortTimers(hiddenEnv, 12);
+    const hiddenRoot = hiddenEnv.doc.getElementById('architecture-map');
+    const hiddenFallback = hiddenEnv.doc.getElementById('arch-fallback');
+    const hiddenSettled = hiddenEnv.doc.getElementById('arch-settled');
+    check('architecture-hidden-size',
+          'a temporarily hidden zero-size graph waits without latching fallback',
+          hiddenRoot && hiddenRoot.getAttribute('data-render-mode') === 'waiting'
+          && hiddenFallback && hiddenFallback.hidden && !hiddenFallback.open
+          && hiddenSettled && hiddenSettled.hidden,
+          JSON.stringify({mode: hiddenRoot && hiddenRoot.getAttribute('data-render-mode'),
+                          fallbackHidden: hiddenFallback && hiddenFallback.hidden,
+                          fallbackOpen: hiddenFallback && hiddenFallback.open}));
+
+    const hiddenShell = hiddenEnv.doc.getElementById('arch-graph-shell');
+    hiddenRoot.hidden = false;
+    hiddenShell.hidden = false;
+    hiddenShell.clientWidth = 800;
+    hiddenShell.clientHeight = 500;
+    await notifyArchitectureResize(hiddenEnv);
+    await drainShortTimers(hiddenEnv, 6);
+    check('architecture-hidden-size',
+          'the waiting graph renders after it becomes visible and receives space',
+          hiddenRoot.getAttribute('data-render-mode') === 'graph'
+          && hiddenEnv.doc.querySelectorAll('.arch-node').length > 0
+          && hiddenFallback.hidden && !hiddenFallback.open
+          && !hiddenSettled.hidden,
+          JSON.stringify({mode: hiddenRoot.getAttribute('data-render-mode'),
+                          nodes: hiddenEnv.doc.querySelectorAll('.arch-node').length}));
+
+    const visibleZeroEnv = await run(html, {
+      architectureZeroSize: true,
+      routes: routes
+    });
+    const fired = await drainShortTimers(visibleZeroEnv, 40);
+    const visibleZeroRoot = visibleZeroEnv.doc.getElementById('architecture-map');
+    const visibleZeroFallback = visibleZeroEnv.doc.getElementById('arch-fallback');
+    const visibleZeroSettled = visibleZeroEnv.doc.getElementById('arch-settled');
+    check('architecture-visible-zero-size',
+          'a persistently visible zero-size graph falls back after bounded retries',
+          fired < 40
+          && visibleZeroRoot.getAttribute('data-render-mode') === 'fallback'
+          && visibleZeroFallback && !visibleZeroFallback.hidden && visibleZeroFallback.open
+          && visibleZeroSettled && visibleZeroSettled.hidden,
+          JSON.stringify({timersRun: fired,
+                          mode: visibleZeroRoot.getAttribute('data-render-mode'),
+                          fallbackHidden: visibleZeroFallback && visibleZeroFallback.hidden}));
+  }
+
+  /* ----------- 1c. oversized maps fail closed before expensive SVG work */
+  if (!isRetro && hasArchitecture && !unchangedArchitecture) {
+    const routes = {
+      '/api/health': HEALTH_OK(),
+      '/api/state': response(200, stateBody())
+    };
+    const budgetNode = (id, parent, kind) => ({
+      id: id, label: id, path: id, kind: kind || 'folder',
+      architecture_module: (kind || 'folder') === 'folder',
+      state: 'existing', action: '', parent: parent || null,
+      what: 'A bounded architecture test item.',
+      changing: 'Nothing changes.', why: 'No change is proposed.',
+      design: 'No design claim.', depends: 'No dependency claim.',
+      risk: 'No change risk.', undo: 'Not applicable.', check: 'Harness proof.',
+      options: [], responsibility: null
+    });
+    const assertBudgetFallback = (env, scenario, expectedCount) => {
+      const root = env.doc.getElementById('architecture-map');
+      const fallback = env.doc.getElementById('arch-fallback');
+      const settled = env.doc.getElementById('arch-settled');
+      const graph = env.doc.getElementById('arch-graph');
+      check(scenario, 'the responsive budget degrades to the readable fallback',
+            root && root.getAttribute('data-render-mode') === 'fallback'
+            && root.getAttribute('data-recoverable-fallback') === 'true'
+            && fallback && !fallback.hidden && fallback.open
+            && settled && settled.hidden
+            && graph && graph.querySelectorAll('.arch-node').length === 0,
+            JSON.stringify({expectedCount: expectedCount,
+                            mode: root && root.getAttribute('data-render-mode'),
+                            fallbackHidden: fallback && fallback.hidden,
+                            settledHidden: settled && settled.hidden,
+                            svgNodes: graph && graph.querySelectorAll('.arch-node').length}));
+    };
+
+    const oversizedNodes = Array.from(
+      {length: 2001}, (_, index) => budgetNode(
+        'function:budget-' + index, null, 'function'
+      )
+    );
+    const nodeBudgetEnv = await run(html, {
+      architectureModelOverride: {nodes: oversizedNodes, links: []},
+      routes: routes
+    });
+    assertBudgetFallback(nodeBudgetEnv, 'architecture-node-budget', 2001);
+
+    const nodeRoot = nodeBudgetEnv.doc.getElementById('architecture-map');
+    const nodeFallback = nodeBudgetEnv.doc.getElementById('arch-fallback');
+    const nodeSettled = nodeBudgetEnv.doc.getElementById('arch-settled');
+    const nodeShell = nodeBudgetEnv.doc.getElementById('arch-graph-shell');
+    const nodeLegend = nodeBudgetEnv.doc.getElementById('arch-legend');
+    const nodeCamera = nodeBudgetEnv.doc.getElementById('arch-camera-controls');
+    const moduleDepth = nodeBudgetEnv.doc.querySelector('[data-arch-depth="module"]');
+    const functionDepth = nodeBudgetEnv.doc.querySelector('[data-arch-depth="function"]');
+    const changesView = nodeBudgetEnv.doc.querySelector('[data-arch-view="changes"]');
+    moduleDepth.fire('click');
+    check('architecture-node-budget',
+          'narrowing depth retries a recoverable fallback as a graph',
+          nodeRoot.getAttribute('data-render-mode') === 'graph'
+          && nodeRoot.getAttribute('data-recoverable-fallback') === null
+          && nodeFallback.hidden && !nodeFallback.open
+          && !nodeSettled.hidden
+          && !nodeShell.hidden && !nodeLegend.hidden && !nodeCamera.hidden
+          && nodeBudgetEnv.doc.querySelectorAll('.arch-node').length === 0,
+          JSON.stringify({mode: nodeRoot.getAttribute('data-render-mode'),
+                          recoverable: nodeRoot.getAttribute('data-recoverable-fallback'),
+                          fallbackHidden: nodeFallback.hidden,
+                          settledHidden: nodeSettled.hidden,
+                          shellHidden: nodeShell.hidden,
+                          legendHidden: nodeLegend.hidden,
+                          cameraHidden: nodeCamera.hidden}));
+    functionDepth.fire('click');
+    check('architecture-node-budget',
+          'expanding back over budget uses the recoverable fallback again',
+          nodeRoot.getAttribute('data-render-mode') === 'fallback'
+          && nodeRoot.getAttribute('data-recoverable-fallback') === 'true');
+    changesView.fire('click');
+    check('architecture-node-budget',
+          'narrowing map focus also retries the responsive graph',
+          nodeRoot.getAttribute('data-render-mode') === 'graph'
+          && nodeRoot.getAttribute('data-recoverable-fallback') === null
+          && nodeFallback.hidden && !nodeFallback.open
+          && !nodeSettled.hidden
+          && !nodeShell.hidden && !nodeLegend.hidden && !nodeCamera.hidden
+          && nodeBudgetEnv.doc.querySelectorAll('.arch-node').length === 0,
+          JSON.stringify({mode: nodeRoot.getAttribute('data-render-mode'),
+                          recoverable: nodeRoot.getAttribute('data-recoverable-fallback'),
+                          fallbackHidden: nodeFallback.hidden,
+                          settledHidden: nodeSettled.hidden,
+                          shellHidden: nodeShell.hidden,
+                          legendHidden: nodeLegend.hidden,
+                          cameraHidden: nodeCamera.hidden}));
+
+    const linkNodes = [
+      budgetNode('folder:budget-source', null),
+      budgetNode('folder:budget-target', null)
+    ];
+    const oversizedLinks = Array.from({length: 12001}, () => ({
+      source: linkNodes[0].id, target: linkNodes[1].id,
+      relation: 'uses', provenance: 'observed'
+    }));
+    const linkBudgetEnv = await run(html, {
+      architectureModelOverride: {nodes: linkNodes, links: oversizedLinks},
+      routes: routes
+    });
+    assertBudgetFallback(linkBudgetEnv, 'architecture-link-budget', 12001);
+  }
+
+  /* ------------------------- 1d. recorded reversible operator controls */
   if (!isRetro && /id="plan-recorded-controls"/.test(html)) {
     const S = 'recorded-plan-decision';
     const env = await run(html, {routes: {
@@ -630,7 +1136,7 @@ async function main() {
           String(env.ctx.location.reloads));
   }
 
-  /* --------------------------------------- 1b. ordering and partitioning */
+  /* --------------------------------------- 1c. ordering and partitioning */
   if (isRetro) {
     const S = 'ordering';
     const probe = buildDocument(html);
