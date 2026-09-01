@@ -1191,6 +1191,18 @@ def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     return report, members
 
 
+def read_verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
+    """Return authenticated archive metadata and members for the installer.
+
+    Installation and upgrade need the same bounded reader as release
+    verification.  Keeping one public entry point prevents a second extractor
+    from drifting away from the release allowlist, size limits and hash checks.
+    Callers receive immutable in-memory member values and must never use a
+    general-purpose ``extractall`` operation.
+    """
+    return _verified_archive(path)
+
+
 def verify_archive(path: Path) -> dict:
     """Verify allowlist, manifest, hashes, sizes, modes, legal data, and version."""
     report, _members = _verified_archive(path)
