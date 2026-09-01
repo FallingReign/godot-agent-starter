@@ -42,6 +42,7 @@ RELEASE_MANIFEST = "RELEASE-MANIFEST.json"
 MARKER = ".agent-kit.json"
 LEGACY_VERSION = "VERSION"
 MANAGED_ROOT = ".agent-kit"
+STABLE_LAUNCHER_PATH = ".agent-kit/launcher.py"
 CURRENT_STATE = ".agent-kit/current.json"
 RELEASES_ROOT = ".agent-kit/releases"
 UPGRADE_ROOT = ".kit/runtime/upgrade"
@@ -545,6 +546,8 @@ def _nullable_sha(value: object, label: str) -> str | None:
 
 def _validate_surface_destination(path: str) -> None:
     folded = path.casefold()
+    if folded == STABLE_LAUNCHER_PATH.casefold():
+        return
     if (
         folded in {MANAGED_ROOT.casefold(), ".godot", ".kit"}
         or any(folded.startswith(prefix.casefold()) for prefix in SURFACE_PROTECTED_PREFIXES)

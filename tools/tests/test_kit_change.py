@@ -681,6 +681,55 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "install-manifest-invalid")
         self.assertFalse((self.root / "project.godot").exists())
 
+    def test_only_the_stable_launcher_may_be_an_agent_kit_surface(self) -> None:
+        report, members = _release_fixture()
+        manifest = json.loads(members["INSTALL-MANIFEST.json"].content.decode("utf-8"))
+        launcher = b"#!/usr/bin/env python3\nprint('managed launcher')\n"
+        manifest["owned_files"].append(
+            {
+                "id": "stable-launcher",
+                "path": ".agent-kit/launcher.py",
+                "source": "tools/managed_launcher.py",
+                "mode": "0755",
+                "strategy": "replace",
+                "legacy_sha256": None,
+            }
+        )
+        members["tools/managed_launcher.py"] = SimpleNamespace(
+            content=launcher, mode=0o755
+        )
+        members["INSTALL-MANIFEST.json"] = SimpleNamespace(
+            content=_canonical(manifest), mode=0o644
+        )
+        self._switch_release((report, members))
+
+        decision = kit_change.preview(self.root, self.archive)
+        self.assertTrue(decision["approval"]["approvable"])
+        kit_change.apply(
+            self.root, self.archive, str(decision["approval"]["sha256"])
+        )
+        self.assertEqual(
+            (self.root / ".agent-kit" / "launcher.py").read_bytes(), launcher
+        )
+
+        manifest["owned_files"].append(
+            {
+                "id": "unsafe-private-file",
+                "path": ".agent-kit/other.py",
+                "source": "tools/managed_launcher.py",
+                "mode": "0755",
+                "strategy": "replace",
+                "legacy_sha256": None,
+            }
+        )
+        members["INSTALL-MANIFEST.json"] = SimpleNamespace(
+            content=_canonical(manifest), mode=0o644
+        )
+        self._switch_release((report, members))
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
+        self.assertEqual(raised.exception.code, "install-manifest-invalid")
+
     def test_control_manifests_cannot_be_project_surface_sources(self) -> None:
         report, members = _release_fixture()
         manifest = json.loads(members["INSTALL-MANIFEST.json"].content.decode("utf-8"))
