@@ -2,7 +2,11 @@
 """Regression tests for kit consumers of the configured game root."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import shutil
+import subprocess
 import sys
 import unittest
 import uuid
@@ -21,6 +25,93 @@ import gen_gdscript_doc  # noqa: E402
 import plan_html  # noqa: E402
 import project_context  # noqa: E402
 import sanitise  # noqa: E402
+import managed_launcher  # noqa: E402
+
+
+def _canonical_json(value: dict) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
+    """Create one fully validated managed core from selected source files."""
+    marker = {"kind": managed_launcher.MARKER_KIND, "schema": 1}
+    (project / managed_launcher.MARKER_NAME).write_bytes(_canonical_json(marker))
+    release_sha = hashlib.sha256(b"managed-layout-consumer-fixture").hexdigest()
+    core = project / ".agent-kit" / "releases" / release_sha
+    core.mkdir(parents=True)
+    contents: dict[str, bytes] = {
+        "INSTALL-MANIFEST.json": b'{"schema":1}\n',
+        "LICENSE": b"MIT\n",
+        "kit.py": b"#!/usr/bin/env python3\n",
+    }
+    for relative in relative_files:
+        contents[relative] = (ROOT / relative).read_bytes()
+    files = []
+    for relative, content in sorted(contents.items()):
+        target = core.joinpath(*relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if relative.endswith(".py") else 0o644)
+        files.append({
+            "path": relative,
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mode": "0755" if relative.endswith(".py") else "0644",
+        })
+    manifest = {
+        "schema": managed_launcher.MANIFEST_SCHEMA,
+        "version": "0.3.0",
+        "source": {"commit": "a" * 40, "dirty": False},
+        "authority_evidence": {
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+            "receipt_trust": "portable-policy",
+        },
+        "license_files": ["LICENSE"],
+        "normalization": {
+            "line_endings": "lf",
+            "regular_mode": "0644",
+            "executable_mode": "0755",
+            "timestamps": "fixed",
+        },
+        "files": files,
+    }
+    manifest_content = _canonical_json(manifest)
+    (core / managed_launcher.MANIFEST_NAME).write_bytes(manifest_content)
+    install_content = contents["INSTALL-MANIFEST.json"]
+    active_release = {
+        "kit_version": "0.3.0",
+        "archive_sha256": release_sha,
+        "release_manifest_sha256": hashlib.sha256(manifest_content).hexdigest(),
+        "install_manifest_sha256": hashlib.sha256(install_content).hexdigest(),
+        "source_commit": "a" * 40,
+        "core_path": f".agent-kit/releases/{release_sha}",
+    }
+    current = {
+        "schema": 1,
+        "kind": managed_launcher.CURRENT_KIND,
+        "installation_id": "1" * 32,
+        "install_schema": 1,
+        "layout_schema": 1,
+        "config_schema": 1,
+        "active_release": active_release,
+        "previous_release": None,
+        "managed_surfaces": [],
+        "applied_migrations": [],
+    }
+    (project / ".agent-kit" / "current.json").write_bytes(_canonical_json(current))
+    return core
+
+
+def _managed_environment(project: Path, core: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment[managed_launcher.PROJECT_ROOT_ENV] = str(project)
+    environment[managed_launcher.CORE_ROOT_ENV] = str(core)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["KIT_ENGINE_DISABLED"] = "1"
+    return environment
 
 
 class ConfiguredGameRootConsumers(unittest.TestCase):
@@ -182,6 +273,143 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
                 gate.repository_game_relative("src/scripts/main.gd"),
             )
             self.assertIsNone(gate.repository_game_relative("../outside"))
+
+    def test_managed_gate_uses_release_integrity_and_private_project_runtime(self) -> None:
+        project = self.scratch / "managed-gate"
+        game = project / "game" / "client"
+        game.mkdir(parents=True)
+        (game / "project.godot").write_text("[application]\n", encoding="utf-8")
+        (project / "kit.config.json").write_text(
+            json.dumps({
+                "schema": 1,
+                "game_root": "game/client",
+                "runtime_root": ".kit/runtime",
+                "note_threshold": 10,
+            }),
+            encoding="utf-8",
+        )
+        core = _managed_core(project, (
+            "check.py",
+            "dependencies.lock.json",
+            "tools/managed_launcher.py",
+            "tools/project_context.py",
+        ))
+        environment = _managed_environment(project, core)
+
+        checked = subprocess.run(
+            [sys.executable, str(core / "check.py"), "--only", "integrity"],
+            cwd=project,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        accepted = subprocess.run(
+            [sys.executable, str(core / "check.py"), "--accept-gate-changes"],
+            cwd=project,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+        self.assertIn("active managed release manifest verified", checked.stdout)
+        self.assertTrue(
+            (project / ".kit" / "runtime" / "verification" / "runs"
+             / "run-summary.json").is_file()
+        )
+        self.assertFalse((project / ".gate.sha256").exists())
+        self.assertEqual(2, accepted.returncode)
+        self.assertIn("managed release integrity is immutable", accepted.stdout)
+
+    def test_managed_architecture_reads_an_arbitrary_safe_game_root(self) -> None:
+        project = self.scratch / "managed-architecture"
+        game = project / "products" / "gameplay"
+        logic = game / "scripts" / "logic"
+        logic.mkdir(parents=True)
+        (game / "project.godot").write_text("[application]\n", encoding="utf-8")
+        (logic / "probe.gd").write_text(
+            "class_name ManagedProbe\nextends RefCounted\n",
+            encoding="utf-8",
+        )
+        (project / "kit.config.json").write_text(
+            json.dumps({
+                "schema": 1,
+                "game_root": "products/gameplay",
+                "runtime_root": ".kit/runtime",
+            }),
+            encoding="utf-8",
+        )
+        (project / "arch.rules.json").write_text(
+            json.dumps({"module_depth": 2, "modules": {}}), encoding="utf-8"
+        )
+        core = _managed_core(project, (
+            "arch.py",
+            "tools/gd_signature.py",
+            "tools/managed_launcher.py",
+            "tools/project_context.py",
+        ))
+
+        result = subprocess.run(
+            [sys.executable, str(core / "arch.py"), "--json"],
+            cwd=project,
+            env=_managed_environment(project, core),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("scripts/logic", payload["modules"])
+        self.assertIn("scripts/logic/probe.gd", payload["tree"])
+
+    def test_managed_doctor_reports_an_arbitrary_safe_game_root(self) -> None:
+        project = self.scratch / "managed-doctor"
+        game = project / "existing" / "godot-project"
+        game.mkdir(parents=True)
+        (game / "project.godot").write_text(
+            '[application]\nconfig/name="Existing Game"\n', encoding="utf-8"
+        )
+        (project / "kit.config.json").write_text(
+            json.dumps({
+                "schema": 1,
+                "game_root": "existing/godot-project",
+                "runtime_root": ".kit/runtime",
+            }),
+            encoding="utf-8",
+        )
+        core = _managed_core(project, (
+            "bootstrap.py",
+            "dependencies.lock.json",
+            "tools/engine_discovery.py",
+            "tools/managed_launcher.py",
+            "tools/native_engine.py",
+            "tools/process_supervisor.py",
+            "tools/project_context.py",
+        ))
+
+        result = subprocess.run(
+            [sys.executable, str(core / "bootstrap.py"), "--json"],
+            cwd=project,
+            env=_managed_environment(project, core),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        context_result = next(
+            item for item in payload["results"] if item["name"] == "kit-context"
+        )
+        self.assertEqual("OK", context_result["state"])
+        self.assertIn("game=existing/godot-project", context_result["detail"])
 
 
 class ProviderGovernanceBridge(unittest.TestCase):

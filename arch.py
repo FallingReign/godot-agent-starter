@@ -26,15 +26,16 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "tools"))
+CORE_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(CORE_ROOT / "tools"))
 import gd_signature  # noqa: E402
 import project_context  # noqa: E402
 
-CONTEXT = project_context.load_configured_context(ROOT)
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+PROJECT_ROOT = CONTEXT.project_root
 PROJECT_DIR = CONTEXT.game_root
-RULES_FILE = ROOT / "arch.rules.json"
-ARCH_DOC = ROOT / "ARCHITECTURE.md"
+RULES_FILE = PROJECT_ROOT / "arch.rules.json"
+ARCH_DOC = PROJECT_ROOT / "ARCHITECTURE.md"
 
 BEGIN = "<!-- BEGIN GENERATED GRAPH -->"
 END = "<!-- END GENERATED GRAPH -->"

@@ -38,13 +38,20 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# ROOT is the repository: gate scripts, docs, rule files, skills.
-# PROJECT_DIR is the Godot project: everything the engine loads. Keeping them
-# separate means an agent working on game code never has the gate's own files
-# in scope, and `godot --path src` cannot import a tool script by accident.
-ROOT = Path(__file__).resolve().parent
-KIT_CONFIG_FILE = ROOT / "kit.config.json"
-DEPENDENCY_LOCK_FILE = ROOT / "dependencies.lock.json"
+# CORE_ROOT contains immutable gate code and rules. PROJECT_ROOT contains the
+# repository's configuration, design and generated views. PROJECT_DIR is the
+# Godot project: everything the engine loads.
+CORE_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(CORE_ROOT / "tools"))
+import project_context  # noqa: E402
+
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+PROJECT_ROOT = CONTEXT.project_root
+# Compatibility for older focused tests and helper calls. ROOT always means
+# the project repository; code paths must use CORE_ROOT explicitly.
+ROOT = PROJECT_ROOT
+KIT_CONFIG_FILE = PROJECT_ROOT / "kit.config.json"
+DEPENDENCY_LOCK_FILE = CORE_ROOT / "dependencies.lock.json"
 
 
 def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
@@ -58,8 +65,8 @@ def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
         if config.get("schema") != 1:
             errors.append("kit.config.json schema must be 1")
         candidate = config.get("game_root")
-        if candidate not in (".", "src"):
-            errors.append("kit.config.json game_root must be '.' or 'src'")
+        if not isinstance(candidate, str) or not candidate.strip():
+            errors.append("kit.config.json game_root must be a non-empty relative path")
         else:
             game_layout = candidate
         runtime = config.get("runtime_root")
@@ -86,10 +93,10 @@ def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
             gdtoolkit_version = value
     except (OSError, ValueError, TypeError) as exc:
         errors.append(f"dependencies.lock.json is unreadable: {exc}")
-    project_dir = (ROOT / game_layout).resolve()
-    if not project_dir.is_relative_to(ROOT.resolve()):
-        errors.append("configured game root escapes the kit root")
-        project_dir = ROOT / "src"
+    project_dir = CONTEXT.game_root
+    if CONTEXT.game_layout != game_layout:
+        errors.append("configured game root changed while verification started")
+        game_layout = CONTEXT.game_layout
     return (
         project_dir,
         game_layout,
@@ -106,7 +113,7 @@ def _load_portable_contracts() -> Tuple[Path, str, str, str, int]:
     PORTABLE_CONTRACT_ERROR,
     RETRO_NOTE_THRESHOLD,
 ) = _load_portable_contracts()
-LOG_DIR = ROOT / ".checklogs"
+LOG_DIR = CONTEXT.runtime_root / "verification" / "runs"
 VERIFY_RUN_ID = os.environ.get("KIT_VERIFY_NONCE", "").strip()
 VERIFY_RUN_ID_VALID = bool(
     not VERIFY_RUN_ID or re.fullmatch(r"[0-9a-f]{32}", VERIFY_RUN_ID)
@@ -129,8 +136,8 @@ STAGES = ["integrity", "skills", "schema", "shape", "design", "conformance", "fo
 ENGINE_STAGES = ("import", "typecheck", "resources", "gut", "smoke")
 STATIC_STAGES = tuple(stage for stage in STAGES if stage not in ENGINE_STAGES)
 CONFORMANCE_COMPLETION_REQUIRED = True
-GATE_RULES_FILE = ROOT / "gate.rules.json"
-MANIFEST_FILE = ROOT / ".gate.sha256"
+GATE_RULES_FILE = CORE_ROOT / "gate.rules.json"
+MANIFEST_FILE = PROJECT_ROOT / ".gate.sha256"
 
 # Files whose integrity is asserted before any other stage runs. A deny list is
 # something an agent can be configured around; a hash is a tripwire that shows
@@ -627,11 +634,10 @@ def gdtool(name: str) -> Optional[List[str]]:
 # -------------------------------------------------------------------- stages
 
 def _manifest_hash(rel: str) -> Optional[str]:
-    # Gate files live at the repo root; project.godot lives inside the Godot
-    # project. Resolve against ROOT first, then PROJECT_DIR, so both are
-    # covered after the src/ split.
-    path = ROOT / rel
-    if not path.is_file():
+    # Protected gate files belong to the selected core. Advisory files belong
+    # to the project or its configured game root.
+    path = CORE_ROOT / rel if rel in GATE_FILES else PROJECT_ROOT / rel
+    if not path.is_file() and rel not in GATE_FILES:
         path = PROJECT_DIR / rel
     if not path.is_file():
         return None
@@ -643,6 +649,10 @@ def _manifest_hash(rel: str) -> Optional[str]:
 
 
 def write_manifest() -> None:
+    if CONTEXT.install_mode == "managed":
+        raise RuntimeError(
+            "managed release integrity is immutable; install a reviewed release"
+        )
     lines = []
     # Advisory files are hashed too. Without a baseline there is nothing to
     # compare against, so a change to them would pass unnoticed rather than
@@ -659,6 +669,12 @@ def write_manifest() -> None:
 
 def stage_integrity() -> None:
     head("gate integrity")
+    if CONTEXT.install_mode == "managed":
+        # load_active_context revalidated current.json and every file in the
+        # selected release manifest before this module could import.
+        print("  active managed release manifest verified")
+        RESULTS.passed("integrity")
+        return
     if not MANIFEST_FILE.is_file():
         print(f"  {RED}MISSING   {MANIFEST_FILE.name}{RST}")
         print()
@@ -773,7 +789,7 @@ def stage_skills() -> None:
 
 def stage_sanitise() -> None:
     head("sanitise (scene/resource hygiene)")
-    script = ROOT / "sanitise.py"
+    script = CORE_ROOT / "sanitise.py"
     if not script.is_file():
         print("  sanitise.py not present, stage disabled")
         RESULTS.skip("sanitise")
@@ -985,7 +1001,7 @@ def stage_schema() -> None:
         print(f"  {RED}error: {PORTABLE_CONTRACT_ERROR}{RST}")
         RESULTS.fail("schema")
         return
-    tool = ROOT / "tools" / "schema.py"
+    tool = CORE_ROOT / "tools" / "schema.py"
     if not tool.exists():
         print("  tools/schema.py missing")
         RESULTS.skip("schema")
@@ -1517,7 +1533,7 @@ def stage_types() -> None:
 
 def stage_arch() -> None:
     head("architecture (generated graph + boundary rules)")
-    script = ROOT / "arch.py"
+    script = CORE_ROOT / "arch.py"
     if not script.is_file():
         print("  arch.py not present, architecture stage disabled")
         RESULTS.skip("arch")
@@ -1599,7 +1615,7 @@ def write_plan() -> None:
     refresh is a view that is silently stale, and a stale plan is worse than
     no plan because it reads as current.
     """
-    script = ROOT / "tools" / "plan_html.py"
+    script = CORE_ROOT / "tools" / "plan_html.py"
     if not script.is_file():
         return
     code, _ = run([sys.executable, str(script)], 30, LOG_DIR / "plan.log")
@@ -1634,8 +1650,8 @@ def stage_design() -> None:
                   experience contract, is exactly what this surfaces.
     """
     head("design index and bindings")
-    tool = ROOT / "tools" / "design.py"
-    design_dir = ROOT / "docs" / "design"
+    tool = CORE_ROOT / "tools" / "design.py"
+    design_dir = PROJECT_ROOT / "docs" / "design"
     if not tool.is_file():
         print("  tools/design.py not found")
         RESULTS.skip("design")
@@ -2615,7 +2631,7 @@ def stage_conformance() -> None:
             action_wrong.append(f"{rel}/: still exists but is marked 'delete'")
 
     graph_code, graph_output = run(
-        [sys.executable, str(ROOT / "arch.py"), "--json"],
+        [sys.executable, str(CORE_ROOT / "arch.py"), "--json"],
         60,
         LOG_DIR / "conformance-architecture.log",
     )
@@ -3107,8 +3123,8 @@ def retro_nudge() -> None:
 
     The builder writes a note at slice end. This counts them.
     """
-    tool = ROOT / "tools" / "retro_due.py"
-    notes = ROOT / "docs" / "retro" / "notes"
+    tool = CORE_ROOT / "tools" / "retro_due.py"
+    notes = PROJECT_ROOT / "docs" / "retro" / "notes"
     if not tool.exists() or not notes.is_dir():
         return
     n = len([q for q in notes.glob("*.md") if q.name.lower() != "readme.md"])
@@ -3204,10 +3220,16 @@ def main() -> int:
         return 0
 
     if args.fix_format:
-        LOG_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         return fix_format()
 
     if args.accept_gate_changes:
+        if CONTEXT.install_mode == "managed":
+            print(
+                "managed release integrity is immutable; install a reviewed "
+                "release instead of changing its baseline"
+            )
+            return 2
         write_manifest()
         print(f"re-baselined {MANIFEST_FILE.name} against the current gate files.")
         print("Commit it in the same commit as the gate change, so review sees both.")
@@ -3225,7 +3247,7 @@ def main() -> int:
         return 2
     active = list(STATIC_STAGES) if args.static else (selected or list(STAGES))
 
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     head("prerequisites")
     print(f"python: {sys.version.split()[0]} on {sys.platform}")

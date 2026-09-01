@@ -33,11 +33,12 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "tools"))
+CORE_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(CORE_ROOT / "tools"))
 import project_context  # noqa: E402
 
-CONTEXT = project_context.load_configured_context(ROOT)
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+PROJECT_ROOT = CONTEXT.project_root
 PROJECT_DIR = CONTEXT.game_root
 EXCLUDED = {
     ".agents", ".checklogs", ".git", ".github", ".godot", ".godot_doc",

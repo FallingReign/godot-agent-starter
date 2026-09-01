@@ -29,7 +29,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-TOOLS = Path(__file__).resolve().parent / "tools"
+CORE_ROOT = Path(__file__).resolve().parent
+TOOLS = CORE_ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import engine_discovery  # noqa: E402
@@ -38,6 +39,9 @@ import cockpit  # noqa: E402
 import runtime_paths  # noqa: E402
 import native_engine  # noqa: E402
 import process_supervisor  # noqa: E402
+
+ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+DEFAULT_PROJECT_ROOT = ACTIVE_INSTALLATION.project_root
 
 MIN_PYTHON = (3, 10)
 EXIT_OK = 0
@@ -347,7 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_project(raw: str | os.PathLike[str] | None) -> Path:
-    candidate = Path(raw) if raw is not None else Path.cwd()
+    candidate = Path(raw) if raw is not None else DEFAULT_PROJECT_ROOT
     try:
         project = candidate.expanduser().resolve()
     except OSError as exc:
@@ -372,7 +376,8 @@ def _resolve_project(raw: str | os.PathLike[str] | None) -> Path:
 
 
 def _script(project: Path, *parts: str) -> Path:
-    path = project.joinpath(*parts)
+    del project  # command code belongs to the selected immutable core
+    path = CORE_ROOT.joinpath(*parts)
     if not path.is_file():
         raise CliError(
             f"required kit command is unavailable: {path}",
@@ -657,7 +662,7 @@ def _final_json_object(text: str) -> dict[str, Any] | None:
 
 def _gdls_read_only_status(project: Path) -> dict[str, Any] | None:
     """Inspect retained GDLS ownership without starting or stopping anything."""
-    tool = project / "tools" / "gdls.py"
+    tool = CORE_ROOT / "tools" / "gdls.py"
     if not tool.is_file():
         return None
     result = _run_process(
@@ -718,7 +723,7 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
             "status": "probe_failed",
             "project": str(project),
             "bootstrap": state,
-            "check": {"available": (project / "check.py").is_file()},
+            "check": {"available": (CORE_ROOT / "check.py").is_file()},
             "warnings": warnings,
             "gdls": gdls_status,
             "process": _process_summary(result),
@@ -757,7 +762,7 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
         "project": str(project),
         "bootstrap": state,
         "check": {
-            "available": (project / "check.py").is_file(),
+            "available": (CORE_ROOT / "check.py").is_file(),
             "bootstrap_result": check_result,
         },
         "blocking": blocking,
@@ -846,6 +851,21 @@ def _setup(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
 
 def _integrity_accept(
         project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
+    try:
+        context = project_context.load_active_context(CORE_ROOT)
+    except project_context.ProjectContextError as exc:
+        raise CliError(
+            f"cannot validate the active kit before integrity acceptance: {exc}",
+            code=EXIT_REFUSED,
+            status="project_unavailable",
+        ) from exc
+    if context.project_root == project and context.install_mode == "managed":
+        raise CliError(
+            "managed kit code is verified by its release manifest; install a reviewed "
+            "release instead of changing its integrity baseline",
+            code=EXIT_REFUSED,
+            status="managed_integrity_immutable",
+        )
     check = _script(project, "check.py")
     result = _run_process(
         [sys.executable, str(check), "--accept-gate-changes"],
@@ -868,7 +888,15 @@ def _integrity_accept(
 
 def _gate_summary_path(project: Path, nonce: str | None = None) -> Path:
     suffix = f"-{nonce}" if nonce else ""
-    return project / ".checklogs" / f"run-summary{suffix}.json"
+    try:
+        runs = runtime_paths.resolve(project, create=False).verification_runs
+    except runtime_paths.RuntimeConfigError as exc:
+        raise CliError(
+            f"cannot resolve private verification evidence: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+    return runs / f"run-summary{suffix}.json"
 
 
 def _prepare_gate_summary(project: Path, nonce: str) -> None:
@@ -1337,7 +1365,7 @@ def _self_test(
         "unittest",
         "discover",
         "-s",
-        "tools/tests",
+        str(CORE_ROOT / "tools" / "tests"),
     ]
     environment = {
         "KIT_ENGINE_DISABLED": "1",
@@ -1874,7 +1902,8 @@ def _retro_publish(
 
 
 def _release_path(project: Path) -> Path:
-    return project / "tools" / "release.py"
+    del project
+    return CORE_ROOT / "tools" / "release.py"
 
 
 def _release(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:

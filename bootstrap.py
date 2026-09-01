@@ -40,15 +40,19 @@ from pathlib import Path, PurePosixPath
 
 INVOLVEMENT_LEVELS = ("hands-off", "module", "file", "function")
 
-ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-TOOLS = ROOT / "tools"
+CORE_ROOT = Path(__file__).resolve().parent
+TOOLS = CORE_ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import engine_discovery  # noqa: E402
 import native_engine  # noqa: E402
 
+ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+ROOT = ACTIVE_INSTALLATION.project_root
+SRC = ROOT / "src"
+
 EXPECTED_GODOT = engine_discovery.EXPECTED_GODOT_VERSION
-DEPENDENCY_LOCK = ROOT / "dependencies.lock.json"
+DEPENDENCY_LOCK = CORE_ROOT / "dependencies.lock.json"
 MAX_ARCHIVE_FILES = 2_000
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 KIT_CONFIG = ROOT / "kit.config.json"
@@ -131,31 +135,29 @@ def check_kit_context():
     """Resolve the portable game root from the explicit marker and config."""
     global SRC
     try:
-        marker = json.loads(KIT_MARKER.read_text(encoding="utf-8"))
-        if marker != {"kind": "portable-agent-kit-root", "schema": 1}:
-            raise ValueError(".agent-kit.json has an unsupported contract")
+        context = (
+            project_context.load_active_context(CORE_ROOT)
+            if ROOT == ACTIVE_INSTALLATION.project_root
+            else project_context.load_configured_context(ROOT)
+        )
         config = json.loads(KIT_CONFIG.read_text(encoding="utf-8"))
-        if config.get("schema") != 1:
-            raise ValueError("kit.config.json schema must be 1")
-        layout = config.get("game_root")
-        if layout not in (".", "src"):
-            raise ValueError("kit.config.json game_root must be '.' or 'src'")
+        layout = context.game_layout
         runtime = config.get("runtime_root")
-        runtime_path = Path(runtime) if isinstance(runtime, str) else Path(".")
-        if (not isinstance(runtime, str) or runtime_path.is_absolute()
-                or ".." in runtime_path.parts or runtime_path.as_posix() in ("", ".")):
-            raise ValueError("kit.config.json runtime_root must be a private relative path")
-        candidate = (ROOT / layout).resolve()
-        if not candidate.is_relative_to(ROOT.resolve()):
-            raise ValueError("configured game root escapes the kit root")
-        if not candidate.is_dir() or not (candidate / "project.godot").is_file():
+        candidate = context.game_root
+        if not (candidate / "project.godot").is_file():
             raise ValueError(
                 f"configured game root does not contain project.godot: {candidate}"
             )
         SRC = candidate
         record("kit-context", OK, f"game={layout}, runtime={runtime}")
         return config
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        project_context.ProjectContextError,
+    ) as exc:
         detail = str(exc)
         remedy = (
             "Run kit setup layout root or kit setup layout src for the existing Godot project"
@@ -784,8 +786,8 @@ def check_mermaid(download: bool, lock) -> None:
     fail there. Advisory, never MANUAL: a missing renderer degrades the diagram
     to readable source text, which is a cosmetic loss rather than a broken kit.
     """
-    dest = ROOT / "tools" / "vendor" / "mermaid.min.js"
-    license_dest = ROOT / "tools" / "vendor" / "mermaid.LICENSE.txt"
+    dest = CORE_ROOT / "tools" / "vendor" / "mermaid.min.js"
+    license_dest = CORE_ROOT / "tools" / "vendor" / "mermaid.LICENSE.txt"
     if dest.is_file() and dest.stat().st_size > 100_000:
         if lock:
             expected = lock["artifacts"]["mermaid"]
@@ -1314,7 +1316,7 @@ def apply_import_profile(name):
     into each .import sidecar individually rather than recording "uses default",
     so a later change does not propagate to existing assets.
     """
-    src = ROOT / "import_profiles.json"
+    src = CORE_ROOT / "import_profiles.json"
     if not src.is_file():
         print("import_profiles.json not found")
         return 2
@@ -1379,11 +1381,11 @@ def normalise_formatting():
     Shipping pre-formatted GDScript means guessing that tool's output, and a
     wrong guess used to produce an unpassable gate. Let the tool decide.
     """
-    if not (ROOT / "check.py").is_file():
+    if not (CORE_ROOT / "check.py").is_file():
         return
     if not QUIET:
         print(f"  {DIM}normalising GDScript formatting with local gdtoolkit...{RST}")
-    code, out = run([sys.executable, str(ROOT / "check.py"), "--fix-format"],
+    code, out = run([sys.executable, str(CORE_ROOT / "check.py"), "--fix-format"],
                     timeout=240)
     if code != 0 and not QUIET:
         print(f"  {YEL}gdformat unavailable or failed; formatting left as shipped{RST}")
@@ -1447,7 +1449,7 @@ def main():
         ap.error("--json is read-only and cannot be combined with state-changing options")
 
     if args.list_import_profiles:
-        src = ROOT / "import_profiles.json"
+        src = CORE_ROOT / "import_profiles.json"
         if not src.is_file():
             print("import_profiles.json not found")
             return 2

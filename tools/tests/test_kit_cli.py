@@ -819,7 +819,7 @@ class KitCliTest(unittest.TestCase):
                 "unittest",
                 "discover",
                 "-s",
-                "tools/tests",
+                str(kit.CORE_ROOT / "tools" / "tests"),
             ],
             cwd=ROOT.resolve(),
             timeout=1800,
@@ -834,6 +834,21 @@ class KitCliTest(unittest.TestCase):
             },
         )
         inherited.assert_not_called()
+
+    def test_core_commands_are_resolved_from_the_selected_core(self) -> None:
+        project = ROOT / "not-the-core"
+        self.assertEqual(kit.CORE_ROOT / "check.py", kit._script(project, "check.py"))
+
+    def test_managed_integrity_cannot_replace_release_manifest_trust(self) -> None:
+        context = mock.Mock(project_root=ROOT.resolve(), install_mode="managed")
+        with mock.patch.object(
+            kit.project_context, "load_active_context", return_value=context
+        ), mock.patch.object(kit, "_run_process") as run:
+            with self.assertRaises(kit.CliError) as caught:
+                kit._integrity_accept(ROOT.resolve(), mock.Mock())
+
+        self.assertEqual("managed_integrity_immutable", caught.exception.status)
+        run.assert_not_called()
 
     def test_self_test_marker_prevents_nested_verify_evidence_writes(self) -> None:
         result = {
@@ -886,8 +901,10 @@ class KitCliTest(unittest.TestCase):
             },
         )
         with mock.patch.object(
-            Path, "read_text", return_value=json.dumps(raw)
-        ):
+            kit,
+            "_gate_summary_path",
+            return_value=ROOT / "private-run-summary.json",
+        ), mock.patch.object(Path, "read_text", return_value=json.dumps(raw)):
             summary = kit._read_gate_summary(
                 ROOT, nonce, auth_key, repository_sha256
             )
@@ -925,7 +942,11 @@ class KitCliTest(unittest.TestCase):
         raw["auth_sha256"] = hmac.new(
             bytes.fromhex(auth_key), canonical, hashlib.sha256
         ).hexdigest()
-        with mock.patch.object(Path, "read_text", return_value=json.dumps(raw)):
+        with mock.patch.object(
+            kit,
+            "_gate_summary_path",
+            return_value=ROOT / "private-run-summary.json",
+        ), mock.patch.object(Path, "read_text", return_value=json.dumps(raw)):
             self.assertIsNone(
                 kit._read_gate_summary(
                     ROOT, nonce, auth_key, repository_sha256
@@ -937,7 +958,11 @@ class KitCliTest(unittest.TestCase):
         auth_key = "b" * 64
         repository_sha256 = "c" * 64
         raw = self.signed_gate_summary(nonce, auth_key, repository_sha256)
-        with mock.patch.object(Path, "read_text", return_value=json.dumps(raw)):
+        with mock.patch.object(
+            kit,
+            "_gate_summary_path",
+            return_value=ROOT / "private-run-summary.json",
+        ), mock.patch.object(Path, "read_text", return_value=json.dumps(raw)):
             self.assertIsNone(
                 kit._read_gate_summary(
                     ROOT, nonce, "d" * 64, repository_sha256
