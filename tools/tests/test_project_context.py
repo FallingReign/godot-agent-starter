@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -59,21 +60,99 @@ def _write_marker(root: Path, value: dict | None = None) -> Path:
     return marker
 
 
+def _canonical_json(value: dict) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _write_managed_install(root: Path) -> tuple[Path, str]:
+    release_sha = hashlib.sha256(b"managed archive").hexdigest()
+    source_commit = "a" * 40
+    core = root / ".agent-kit" / "releases" / release_sha
+    core.mkdir(parents=True)
+    install_manifest_content = b'{"schema":1}\n'
+    contents = {
+        "INSTALL-MANIFEST.json": install_manifest_content,
+        "LICENSE": b"MIT\n",
+        "kit.py": b"#!/usr/bin/env python3\n",
+    }
+    entries = []
+    for relative, content in sorted(contents.items()):
+        target = core / relative
+        target.write_bytes(content)
+        target.chmod(0o755 if relative.endswith(".py") else 0o644)
+        entries.append({
+            "path": relative,
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mode": "0755" if relative.endswith(".py") else "0644",
+        })
+    manifest = {
+        "schema": 2,
+        "version": "0.3.0",
+        "source": {"commit": source_commit, "dirty": False},
+        "authority_evidence": {
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+            "receipt_trust": "portable-policy",
+        },
+        "license_files": ["LICENSE"],
+        "normalization": {
+            "line_endings": "lf",
+            "regular_mode": "0644",
+            "executable_mode": "0755",
+            "timestamps": "fixed",
+        },
+        "files": entries,
+    }
+    manifest_content = _canonical_json(manifest)
+    manifest_path = core / "RELEASE-MANIFEST.json"
+    manifest_path.write_bytes(manifest_content)
+    manifest_path.chmod(0o644)
+    current = {
+        "schema": 1,
+        "kind": "agent-kit-install-state",
+        "installation_id": "1" * 32,
+        "install_schema": 1,
+        "layout_schema": 1,
+        "config_schema": 1,
+        "active_release": {
+            "kit_version": "0.3.0",
+            "archive_sha256": release_sha,
+            "release_manifest_sha256": hashlib.sha256(manifest_content).hexdigest(),
+            "install_manifest_sha256": hashlib.sha256(
+                install_manifest_content
+            ).hexdigest(),
+            "source_commit": source_commit,
+            "core_path": f".agent-kit/releases/{release_sha}",
+        },
+        "previous_release": None,
+        "managed_surfaces": [],
+        "applied_migrations": [],
+    }
+    (root / ".agent-kit" / "current.json").write_bytes(_canonical_json(current))
+    return core, release_sha
+
+
 class ProjectRootDiscovery(unittest.TestCase):
-    def test_nearest_marker_distinguishes_all_roots(self) -> None:
+    def test_nearest_marker_is_the_flat_project_and_core_root(self) -> None:
         with _scratch() as root:
             kit = root / "kit"
             project = kit / "projects" / "sample"
             project.mkdir(parents=True)
+            (kit / "src").mkdir()
             _write_marker(kit)
 
             found = context.resolve_project_context(project)
 
             self.assertEqual(kit.resolve(), found.kit_root)
-            self.assertEqual(project.resolve(), found.project_root)
-            self.assertEqual((project / "src").resolve(), found.game_root)
-            self.assertEqual((project / ".kit" / "runtime").resolve(), found.runtime_root)
+            self.assertEqual(kit.resolve(), found.project_root)
+            self.assertEqual(kit.resolve(), found.core_root)
+            self.assertEqual((kit / "src").resolve(), found.game_root)
+            self.assertEqual((kit / ".kit" / "runtime").resolve(), found.runtime_root)
             self.assertEqual((kit / context.MARKER_NAME).resolve(), found.marker_path)
+            self.assertEqual("flat", found.install_mode)
 
     def test_game_root_dot_and_custom_private_runtime(self) -> None:
         with _scratch() as project:
@@ -91,6 +170,7 @@ class ProjectRootDiscovery(unittest.TestCase):
     def test_repository_paths_map_into_src_layout_without_case_or_prefix_guessing(self) -> None:
         with _scratch() as project:
             _write_marker(project)
+            (project / "src").mkdir()
             found = context.resolve_project_context(project, game_layout="src")
 
             self.assertEqual("src", found.git_pathspec)
@@ -126,8 +206,11 @@ class ProjectRootDiscovery(unittest.TestCase):
         with _scratch() as project:
             _write_marker(project)
             config = project / context.CONFIG_NAME
-            config.write_text('{"schema":1,"game_root":"game"}\n', encoding="utf-8")
-            with self.assertRaisesRegex(context.ProjectContextError, "game_root"):
+            config.write_text(
+                '{"schema":1,"game_root":"../game","runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(context.ProjectContextError, "game root"):
                 context.load_configured_context(project)
 
             config.write_text(
@@ -135,12 +218,20 @@ class ProjectRootDiscovery(unittest.TestCase):
                 encoding="utf-8",
             )
             path_type = type(config)
-            original = path_type.is_symlink
+            original = path_type.lstat
 
-            def fake_is_symlink(path: Path) -> bool:
-                return path == config or original(path)
+            def fake_lstat(path: Path, *args, **kwargs):
+                info = original(path, *args, **kwargs)
+                if path == config:
+                    redirected = mock.Mock(wraps=info)
+                    redirected.st_mode = info.st_mode
+                    redirected.st_file_attributes = 0x0400
+                    return redirected
+                return info
 
-            with mock.patch.object(path_type, "is_symlink", fake_is_symlink):
+            with mock.patch.object(
+                path_type, "lstat", autospec=True, side_effect=fake_lstat
+            ):
                 with self.assertRaisesRegex(context.ProjectContextError, "regular file"):
                     context.load_configured_context(project)
 
@@ -150,6 +241,8 @@ class ProjectRootDiscovery(unittest.TestCase):
             project.mkdir()
             with mock.patch.object(
                 context, "MARKER_NAME", ".missing-agent-kit.json"
+            ), mock.patch.object(
+                context.managed_launcher, "MARKER_NAME", ".missing-agent-kit.json"
             ):
                 with self.assertRaisesRegex(
                     context.ProjectContextError, "no .missing-agent-kit.json"
@@ -158,7 +251,7 @@ class ProjectRootDiscovery(unittest.TestCase):
 
             _write_marker(root)
             _write_marker(project, {"kind": "wrong", "schema": 1})
-            with self.assertRaisesRegex(context.ProjectContextError, "unsupported"):
+            with self.assertRaisesRegex(context.ProjectContextError, "kit marker"):
                 context.resolve_project_context(project)
 
     def test_layout_runtime_traversal_and_outside_paths_are_rejected(self) -> None:
@@ -171,36 +264,157 @@ class ProjectRootDiscovery(unittest.TestCase):
                 with self.subTest(runtime=runtime):
                     with self.assertRaises(context.ProjectContextError):
                         context.resolve_project_context(project, runtime_root=runtime)
+            for game_root in ("../game", ".agent-kit/game", "tools/game"):
+                with self.subTest(game_root=game_root):
+                    with self.assertRaises(context.ProjectContextError):
+                        context.resolve_project_context(project, game_layout=game_root)
             with self.assertRaises(context.ProjectContextError):
-                context.resolve_project_context(project, game_layout="game")
+                context.resolve_project_context(
+                    project, game_layout=str(project.parent / "outside-game")
+                )
             with self.assertRaises(context.ProjectContextError):
                 context.resolve_project_context(project, runtime_root=".")
+
+    def test_existing_custom_nested_game_root_is_supported(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            custom = project / "games" / "prototype"
+            custom.mkdir(parents=True)
+
+            found = context.resolve_project_context(
+                project, game_layout="games/prototype"
+            )
+
+            self.assertEqual(custom.resolve(), found.game_root)
+            self.assertEqual("games/prototype", found.game_layout)
+            self.assertEqual("games/prototype", found.git_pathspec)
+            self.assertEqual(
+                "scripts/main.gd",
+                found.game_relative("games/prototype/scripts/main.gd"),
+            )
+
+    def test_managed_context_separates_project_core_game_and_runtime(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            game = project / "game"
+            game.mkdir()
+            core, release_sha = _write_managed_install(project)
+            (project / context.CONFIG_NAME).write_text(
+                json.dumps({
+                    "schema": 1,
+                    "game_root": "game",
+                    "runtime_root": ".kit/runtime",
+                }),
+                encoding="utf-8",
+            )
+
+            found = context.resolve_project_context(project, game_layout="game")
+            active = context.load_active_context(core, {
+                context.managed_launcher.PROJECT_ROOT_ENV: str(project),
+                context.managed_launcher.CORE_ROOT_ENV: str(core),
+            })
+            installation = context.resolve_active_installation(core, {
+                context.managed_launcher.PROJECT_ROOT_ENV: str(project),
+                context.managed_launcher.CORE_ROOT_ENV: str(core),
+            })
+
+            self.assertEqual(project, found.project_root)
+            self.assertEqual(project, found.kit_root)
+            self.assertEqual(core, found.core_root)
+            self.assertEqual(core, found.code_root)
+            self.assertEqual(game, found.game_root)
+            self.assertEqual(project / ".kit" / "runtime", found.runtime_root)
+            self.assertEqual("managed", found.install_mode)
+            self.assertEqual(release_sha, found.release_sha256)
+            self.assertEqual(project / ".agent-kit" / "current.json", found.current_path)
+            self.assertEqual(found.project_root, active.project_root)
+            self.assertEqual(found.core_root, active.core_root)
+            self.assertEqual(found.game_root, active.game_root)
+            self.assertEqual(project, installation.project_root)
+            self.assertEqual(core, installation.core_root)
+
+    def test_active_context_accepts_an_unbound_flat_core(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            (project / "game").mkdir()
+            (project / context.CONFIG_NAME).write_text(
+                json.dumps({
+                    "schema": 1,
+                    "game_root": "game",
+                    "runtime_root": ".kit/runtime",
+                }),
+                encoding="utf-8",
+            )
+
+            found = context.load_active_context(project, {})
+
+            self.assertEqual("flat", found.install_mode)
+            self.assertEqual(project, found.project_root)
+            self.assertEqual(project, found.core_root)
+
+    def test_game_root_rejects_case_ambiguity_and_reserved_paths(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            (project / "Game").mkdir()
+
+            with self.assertRaisesRegex(context.ProjectContextError, "unsafe casing"):
+                context.resolve_project_context(project, game_layout="game")
+            with self.assertRaisesRegex(context.ProjectContextError, "reserved kit path"):
+                context.resolve_project_context(project, game_layout=".KIT/game")
+
+    def test_game_root_rejects_a_reparse_component(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            game = project / "games"
+            (game / "prototype").mkdir(parents=True)
+            path_lstat = Path.lstat
+
+            def redirected_lstat(path: Path, *args, **kwargs):
+                info = path_lstat(path, *args, **kwargs)
+                if path == game:
+                    redirected = mock.Mock(wraps=info)
+                    redirected.st_mode = info.st_mode
+                    redirected.st_file_attributes = 0x0400
+                    return redirected
+                return info
+
+            with mock.patch.object(
+                Path, "lstat", autospec=True, side_effect=redirected_lstat
+            ):
+                with self.assertRaisesRegex(
+                    context.ProjectContextError, "unredirected directories"
+                ):
+                    context.resolve_project_context(
+                        project, game_layout="games/prototype"
+                    )
 
     def test_resolved_redirect_cannot_escape_the_project(self) -> None:
         with _scratch() as root:
             project = root / "project"
-            outside = root / "outside"
             project.mkdir()
-            outside.mkdir()
             _write_marker(project)
+            (project / "src").mkdir()
             link = project / ".kit" / "linked"
-            path_resolve = Path.resolve
+            (link / "runtime").mkdir(parents=True)
+            path_lstat = Path.lstat
 
-            def redirected_resolve(path: Path, *args, **kwargs) -> Path:
-                try:
-                    remainder = path.relative_to(link)
-                except ValueError:
-                    return path_resolve(path, *args, **kwargs)
-                return outside / remainder
+            def redirected_lstat(path: Path, *args, **kwargs):
+                info = path_lstat(path, *args, **kwargs)
+                if path == link:
+                    redirected = mock.Mock(wraps=info)
+                    redirected.st_mode = info.st_mode
+                    redirected.st_file_attributes = 0x0400
+                    return redirected
+                return info
 
-            # Windows directory symlinks require privileges that a release
-            # verifier must not assume.  Model the canonical result directly:
-            # _resolve_within must reject it regardless of which filesystem
-            # alias (symlink, junction, mount) produced that result.
+            # Windows junction creation needs privileges the verifier cannot
+            # assume.  Model the filesystem reparse attribute directly.
             with mock.patch.object(
-                Path, "resolve", autospec=True, side_effect=redirected_resolve
+                Path, "lstat", autospec=True, side_effect=redirected_lstat
             ):
-                with self.assertRaisesRegex(context.ProjectContextError, "escapes"):
+                with self.assertRaisesRegex(
+                    context.ProjectContextError, "unredirected directories"
+                ):
                     context.resolve_project_context(
                         project, runtime_root=".kit/linked/runtime"
                     )
@@ -208,12 +422,21 @@ class ProjectRootDiscovery(unittest.TestCase):
     def test_runtime_container_must_be_an_unredirected_directory(self) -> None:
         with _scratch() as project:
             _write_marker(project)
+            (project / "src").mkdir()
             (project / ".kit").write_text("not a directory", encoding="utf-8")
 
             with self.assertRaisesRegex(
-                context.ProjectContextError, "unredirected directory"
+                context.ProjectContextError, "unredirected director"
             ):
                 context.resolve_project_context(project)
+
+    def test_runtime_container_rejects_nonportable_casing(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            (project / ".KIT").mkdir()
+
+            with self.assertRaisesRegex(context.ProjectContextError, "unsafe casing"):
+                context.resolve_project_context(project, game_layout=".")
 
 
 class DispatchPathPolicy(unittest.TestCase):
@@ -222,7 +445,7 @@ class DispatchPathPolicy(unittest.TestCase):
             _write_marker(kit)
             project = kit / "project"
             project.mkdir()
-            found = context.resolve_project_context(project)
+            found = context.resolve_project_context(project, game_layout=".")
             policy = found.path_policy(
                 owned=("tools", "docs"), forbidden=("tools/private", "docs/design")
             )
@@ -236,7 +459,7 @@ class DispatchPathPolicy(unittest.TestCase):
     def test_policy_rejects_traversal_outside_and_empty_ownership(self) -> None:
         with _scratch() as kit:
             _write_marker(kit)
-            found = context.resolve_project_context(kit)
+            found = context.resolve_project_context(kit, game_layout=".")
             with self.assertRaisesRegex(context.ProjectContextError, "at least one"):
                 found.path_policy(owned=())
             policy = found.path_policy(owned=("tools",))

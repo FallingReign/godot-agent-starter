@@ -13,19 +13,41 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
-SCHEMA = 1
-MARKER_NAME = ".agent-kit.json"
-MARKER_KIND = "portable-agent-kit-root"
+try:
+    import managed_launcher
+except ImportError:  # package import in tests and installed cores
+    from tools import managed_launcher  # type: ignore[no-redef]
+
+SCHEMA = managed_launcher.MARKER_SCHEMA
+MARKER_NAME = managed_launcher.MARKER_NAME
+MARKER_KIND = managed_launcher.MARKER_KIND
 CONFIG_NAME = "kit.config.json"
+# Kept as common presets for older callers.  It is no longer a whitelist.
 GAME_LAYOUTS = (".", "src")
 DEFAULT_RUNTIME_ROOT = ".kit/runtime"
 PRIVATE_RUNTIME_CONTAINER = ".kit"
+RESERVED_GAME_ROOTS = frozenset({
+    ".agent-kit",
+    ".agents",
+    ".checklogs",
+    ".claude",
+    ".git",
+    ".github",
+    ".godot_doc",
+    ".kit",
+    "docs",
+    "plan",
+    "tools",
+})
 
 
 class ProjectContextError(ValueError):
     """A project path or marker cannot establish a safe context."""
+
+
+ActiveInstallation = managed_launcher.Installation
 
 
 def marker_document() -> dict:
@@ -41,14 +63,86 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
+def _is_reparse(info: object) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+
 def _canonical_directory(value: str | Path, label: str) -> Path:
+    raw = Path(value).expanduser()
     try:
-        path = Path(value).expanduser().resolve(strict=True)
+        info = raw.lstat()
+        path = raw.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ProjectContextError(f"{label} is not a readable path: {value!s}") from exc
-    if not path.is_dir():
-        raise ProjectContextError(f"{label} must be a directory: {path}")
+    if (stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+            or not stat.S_ISDIR(info.st_mode)):
+        raise ProjectContextError(f"{label} must be an unredirected directory: {path}")
     return path
+
+
+def _matching_names(parent: Path, expected: str, label: str) -> list[str]:
+    try:
+        matches = sorted(
+            item.name for item in parent.iterdir()
+            if item.name.casefold() == expected.casefold()
+        )
+    except OSError as exc:
+        raise ProjectContextError(f"cannot inspect {label}: {parent}: {exc}") from exc
+    if len(matches) > 1:
+        raise ProjectContextError(
+            f"{label} has a case collision for {expected!r}: {', '.join(matches)}"
+        )
+    if matches and matches[0] != expected:
+        raise ProjectContextError(
+            f"{label} uses unsafe casing for {expected!r}: {matches[0]!r}"
+        )
+    return matches
+
+
+def _portable_relative(value: str | Path, label: str, *, allow_root: bool) -> str:
+    rendered = str(value).strip().replace("\\", "/")
+    if not rendered or "\x00" in rendered:
+        raise ProjectContextError(f"{label} must be a non-empty repository-relative path")
+    path = PurePosixPath(rendered)
+    if (path.is_absolute() or (path.parts and ":" in path.parts[0])
+            or ".." in path.parts):
+        raise ProjectContextError(f"{label} must not escape the project")
+    if rendered == ".":
+        if allow_root:
+            return "."
+        raise ProjectContextError(f"{label} must be below the project root")
+    if (not path.parts or any(part in ("", ".", "..") for part in path.parts)
+            or path.as_posix() != rendered):
+        raise ProjectContextError(f"{label} must use one canonical repository-relative path")
+    return path.as_posix()
+
+
+def _inspect_existing_path(
+    root: Path, relative: str, label: str, *, require_final: bool
+) -> Path:
+    """Resolve a child while rejecting redirection and case ambiguity."""
+    cursor = root
+    parts = () if relative == "." else PurePosixPath(relative).parts
+    for index, component in enumerate(parts):
+        matches = _matching_names(cursor, component, label)
+        if not matches:
+            if require_final:
+                raise ProjectContextError(f"{label} does not exist: {cursor / component}")
+            return cursor.joinpath(*parts[index:])
+        cursor = cursor / component
+        try:
+            info = cursor.lstat()
+        except OSError as exc:
+            raise ProjectContextError(f"{label} is unreadable: {cursor}: {exc}") from exc
+        if (stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+                or not stat.S_ISDIR(info.st_mode)):
+            raise ProjectContextError(
+                f"{label} must use unredirected directories: {cursor}"
+            )
+    if require_final and relative == ".":
+        _canonical_directory(root, label)
+    return cursor
 
 
 def _relative_has_traversal(value: str | Path) -> bool:
@@ -82,70 +176,21 @@ def runtime_root_relative(value: str | Path) -> str:
     private container is therefore ``.kit/`` and the runtime must be a proper
     descendant of it.
     """
-    raw = Path(value)
-    if (not str(value).strip() or raw.is_absolute() or ".." in raw.parts):
-        raise ProjectContextError(
-            "runtime root must be a non-empty project-relative path without '..'"
-        )
-    portable = PurePosixPath(str(value).replace("\\", "/"))
-    if (not portable.parts or portable.parts[0] != PRIVATE_RUNTIME_CONTAINER
-            or len(portable.parts) < 2
-            or any(part in ("", ".", "..") for part in portable.parts)):
+    relative = _portable_relative(value, "runtime root", allow_root=False)
+    portable = PurePosixPath(relative)
+    if (portable.parts[0] != PRIVATE_RUNTIME_CONTAINER or len(portable.parts) < 2):
         raise ProjectContextError(
             "runtime root must be a descendant of the project-local .kit directory"
         )
     return portable.as_posix()
 
 
-def _require_unredirected_runtime(root: Path, relative: str) -> None:
-    """Reject existing private-root components that redirect into another tree."""
-    cursor = root
-    for component in PurePosixPath(relative).parts:
-        cursor = cursor / component
-        try:
-            info = cursor.lstat()
-        except FileNotFoundError:
-            break
-        except OSError as exc:
-            raise ProjectContextError(
-                f"runtime root component is unreadable: {cursor}: {exc}"
-            ) from exc
-        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
-        is_reparse = bool(
-            int(getattr(info, "st_file_attributes", 0)) & marker
-        )
-        if not stat.S_ISDIR(info.st_mode) or is_reparse:
-            raise ProjectContextError(
-                f"runtime root component must be an unredirected directory: {cursor}"
-            )
-
-
-def _validate_marker(path: Path) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise ProjectContextError(f"kit marker must be a regular file: {path}")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise ProjectContextError(f"kit marker is not readable JSON: {path}") from exc
-    if not isinstance(value, dict):
-        raise ProjectContextError(f"kit marker root must be an object: {path}")
-    if value.get("schema") != SCHEMA or value.get("kind") != MARKER_KIND:
-        raise ProjectContextError(
-            f"unsupported kit marker contract in {path}; expected {marker_document()}"
-        )
-
-
 def locate_kit_root(project: str | Path) -> tuple[Path, Path]:
-    """Return ``(kit_root, marker_path)`` nearest to an existing project path."""
-    project_root = _canonical_directory(project, "project")
-    for candidate in (project_root, *project_root.parents):
-        marker = candidate / MARKER_NAME
-        if marker.exists() or marker.is_symlink():
-            _validate_marker(marker)
-            return candidate.resolve(strict=True), marker.resolve(strict=True)
-    raise ProjectContextError(
-        f"no {MARKER_NAME} marker found from {project_root} to the filesystem root"
-    )
+    """Return ``(project_root, marker_path)`` for compatibility callers."""
+    try:
+        return managed_launcher.locate_project_root(project)
+    except managed_launcher.LauncherError as exc:
+        raise ProjectContextError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -218,6 +263,25 @@ class ProjectContext:
     runtime_root: Path
     marker_path: Path
     game_layout: str
+    core_root: Path | None = None
+    install_mode: str = "flat"
+    release_sha256: str | None = None
+    current_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.core_root is None:
+            object.__setattr__(self, "core_root", self.kit_root)
+
+    @property
+    def code_root(self) -> Path:
+        """Compatibility alias for the selected core root."""
+        assert self.core_root is not None
+        return self.core_root
+
+    @property
+    def mode(self) -> str:
+        """Compatibility alias for the installation mode."""
+        return self.install_mode
 
     @property
     def git_pathspec(self) -> str:
@@ -249,8 +313,10 @@ class ProjectContext:
 
     def status(self, policy: PathPolicy | None = None) -> dict:
         value = {
+            "core_root": _portable(self.code_root),
             "game_layout": self.game_layout,
             "game_root": _portable(self.game_root),
+            "install_mode": self.install_mode,
             "kit_root": _portable(self.kit_root),
             "marker": {
                 "kind": MARKER_KIND,
@@ -258,9 +324,12 @@ class ProjectContext:
                 "schema": SCHEMA,
             },
             "project_root": _portable(self.project_root),
+            "release_sha256": self.release_sha256,
             "runtime_root": _portable(self.runtime_root),
             "schema": SCHEMA,
         }
+        if self.current_path is not None:
+            value["current"] = _portable(self.current_path)
         if policy is not None:
             if policy.anchor != self.kit_root:
                 raise ProjectContextError("status policy belongs to a different kit root")
@@ -273,39 +342,69 @@ class ProjectContext:
         )
 
 
-def resolve_project_context(project: str | Path, *, game_layout: str = "src",
-                            runtime_root: str | Path = DEFAULT_RUNTIME_ROOT) -> ProjectContext:
-    project_root = _canonical_directory(project, "project")
-    kit_root, marker_path = locate_kit_root(project_root)
-    if not _is_within(project_root, kit_root):
-        raise ProjectContextError(f"project root is outside kit root: {project_root}")
-    if game_layout not in GAME_LAYOUTS:
-        raise ProjectContextError(
-            f"game layout must be one of {', '.join(GAME_LAYOUTS)}: {game_layout!r}"
-        )
-    game_root = _resolve_within(project_root, game_layout, "game root")
+def _context_for_installation(
+    installation: managed_launcher.Installation,
+    *,
+    game_layout: str,
+    runtime_root: str | Path,
+) -> ProjectContext:
+    project_root = installation.project_root
+    game_relative = _portable_relative(game_layout, "game root", allow_root=True)
+    if game_relative != ".":
+        first = PurePosixPath(game_relative).parts[0]
+        if first.casefold() in {item.casefold() for item in RESERVED_GAME_ROOTS}:
+            raise ProjectContextError(
+                f"game root uses reserved kit path {first!r}: {game_relative}"
+            )
+    game_root = _inspect_existing_path(
+        project_root, game_relative, "game root", require_final=True
+    )
     runtime_relative = runtime_root_relative(runtime_root)
-    _require_unredirected_runtime(project_root, runtime_relative)
-    resolved_runtime = _resolve_within(
-        project_root, runtime_relative, "runtime root", allow_root=False
+    resolved_runtime = _inspect_existing_path(
+        project_root, runtime_relative, "runtime root", require_final=False
     )
     return ProjectContext(
-        kit_root=kit_root,
+        kit_root=project_root,
         project_root=project_root,
         game_root=game_root,
         runtime_root=resolved_runtime,
-        marker_path=marker_path,
-        game_layout=game_layout,
+        marker_path=installation.marker_path,
+        game_layout=game_relative,
+        core_root=installation.core_root,
+        install_mode=installation.mode,
+        release_sha256=installation.release_sha256,
+        current_path=installation.current_path,
     )
 
 
-def load_configured_context(project: str | Path) -> ProjectContext:
-    """Resolve the kit root and load its one authoritative path configuration."""
-    kit_root, _marker = locate_kit_root(project)
-    config_path = kit_root / CONFIG_NAME
-    if config_path.is_symlink() or not config_path.is_file():
+def resolve_project_context(project: str | Path, *, game_layout: str = "src",
+                            runtime_root: str | Path = DEFAULT_RUNTIME_ROOT) -> ProjectContext:
+    try:
+        installation = managed_launcher.resolve_installation(project)
+    except managed_launcher.LauncherError as exc:
+        raise ProjectContextError(str(exc)) from exc
+    return _context_for_installation(
+        installation, game_layout=game_layout, runtime_root=runtime_root
+    )
+
+
+def _load_installation_config(
+    installation: managed_launcher.Installation,
+) -> ProjectContext:
+    project_root = installation.project_root
+    matches = _matching_names(project_root, CONFIG_NAME, "kit configuration")
+    config_path = project_root / CONFIG_NAME
+    if not matches:
+        raise ProjectContextError(f"kit configuration is missing: {config_path}")
+    try:
+        info = config_path.lstat()
+    except OSError as exc:
+        raise ProjectContextError(f"kit configuration is unreadable: {config_path}") from exc
+    if (stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+            or not stat.S_ISREG(info.st_mode)
+            or int(getattr(info, "st_nlink", 1)) != 1):
         raise ProjectContextError(
-            f"kit configuration must be a regular file: {config_path}"
+            f"kit configuration must be an unredirected regular file: {config_path}"
         )
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -317,25 +416,59 @@ def load_configured_context(project: str | Path) -> ProjectContext:
         raise ProjectContextError("kit.config.json must be a schema-1 object")
     game_layout = config.get("game_root")
     runtime_root = config.get("runtime_root")
-    if game_layout not in GAME_LAYOUTS:
+    if not isinstance(game_layout, str) or not game_layout.strip():
         raise ProjectContextError(
-            f"kit.config.json game_root must be one of {', '.join(GAME_LAYOUTS)}"
+            "kit.config.json game_root must be a non-empty relative path"
         )
     if not isinstance(runtime_root, str) or not runtime_root.strip():
         raise ProjectContextError(
             "kit.config.json runtime_root must be a non-empty relative path"
         )
-    return resolve_project_context(
-        kit_root,
+    return _context_for_installation(
+        installation,
         game_layout=game_layout,
         runtime_root=runtime_root,
     )
 
 
+def load_configured_context(project: str | Path) -> ProjectContext:
+    """Resolve a requested project and load its authoritative path configuration."""
+    try:
+        installation = managed_launcher.resolve_installation(project)
+    except managed_launcher.LauncherError as exc:
+        raise ProjectContextError(str(exc)) from exc
+    return _load_installation_config(installation)
+
+
+def load_active_context(
+    core_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+) -> ProjectContext:
+    """Load context for code running from a flat or launcher-bound core.
+
+    Downstream modules pass the core root derived from their own ``__file__``.
+    Managed mode requires both launcher environment bindings and revalidates
+    those paths through ``current.json`` before trusting either one.
+    """
+    installation = resolve_active_installation(core_root, environment)
+    return _load_installation_config(installation)
+
+
+def resolve_active_installation(
+    core_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+) -> ActiveInstallation:
+    """Resolve only project/core roots for setup and other pre-config commands."""
+    try:
+        return managed_launcher.resolve_bound_installation(core_root, environment)
+    except managed_launcher.LauncherError as exc:
+        raise ProjectContextError(str(exc)) from exc
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve portable agent-kit project context")
     parser.add_argument("--project", required=True, help="project directory or path")
-    parser.add_argument("--game-root", choices=GAME_LAYOUTS, default="src",
+    parser.add_argument("--game-root", default="src",
                         help="game root relative to the project")
     parser.add_argument("--runtime-root", default=DEFAULT_RUNTIME_ROOT,
                         help="private runtime root relative to the project")
