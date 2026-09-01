@@ -196,6 +196,12 @@ def _synthetic_smoke_archive(base: Path) -> Path:
         )
         for name, value in sorted(content.items())
     ]
+    source_members = {
+        item.path: release.ArchiveMember(item.path, item.content, item.mode)
+        for item in files
+    }
+    files.extend(release._generated_install_release_files("1.0.0", source_members))
+    files.sort(key=lambda item: item.path)
     manifest = release._manifest(
         "1.0.0",
         ["LICENSE"],
@@ -212,6 +218,56 @@ def _synthetic_smoke_archive(base: Path) -> Path:
     archive = base / "synthetic-smoke.zip"
     release._write_zip(archive, members)
     return archive
+
+
+def _historic_0_2_archive(base: Path) -> Path:
+    content = {
+        path: f"# historic {path}\n".encode("utf-8")
+        for path in release.LEGACY_0_2_0_REQUIRED_KIT_FILES
+    }
+    content.update({
+        ".agent-kit.json": b'{"kind":"portable-agent-kit-root","schema":1}\n',
+        "ARCHITECTURE.md": release.CANONICAL_ARCHITECTURE,
+        "LICENSE": b"Approved historic license.\n",
+        "VERSION": b"0.2.0\n",
+        "arch.rules.json": release.CANONICAL_ARCH_RULES,
+        "kit": b"#!/bin/sh\nexit 0\n",
+    })
+    files = [
+        release.ReleaseFile(
+            name,
+            value,
+            0o755 if name.endswith(".py") or name == "kit" else 0o644,
+        )
+        for name, value in sorted(content.items())
+    ]
+    manifest = release._manifest(
+        "0.2.0",
+        ["LICENSE"],
+        files,
+        {"commit": release.LEGACY_0_2_0_SOURCE_COMMIT, "dirty": False},
+        {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+        },
+    )
+    members = {item.path: (item.content, item.mode) for item in files}
+    members[release.MANIFEST_PATH] = (release._canonical_json(manifest), 0o644)
+    archive = base / "historic-0.2.0.zip"
+    release._write_zip(archive, members)
+    return archive
+
+
+def _extract_exact(path: Path, destination: Path) -> None:
+    report = release.inspect_archive(path)
+    modes = {
+        item["path"]: int(item["mode"], 8)
+        for item in report["members"]
+    }
+    for relative, content in _member_contents(path).items():
+        target = _write(destination, relative, content)
+        target.chmod(modes[relative])
 
 
 class ReleaseTestCase(unittest.TestCase):
@@ -246,6 +302,23 @@ class TestDeterministicBuild(ReleaseTestCase):
         verified = release.verify_archive(output_one)
         self.assertTrue(verified["ok"])
         manifest = inspected["manifest"]
+        install_manifest = inspected["install_manifest"]
+        self.assertIsInstance(install_manifest, dict)
+        self.assertEqual(install_manifest["kit_version"], "1.2.3")
+        self.assertEqual(install_manifest["core_layout"],
+                         "versioned-by-archive-sha256")
+        surface_paths = {
+            item["path"]
+            for item in [
+                *install_manifest["owned_files"],
+                *install_manifest["managed_blocks"],
+            ]
+        }
+        self.assertIn(".agent-kit/launcher.py", surface_paths)
+        self.assertIn(".github/workflows/agent-kit-ci.yml", surface_paths)
+        self.assertNotIn("README.md", surface_paths)
+        self.assertNotIn("LICENSE", surface_paths)
+        self.assertNotIn("VERSION", surface_paths)
         self.assertEqual(manifest["version"], "1.2.3")
         self.assertEqual(manifest["source"], {"commit": commit, "dirty": False})
         self.assertEqual(manifest["authority_evidence"], {
@@ -259,7 +332,7 @@ class TestDeterministicBuild(ReleaseTestCase):
 
         contents = _member_contents(output_one)
         expected = set(release.REQUIRED_KIT_FILES) | {
-            "LICENSE", release.MANIFEST_PATH,
+            "LICENSE", release.MANIFEST_PATH, *release.GENERATED_INSTALL_FILES,
         }
         self.assertEqual(set(contents), expected)
         self.assertNotIn(b"\r", contents["README.md"])
@@ -462,7 +535,143 @@ class TestDeterministicBuild(ReleaseTestCase):
         with self.assertRaisesRegex(
             release.ReleaseError, "must either both exist or both be absent"
         ):
-            release.build_release(root, self.scratch / "out" / "kit.zip")
+                release.build_release(root, self.scratch / "out" / "kit.zip")
+
+
+class TestManagedInstallContract(ReleaseTestCase):
+    def test_historic_0_2_archive_remains_verifiable_without_install_support(self) -> None:
+        archive = _historic_0_2_archive(self.scratch)
+
+        inspected = release.inspect_archive(archive)
+        verified = release.verify_archive(archive)
+
+        self.assertIsNone(inspected["install_manifest"])
+        self.assertIsNone(verified["install_schema"])
+        self.assertEqual(verified["version"], "0.2.0")
+
+    def test_generated_install_source_cannot_be_reauthorized_by_release_manifest(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        changed = contents["install/agents.block.md"] + b"hidden change\n"
+        entry = next(
+            item for item in manifest["files"]
+            if item["path"] == "install/agents.block.md"
+        )
+        entry["bytes"] = len(changed)
+        entry["sha256"] = release.hashlib.sha256(changed).hexdigest()
+        contents["install/agents.block.md"] = changed
+        contents[release.MANIFEST_PATH] = release._canonical_json(manifest)
+        members = {
+            name: (
+                content,
+                0o755 if name.endswith(".py") or name == "kit" else 0o644,
+            )
+            for name, content in contents.items()
+        }
+        release._write_zip(archive, members)
+
+        with self.assertRaisesRegex(release.ReleaseError,
+                                    "managed install source is not canonical"):
+            release.verify_archive(archive)
+
+    def test_release_at_or_after_0_3_requires_complete_install_support(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        manifest = json.loads(contents[release.MANIFEST_PATH])
+        manifest["files"] = [
+            item for item in manifest["files"]
+            if item["path"] not in release.GENERATED_INSTALL_FILES
+        ]
+        for path in release.GENERATED_INSTALL_FILES:
+            contents.pop(path, None)
+        contents[release.MANIFEST_PATH] = release._canonical_json(manifest)
+        members = {
+            name: (
+                content,
+                0o755 if name.endswith(".py") or name == "kit" else 0o644,
+            )
+            for name, content in contents.items()
+        }
+        release._write_zip(archive, members)
+
+        with self.assertRaisesRegex(release.ReleaseError,
+                                    "missing required kit files|missing managed install support"):
+            release.verify_archive(archive)
+
+    def test_pinned_legacy_contract_is_complete_and_excludes_project_state(self) -> None:
+        manifest = release._install_manifest_document("0.3.0")
+
+        self.assertEqual([], release._definition_errors(manifest))
+        self.assertEqual(30, len(release.LEGACY_0_2_0_SURFACE_SHA256))
+        self.assertEqual(83, len(release.LEGACY_0_2_0_RETIRED_SHA256))
+        retired = set(release.LEGACY_0_2_0_RETIRED_SHA256)
+        self.assertFalse(retired & {
+            "README.md", "LICENSE", "VERSION", ".gate.sha256",
+            "kit.config.json", "ARCHITECTURE.md", "arch.rules.json",
+        })
+        self.assertFalse(any(path.startswith(("src/", "docs/retro/", "docs/design/"))
+                             for path in retired))
+
+
+class TestVerifiedDirectory(ReleaseTestCase):
+    def _directory(self) -> tuple[Path, Path]:
+        base = self.scratch / f"directory-{uuid.uuid4().hex}"
+        base.mkdir()
+        archive = _synthetic_smoke_archive(base)
+        directory = base / "extracted"
+        directory.mkdir()
+        _extract_exact(archive, directory)
+        return archive, directory
+
+    def test_exact_directory_has_the_canonical_zip_identity(self) -> None:
+        archive, directory = self._directory()
+
+        report, members = release.read_verified_directory(directory)
+
+        self.assertEqual("directory", report["format"])
+        self.assertEqual(release.verify_archive(archive)["archive_sha256"],
+                         report["archive_sha256"])
+        self.assertIn(release.INSTALL_MANIFEST_PATH, members)
+
+    def test_tampered_and_extra_directory_content_is_refused(self) -> None:
+        _archive, directory = self._directory()
+        (directory / "README.md").write_bytes(b"tampered\n")
+        with self.assertRaisesRegex(release.ReleaseError, "size does not match|SHA-256"):
+            release.read_verified_directory(directory)
+
+        _archive, directory = self._directory()
+        _write(directory, "extra.txt", "extra\n")
+        with self.assertRaisesRegex(release.ReleaseError, "member set differs"):
+            release.read_verified_directory(directory)
+
+    def test_extra_or_linked_directory_is_refused(self) -> None:
+        _archive, directory = self._directory()
+        (directory / "extra-empty").mkdir()
+        with self.assertRaisesRegex(release.ReleaseError, "directory set is not exact"):
+            release.read_verified_directory(directory)
+
+        _archive, directory = self._directory()
+        linked = directory / "linked"
+        linked.mkdir()
+        original = release._is_reparse_point
+
+        def marked(path: Path) -> bool:
+            return path == linked or original(path)
+
+        with mock.patch.object(release, "_is_reparse_point", side_effect=marked):
+            with self.assertRaisesRegex(release.ReleaseError, "linked directory"):
+                release.read_verified_directory(directory)
+
+    def test_directory_materializes_to_the_same_deterministic_zip(self) -> None:
+        archive, directory = self._directory()
+        output = self.scratch / "materialized.zip"
+
+        report = release.materialize_verified_directory_zip(directory, output)
+
+        self.assertEqual(archive.read_bytes(), output.read_bytes())
+        self.assertEqual(report["archive_sha256"],
+                         release.verify_archive(archive)["archive_sha256"])
 
 
 class TestSemanticIsolation(ReleaseTestCase):
