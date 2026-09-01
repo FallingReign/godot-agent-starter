@@ -33,11 +33,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 
-CONTEXT = project_context.load_configured_context(ROOT)
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 
 # A file touched this many times since the baseline is being iterated on rather
 # than written. Deliberately not tuned: the point is to surface candidates for a

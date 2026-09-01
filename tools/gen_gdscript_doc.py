@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-ROOT = Path(__file__).resolve().parent.parent
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
 
 ExampleMap = Dict[str, List[str]]
 SECTIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
@@ -175,7 +176,7 @@ def main() -> int:
     arguments = parser.parse_args()
 
     text = render(collect())
-    target = ROOT / "docs" / "GDSCRIPT.md"
+    target = CORE_ROOT / "docs" / "GDSCRIPT.md"
 
     if arguments.check:
         current = target.read_text(encoding="utf-8") if target.is_file() else ""
@@ -191,7 +192,7 @@ def main() -> int:
     if arguments.write:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8", newline="")
-        print(f"wrote {target.relative_to(ROOT).as_posix()}")
+        print(f"wrote {target.relative_to(CORE_ROOT).as_posix()}")
         return 0
 
     sys.stdout.write(text)

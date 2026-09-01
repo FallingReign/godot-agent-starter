@@ -35,12 +35,15 @@ import json
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
 BOARD_STATE = runtime_paths.resolve(ROOT).board_state
 PROTOCOL_SCHEMA = 2
 PROTOCOL_FILES = (
@@ -93,9 +96,8 @@ def _inline_json(value: str) -> str:
 def protocol_version() -> str:
     """Fingerprint the server/client contract so stale board code is refused."""
     digest = hashlib.sha256()
-    tools = Path(__file__).resolve().parent
     for name in PROTOCOL_FILES:
-        path = tools / name
+        path = TOOLS / name
         try:
             content = path.read_bytes()
         except OSError:

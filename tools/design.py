@@ -23,12 +23,14 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-DESIGN = ROOT / "docs" / "design"
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 
-CONTEXT = project_context.load_configured_context(ROOT)
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
+DESIGN = ROOT / "docs" / "design"
 GAME_ROOT = CONTEXT.game_root
 
 INDEX_NAME = "INDEX.md"

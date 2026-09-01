@@ -27,7 +27,10 @@ import engine_discovery
 import native_engine
 import project_context
 
-ROOT = Path(__file__).resolve().parent.parent
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 DOC_DIR = ROOT / ".godot_doc" / "classes"
 DOC_ROOT = DOC_DIR.parent
 _ERROR_RE = re.compile(r"(?im)^\s*(?:SCRIPT ERROR|ERROR|FATAL|CRASH):")
@@ -64,6 +67,8 @@ def build(engine: str | None) -> int:
     except engine_discovery.EngineAuthenticationError as exc:
         print(f"godot-docs build refused: {exc}")
         return 2
+    # Resolve again so synthetic project fixtures and explicit target projects
+    # retain their own private runtime rather than borrowing this process's.
     runtime = project_context.load_configured_context(ROOT).runtime_root
     build_root = runtime / "godot-docs"
     build_root.mkdir(parents=True, exist_ok=True)

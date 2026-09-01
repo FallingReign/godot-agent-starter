@@ -775,7 +775,12 @@ def describe(spec_name: str, indent: int = 0) -> List[str]:
 
 
 def main(argv: List[str]) -> int:
-    root = Path(__file__).resolve().parent.parent
+    tools = Path(__file__).resolve().parent
+    try:
+        import project_context
+    except ImportError:  # package import in tests
+        from tools import project_context  # type: ignore[no-redef]
+    root = project_context.load_active_context(tools.parent).project_root
     if "--describe" in argv:
         which = argv[argv.index("--describe") + 1] if len(argv) > argv.index("--describe") + 1 else "PROPOSAL"
         print("\n".join(describe(which.upper())))

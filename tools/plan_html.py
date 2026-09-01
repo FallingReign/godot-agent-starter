@@ -54,14 +54,16 @@ import schema as artifact_schema  # noqa: E402  (shared artefact contract)
 import project_context  # noqa: E402  (shared configured roots)
 import release as kit_release  # noqa: E402  (authoritative fixed kit paths)
 
-ROOT = Path(__file__).resolve().parent.parent
-CONTEXT = project_context.load_configured_context(ROOT)
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 GAME_ROOT = CONTEXT.game_root
 SHAPE = ROOT / "project.shape.json"
 PROPOSAL = ROOT / "proposal.json"
 DOCS = ROOT / "docs"
 DESIGN = DOCS / "design"
-VENDOR = ROOT / "tools" / "vendor"
+VENDOR = CORE_ROOT / "tools" / "vendor"
 OUT = ROOT / "plan.html"
 SNAP_DIR = ROOT / "plan"
 
@@ -401,7 +403,7 @@ def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     """Real modules and a mermaid diagram, from arch.py. Never hand-derived:
     arch.py already owns the definition of a module and the gate already fails
     when its output is stale."""
-    script = ROOT / "arch.py"
+    script = CORE_ROOT / "arch.py"
     if not script.is_file():
         return [], "", {}
     try:

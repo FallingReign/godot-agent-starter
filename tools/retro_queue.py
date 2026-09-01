@@ -40,11 +40,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-ROOT = Path(__file__).resolve().parent.parent
-RETRO_DIR = ROOT / "docs" / "retro"
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
+RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
 QUEUE_DIR = _RUNTIME.retro_queue
 INDEX_FILE = QUEUE_DIR / "index.json"

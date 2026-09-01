@@ -59,16 +59,18 @@ import sys
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-ROOT = Path(__file__).resolve().parent.parent
-RETRO_DIR = ROOT / "docs" / "retro"
-DEFERRED_FILE = RETRO_DIR / "deferred.json"
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 import retro_ledger  # noqa: E402
 import session_digest  # noqa: E402  (needs sys.path set first)
 import session_evidence  # noqa: E402
 
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
+RETRO_DIR = ROOT / "docs" / "retro"
+DEFERRED_FILE = RETRO_DIR / "deferred.json"
 _RUNTIME = runtime_paths.resolve(ROOT)
 SESSION_EVIDENCE_DIR = _RUNTIME.session_evidence
 BOARD_STATE_FILE = _RUNTIME.board_state

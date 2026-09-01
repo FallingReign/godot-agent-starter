@@ -19,11 +19,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import project_context  # noqa: E402
+import managed_launcher  # noqa: E402
 import runtime_paths  # noqa: E402
+
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+_ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+PROJECT_ROOT = _ACTIVE_INSTALLATION.project_root
+CHILD_ENVIRONMENT = managed_launcher.bound_environment(_ACTIVE_INSTALLATION)
 
 SCHEMA = 1
 OUTCOMES = ("implemented", "blocked", "failed")
 RUN_ID = re.compile(r"(?:run|retro)-[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _core_for_project(root: Path) -> Path:
+    canonical = root.resolve(strict=True)
+    return CORE_ROOT if canonical == PROJECT_ROOT else canonical
 
 
 class DispatchWorkspaceError(RuntimeError):
@@ -688,7 +700,9 @@ def evaluate(path: Path, expected_run_id: str, expected_before_sha: str,
 
     if run_gate:
         static_only = trusted_host_result
-        gate_command = [sys.executable, str(root / "check.py")]
+        canonical_root = root.resolve(strict=True)
+        core = _core_for_project(root)
+        gate_command = [sys.executable, str(core / "check.py")]
         public_command = "kit verify"
         if static_only:
             gate_command.append("--static")
@@ -697,6 +711,7 @@ def evaluate(path: Path, expected_run_id: str, expected_before_sha: str,
             gate = subprocess.run(
                 gate_command, cwd=str(root),
                 capture_output=True, text=True, timeout=gate_timeout,
+                env=CHILD_ENVIRONMENT if canonical_root == PROJECT_ROOT else None,
             )
             output = (gate.stdout or "") + (gate.stderr or "")
             passed = gate.returncode == 0 and "GATE PASSED" in output

@@ -25,6 +25,8 @@ from typing import Any, Iterable
 
 import runtime_paths
 import proposal_authority
+import project_context
+import managed_launcher
 try:
     import native_engine
 except ImportError:  # compatibility with older kit revisions
@@ -48,6 +50,18 @@ AUTHORITY_TRUST = (
     "Receipts bind the exact reviewed page. They are tamper-evident policy "
     "evidence, not person authentication."
 )
+
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+_ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+PROJECT_ROOT = _ACTIVE_INSTALLATION.project_root
+CHILD_ENVIRONMENT = managed_launcher.bound_environment(_ACTIVE_INSTALLATION)
+
+
+def _core_for_project(root: Path) -> Path:
+    """Keep synthetic flat fixtures working while selecting the active core."""
+    canonical = root.resolve(strict=True)
+    return CORE_ROOT if canonical == PROJECT_ROOT else canonical
 
 _decision_lock = threading.RLock()
 
@@ -2158,12 +2172,14 @@ def secrets_compare(left: str, right: str) -> bool:
 def regenerate_views(root: Path, *, snapshot: str = "") -> dict[str, Any]:
     """Regenerate plan and retro as one pure operation; never start the board."""
     canonical = root.resolve(strict=True)
-    plan_command = [sys.executable, str(canonical / "tools" / "plan_html.py")]
+    core = _core_for_project(canonical)
+    child_environment = CHILD_ENVIRONMENT if canonical == PROJECT_ROOT else None
+    plan_command = [sys.executable, str(core / "tools" / "plan_html.py")]
     if snapshot:
         plan_command.extend(("--slice", snapshot_label(snapshot)))
     jobs = {
         "plan": plan_command,
-        "retro": [sys.executable, str(canonical / "tools" / "retro_html.py")],
+        "retro": [sys.executable, str(core / "tools" / "retro_html.py")],
     }
     processes: dict[str, Any] = {}
     ok = True
@@ -2176,6 +2192,7 @@ def regenerate_views(root: Path, *, snapshot: str = "") -> dict[str, Any]:
                 text=True,
                 timeout=180,
                 check=False,
+                env=child_environment,
             )
             processes[name] = {
                 "returncode": result.returncode,

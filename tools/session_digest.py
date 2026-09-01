@@ -39,8 +39,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import session_evidence
+import project_context
 
-ROOT = Path(__file__).resolve().parent.parent
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
 
 # Copilot keeps one directory per session, each with a workspace.yaml carrying
 # the cwd. That file is small and declarative; the session database is an

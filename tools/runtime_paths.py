@@ -10,11 +10,19 @@ from __future__ import annotations
 
 import json
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
+
+# Runtime state always belongs to the marked project, not to the immutable
+# release directory that happens to contain this module.
+DEFAULT_ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 CONFIG_NAME = "kit.config.json"
 CONFIG_SCHEMA = 1
 DEFAULT_RUNTIME = ".kit/runtime"

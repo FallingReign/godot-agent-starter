@@ -28,14 +28,17 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-ROOT = Path(__file__).resolve().parent.parent
-RETRO_DIR = ROOT / "docs" / "retro"
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import session_digest  # noqa: E402
 import session_evidence  # noqa: E402
 import runtime_paths  # noqa: E402
 import retro_due  # noqa: E402
 
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
+RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
 EVIDENCE_DIR = _RUNTIME.evidence
 PROMPT_DIR = _RUNTIME.retro_sdk
@@ -1135,7 +1138,7 @@ def finalise_retro(pack: dict, pack_path: Path, completion_key: str) -> int:
         return 1
     report = reports[-1]
     ranked = subprocess.run(
-        [sys.executable, str(ROOT / "tools" / "retro_rank.py"), str(report)],
+        [sys.executable, str(CORE_ROOT / "tools" / "retro_rank.py"), str(report)],
         cwd=str(ROOT), capture_output=True, text=True, timeout=120,
     )
     if ranked.returncode != 0:
@@ -1143,10 +1146,10 @@ def finalise_retro(pack: dict, pack_path: Path, completion_key: str) -> int:
         print((ranked.stderr or ranked.stdout)[-1500:])
         return 1
     for label, command in (
-        ("plan", [sys.executable, str(ROOT / "tools" / "plan_html.py")]),
+        ("plan", [sys.executable, str(CORE_ROOT / "tools" / "plan_html.py")]),
         (
             "retrospective",
-            [sys.executable, str(ROOT / "tools" / "retro_html.py"), "--no-board"],
+            [sys.executable, str(CORE_ROOT / "tools" / "retro_html.py"), "--no-board"],
         ),
     ):
         rendered = subprocess.run(

@@ -43,8 +43,10 @@ import engine_discovery
 import native_engine
 import project_context
 
-ROOT = Path(__file__).resolve().parent.parent
-CONTEXT = project_context.load_configured_context(ROOT)
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 GAME_ROOT = CONTEXT.game_root
 PORT = 6105
 PID_FILE = CONTEXT.runtime_root / "gdls.json"
@@ -433,7 +435,7 @@ class Client:
     def initialise(self, *, timeout: float = 20.0) -> bool:
         response = self.request("initialize", {
             "processId": os.getpid(),
-            "rootUri": ROOT.as_uri(),
+            "rootUri": GAME_ROOT.as_uri(),
             "capabilities": {},
         }, timeout=timeout)
         if not isinstance(response, dict) or not isinstance(response.get("result"), dict):
@@ -443,7 +445,7 @@ class Client:
 
     def open_fresh(self, rel: str) -> str:
         """Push current disk text so the server cannot serve a stale buffer."""
-        path = (ROOT / rel).resolve()
+        path = (GAME_ROOT / rel).resolve()
         uri = path.as_uri()
         text = path.read_text(encoding="utf-8", errors="replace")
         self.notify("textDocument/didOpen", {
@@ -815,14 +817,14 @@ def cmd_symbols(args: argparse.Namespace) -> int:
 
 def _text_scan(symbol: str) -> List[Dict[str, Any]]:
     hits: List[Dict[str, Any]] = []
-    for path in sorted(ROOT.rglob("*.gd")):
-        parts = path.relative_to(ROOT).parts
+    for path in sorted(GAME_ROOT.rglob("*.gd")):
+        parts = path.relative_to(GAME_ROOT).parts
         if any(p in {".godot", "addons", "build", ".git"} for p in parts):
             continue
         for num, line in enumerate(
                 path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if symbol in line:
-                hits.append({"file": path.relative_to(ROOT).as_posix(),
+                hits.append({"file": path.relative_to(GAME_ROOT).as_posix(),
                              "line": num, "text": line.strip()[:160]})
     return hits
 

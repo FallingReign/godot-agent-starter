@@ -33,12 +33,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 TOOLS = Path(__file__).resolve().parent
-ROOT = TOOLS.parent
+CORE_ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
+import project_context  # noqa: E402
+import managed_launcher  # noqa: E402
 import runtime_paths  # noqa: E402
 import proposal_authority  # noqa: E402
 import process_supervisor  # noqa: E402
+
+_ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+ROOT = _ACTIVE_INSTALLATION.project_root
+CHILD_ENVIRONMENT = managed_launcher.bound_environment(_ACTIVE_INSTALLATION)
 
 SCHEMA = 1
 EXIT_OK = 0
@@ -421,9 +427,9 @@ def _run_stage(
     return stage, outcome
 
 
-def _release_metadata(root: Path) -> list[str]:
+def _release_metadata(core_root: Path) -> list[str]:
     blockers: list[str] = []
-    version = root / "VERSION"
+    version = core_root / "VERSION"
     try:
         version_present = version.is_file() and bool(
             version.read_text(encoding="utf-8").strip()
@@ -432,19 +438,19 @@ def _release_metadata(root: Path) -> list[str]:
         version_present = False
     if not version_present:
         blockers.append("required VERSION metadata is absent")
-    legal = [name for name in LEGAL_FILES if (root / name).is_file()]
+    legal = [name for name in LEGAL_FILES if (core_root / name).is_file()]
     if not legal:
         blockers.append("required approved LICENSE or COPYING metadata is absent")
     else:
         try:
             legal_valid = all(
-                bool((root / name).read_text(encoding="utf-8").strip()) for name in legal
+                bool((core_root / name).read_text(encoding="utf-8").strip()) for name in legal
             )
         except (OSError, UnicodeError):
             legal_valid = False
         if not legal_valid:
             blockers.append("present legal metadata is empty or unreadable")
-    if not (root / "tools" / "release.py").is_file():
+    if not (core_root / "tools" / "release.py").is_file():
         blockers.append("tools/release.py is unavailable")
     return blockers
 
@@ -495,6 +501,7 @@ def _overall_status(stages: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
 def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict[str, Any], int]:
     """Run every strict proof and atomically retain a machine-readable report."""
     root = root.resolve(strict=True)
+    core_root = CORE_ROOT if root == ROOT else root
     verification = _private_verification_root(root)
     report_path = verification / "strict-report.json"
     run_id = (
@@ -506,7 +513,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
     test_scratch = run_directory / "test-scratch"
     test_scratch.mkdir()
     selected_runner = runner or _default_runner
-    environment = dict(os.environ)
+    environment = dict(CHILD_ENVIRONMENT if root == ROOT else os.environ)
     environment.update(
         {
             "CI": environment.get("CI", "1"),
@@ -541,13 +548,13 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             ),
             (
                 "doctor",
-                [sys.executable, str(root / "kit.py"), "doctor", "--json"],
+                [sys.executable, str(core_root / "kit.py"), "doctor", "--json"],
                 60,
                 _classify_doctor,
             ),
             (
                 "gate",
-                [sys.executable, str(root / "check.py")],
+                [sys.executable, str(core_root / "check.py")],
                 1800,
                 lambda outcome: _classify_gate(outcome, allowed_gate_skips),
             ),
@@ -559,7 +566,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                     "unittest",
                     "discover",
                     "-s",
-                    "tools/tests",
+                    str(core_root / "tools" / "tests"),
                     "-v",
                 ],
                 1200,
@@ -567,7 +574,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             ),
             (
                 "browser-check",
-                [sys.executable, str(root / "tools" / "tests" / "browser_check.py")],
+                [sys.executable, str(core_root / "tools" / "tests" / "browser_check.py")],
                 900,
                 _classify_browser,
             ),
@@ -615,7 +622,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 )
                 stage["reason"] += "; later commands were not started"
 
-        metadata_blockers = _release_metadata(root)
+        metadata_blockers = _release_metadata(core_root)
         if abort_remaining:
             stages.append(
                 {
@@ -644,7 +651,7 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             with _release_workspace(run_directory) as release_workspace:
                 release_one = release_workspace / "kit-one.zip"
                 release_two = release_workspace / "kit-two.zip"
-                release_tool = root / "tools" / "release.py"
+                release_tool = core_root / "tools" / "release.py"
                 release_commands = (
                     (
                         "release-build-1",

@@ -20,7 +20,13 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
+import runtime_paths  # noqa: E402
+
+ROOT = project_context.load_active_context(CORE_ROOT).project_root
 NOTES = ROOT / "docs" / "retro" / "notes"
 ARCHIVE = ROOT / "docs" / "retro" / "archive"
 DEFAULT_THRESHOLD = 10
@@ -41,10 +47,6 @@ _DECLARATION_RE = re.compile(
     r"([a-z][a-z0-9_-]*(?::[a-z][a-z0-9_-]*)?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import runtime_paths  # noqa: E402
-
 
 def threshold() -> int:
     cfg = runtime_paths.load_config(ROOT)

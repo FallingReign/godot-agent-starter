@@ -86,10 +86,10 @@ import webbrowser
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-RETRO_DIR = ROOT / "docs" / "retro"
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TOOLS = Path(__file__).resolve().parent
+CORE_ROOT = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+import project_context  # noqa: E402
 import runtime_paths   # noqa: E402
 import cockpit         # noqa: E402  (plan decisions and verification; no provider calls)
 import providers       # noqa: E402  (closed adapters; no arbitrary commands)
@@ -103,6 +103,9 @@ import session_evidence  # noqa: E402  (stable repository scope identity)
 import board_client    # noqa: E402  (CSS/JS constants only, zero project imports of its own)
 import run_result      # noqa: E402  (structured worker outcome verification)
 
+CONTEXT = project_context.load_active_context(CORE_ROOT)
+ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
+RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
 RUNS_DIR = _RUNTIME.board_runs
 STATE_FILE = _RUNTIME.board_state
@@ -1573,7 +1576,7 @@ class RunManager:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         run_id = self._new_run_id("retro")
         log_path = RUNS_DIR / f"{run_id}.log"
-        cmd = [sys.executable, str(ROOT / "tools" / "retro.py"), "--sdk", "--force"]
+        cmd = [sys.executable, str(CORE_ROOT / "tools" / "retro.py"), "--sdk", "--force"]
         env = dict(os.environ)
         env.pop("COPILOT_ALLOW_ALL", None)
         env["COPILOT_AUTO_UPDATE"] = "false"
