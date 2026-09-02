@@ -31,8 +31,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping
 
 try:
-    from tools import process_supervisor, release
+    from tools import managed_launcher, process_supervisor, release
 except ImportError:  # pragma: no cover - direct execution/import from tools/
+    import managed_launcher  # type: ignore[no-redef]
     import process_supervisor  # type: ignore[no-redef]
     import release  # type: ignore[no-redef]
 
@@ -1051,6 +1052,150 @@ def _validate_release_state(value: object) -> dict[str, Any]:
     return item
 
 
+def _authenticated_active_surfaces(
+    root: Path,
+    state: dict[str, Any],
+    raw_state: bytes,
+) -> list[Surface]:
+    """Bind managed ownership claims to the exact authenticated active core."""
+    try:
+        installation = managed_launcher.resolve_installation(root)
+    except managed_launcher.LauncherError as exc:
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            f"the active kit cannot be authenticated; use kit change recovery: {exc}",
+        ) from exc
+    active = state["active_release"]
+    if (
+        installation.mode != "managed"
+        or installation.current_path is None
+        or installation.manifest_path is None
+        or installation.release_sha256 != active["archive_sha256"]
+        or installation.version != active["kit_version"]
+        or installation.source_commit != active["source_commit"]
+    ):
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            "the active kit selection does not match its install record; use kit change recovery",
+        )
+    if _stable_bytes(installation.current_path) != raw_state:
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            "the install record changed while it was authenticated; retry or use kit change recovery",
+        )
+
+    manifest_content = _stable_bytes(installation.manifest_path)
+    try:
+        release_manifest = json.loads(manifest_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise KitChangeError(
+            "installed-kit-untrusted", "the active release manifest is unreadable"
+        ) from exc
+    files = release_manifest.get("files") if isinstance(release_manifest, dict) else None
+    if not isinstance(files, list):
+        raise KitChangeError(
+            "installed-kit-untrusted", "the active release manifest has no exact file list"
+        )
+    members: dict[str, Any] = {
+        RELEASE_MANIFEST: release.ArchiveMember(
+            RELEASE_MANIFEST, manifest_content, 0o644
+        )
+    }
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise KitChangeError(
+                "installed-kit-untrusted", "the active release file list is malformed"
+            )
+        relative = _safe_relative(entry.get("path"), label="active release member")
+        mode = entry.get("mode")
+        if mode not in {"0644", "0755"}:
+            raise KitChangeError(
+                "installed-kit-untrusted", "the active release member mode is malformed"
+            )
+        member_path = installation.core_root.joinpath(*PurePosixPath(relative).parts)
+        members[relative] = release.ArchiveMember(
+            relative,
+            _stable_bytes(
+                member_path,
+                limit=getattr(release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES),
+            ),
+            int(mode, 8),
+        )
+    if not _core_matches(installation.core_root, members):
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            "the active kit core changed while it was authenticated; use kit change recovery",
+        )
+    report = {"version": active["kit_version"]}
+    _manifest, surfaces, _retired = _install_manifest(report, members)
+    return surfaces
+
+
+def _validate_managed_ownership(
+    root: Path,
+    state: dict[str, Any],
+    surfaces: list[Surface],
+) -> None:
+    claimed = state["managed_surfaces"]
+    by_id = {str(item["id"]): item for item in claimed}
+    expected_ids = [surface.id for surface in surfaces]
+    if sorted(by_id) != expected_ids or len(by_id) != len(claimed):
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            "the install record does not name the active kit surfaces; use kit change recovery",
+        )
+    for surface in surfaces:
+        item = by_id[surface.id]
+        source_path = root / MANAGED_ROOT / "releases" / state["active_release"][
+            "archive_sha256"
+        ] / PurePosixPath(surface.source)
+        source = _stable_bytes(
+            source_path,
+            limit=getattr(release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES),
+        )
+        if surface.strategy == "managed-block" and not source.endswith(b"\n"):
+            source += b"\n"
+        expected_base = _sha256(source)
+        if (
+            item["path"] != surface.path
+            or item["strategy"] != surface.strategy
+            or item["base_sha256"] != expected_base
+        ):
+            raise KitChangeError(
+                "installed-kit-untrusted",
+                f"the ownership record for {surface.path} does not match the active kit",
+            )
+
+        if surface.strategy == "replace":
+            current = _snapshot(_target(root, surface.path))
+            if (
+                current.get("kind") != "file"
+                or current.get("sha256") != item["applied_sha256"]
+                or item["applied_sha256"] != expected_base
+            ):
+                raise KitChangeError(
+                    "installed-kit-untrusted",
+                    f"the kit-owned file {surface.path} no longer matches its ownership record",
+                )
+        elif surface.strategy == "managed-block":
+            path = _target(root, surface.path)
+            if not path.is_file():
+                raise KitChangeError(
+                    "installed-kit-untrusted",
+                    f"the managed section in {surface.path} is missing",
+                )
+            _text, block, _outside = _block_parts(_stable_bytes(path), surface)
+            if (
+                block is None
+                or _sha256(block.encode("utf-8")) != item["applied_sha256"]
+                or item["applied_sha256"] != expected_base
+            ):
+                raise KitChangeError(
+                    "installed-kit-untrusted",
+                    f"the managed section in {surface.path} no longer matches its ownership record",
+                )
+
+
 def _legacy_context(
     root: Path, surfaces: list[Surface], retired: list[RetiredFile]
 ) -> dict[str, Any] | None:
@@ -1092,6 +1237,8 @@ def _current_context(
     loaded = _load_state(root)
     if loaded is not None:
         state, raw = loaded
+        active_surfaces = _authenticated_active_surfaces(root, state, raw)
+        _validate_managed_ownership(root, state, active_surfaces)
         active = state["active_release"]
         return {
             "mode": "managed",

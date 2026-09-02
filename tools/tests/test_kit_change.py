@@ -51,7 +51,7 @@ def _release_fixture(
     version: str = "0.3.0",
     archive_sha256: str = "a" * 64,
     source_commit: str = "b" * 40,
-    launcher: bytes = b"@echo off\r\necho managed kit\r\n",
+    launcher: bytes = b"@echo off\necho managed kit\n",
     block_body: str = "Use the active managed kit release.",
     legacy_launcher: bytes | None = None,
     legacy_marker: bytes | None = None,
@@ -167,9 +167,7 @@ def _release_fixture(
     members = {
         ".agent-kit.json": SimpleNamespace(content=MARKER_BYTES, mode=0o644),
         "INSTALL-MANIFEST.json": SimpleNamespace(content=_canonical(manifest), mode=0o644),
-        "RELEASE-MANIFEST.json": SimpleNamespace(
-            content=(f'{{"version":"{version}"}}\n').encode("utf-8"), mode=0o644
-        ),
+        "LICENSE": SimpleNamespace(content=b"MIT fixture license\n", mode=0o644),
         "install/agents.block.md": SimpleNamespace(content=block, mode=0o644),
         "install/.gdlintrc": SimpleNamespace(content=b"max-line-length=100\n", mode=0o644),
         "install/ARCHITECTURE.md": SimpleNamespace(
@@ -180,8 +178,37 @@ def _release_fixture(
             content=_canonical(config_defaults), mode=0o644
         ),
         "install/kit.cmd": SimpleNamespace(content=launcher, mode=0o644),
-        "kit.py": SimpleNamespace(content=b"# managed core\n", mode=0o644),
+        "kit.py": SimpleNamespace(content=b"# managed core\n", mode=0o755),
     }
+    release_manifest = {
+        "schema": 2,
+        "version": version,
+        "source": {"commit": source_commit, "dirty": False},
+        "authority_evidence": {
+            "receipt_trust": "portable-policy",
+            "identity_model": "portable-policy-audit",
+            "project_receipt_trust": "not-applicable-no-project-state",
+        },
+        "license_files": ["LICENSE"],
+        "normalization": {
+            "line_endings": "lf",
+            "regular_mode": "0644",
+            "executable_mode": "0755",
+            "timestamps": "fixed",
+        },
+        "files": [
+            {
+                "path": name,
+                "bytes": len(member.content),
+                "sha256": _sha256(member.content),
+                "mode": format(member.mode, "04o"),
+            }
+            for name, member in sorted(members.items())
+        ],
+    }
+    members["RELEASE-MANIFEST.json"] = SimpleNamespace(
+        content=_canonical(release_manifest), mode=0o644
+    )
     report: dict[str, object] = {
         "ok": True,
         "version": version,
@@ -600,13 +627,51 @@ class KitChangeTest(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"hardlinks unavailable on this host: {exc}")
 
-        decision = kit_change.preview(self.root, self.archive)
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
 
-        self.assertFalse(decision["approval"]["approvable"])
-        self.assertIn(
-            "managed-core-modified",
-            {blocker["code"] for blocker in decision["material"]["blockers"]},
+        self.assertEqual("installed-kit-untrusted", raised.exception.code)
+
+    def test_forged_ownership_hash_cannot_authorize_overwriting_human_work(self) -> None:
+        self._preview_and_apply()
+        human = b"@echo off\necho human launcher\n"
+        (self.root / "kit.cmd").write_bytes(human)
+        current_path = self.root / ".agent-kit" / "current.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        launcher = next(
+            item for item in current["managed_surfaces"] if item["id"] == "launcher"
         )
+        launcher["applied_sha256"] = _sha256(human)
+        current_path.write_bytes(_canonical(current))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
+
+        self.assertEqual("installed-kit-untrusted", raised.exception.code)
+        self.assertEqual(human, (self.root / "kit.cmd").read_bytes())
+
+    def test_noncanonical_install_record_blocks_upgrade(self) -> None:
+        self._preview_and_apply()
+        current_path = self.root / ".agent-kit" / "current.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
+
+        self.assertEqual("installed-kit-untrusted", raised.exception.code)
+
+    def test_core_identity_mismatch_blocks_upgrade(self) -> None:
+        self._preview_and_apply()
+        current_path = self.root / ".agent-kit" / "current.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current["active_release"]["install_manifest_sha256"] = "f" * 64
+        current_path.write_bytes(_canonical(current))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
+
+        self.assertEqual("installed-kit-untrusted", raised.exception.code)
 
     def test_exact_transaction_can_be_inspected_after_apply(self) -> None:
         decision = kit_change.preview(self.root, self.archive)
@@ -920,7 +985,7 @@ class KitChangeTest(unittest.TestCase):
             version="0.4.0",
             archive_sha256="c" * 64,
             source_commit="d" * 40,
-            launcher=b"@echo off\r\necho managed kit 0.4\r\n",
+            launcher=b"@echo off\necho managed kit 0.4\n",
             block_body="Use the active managed kit release, version two.",
         )
         self._switch_release(second)
