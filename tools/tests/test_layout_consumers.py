@@ -184,7 +184,9 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with mock.patch.object(design, "GAME_ROOT", self.scratch):
+        with mock.patch.object(
+            design, "_configured_game_root", return_value=self.scratch
+        ):
             found = design.scan_tunables()
 
         self.assertIn("movement.speed", found)
