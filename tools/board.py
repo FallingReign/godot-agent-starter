@@ -3506,8 +3506,15 @@ def main() -> int:
     ap.add_argument("--started", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    if args.kit_change_session and (not args.ensure or args.open):
-        ap.error("--kit-change-session requires --ensure and cannot be combined with --open")
+    if args.kit_change_session and (
+        not args.ensure
+        or args.serve
+        or args.status
+        or args.open
+        or args.stop
+        or args.migrate
+    ):
+        ap.error("--kit-change-session requires --ensure as the only lifecycle action")
 
     if args.migrate:
         n = migrate_accepted_file()

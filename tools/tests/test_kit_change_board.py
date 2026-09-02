@@ -228,6 +228,18 @@ class KitChangeBoard(unittest.TestCase):
             self.base + f"kit-change.html?session={SESSION_A}", payload["review_url"]
         )
 
+    def test_registration_refuses_a_second_lifecycle_action(self) -> None:
+        stderr = io.StringIO()
+        argv = [
+            "board.py", "--ensure", "--status", "--kit-change-session", SESSION_A
+        ]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                board.main()
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("only lifecycle action", stderr.getvalue())
+        self.status.assert_not_called()
+
     def test_direct_url_active_fallback_and_two_session_isolation(self) -> None:
         self.activate(SESSION_A)
         code, active_page = self.get_text("kit-change.html")
