@@ -90,6 +90,15 @@ boundary. Do not run two kit changes or another file-writing agent against the
 same project at once. The lifecycle lock prevents two cooperating kit changes;
 it cannot contain unrelated software that ignores the lock.
 
+## Storage and cleanup
+
+Version 0.3.0 never automatically removes managed releases, review sessions,
+transaction journals, or Restore backups. A successful upgrade remains
+restorable, and an older release may still be part of that Restore chain. Do
+not manually delete `.agent-kit/releases`, `.kit/runtime/upgrade`, or the
+controller storage. A future separately reviewed cleanup command can remove
+only records that have first been explicitly made non-restorable.
+
 ## Result states
 
 | State | Meaning | Next action |
