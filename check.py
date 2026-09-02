@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # CORE_ROOT contains immutable gate code and rules. PROJECT_ROOT contains the
 # repository's configuration, design and generated views. PROJECT_DIR is the
@@ -285,6 +285,170 @@ class Results:
 
 
 RESULTS = Results()
+
+BASELINEABLE_STAGES = frozenset({"format", "lint", "sanitise", "grep", "types"})
+BROWNFIELD_CAPTURE = False
+BROWNFIELD_CAPTURE_ISSUES: List[dict] = []
+BROWNFIELD_CAPTURE_ERRORS: List[str] = []
+_BROWNFIELD_UNSET = object()
+_BROWNFIELD_STATE: object = _BROWNFIELD_UNSET
+_BROWNFIELD_NOTICE_SHOWN = False
+
+
+def _game_repository_relative(relative: str) -> str:
+    rendered = relative.replace("\\", "/").removeprefix("./")
+    return rendered if GAME_LAYOUT == "." else f"{GAME_LAYOUT}/{rendered}"
+
+
+def _diagnostic_game_relative(value: str) -> Optional[str]:
+    """Normalize one tool-reported path back into configured game space."""
+    rendered = value.strip().strip("'\"")
+    candidate = Path(rendered)
+    if not candidate.is_absolute():
+        candidate = PROJECT_DIR / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(PROJECT_DIR.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return relative.as_posix()
+
+
+def _issue(
+    stage: str,
+    code: str,
+    game_relative: str,
+    line: int,
+    message: str,
+) -> dict:
+    normalized_message = " ".join(ANSI_RE.sub("", message).split())
+    return {
+        "stage": stage,
+        "code": code,
+        "path": _game_repository_relative(game_relative),
+        "line": line,
+        "message_sha256": hashlib.sha256(
+            normalized_message.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _capture_error(stage: str, detail: str) -> None:
+    BROWNFIELD_CAPTURE_ERRORS.append(f"{stage}: {' '.join(detail.split())}")
+
+
+def _reset_brownfield_state() -> None:
+    global _BROWNFIELD_STATE, _BROWNFIELD_NOTICE_SHOWN
+    _BROWNFIELD_STATE = _BROWNFIELD_UNSET
+    _BROWNFIELD_NOTICE_SHOWN = False
+
+
+def _load_brownfield_state() -> object:
+    """Load one safe allowance document, or a clear fail-closed reason."""
+    global _BROWNFIELD_STATE
+    if _BROWNFIELD_STATE is not _BROWNFIELD_UNSET:
+        return _BROWNFIELD_STATE
+    if CONTEXT.install_mode != "managed":
+        _BROWNFIELD_STATE = None
+        return _BROWNFIELD_STATE
+    try:
+        from tools import brownfield
+
+        binding = brownfield.read_install_binding(PROJECT_ROOT)
+        if binding["release_sha256"] != CONTEXT.release_sha256:
+            raise brownfield.BrownfieldError(
+                "active release changed while verification started"
+            )
+        content = brownfield.read_baseline_file(PROJECT_ROOT)
+        if content is None:
+            _BROWNFIELD_STATE = {
+                "error": "no existing-problem baseline is installed",
+            }
+        else:
+            baseline = brownfield.validate_baseline(
+                content,
+                installation_id=binding["installation_id"],
+                release_sha256=binding["release_sha256"],
+            )
+            _BROWNFIELD_STATE = {
+                "baseline": baseline,
+                "binding": binding,
+            }
+    except (OSError, ValueError) as exc:
+        _BROWNFIELD_STATE = {
+            "error": f"existing-problem baseline ignored: {exc}",
+        }
+    return _BROWNFIELD_STATE
+
+
+def _brownfield_allows(stage: str, issues: Sequence[Mapping[str, object]]) -> bool:
+    """Show exact unchanged old issues and allow only those issue identities."""
+    global _BROWNFIELD_NOTICE_SHOWN
+    if stage not in BASELINEABLE_STAGES:
+        return False
+    if CONTEXT.install_mode != "managed" or not issues:
+        return False
+    state = _load_brownfield_state()
+    if not isinstance(state, Mapping) or "baseline" not in state:
+        if isinstance(state, Mapping) and not _BROWNFIELD_NOTICE_SHOWN:
+            print(f"  {YEL}{state.get('error', 'existing-problem baseline unavailable')}{RST}")
+            _BROWNFIELD_NOTICE_SHOWN = True
+        return False
+    try:
+        from tools import brownfield
+
+        binding = state["binding"]
+        assert isinstance(binding, Mapping)
+        result = brownfield.evaluate_baseline(
+            PROJECT_ROOT,
+            state["baseline"],
+            issues,
+            installation_id=str(binding["installation_id"]),
+            release_sha256=str(binding["release_sha256"]),
+        )
+    except (OSError, ValueError) as exc:
+        if not _BROWNFIELD_NOTICE_SHOWN:
+            print(f"  {YEL}existing-problem baseline ignored: {exc}{RST}")
+            _BROWNFIELD_NOTICE_SHOWN = True
+        return False
+    for issue in result["existing_gaps"]:
+        location = str(issue["path"])
+        if issue["line"]:
+            location += f":{issue['line']}"
+        print(f"  {YEL}EXISTING{RST} [{issue['code']}] {location}")
+    for issue in result["failing_gaps"]:
+        location = str(issue["path"])
+        if issue["line"]:
+            location += f":{issue['line']}"
+        reason = str(issue.get("reason", "new-or-changed-gap"))
+        print(f"  {RED}NEW OR CHANGED{RST} [{issue['code']}] {location} ({reason})")
+    return result["status"] == "pass"
+
+
+def _finish_file_stage(
+    stage: str,
+    issues: Sequence[Mapping[str, object]],
+    *,
+    failed: bool,
+    scan_errors: Iterable[str] = (),
+) -> None:
+    errors = [str(error) for error in scan_errors if str(error).strip()]
+    if BROWNFIELD_CAPTURE:
+        BROWNFIELD_CAPTURE_ISSUES.extend(dict(issue) for issue in issues)
+        for error in errors:
+            _capture_error(stage, error)
+        if failed and not issues and not errors:
+            _capture_error(stage, "stage failed without a file-scoped issue")
+        return
+    # Flat/source mode keeps the historical stage semantics. Managed mode also
+    # fails closed when a collector could not prove its file-scoped result.
+    blocking_errors = errors if CONTEXT.install_mode == "managed" else []
+    if not failed and not blocking_errors:
+        RESULTS.passed(stage)
+    elif not blocking_errors and _brownfield_allows(stage, issues):
+        RESULTS.passed(stage)
+    else:
+        RESULTS.fail(stage)
 
 
 def head(title: str) -> None:
@@ -787,22 +951,114 @@ def stage_skills() -> None:
         RESULTS.passed("skills")
 
 
+SANITISE_LOCATION_RE = re.compile(
+    r"^(.+\.(?:tscn|tres))(?::(\d+))?:\s*(.*)$"
+)
+
+
+def _sanitise_code(message: str, *, structural: bool) -> str:
+    if not structural:
+        return "needs-cleanup"
+    lowered = message.lower()
+    if "ext_resource path does not exist" in lowered:
+        return "missing-ext-resource"
+    if "with no name=" in lowered:
+        return "missing-node-name"
+    if "is not a declared node" in lowered:
+        return "undeclared-parent"
+    if "duplicate node path" in lowered:
+        return "duplicate-node-path"
+    if "no root node" in lowered:
+        return "missing-root-node"
+    if "root nodes" in lowered:
+        return "multiple-root-nodes"
+    return "structural-error"
+
+
+def _sanitise_issues(document: Mapping[str, object]) -> Tuple[List[dict], List[str]]:
+    issues: List[dict] = []
+    errors: List[str] = []
+    notes = document.get("notes")
+    structural = document.get("structural_errors")
+    changed = document.get("changed")
+    if not isinstance(notes, list) or not all(isinstance(item, str) for item in notes):
+        return [], ["sanitise JSON notes are malformed"]
+    if not isinstance(structural, list) or not all(
+        isinstance(item, str) for item in structural
+    ):
+        return [], ["sanitise JSON structural_errors are malformed"]
+    if not isinstance(changed, list) or not all(isinstance(item, str) for item in changed):
+        return [], ["sanitise JSON changed files are malformed"]
+    noted_files: set[str] = set()
+    for structural_issue, values in ((False, notes), (True, structural)):
+        for value in values:
+            match = SANITISE_LOCATION_RE.fullmatch(value)
+            if not match:
+                errors.append(f"sanitise returned an unscoped diagnostic: {value}")
+                continue
+            relative = match.group(1)
+            noted_files.add(relative)
+            issues.append(_issue(
+                "sanitise",
+                _sanitise_code(match.group(3), structural=structural_issue),
+                relative,
+                int(match.group(2) or 0),
+                match.group(3),
+            ))
+    for value in changed:
+        if value not in noted_files:
+            issues.append(_issue(
+                "sanitise",
+                "needs-cleanup",
+                value,
+                0,
+                "sanitise would change this file",
+            ))
+    return issues, errors
+
+
 def stage_sanitise() -> None:
     head("sanitise (scene/resource hygiene)")
     script = CORE_ROOT / "sanitise.py"
     if not script.is_file():
         print("  sanitise.py not present, stage disabled")
+        if BROWNFIELD_CAPTURE:
+            _capture_error("sanitise", "sanitise.py is unavailable")
         RESULTS.skip("sanitise")
         return
     code, out = run([sys.executable, str(script)], 60, LOG_DIR / "sanitise.log")
     indent(out, 40)
     if code == 0:
-        RESULTS.passed("sanitise")
+        _finish_file_stage("sanitise", [], failed=False)
     else:
-        print("  apply the automatic fixes with: python sanitise.py --write")
+        print("  apply the automatic fixes with: kit sanitize --write")
         print("  structural errors are NOT auto-fixable and need a real correction")
         skill("godot-scene-files", "what is safe to author and what is engine-owned")
-        RESULTS.fail("sanitise")
+        json_code, json_out = run(
+            [sys.executable, str(script), "--json"],
+            60,
+            LOG_DIR / "sanitise-scan.log",
+        )
+        try:
+            document = json.loads(json_out)
+        except json.JSONDecodeError as exc:
+            document = {}
+            errors = [f"sanitise JSON is unreadable: {exc}"]
+            issues: List[dict] = []
+        else:
+            if not isinstance(document, Mapping):
+                issues = []
+                errors = ["sanitise JSON must be an object"]
+            else:
+                issues, errors = _sanitise_issues(document)
+        if json_code not in (0, 1):
+            errors.append(f"sanitise scan exited {json_code}")
+        _finish_file_stage(
+            "sanitise",
+            issues,
+            failed=True,
+            scan_errors=errors,
+        )
 
 
 def stage_tests() -> None:
@@ -1255,11 +1511,39 @@ def stage_shape() -> None:
     RESULTS.passed("shape")
 
 
+def _format_issues(out: str) -> Tuple[List[dict], List[str]]:
+    issues: List[dict] = []
+    errors: List[str] = []
+    for raw in ANSI_RE.sub("", out).splitlines():
+        match = re.fullmatch(r"would reformat (.+)", raw.strip())
+        if match:
+            relative = _diagnostic_game_relative(match.group(1))
+            if relative is None:
+                errors.append(f"formatter reported an unsafe path: {match.group(1)}")
+            else:
+                issues.append(_issue(
+                    "format",
+                    "would-reformat",
+                    relative,
+                    0,
+                    "gdformat would reformat this file",
+                ))
+        elif re.search(
+            r"Cannot open file|Failed to format|Traceback|TIMEOUT after|executable",
+            raw,
+            re.IGNORECASE,
+        ):
+            errors.append(raw.strip())
+    return issues, errors
+
+
 def stage_format() -> None:
     head("format (gdformat --check)")
     tool = gdtool("gdformat")
     if tool is None:
         print("  gdformat unavailable. Install the locked gdtoolkit version shown by: kit doctor")
+        if BROWNFIELD_CAPTURE:
+            _capture_error("format", "gdformat is unavailable")
         RESULTS.skip("format")
         return
     files = [str(p) for p in gd_files()]
@@ -1269,14 +1553,18 @@ def stage_format() -> None:
     code, out = run(tool + ["--line-length=120", "--check"] + files, 120,
                     LOG_DIR / "format.log")
     indent(out, 20)
-    if code == 0:
-        RESULTS.passed("format")
-    else:
+    issues, errors = _format_issues(out)
+    if code != 0:
         # Deliberately not "gdformat ." -- that is unscoped and reformats
         # addons/, which is third-party code the gate excludes. --fix-format
         # reuses this stage's own filtered file list.
         print("  fix with: kit setup format")
-        RESULTS.fail("format")
+    _finish_file_stage(
+        "format",
+        issues,
+        failed=code != 0,
+        scan_errors=errors,
+    )
 
 
 def fix_format() -> int:
@@ -1301,11 +1589,86 @@ def fix_format() -> int:
     return 1
 
 
+LINT_PROBLEM_RE = re.compile(
+    r"^(.*\.gd):(\d+):\s+Error:\s+(.*?)\s+\(([^()]+)\)\s*$"
+)
+LINT_FILE_HEADER_RE = re.compile(r"^(.*\.gd):\s*$")
+
+
+def _lint_issues(out: str) -> Tuple[List[dict], List[str]]:
+    clean_lines = ANSI_RE.sub("", out).splitlines()
+    issues: List[dict] = []
+    errors: List[str] = []
+    index = 0
+    while index < len(clean_lines):
+        raw = clean_lines[index].strip()
+        direct = LINT_PROBLEM_RE.fullmatch(raw)
+        if direct:
+            relative = _diagnostic_game_relative(direct.group(1))
+            if relative is None:
+                errors.append(f"linter reported an unsafe path: {direct.group(1)}")
+            else:
+                issues.append(_issue(
+                    "lint",
+                    direct.group(4),
+                    relative,
+                    int(direct.group(2)),
+                    direct.group(3),
+                ))
+            index += 1
+            continue
+        header = LINT_FILE_HEADER_RE.fullmatch(raw)
+        if header:
+            block: List[str] = []
+            index += 1
+            while index < len(clean_lines):
+                next_line = clean_lines[index].strip()
+                if LINT_PROBLEM_RE.fullmatch(next_line) or LINT_FILE_HEADER_RE.fullmatch(next_line):
+                    break
+                if re.fullmatch(r"Failure: \d+ problems? found", next_line):
+                    break
+                if next_line:
+                    block.append(next_line)
+                index += 1
+            relative = _diagnostic_game_relative(header.group(1))
+            line_match = re.search(
+                r"(?:at\s+)?line\s+(\d+)", " ".join(block), re.IGNORECASE
+            )
+            if relative is None:
+                errors.append(f"linter reported an unsafe path: {header.group(1)}")
+            elif not block:
+                errors.append(f"linter gave no diagnostic for {header.group(1)}")
+            else:
+                issues.append(_issue(
+                    "lint",
+                    "parse-error",
+                    relative,
+                    int(line_match.group(1)) if line_match else 0,
+                    " ".join(block),
+                ))
+            continue
+        if re.search(
+            r"Cannot open file|Traceback|NotImplementedError|TIMEOUT after|executable",
+            raw,
+            re.IGNORECASE,
+        ):
+            errors.append(raw)
+        index += 1
+    count_match = re.search(r"Failure: (\d+) problems? found", out)
+    if count_match and int(count_match.group(1)) != len(issues):
+        errors.append(
+            "gdlint problem count did not match its file-scoped diagnostics"
+        )
+    return issues, errors
+
+
 def stage_lint() -> None:
     head("lint (gdlint)")
     tool = gdtool("gdlint")
     if tool is None:
         print("  gdlint unavailable. Install the locked gdtoolkit version shown by: kit doctor")
+        if BROWNFIELD_CAPTURE:
+            _capture_error("lint", "gdlint is unavailable")
         RESULTS.skip("lint")
         return
     # gdlint honours .gdlintrc excluded_directories; gdformat does not, so both
@@ -1313,15 +1676,23 @@ def stage_lint() -> None:
     targets = [str(p) for p in gd_files()] or [str(PROJECT_DIR)]
     code, out = run(tool + targets, 120, LOG_DIR / "lint.log")
     indent(out, 30)
+    issues, errors = _lint_issues(out)
     if code == 0:
-        RESULTS.passed("lint")
+        _finish_file_stage("lint", issues, failed=False, scan_errors=errors)
     elif re.search(r"NotImplementedError|Traceback", out):
         # gdlint lags new GDScript syntax and has crashed on valid code.
         print(f"  {YEL}gdlint crashed rather than reported a violation{RST}")
         print("  Known gdtoolkit issue with newer syntax. Not blocking.")
+        if BROWNFIELD_CAPTURE:
+            _capture_error("lint", "gdlint crashed before a complete scan")
         RESULTS.skip("lint (tool crash)")
     else:
-        RESULTS.fail("lint")
+        _finish_file_stage(
+            "lint",
+            issues,
+            failed=True,
+            scan_errors=errors,
+        )
 
 
 def stage_import(godot: str) -> None:
@@ -1396,12 +1767,15 @@ def stage_grep() -> None:
     if not GATE_RULES_FILE.is_file():
         print(f"  {YEL}gate.rules.json missing -- only the critical rule is active{RST}")
     hits = 0
+    issues: List[dict] = []
+    scan_errors: List[str] = []
     for path in gd_files():
         rel = path.relative_to(PROJECT_DIR).as_posix()
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as exc:
             print(f"  could not read {rel}: {exc}")
+            scan_errors.append(f"could not read {rel}: {exc}")
             continue
         for lineno, line in enumerate(lines, 1):
             if SUPPRESS.search(line):
@@ -1410,14 +1784,24 @@ def stage_grep() -> None:
                 if pattern.search(line):
                     print(f"  {RED}[{rule_id}] {msg}{RST}")
                     print(f"    {rel}:{lineno}: {line.strip()[:120]}")
+                    issues.append(_issue(
+                        "grep",
+                        rule_id,
+                        rel,
+                        lineno,
+                        msg,
+                    ))
                     hits += 1
     if hits:
         print(f"\n  {hits} banned idiom(s). Suppress a false positive with"
               " a trailing  # gate:allow")
         skill("godot-api-lookup", "these are Godot 3 APIs -- confirm the Godot 4 equivalent")
-        RESULTS.fail("grep")
-    else:
-        RESULTS.passed("grep")
+    _finish_file_stage(
+        "grep",
+        issues,
+        failed=bool(hits),
+        scan_errors=scan_errors,
+    )
 
 
 # Loose containers in a signature: Dictionary/Array with no element type, or a
@@ -1472,6 +1856,8 @@ def stage_types() -> None:
     interior, boundary = _layer_dirs()
     head("type boundary (untyped data must not reach typed code)")
     blocking: list[str] = []
+    issues: List[dict] = []
+    scan_errors: List[str] = []
     advisory: list[str] = []
     checked = 0
     for path in gd_files():
@@ -1486,6 +1872,7 @@ def stage_types() -> None:
                                    errors="replace").splitlines()
         except OSError as exc:
             print(f"  could not read {rel}: {exc}")
+            scan_errors.append(f"could not read {rel}: {exc}")
             continue
         parses = any(PARSE_CALL.search(ln) for ln in lines
                      if not SUPPRESS.search(ln)
@@ -1500,10 +1887,27 @@ def stage_types() -> None:
                 m = LOOSE_SIG.search(line)
                 if m and not _typed_generic(line, m.start()):
                     entry = f"    {rel}:{lineno}: {stripped[:110]}"
-                    (blocking if parses else advisory).append(entry)
+                    if parses:
+                        blocking.append(entry)
+                        issues.append(_issue(
+                            "types",
+                            "loose-signature",
+                            rel,
+                            lineno,
+                            "loose container signature in a file that parses external data",
+                        ))
+                    else:
+                        advisory.append(entry)
             if PARSE_CALL.search(line):
                 blocking.append(
                     f"    {rel}:{lineno}: {stripped[:110]}   <- parse call")
+                issues.append(_issue(
+                    "types",
+                    "external-parse-call",
+                    rel,
+                    lineno,
+                    "external data parse call inside the typed interior",
+                ))
     print(f"  checked {checked} file(s) under {', '.join(interior)}")
     if advisory:
         print(f"  {YEL}note{RST}: loose container(s) in parse-free file(s) - "
@@ -1526,9 +1930,12 @@ def stage_types() -> None:
   the next. See docs/GDSCRIPT.md.
   Suppress a deliberate exception with a trailing  # gate:allow""")
         skill("godot-typed-data-boundary", "the rule and how to apply it")
-        RESULTS.fail("types")
-    else:
-        RESULTS.passed("types")
+    _finish_file_stage(
+        "types",
+        issues,
+        failed=bool(blocking),
+        scan_errors=scan_errors,
+    )
 
 
 def stage_arch() -> None:
@@ -3137,6 +3544,77 @@ def retro_nudge() -> None:
         print(f"{DIM}  kit retro run{RST}")
 
 
+def run_brownfield_scan(output: str) -> int:
+    """INTERNAL: capture only file-scoped adoption issues as canonical JSON.
+
+    This read-only scan is called by the managed install/upgrade lifecycle. It
+    never launches Godot, evaluates an existing allowance, or writes the
+    baseline. The caller must review a complete result before separately
+    building ``.agent-kit/brownfield.json``.
+    """
+    global BROWNFIELD_CAPTURE
+    destination = Path(output)
+    if not destination.is_absolute():
+        print("brownfield scan output must be an absolute path")
+        return 2
+    try:
+        destination.absolute().relative_to(Path(CONTEXT.runtime_root).absolute())
+    except ValueError:
+        print("brownfield scan output must stay inside the private runtime folder")
+        return 2
+    baseline_path = PROJECT_ROOT / ".agent-kit" / "brownfield.json"
+    if os.path.normcase(os.path.abspath(destination)) == os.path.normcase(
+        os.path.abspath(baseline_path)
+    ):
+        print("brownfield scan refuses to write the baseline itself")
+        return 2
+    if CONTEXT.install_mode != "managed":
+        print("brownfield scan is available only after a managed kit install")
+        return 2
+
+    BROWNFIELD_CAPTURE_ISSUES.clear()
+    BROWNFIELD_CAPTURE_ERRORS.clear()
+    _reset_brownfield_state()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    BROWNFIELD_CAPTURE = True
+    try:
+        stage_format()
+        stage_lint()
+        stage_sanitise()
+        stage_grep()
+        stage_types()
+    finally:
+        BROWNFIELD_CAPTURE = False
+
+    from tools import brownfield
+
+    try:
+        document = brownfield.build_scan_document(
+            BROWNFIELD_CAPTURE_ISSUES,
+            errors=BROWNFIELD_CAPTURE_ERRORS,
+        )
+    except ValueError as exc:
+        document = brownfield.build_scan_document(
+            [],
+            errors=[*BROWNFIELD_CAPTURE_ERRORS, f"issue normalization failed: {exc}"],
+        )
+    content = brownfield.canonical_json(document)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        if not destination.parent.is_dir():
+            raise OSError(f"output directory does not exist: {destination.parent}")
+        temporary.write_bytes(content)
+        os.replace(temporary, destination)
+    except OSError as exc:
+        print(f"brownfield scan could not write its result: {exc}")
+        return 2
+    status = "complete" if document["complete"] else "incomplete"
+    print(
+        f"brownfield scan: {len(document['issues'])} file-scoped issue(s), {status}"
+    )
+    return 0 if document["complete"] else 2
+
+
 def finish() -> int:
     """Print the one authoritative summary after a bounded verification run."""
     summary = {
@@ -3207,6 +3685,14 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="list stages and exit")
     parser.add_argument("--fix-format", action="store_true",
                         help="run gdformat over project .gd files (addons excluded)")
+    parser.add_argument(
+        "--brownfield-scan",
+        metavar="OUTPUT",
+        help=(
+            "INTERNAL: scan format/lint/sanitise/grep/types without Godot and "
+            "write canonical JSON to an absolute OUTPUT; never writes the baseline"
+        ),
+    )
     parser.add_argument("--accept-gate-changes", action="store_true",
                         help="re-baseline the integrity manifest (HUMAN ONLY)")
     args = parser.parse_args()
@@ -3214,6 +3700,18 @@ def main() -> int:
 
     for diagnostic_items in RUN_DIAGNOSTICS.values():
         diagnostic_items.clear()
+
+    if args.brownfield_scan:
+        if (
+            args.only
+            or args.fast
+            or args.static
+            or args.list
+            or args.fix_format
+            or args.accept_gate_changes
+        ):
+            parser.error("--brownfield-scan cannot be combined with other actions")
+        return run_brownfield_scan(args.brownfield_scan)
 
     if args.list:
         print("\n".join(STAGES))

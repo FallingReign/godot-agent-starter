@@ -18,6 +18,9 @@ from typing import Iterable, Mapping
 SCHEMA = 1
 KIND = "agent-kit-brownfield-baseline"
 EVALUATION_KIND = "agent-kit-brownfield-evaluation"
+SCAN_KIND = "agent-kit-brownfield-scan"
+BASELINE_RELATIVE = ".agent-kit/brownfield.json"
+CURRENT_RELATIVE = ".agent-kit/current.json"
 
 MAX_ISSUES = 4096
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -31,6 +34,7 @@ _ISSUE_FIELDS = frozenset({"stage", "code", "path", "line", "message_sha256"})
 _STORED_ISSUE_FIELDS = _ISSUE_FIELDS | {"file_sha256"}
 _BASELINE_FIELDS = frozenset({"schema", "kind", "binding", "issues"})
 _BINDING_FIELDS = frozenset({"installation_id", "release_sha256"})
+_SCAN_FIELDS = frozenset({"schema", "kind", "complete", "issues", "errors"})
 _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*\Z")
@@ -56,6 +60,87 @@ def canonical_json(document: Mapping[str, object]) -> bytes:
             f"brownfield baseline exceeds {MAX_DOCUMENT_BYTES} bytes"
         )
     return content
+
+
+def normalize_issues(
+    issues: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Validate and canonically order public, file-scoped issue records."""
+    return _issue_list(issues, stored=False)
+
+
+def build_scan_document(
+    issues: Iterable[Mapping[str, object]],
+    *,
+    errors: Iterable[str] = (),
+) -> dict[str, object]:
+    """Build deterministic output for the installer's read-only adoption scan.
+
+    A scan with errors is deliberately incomplete.  A lifecycle controller may
+    show that result, but must never turn it into a baseline.
+    """
+    normalized = normalize_issues(issues)
+    normalized_errors: list[str] = []
+    for error in errors:
+        if not isinstance(error, str) or not error.strip():
+            raise BrownfieldError("brownfield scan errors must be non-empty strings")
+        rendered = " ".join(error.split())
+        if len(rendered) > 1024:
+            raise BrownfieldError("brownfield scan error exceeds 1024 characters")
+        normalized_errors.append(rendered)
+    normalized_errors = sorted(set(normalized_errors))
+    document: dict[str, object] = {
+        "schema": SCHEMA,
+        "kind": SCAN_KIND,
+        "complete": not normalized_errors,
+        "issues": normalized,
+        "errors": normalized_errors,
+    }
+    _exact_fields(document, _SCAN_FIELDS, "brownfield scan")
+    canonical_json(document)
+    return document
+
+
+def read_baseline_file(project_root: str | Path) -> bytes | None:
+    """Read the exact managed baseline without following redirected paths."""
+    root = _project_root(project_root)
+    return _read_safe_file(
+        root,
+        BASELINE_RELATIVE,
+        maximum=MAX_DOCUMENT_BYTES,
+        allow_missing=True,
+    )
+
+
+def read_install_binding(project_root: str | Path) -> dict[str, str]:
+    """Read the binding already authenticated by the managed launcher.
+
+    This second bounded read prevents a baseline from being evaluated against a
+    current pointer that was swapped after process startup.
+    """
+    root = _project_root(project_root)
+    content = _read_safe_file(
+        root,
+        CURRENT_RELATIVE,
+        maximum=MAX_DOCUMENT_BYTES,
+        allow_missing=False,
+    )
+    assert content is not None
+    try:
+        parsed = json.loads(content.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, BrownfieldError) as exc:
+        raise BrownfieldError(f"managed current pointer is invalid: {exc}") from exc
+    if not isinstance(parsed, Mapping):
+        raise BrownfieldError("managed current pointer must be a JSON object")
+    if canonical_json(dict(parsed)) != content:
+        raise BrownfieldError("managed current pointer JSON is not canonical")
+    active = parsed.get("active_release")
+    if not isinstance(active, Mapping):
+        raise BrownfieldError("managed current pointer has no active release")
+    return _binding(
+        str(parsed.get("installation_id") or ""),
+        str(active.get("archive_sha256") or ""),
+    )
 
 
 def build_baseline(
@@ -380,6 +465,24 @@ def _is_reparse(info: object) -> bool:
 
 
 def _hash_safe_file(root: Path, relative: str) -> str:
+    content = _read_safe_file(
+        root,
+        relative,
+        maximum=MAX_FILE_BYTES,
+        allow_missing=False,
+    )
+    assert content is not None
+    return hashlib.sha256(content).hexdigest()
+
+
+def _read_safe_file(
+    root: Path,
+    relative: str,
+    *,
+    maximum: int,
+    allow_missing: bool,
+) -> bytes | None:
+    relative = _relative_path(relative)
     cursor = root
     for index, component in enumerate(PurePosixPath(relative).parts):
         try:
@@ -397,6 +500,8 @@ def _hash_safe_file(root: Path, relative: str) -> str:
                 detail = f"unsafe casing {matches[0]!r}"
             else:
                 detail = "missing path"
+            if allow_missing and not matches:
+                return None
             raise BrownfieldError(f"issue path {relative!r} has {detail}")
         cursor = cursor / component
         try:
@@ -419,9 +524,11 @@ def _hash_safe_file(root: Path, relative: str) -> str:
         or not stat.S_ISREG(before.st_mode)
     ):
         raise BrownfieldError(f"issue path {relative!r} is no longer a regular file")
-    if before.st_size > MAX_FILE_BYTES:
+    if int(getattr(before, "st_nlink", 1)) != 1:
+        raise BrownfieldError(f"issue path {relative!r} may not be a hard link")
+    if before.st_size > maximum:
         raise BrownfieldError(
-            f"issue file {relative!r} exceeds {MAX_FILE_BYTES} bytes"
+            f"issue file {relative!r} exceeds {maximum} bytes"
         )
     try:
         content = cursor.read_bytes()
@@ -429,10 +536,11 @@ def _hash_safe_file(root: Path, relative: str) -> str:
     except OSError as exc:
         raise BrownfieldError(f"cannot read issue file {relative!r}: {exc}") from exc
     if (
-        after.st_size > MAX_FILE_BYTES
+        after.st_size > maximum
         or stat.S_ISLNK(after.st_mode)
         or _is_reparse(after)
         or not stat.S_ISREG(after.st_mode)
+        or int(getattr(after, "st_nlink", 1)) != 1
     ):
         raise BrownfieldError(f"issue file {relative!r} changed while it was read")
     before_identity = (
@@ -449,4 +557,4 @@ def _hash_safe_file(root: Path, relative: str) -> str:
     )
     if before_identity != after_identity or len(content) != after.st_size:
         raise BrownfieldError(f"issue file {relative!r} changed while it was read")
-    return hashlib.sha256(content).hexdigest()
+    return content
