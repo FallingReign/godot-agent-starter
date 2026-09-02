@@ -76,10 +76,7 @@ def _managed(
     root: Path, *, extra_files: dict[str, bytes] | None = None
 ) -> tuple[Path, Path, dict]:
     _marker(root)
-    release_sha = hashlib.sha256(b"archive bytes").hexdigest()
     source_commit = "b" * 40
-    core = root / launcher.MANAGED_DIRECTORY / launcher.RELEASES_DIRECTORY / release_sha
-    core.mkdir(parents=True)
     install_manifest_content = b'{"schema":1}\n'
     contents = {
         launcher.INSTALL_MANIFEST_NAME: install_manifest_content,
@@ -89,10 +86,6 @@ def _managed(
     contents.update(extra_files or {})
     entries = []
     for relative, content in sorted(contents.items()):
-        target = core.joinpath(*relative.split("/"))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        target.chmod(0o755 if relative.endswith(".py") else 0o644)
         entries.append({
             "path": relative,
             "bytes": len(content),
@@ -118,6 +111,19 @@ def _managed(
         "files": entries,
     }
     manifest_content = _canonical(manifest)
+    archive_members = {
+        relative: (content, 0o755 if relative.endswith(".py") else 0o644)
+        for relative, content in contents.items()
+    }
+    archive_members[launcher.MANIFEST_NAME] = (manifest_content, 0o644)
+    release_sha = launcher._canonical_archive_sha256(archive_members)
+    core = root / launcher.MANAGED_DIRECTORY / launcher.RELEASES_DIRECTORY / release_sha
+    core.mkdir(parents=True)
+    for relative, content in sorted(contents.items()):
+        target = core.joinpath(*relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if relative.endswith(".py") else 0o644)
     manifest_path = core / launcher.MANIFEST_NAME
     manifest_path.write_bytes(manifest_content)
     manifest_path.chmod(0o644)
@@ -208,6 +214,23 @@ class InstallationSelection(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 launcher.LauncherError, "unlisted directory empty-extra-directory"
+            ):
+                launcher.resolve_installation(root)
+
+    def test_managed_release_identity_cannot_be_relabelled(self) -> None:
+        with _scratch() as root:
+            core, current_path, current = _managed(root)
+            forged_sha = "f" * 64
+            forged_core = core.parent / forged_sha
+            shutil.copytree(core, forged_core)
+            current["active_release"]["archive_sha256"] = forged_sha
+            current["active_release"]["core_path"] = (
+                f"{launcher.MANAGED_DIRECTORY}/{launcher.RELEASES_DIRECTORY}/{forged_sha}"
+            )
+            current_path.write_bytes(_canonical(current))
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError, "does not match archive_sha256"
             ):
                 launcher.resolve_installation(root)
 

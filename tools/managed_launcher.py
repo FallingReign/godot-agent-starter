@@ -8,12 +8,14 @@ any release-owned module is imported.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import stat
 import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
@@ -161,6 +163,24 @@ def _canonical_json(value: dict) -> bytes:
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _canonical_archive_sha256(
+    members: Mapping[str, tuple[bytes, int]],
+) -> str:
+    """Return the canonical release identity for one exact member set."""
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.comment = b""
+        for name in sorted(members):
+            content, mode = members[name]
+            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            info.flag_bits |= 0x800
+            archive.writestr(info, content, compress_type=zipfile.ZIP_STORED)
+    return hashlib.sha256(payload.getvalue()).hexdigest()
 
 
 def _json_object(content: bytes, label: str) -> dict:
@@ -397,6 +417,9 @@ def _validate_manifest(core: Path, release: dict, manifest_path: Path) -> dict:
 
     _validate_core_tree(core, paths)
 
+    archive_members: dict[str, tuple[bytes, int]] = {
+        MANIFEST_NAME: (manifest_content, 0o644)
+    }
     for entry, parts in entries:
         rendered = "/".join(parts)
         path = _member_file(core, parts)
@@ -413,6 +436,9 @@ def _validate_manifest(core: Path, release: dict, manifest_path: Path) -> dict:
                 raise LauncherError(f"release member mode does not match: {rendered}")
         if b"\r" in content:
             raise LauncherError(f"release member does not use LF line endings: {rendered}")
+        archive_members[rendered] = (content, int(entry["mode"], 8))
+    if _canonical_archive_sha256(archive_members) != release["archive_sha256"]:
+        raise LauncherError("release member set does not match archive_sha256")
     return manifest
 
 
