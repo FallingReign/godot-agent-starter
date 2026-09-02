@@ -122,6 +122,21 @@ def _managed_gate(root: Path):
         gate._reset_brownfield_state()
 
 
+@contextlib.contextmanager
+def _empty_scan(root: Path):
+    with _managed_gate(root), contextlib.ExitStack() as stack:
+        for name in (
+            "stage_format",
+            "stage_lint",
+            "stage_sanitise",
+            "stage_grep",
+            "stage_types",
+        ):
+            stack.enter_context(mock.patch.object(gate, name, side_effect=lambda: None))
+        stack.enter_context(mock.patch.object(gate, "LOG_DIR", root / "logs"))
+        yield
+
+
 class BrownfieldGateTests(unittest.TestCase):
     def test_unchanged_old_issue_passes_and_is_shown(self) -> None:
         with _Scratch() as root:
@@ -322,6 +337,85 @@ class BrownfieldGateTests(unittest.TestCase):
                     installation_id=INSTALLATION_ID,
                     release_sha256=RELEASE_SHA256,
                 )
+
+    def test_scan_refuses_hardlinked_output_without_touching_sentinel(self) -> None:
+        with _Scratch() as root:
+            sentinel = root.parent / f"brownfield-sentinel-{uuid.uuid4().hex}"
+            output = root / "scan.json"
+            sentinel.write_bytes(b"outside\n")
+            try:
+                os.link(sentinel, output)
+                with _empty_scan(root):
+                    self.assertEqual(2, gate.run_brownfield_scan(str(output)))
+                self.assertEqual(b"outside\n", sentinel.read_bytes())
+            finally:
+                sentinel.unlink(missing_ok=True)
+
+    def test_scan_refuses_symlinked_output_without_touching_sentinel(self) -> None:
+        with _Scratch() as root:
+            sentinel = root.parent / f"brownfield-sentinel-{uuid.uuid4().hex}"
+            output = root / "scan.json"
+            sentinel.write_bytes(b"outside\n")
+            try:
+                try:
+                    output.symlink_to(sentinel)
+                except OSError:
+                    output.write_bytes(b"redirected\n")
+                    path_type = type(output)
+                    original = path_type.lstat
+
+                    def redirected_lstat(
+                        path: Path, *args: object, **kwargs: object
+                    ):
+                        info = original(path, *args, **kwargs)
+                        if path == output:
+                            redirected = mock.Mock(wraps=info)
+                            redirected.st_mode = info.st_mode
+                            redirected.st_file_attributes = 0x0400
+                            return redirected
+                        return info
+
+                    with mock.patch.object(
+                        path_type,
+                        "lstat",
+                        autospec=True,
+                        side_effect=redirected_lstat,
+                    ), _empty_scan(root):
+                        self.assertEqual(2, gate.run_brownfield_scan(str(output)))
+                else:
+                    with _empty_scan(root):
+                        self.assertEqual(2, gate.run_brownfield_scan(str(output)))
+                self.assertEqual(b"outside\n", sentinel.read_bytes())
+            finally:
+                sentinel.unlink(missing_ok=True)
+
+    def test_scan_ignores_the_old_predictable_temporary_name(self) -> None:
+        with _Scratch() as root:
+            sentinel = root.parent / f"brownfield-sentinel-{uuid.uuid4().hex}"
+            output = root / "scan.json"
+            predictable = root / "scan.json.tmp"
+            sentinel.write_bytes(b"outside\n")
+            try:
+                os.link(sentinel, predictable)
+                with _empty_scan(root):
+                    self.assertEqual(0, gate.run_brownfield_scan(str(output)))
+                self.assertEqual(b"outside\n", sentinel.read_bytes())
+                self.assertEqual(b"outside\n", predictable.read_bytes())
+                self.assertTrue(json.loads(output.read_text(encoding="utf-8"))["complete"])
+                self.assertFalse((root / "logs").exists())
+            finally:
+                sentinel.unlink(missing_ok=True)
+
+    def test_scan_refuses_a_case_colliding_output_name(self) -> None:
+        with _Scratch() as root:
+            collision = root / "SCAN.JSON"
+            output = root / "scan.json"
+            collision.write_bytes(b"project-owned\n")
+
+            with _empty_scan(root):
+                self.assertEqual(2, gate.run_brownfield_scan(str(output)))
+
+            self.assertEqual(b"project-owned\n", collision.read_bytes())
 
     def test_format_and_lint_collectors_keep_file_rule_and_line(self) -> None:
         with _Scratch() as root:

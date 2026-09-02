@@ -30,10 +30,12 @@ import importlib.metadata
 import json
 import os
 import re
+import stat
 import datetime as _dt
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -43,6 +45,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # Godot project: everything the engine loads.
 CORE_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(CORE_ROOT / "tools"))
+import managed_launcher  # noqa: E402
 import project_context  # noqa: E402
 
 CONTEXT = project_context.load_active_context(CORE_ROOT)
@@ -565,8 +568,9 @@ def run(
     # newline="" prevents Windows translating Godot's \r\n into \r\r\n.
     # ANSI escapes are stripped: the log is read back by an agent, not a TTY.
     clean = _cap(ANSI_RE.sub("", out))
-    with log.open("w", encoding="utf-8", errors="replace", newline="") as fh:
-        fh.write(clean)
+    if not BROWNFIELD_CAPTURE:
+        with log.open("w", encoding="utf-8", errors="replace", newline="") as fh:
+            fh.write(clean)
     return code, out
 
 
@@ -3544,6 +3548,138 @@ def retro_nudge() -> None:
         print(f"{DIM}  kit retro run{RST}")
 
 
+def _is_reparse_point(info: object) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+
+def _file_identity(info: object) -> Tuple[int, int]:
+    return (int(getattr(info, "st_dev", -1)), int(getattr(info, "st_ino", -1)))
+
+
+def _safe_scan_destination(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (stat.S_ISLNK(info.st_mode) or _is_reparse_point(info)
+            or not stat.S_ISREG(info.st_mode)
+            or int(getattr(info, "st_nlink", 1)) != 1):
+        raise OSError(
+            f"scan output must be an unredirected single-link file: {path}"
+        )
+
+
+def _check_scan_output_name(parent: Path, expected: str) -> None:
+    try:
+        matches = sorted(
+            child.name for child in parent.iterdir()
+            if child.name.casefold() == expected.casefold()
+        )
+    except OSError as exc:
+        raise OSError(f"scan output directory cannot be inspected: {parent}") from exc
+    if len(matches) > 1:
+        raise OSError(
+            f"scan output has a case collision for {expected!r}: {', '.join(matches)}"
+        )
+    if matches and matches[0] != expected:
+        raise OSError(
+            f"scan output uses unsafe casing for {expected!r}: {matches[0]!r}"
+        )
+
+
+def _stable_scan_bytes(path: Path, expected_identity: Tuple[int, int]) -> bytes:
+    before = path.lstat()
+    if (_file_identity(before) != expected_identity
+            or stat.S_ISLNK(before.st_mode) or _is_reparse_point(before)
+            or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_nlink", 1)) != 1):
+        raise OSError("scan temporary file changed while writing")
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        content = stream.read()
+        after_handle = os.fstat(stream.fileno())
+    after = path.lstat()
+    identities = {
+        _file_identity(before),
+        _file_identity(opened),
+        _file_identity(after_handle),
+        _file_identity(after),
+    }
+    if (identities != {expected_identity}
+            or before.st_size != len(content)
+            or after.st_size != len(content)
+            or before.st_mtime_ns != after.st_mtime_ns):
+        raise OSError("scan temporary file changed while writing")
+    return content
+
+
+def _write_brownfield_scan(destination: Path, content: bytes) -> None:
+    """Atomically write one scan without following project-controlled redirects."""
+    try:
+        runtime_root = managed_launcher.canonical_directory(
+            CONTEXT.runtime_root, "private runtime folder"
+        )
+        output_parent = managed_launcher.canonical_directory(
+            destination.parent, "brownfield scan output directory"
+        )
+    except managed_launcher.LauncherError as exc:
+        raise OSError(str(exc)) from exc
+    try:
+        output_parent.relative_to(runtime_root)
+    except ValueError as exc:
+        raise OSError("scan output directory escapes the private runtime folder") from exc
+
+    _check_scan_output_name(output_parent, destination.name)
+    _safe_scan_destination(destination)
+    parent_identity = _file_identity(output_parent.lstat())
+    descriptor = -1
+    temporary: Optional[Path] = None
+    temporary_identity: Optional[Tuple[int, int]] = None
+    try:
+        descriptor, raw_temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=str(output_parent),
+        )
+        temporary = Path(raw_temporary)
+        handle_info = os.fstat(descriptor)
+        path_info = temporary.lstat()
+        temporary_identity = _file_identity(handle_info)
+        if (not stat.S_ISREG(handle_info.st_mode)
+                or int(getattr(handle_info, "st_nlink", 1)) != 1
+                or stat.S_ISLNK(path_info.st_mode)
+                or _is_reparse_point(path_info)
+                or not stat.S_ISREG(path_info.st_mode)
+                or int(getattr(path_info, "st_nlink", 1)) != 1
+                or _file_identity(path_info) != temporary_identity):
+            raise OSError("scan temporary file was redirected or replaced")
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        if _file_identity(output_parent.lstat()) != parent_identity:
+            raise OSError("scan output directory changed while writing")
+        if _stable_scan_bytes(temporary, temporary_identity) != content:
+            raise OSError("scan temporary file content changed while writing")
+        _check_scan_output_name(output_parent, destination.name)
+        _safe_scan_destination(destination)
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None and temporary_identity is not None:
+            try:
+                info = temporary.lstat()
+                if _file_identity(info) == temporary_identity:
+                    temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def run_brownfield_scan(output: str) -> int:
     """INTERNAL: capture only file-scoped adoption issues as canonical JSON.
 
@@ -3575,7 +3711,6 @@ def run_brownfield_scan(output: str) -> int:
     BROWNFIELD_CAPTURE_ISSUES.clear()
     BROWNFIELD_CAPTURE_ERRORS.clear()
     _reset_brownfield_state()
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     BROWNFIELD_CAPTURE = True
     try:
         stage_format()
@@ -3599,12 +3734,8 @@ def run_brownfield_scan(output: str) -> int:
             errors=[*BROWNFIELD_CAPTURE_ERRORS, f"issue normalization failed: {exc}"],
         )
     content = brownfield.canonical_json(document)
-    temporary = destination.with_name(destination.name + ".tmp")
     try:
-        if not destination.parent.is_dir():
-            raise OSError(f"output directory does not exist: {destination.parent}")
-        temporary.write_bytes(content)
-        os.replace(temporary, destination)
+        _write_brownfield_scan(destination, content)
     except OSError as exc:
         print(f"brownfield scan could not write its result: {exc}")
         return 2
