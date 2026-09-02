@@ -117,6 +117,11 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
                 "bound_environment",
                 side_effect=lambda _installation, base: dict(base),
             ),
+            mock.patch.object(
+                check.release,
+                "read_verified_directory",
+                return_value=({"archive_sha256": "a" * 64}, {}),
+            ),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -143,7 +148,13 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         environment = kwargs.get("environment")
         if isinstance(environment, dict):
             self.environments.append(dict(environment))
+        if Path(command[0]).name.casefold() in {"git", "git.exe"}:
+            return self._process_outcome(0)
         if "self-test" in command:
+            copied_kit = next(
+                Path(part) for part in command if str(part).endswith("kit.py")
+            )
+            self.assertTrue((copied_kit.parent / "src").is_dir())
             code = self.returncodes["self-test"]
             return self._process_outcome(code, json.dumps({
                 "command": "self-test", "ok": code == 0, "exit_code": code
@@ -214,14 +225,37 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertEqual(_sha256(baseline or b""), result["baseline_sha256"])
         joined = " ".join(part for command in self.commands for part in command).lower()
         self.assertNotIn("godot", joined)
-        self.assertNotIn("git ", joined)
         self.assertNotIn("http", joined)
-        selected_launcher = "managed_launcher.py"
+        git_commands = self.commands[:3]
         self.assertTrue(
-            all(selected_launcher in " ".join(command) for command in self.commands)
+            all(Path(command[0]).name.casefold() in {"git", "git.exe"}
+                for command in git_commands)
         )
-        for environment in self.environments:
+        for command in git_commands:
+            rendered = " ".join(command)
+            self.assertIn("--no-pager", command)
+            self.assertIn("core.fsmonitor=false", command)
+            self.assertIn("diff.external=", command)
+            self.assertIn("diff.trustExitCode=false", command)
+            self.assertIn(f"core.hooksPath={os.devnull}", command)
+            self.assertIn(f"core.attributesFile={os.devnull}", command)
+            self.assertNotIn(str(self.target / "git"), rendered)
+        for environment in self.environments[:3]:
+            self.assertEqual(os.devnull, environment["GIT_CONFIG_GLOBAL"])
+            self.assertEqual("1", environment["GIT_CONFIG_NOSYSTEM"])
+            self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+            self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+        self.assertIn("kit.py", " ".join(self.commands[3]))
+        self.assertTrue(
+            all(
+                "managed_launcher.py" in " ".join(command)
+                for command in self.commands[4:]
+            )
+        )
+        self.assertNotIn("KIT_LIFECYCLE_CHECK", self.environments[3])
+        for environment in self.environments[4:]:
             self.assertEqual(str(Path(sys.executable).resolve()), environment["KIT_PYTHON"])
+            self.assertEqual("1", environment["KIT_LIFECYCLE_CHECK"])
             for unsafe in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
                 self.assertNotIn(unsafe, environment)
 
@@ -299,6 +333,43 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertEqual([new_issue], result["existing_issues"])
         self.assertIn("static verification failed", str(result["detail"]))
 
+    def test_managed_upgrade_without_a_prior_baseline_stops(self) -> None:
+        self.session["request"] = {"mode": "upgrade"}
+        self.session["preview"] = {
+            "raw": {"material": {"current": {"mode": "managed"}}},
+        }
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertIsNone(brownfield.read_baseline_file(self.target))
+        self.assertIn("no prior brownfield baseline", str(result["detail"]))
+        self.assertEqual(5, len(self.commands))
+
+    def test_reviewed_legacy_upgrade_can_create_its_first_baseline(self) -> None:
+        issue = {
+            "stage": "lint",
+            "code": "legacy-warning",
+            "path": "game/player.gd",
+            "line": 1,
+            "message_sha256": "c" * 64,
+        }
+        self.issues = [issue]
+        self.session["request"] = {"mode": "upgrade"}
+        self.session["preview"] = {
+            "raw": {"material": {"current": {"mode": "legacy"}}},
+        }
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        stored = self._stored_baseline()
+        self.assertEqual([issue], [
+            {key: item[key] for key in check._PUBLIC_ISSUE_FIELDS}
+            for item in stored["issues"]
+        ])
+
     def test_upgrade_does_not_baseline_an_issue_after_its_file_changed(self) -> None:
         issue = {
             "stage": "lint",
@@ -349,7 +420,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         result = check.run(self.target, self.session, runner=self._runner)
 
         self.assertFalse(result["kit_ok"])
-        self.assertEqual(1, len(self.commands))
+        self.assertEqual(4, len(self.commands))
         self.assertIsNone(brownfield.read_baseline_file(self.target))
 
     def test_scan_failure_stops_without_baseline(self) -> None:
@@ -358,7 +429,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         result = check.run(self.target, self.session, runner=self._runner)
 
         self.assertFalse(result["kit_ok"])
-        self.assertEqual(2, len(self.commands))
+        self.assertEqual(5, len(self.commands))
         self.assertIsNone(brownfield.read_baseline_file(self.target))
 
     def test_clean_scan_plus_static_failure_is_a_kit_failure(self) -> None:
@@ -423,6 +494,7 @@ if command in {\"self-test\", \"verify\"}:
 raise SystemExit(4)
 """
         launcher.write_bytes(launcher_bytes)
+        (self.core / "kit.py").write_bytes(launcher_bytes)
         (self.core / "tools" / "managed_launcher.py").write_bytes(launcher_bytes)
         launchers = {
             ".agent-kit/launcher.py": launcher_bytes,
@@ -452,6 +524,10 @@ raise SystemExit(4)
                     encoding="utf-8",
                 )
 
+        trusted_git = check.process_supervisor.resolve_ordinary_executable(
+            "git",
+            excluded_roots=(self.target, self.core),
+        )
         with mock.patch.dict(
             os.environ,
             {
@@ -462,6 +538,10 @@ raise SystemExit(4)
                 "PYTHONUSERBASE": str(poison),
             },
             clear=False,
+        ), mock.patch.object(
+            check.process_supervisor,
+            "resolve_ordinary_executable",
+            return_value=trusted_git,
         ):
             result = check.run(self.target, self.session)
 

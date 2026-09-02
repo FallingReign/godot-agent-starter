@@ -94,6 +94,9 @@ RETIRED_PROTECTED_PREFIXES = (
 )
 PROJECT_SETTING_CASEFOLDS = frozenset(path.casefold() for path in PROJECT_SETTING_PATHS)
 RETIRED_PROTECTED_CASEFOLDS = frozenset(path.casefold() for path in RETIRED_PROTECTED_PATHS)
+LEGACY_0_2_0_RELEASE_MANIFEST_SHA256 = (
+    "6d9629f973aeed32ee022b117146f1ee81ba3b58c6a9ff7b14afdcd0daeaca3c"
+)
 PROJECT_SCAN_SKIP_NAMES = frozenset({
     ".agent-kit",
     ".git",
@@ -896,6 +899,13 @@ def _install_manifest(
     retired = [
         _retired_file(raw, surface_paths) for raw in manifest["legacy_retired_files"]
     ]
+    retired.append(
+        RetiredFile(
+            RELEASE_MANIFEST,
+            LEGACY_0_2_0_RELEASE_MANIFEST_SHA256,
+        )
+    )
+    retired.sort(key=lambda item: item.path)
     retired_paths = [item.path for item in retired]
     if retired_paths != sorted(retired_paths) or len({item.casefold() for item in retired_paths}) != len(
         retired_paths

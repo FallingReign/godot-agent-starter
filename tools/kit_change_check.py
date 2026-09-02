@@ -12,8 +12,10 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import sys
-from collections.abc import Callable, Mapping
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ import kit_change
 import managed_launcher
 import process_supervisor
 import project_context
+import release
 
 
 MAX_DETAIL_CHARS = 2048
@@ -67,6 +70,7 @@ def _clean_environment(
     environment = managed_launcher.bound_environment(installation, base)
     environment.update({
         "KIT_ENGINE_DISABLED": "1",
+        "KIT_LIFECYCLE_CHECK": "1",
         "KIT_NATIVE_RETRY_TOKEN": "",
         "KIT_PYTHON": str(Path(sys.executable).resolve()),
         "KIT_VERIFY_AUTH_KEY": "",
@@ -89,6 +93,151 @@ def _launcher_command(
         launcher,
         installation.core_root,
         *arguments,
+    )
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in process_supervisor.isolated_python_environment().items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return environment
+
+
+def _git_command(executable: str, root: Path, *arguments: str) -> list[str]:
+    return [
+        executable,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.trustExitCode=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-C",
+        str(root),
+        *arguments,
+    ]
+
+
+def _initialise_self_test_repository(
+    core: Path,
+    *,
+    excluded_roots: Sequence[Path],
+    runner: ProcessRunner,
+) -> None:
+    environment = _git_environment()
+    try:
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git",
+            environment=environment,
+            excluded_roots=excluded_roots,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise KitChangeCheckError(
+            "trusted Git is unavailable for the disposable self-test"
+        ) from exc
+    commands = (
+        ("initialise", ("init", "--quiet")),
+        ("stage", ("add", "--all", "--")),
+        (
+            "commit",
+            (
+                "-c",
+                "user.name=Agent Kit Self-Test",
+                "-c",
+                "user.email=agent-kit-self-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "--no-gpg-sign",
+                "-m",
+                "verified release fixture",
+            ),
+        ),
+    )
+    for label, arguments in commands:
+        outcome = _run_process(
+            _git_command(executable, core, *arguments),
+            cwd=core,
+            environment=environment,
+            timeout=60,
+            runner=runner,
+        )
+        if getattr(outcome, "returncode", None) != 0:
+            raise KitChangeCheckError(
+                f"disposable self-test Git {label} failed"
+            )
+
+
+def _self_test_command(
+    installation: managed_launcher.Installation,
+    scratch: Path,
+    *,
+    runner: ProcessRunner,
+) -> tuple[list[str], dict[str, str]]:
+    copied_core = scratch / "c"
+    shutil.copytree(installation.core_root, copied_core)
+    report, _members = release.read_verified_directory(copied_core)
+    if str(report.get("archive_sha256") or "") != installation.release_sha256:
+        raise KitChangeCheckError("self-test copy selected a different release")
+    # Releases deliberately exclude game content.  The disposable placeholder
+    # supplies only the one file a source-context regression test inspects; no
+    # project or game bytes are copied into the self-test sandbox.
+    (copied_core / "src").mkdir()
+    (copied_core / "src" / "project.godot").write_bytes(b"[application]\n")
+    _initialise_self_test_repository(
+        copied_core,
+        excluded_roots=(
+            installation.project_root,
+            installation.core_root,
+            scratch,
+        ),
+        runner=runner,
+    )
+    environment = process_supervisor.isolated_python_environment()
+    environment = {
+        key: value
+        for key, value in environment.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.pop(managed_launcher.PROJECT_ROOT_ENV, None)
+    environment.pop(managed_launcher.CORE_ROOT_ENV, None)
+    environment.pop("KIT_LIFECYCLE_CHECK", None)
+    environment.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "KIT_ENGINE_DISABLED": "1",
+        "KIT_NATIVE_RETRY_TOKEN": "",
+        "KIT_TEST_TMPDIR": str(scratch / "t"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    return (
+        process_supervisor.isolated_python_script_command(
+            Path(sys.executable).resolve(),
+            copied_core / "kit.py",
+            copied_core,
+            "self-test",
+            "--project",
+            str(installation.project_root),
+            "--json",
+        ),
+        environment,
     )
 
 
@@ -287,6 +436,30 @@ def _reviewed_prior_release(session: Mapping[str, Any]) -> str:
     return str(current.get("active_archive_sha256") or "") if isinstance(current, Mapping) else ""
 
 
+def _reviewed_current_mode(session: Mapping[str, Any]) -> str:
+    preview = session.get("preview")
+    raw = preview.get("raw") if isinstance(preview, Mapping) else None
+    material = raw.get("material") if isinstance(raw, Mapping) else None
+    current = material.get("current") if isinstance(material, Mapping) else None
+    return str(current.get("mode") or "") if isinstance(current, Mapping) else ""
+
+
+def _first_baseline(
+    target: Path,
+    issues: list[dict[str, object]],
+    binding: Mapping[str, str],
+) -> dict[str, object]:
+    try:
+        return brownfield.build_baseline(
+            target,
+            issues,
+            installation_id=str(binding.get("installation_id") or ""),
+            release_sha256=str(binding.get("release_sha256") or ""),
+        )
+    except ValueError as exc:
+        raise KitChangeCheckError(f"brownfield baseline cannot be built: {exc}") from exc
+
+
 def _public_issues(values: object) -> list[dict[str, object]]:
     if not isinstance(values, list):
         raise KitChangeCheckError("brownfield evaluation issues are malformed")
@@ -338,21 +511,16 @@ def _baseline_plan(
     request = session.get("request")
     mode = str(request.get("mode") or "") if isinstance(request, Mapping) else ""
     if mode == "install":
-        try:
-            baseline = brownfield.build_baseline(
-                target,
-                current_issues,
-                installation_id=str(current_binding.get("installation_id") or ""),
-                release_sha256=str(current_binding.get("release_sha256") or ""),
-            )
-        except ValueError as exc:
-            raise KitChangeCheckError(f"brownfield baseline cannot be built: {exc}") from exc
-        return baseline, [], 0
+        return _first_baseline(target, current_issues, current_binding), [], 0
     if mode != "upgrade":
         raise KitChangeCheckError("kit change mode is missing or invalid")
     prior_content = _prior_baseline_content(session)
     if prior_content is None:
-        return _rebound_baseline([], current_binding), current_issues, 0
+        if _reviewed_current_mode(session) != "legacy":
+            raise KitChangeCheckError(
+                "approved managed upgrade has no prior brownfield baseline"
+            )
+        return _first_baseline(target, current_issues, current_binding), [], 0
     prior_binding = _prior_binding(prior_content)
     if prior_binding["installation_id"] != current_binding.get("installation_id"):
         raise KitChangeCheckError("approved prior baseline belongs to another installation")
@@ -483,20 +651,19 @@ def run(
         if context.install_mode != "managed" or context.core_root != installation.core_root:
             raise KitChangeCheckError("the configured project selects a different managed core")
         environment = _clean_environment(installation)
-
-        self_test = _run_process(
-            _launcher_command(
+        with tempfile.TemporaryDirectory(prefix="ak-") as temporary:
+            self_test_command, self_test_environment = _self_test_command(
                 installation,
-                "self-test",
-                "--project",
-                str(installation.project_root),
-                "--json",
-            ),
-            cwd=installation.project_root,
-            environment=environment,
-            timeout=1800,
-            runner=runner,
-        )
+                Path(temporary).resolve(),
+                runner=runner,
+            )
+            self_test = _run_process(
+                self_test_command,
+                cwd=Path(temporary).resolve(),
+                environment=self_test_environment,
+                timeout=1800,
+                runner=runner,
+            )
         self_test_receipt = _receipt(self_test, "self-test")
         if getattr(self_test, "returncode", None) != 0 or not self_test_receipt["ok"]:
             return _failure("Installed kit self-test failed.")

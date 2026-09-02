@@ -1005,6 +1005,37 @@ class KitChangeTest(unittest.TestCase):
 
         self.assertEqual((self.root / "check.py").read_bytes(), legacy_core)
 
+    def test_exact_legacy_release_manifest_is_an_internal_retirement(self) -> None:
+        report, members = _release_fixture()
+
+        _manifest, _surfaces, retired = kit_change._install_manifest(report, members)
+
+        release_manifest = next(
+            item for item in retired if item.path == "RELEASE-MANIFEST.json"
+        )
+        self.assertEqual(
+            "6d9629f973aeed32ee022b117146f1ee81ba3b58c6a9ff7b14afdcd0daeaca3c",
+            release_manifest.sha256,
+        )
+
+    def test_release_cannot_authorize_a_general_manifest_retirement(self) -> None:
+        report, members = _release_fixture()
+        manifest = json.loads(members["INSTALL-MANIFEST.json"].content.decode("utf-8"))
+        manifest["legacy_retired_files"].append({
+            "path": "RELEASE-MANIFEST.json",
+            "sha256": kit_change.LEGACY_0_2_0_RELEASE_MANIFEST_SHA256,
+        })
+        manifest["legacy_retired_files"].sort(key=lambda item: item["path"])
+        members["INSTALL-MANIFEST.json"] = SimpleNamespace(
+            content=_canonical(manifest), mode=0o644
+        )
+        self._switch_release((report, members))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.preview(self.root, self.archive)
+
+        self.assertEqual("install-manifest-invalid", raised.exception.code)
+
     def test_modified_legacy_core_file_is_preserved_and_blocks_retirement(self) -> None:
         expected = b"# expected flat core\n"
         modified = b"# project-modified flat core\n"
