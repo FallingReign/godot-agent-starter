@@ -2673,7 +2673,17 @@ def rollback(root: Path, transaction_id: str | None = None) -> dict[str, Any]:
                 "preview_sha256": journal["preview_sha256"],
             }
         if journal["state"] == "blocked":
-            raise KitChangeError("transaction-blocked", "blocked transaction needs manual review")
+            failure = journal.get("failure")
+            retryable = (
+                transaction_id is not None
+                and isinstance(failure, dict)
+                and set(failure) == {"code", "at", "detail"}
+                and failure.get("code") in {"rollback-conflict", "rollback-failed"}
+            )
+            if not retryable:
+                raise KitChangeError(
+                    "transaction-blocked", "blocked transaction needs manual review"
+                )
         return _rollback_locked(canonical_root, path, journal)
 
 

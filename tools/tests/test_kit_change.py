@@ -49,7 +49,6 @@ def _write(root: Path, relative: str, content: bytes) -> Path:
 def _release_fixture(
     *,
     version: str = "0.3.0",
-    archive_sha256: str = "a" * 64,
     source_commit: str = "b" * 40,
     launcher: bytes = b"@echo off\necho managed kit\n",
     block_body: str = "Use the active managed kit release.",
@@ -209,6 +208,7 @@ def _release_fixture(
     members["RELEASE-MANIFEST.json"] = SimpleNamespace(
         content=_canonical(release_manifest), mode=0o644
     )
+    archive_sha256 = kit_change.release._canonical_release_sha256(members)
     report: dict[str, object] = {
         "ok": True,
         "version": version,
@@ -297,12 +297,13 @@ class KitChangeTest(unittest.TestCase):
         self.assertTrue(agents.startswith(original))
         self.assertIn(self.fixture[1]["install/agents.block.md"].content, agents)
         state = json.loads((self.root / ".agent-kit" / "current.json").read_text("utf-8"))
-        self.assertEqual(state["active_release"]["archive_sha256"], "a" * 64)
+        archive_sha256 = str(self.fixture[0]["archive_sha256"])
+        self.assertEqual(state["active_release"]["archive_sha256"], archive_sha256)
         self.assertEqual(
             {surface["strategy"] for surface in state["managed_surfaces"]},
             {"create-only", "managed-block", "replace", "schema-json"},
         )
-        core = self.root / ".agent-kit" / "releases" / ("a" * 64)
+        core = self.root / ".agent-kit" / "releases" / archive_sha256
         self.assertTrue(core.is_dir())
         for relative, member in self.fixture[1].items():
             self.assertEqual(core.joinpath(*relative.split("/")).read_bytes(), member.content)
@@ -543,7 +544,13 @@ class KitChangeTest(unittest.TestCase):
         _write(self.root, "AGENTS.md", original)
         result = self._preview_and_apply()
         installed_agents = (self.root / "AGENTS.md").read_bytes()
-        core_file = self.root / ".agent-kit" / "releases" / ("a" * 64) / "kit.py"
+        core_file = (
+            self.root
+            / ".agent-kit"
+            / "releases"
+            / str(self.fixture[0]["archive_sha256"])
+            / "kit.py"
+        )
         core_file.write_bytes(b"tampered core\n")
 
         with self.assertRaises(kit_change.KitChangeError) as raised:
@@ -554,8 +561,10 @@ class KitChangeTest(unittest.TestCase):
         self.assertTrue((self.root / ".agent-kit" / "current.json").is_file())
 
     def test_rollback_refuses_a_third_version(self) -> None:
-        _write(self.root, "AGENTS.md", b"# Human project rules\n")
+        original = b"# Human project rules\n"
+        _write(self.root, "AGENTS.md", original)
         result = self._preview_and_apply()
+        applied = (self.root / "AGENTS.md").read_bytes()
         third_version = b"A file changed independently after Apply.\n"
         (self.root / "AGENTS.md").write_bytes(third_version)
 
@@ -568,6 +577,47 @@ class KitChangeTest(unittest.TestCase):
             next((self.root / ".kit" / "runtime" / "upgrade" / "transactions").glob("*/journal.json")).read_text("utf-8")
         )
         self.assertEqual(journal["state"], "blocked")
+        with self.assertRaises(kit_change.KitChangeError) as unnamed:
+            kit_change.rollback(self.root)
+        self.assertEqual("transaction-blocked", unnamed.exception.code)
+
+        (self.root / "AGENTS.md").write_bytes(applied)
+        recovered = kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("rolled_back", recovered["status"])
+        self.assertEqual(original, (self.root / "AGENTS.md").read_bytes())
+        self.assertFalse((self.root / ".agent-kit").exists())
+
+    def test_rollback_retries_a_one_shot_permission_error(self) -> None:
+        original = b"# Human project rules\n"
+        agents = _write(self.root, "AGENTS.md", original)
+        result = self._preview_and_apply()
+        applied = agents.read_bytes()
+        original_atomic = kit_change._atomic_bytes
+        failed = False
+
+        def flaky_atomic(path: Path, content: bytes, mode: str) -> None:
+            nonlocal failed
+            if path == agents and content == original and not failed:
+                failed = True
+                raise PermissionError("file is temporarily locked")
+            original_atomic(path, content, mode)
+
+        with mock.patch.object(
+            kit_change, "_atomic_bytes", side_effect=flaky_atomic
+        ):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change.rollback(self.root, str(result["transaction_id"]))
+
+            self.assertEqual("rollback-failed", raised.exception.code)
+            self.assertEqual(applied, agents.read_bytes())
+            recovered = kit_change.rollback(
+                self.root, str(result["transaction_id"])
+            )
+
+        self.assertEqual("rolled_back", recovered["status"])
+        self.assertEqual(original, agents.read_bytes())
+        self.assertFalse((self.root / ".agent-kit").exists())
 
     def test_case_collision_blocks_preview(self) -> None:
         _write(self.root, "agents.md", b"different spelling by case\n")
@@ -617,7 +667,12 @@ class KitChangeTest(unittest.TestCase):
     def test_hardlinked_managed_core_blocks_reuse(self) -> None:
         result = self._preview_and_apply()
         self.assertEqual(result["status"], "applied")
-        core = self.root / ".agent-kit" / "releases" / ("a" * 64)
+        core = (
+            self.root
+            / ".agent-kit"
+            / "releases"
+            / str(self.fixture[0]["archive_sha256"])
+        )
         member = core / "kit.py"
         source = self.root / "core-hardlink-source.py"
         source.write_bytes(member.read_bytes())
@@ -996,13 +1051,13 @@ class KitChangeTest(unittest.TestCase):
         original = b"# Human project rules\n"
         _write(self.root, "AGENTS.md", original)
         first_block = self.fixture[1]["install/agents.block.md"].content
+        first_identity = str(self.fixture[0]["archive_sha256"])
         self._preview_and_apply()
         current = (self.root / "AGENTS.md").read_bytes()
         outside_change = b"A human rule added between releases.\n"
         (self.root / "AGENTS.md").write_bytes(outside_change + current)
         second = _release_fixture(
             version="0.4.0",
-            archive_sha256="c" * 64,
             source_commit="d" * 40,
             launcher=b"@echo off\necho managed kit 0.4\n",
             block_body="Use the active managed kit release, version two.",
@@ -1022,8 +1077,13 @@ class KitChangeTest(unittest.TestCase):
         self.assertIn(second[1]["install/agents.block.md"].content, agents)
         self.assertNotIn(first_block, agents)
         state = json.loads((self.root / ".agent-kit" / "current.json").read_text("utf-8"))
-        self.assertEqual(state["active_release"]["archive_sha256"], "c" * 64)
-        self.assertEqual(state["previous_release"]["archive_sha256"], "a" * 64)
+        self.assertEqual(
+            state["active_release"]["archive_sha256"],
+            second[0]["archive_sha256"],
+        )
+        self.assertEqual(
+            state["previous_release"]["archive_sha256"], first_identity
+        )
 
     def test_windows_replace_retries_only_a_sharing_violation(self) -> None:
         sharing = PermissionError("file is in use")
