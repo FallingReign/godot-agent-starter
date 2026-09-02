@@ -271,6 +271,27 @@ def _extract_exact(path: Path, destination: Path) -> None:
         target.chmod(modes[relative])
 
 
+def _make_directory_redirect(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr or completed.stdout)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _remove_directory_redirect(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink(missing_ok=True)
+
+
 class ReleaseTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = _scratch()
@@ -462,6 +483,21 @@ class TestDeterministicBuild(ReleaseTestCase):
         source, _porcelain = release._git_state(root)
         self.assertEqual(source, {"commit": commit, "dirty": True})
 
+    def test_build_refuses_a_redirected_output_parent(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        external = self.scratch / "external-output"
+        external.mkdir()
+        redirected = self.scratch / "redirected-output"
+        _make_directory_redirect(redirected, external)
+        try:
+            with self.assertRaisesRegex(
+                release.ReleaseError, "unredirected|redirected components"
+            ):
+                release.build_release(root, redirected / "kit.zip")
+            self.assertEqual([], list(external.iterdir()))
+        finally:
+            _remove_directory_redirect(redirected)
+
     def test_dirty_manifest_is_visible_to_inspection_but_rejected_as_release(self) -> None:
         archive = _synthetic_smoke_archive(self.scratch)
         contents = _member_contents(archive)
@@ -569,6 +605,233 @@ class TestDeterministicBuild(ReleaseTestCase):
 
 
 class TestManagedInstallContract(ReleaseTestCase):
+    def _run_generated_launcher(
+        self, project: Path, launcher_content: bytes
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["KIT_PYTHON"] = sys.executable
+        if os.name == "nt":
+            stable = _write(
+                project,
+                "kit.cmd",
+                release._managed_windows_launcher(launcher_content),
+            )
+            command = ["cmd", "/d", "/c", str(stable)]
+        else:
+            stable = _write(
+                project,
+                "kit",
+                release._managed_unix_launcher(launcher_content),
+            )
+            stable.chmod(0o755)
+            command = [str(stable)]
+        return subprocess.run(
+            command,
+            cwd=project,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+
+    def test_generated_launcher_executes_only_exact_regular_bytes(self) -> None:
+        source = (
+            b"from pathlib import Path\n"
+            b"Path(__file__).parent.parent.joinpath('executed').write_text('yes')\n"
+        )
+
+        regular = self.scratch / "regular-project"
+        (regular / ".agent-kit").mkdir(parents=True)
+        _write(regular, ".agent-kit/launcher.py", source)
+        shadow = (
+            "from pathlib import Path\n"
+            "Path(__file__).parent.joinpath('shadow-ran').write_text('bad')\n"
+        )
+        _write(regular, "sitecustomize.py", shadow)
+        _write(regular, "base64.py", shadow)
+        _write(regular, ".agent-kit/hashlib.py", shadow)
+        self.assertEqual(0, self._run_generated_launcher(regular, source).returncode)
+        self.assertEqual("yes", (regular / "executed").read_text(encoding="utf-8"))
+        self.assertFalse((regular / "shadow-ran").exists())
+        self.assertFalse((regular / ".agent-kit" / "shadow-ran").exists())
+
+        changed = self.scratch / "changed-project"
+        (changed / ".agent-kit").mkdir(parents=True)
+        _write(
+            changed,
+            ".agent-kit/launcher.py",
+            source + b"Path(__file__).parent.parent.joinpath('changed').write_text('bad')\n",
+        )
+        outcome = self._run_generated_launcher(changed, source)
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertFalse((changed / "executed").exists())
+        self.assertFalse((changed / "changed").exists())
+
+        linked = self.scratch / "linked-project"
+        (linked / ".agent-kit").mkdir(parents=True)
+        external = _write(self.scratch, "external-launcher.py", source)
+        os.link(external, linked / ".agent-kit" / "launcher.py")
+        outcome = self._run_generated_launcher(linked, source)
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertFalse((linked / "executed").exists())
+
+    def test_generated_launcher_refuses_redirected_launcher_folder(self) -> None:
+        source = (
+            b"from pathlib import Path\n"
+            b"Path(__file__).parent.parent.joinpath('executed').write_text('bad')\n"
+        )
+        project = self.scratch / "redirected-project"
+        project.mkdir()
+        external = self.scratch / "external-agent-kit"
+        external.mkdir()
+        _write(external, "launcher.py", source)
+        redirected = project / ".agent-kit"
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(redirected), str(external)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(0, created.returncode, created.stdout + created.stderr)
+        else:
+            redirected.symlink_to(external, target_is_directory=True)
+
+        outcome = self._run_generated_launcher(project, source)
+
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertFalse((project / "executed").exists())
+        self.assertFalse((self.scratch / "executed").exists())
+
+    def test_source_launchers_embed_the_exact_flat_launcher_identity(self) -> None:
+        launcher_content = (REPOSITORY / "tools" / "managed_launcher.py").read_bytes()
+        self.assertEqual(
+            release._flat_unix_launcher(launcher_content),
+            (REPOSITORY / "kit").read_bytes(),
+        )
+        self.assertEqual(
+            release._flat_windows_launcher(launcher_content),
+            (REPOSITORY / "kit.cmd").read_bytes().replace(b"\r\n", b"\n"),
+        )
+
+        copied = self.scratch / "source-launcher-copy"
+        copied.mkdir()
+        sentinel_source = (
+            b"from pathlib import Path\n"
+            b"Path(__file__).parent.parent.joinpath('executed').write_text('bad')\n"
+        )
+        _write(copied, "tools/managed_launcher.py", sentinel_source)
+        environment = dict(os.environ)
+        environment["KIT_PYTHON"] = sys.executable
+        if os.name == "nt":
+            stable = _write(copied, "kit.cmd", (REPOSITORY / "kit.cmd").read_bytes())
+            command = ["cmd", "/d", "/c", str(stable)]
+        else:
+            stable = _write(copied, "kit", (REPOSITORY / "kit").read_bytes())
+            stable.chmod(0o755)
+            command = [str(stable)]
+        outcome = subprocess.run(
+            command,
+            cwd=copied,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertFalse((copied / "executed").exists())
+
+        environment.pop("KIT_PYTHON", None)
+        environment["PATH"] = str(copied) + os.pathsep + environment.get("PATH", "")
+        if os.name == "nt":
+            _write(
+                copied,
+                "py.bat",
+                "@echo off\r\necho bad>path-python-ran\r\nexit /b 0\r\n",
+            )
+        else:
+            fake_python = _write(
+                copied,
+                "python3",
+                "#!/bin/sh\necho bad > path-python-ran\nexit 0\n",
+            )
+            fake_python.chmod(0o755)
+        outcome = subprocess.run(
+            command,
+            cwd=copied,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertFalse((copied / "path-python-ran").exists())
+
+    def test_source_launcher_refuses_a_dangling_managed_redirect(self) -> None:
+        project = self.scratch / "dangling-source-launcher"
+        project.mkdir()
+        if os.name == "nt":
+            stable = _write(project, "kit.cmd", (REPOSITORY / "kit.cmd").read_bytes())
+        else:
+            stable = _write(project, "kit", (REPOSITORY / "kit").read_bytes())
+            stable.chmod(0o755)
+        target = self.scratch / "removed-agent-kit-target"
+        target.mkdir()
+        redirected = project / ".agent-kit"
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(redirected), str(target)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(0, created.returncode, created.stdout + created.stderr)
+            target.rmdir()
+            command = ["cmd", "/d", "/c", str(stable)]
+        else:
+            target.rmdir()
+            redirected.symlink_to(target, target_is_directory=True)
+            command = [str(stable)]
+        environment = dict(os.environ)
+        environment["KIT_PYTHON"] = sys.executable
+
+        try:
+            outcome = subprocess.run(
+                command,
+                cwd=project,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        finally:
+            if os.name == "nt":
+                os.rmdir(redirected)
+            elif redirected.is_symlink():
+                redirected.unlink(missing_ok=True)
+
+        self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
+        self.assertIn("managed kit change is incomplete", outcome.stderr)
+
     def test_provider_bridges_keep_project_core_and_game_roots_distinct(self) -> None:
         archive = _synthetic_smoke_archive(self.scratch)
         contents = _member_contents(archive)
@@ -1087,6 +1350,21 @@ class TestReleaseSmoke(ReleaseTestCase):
         )
         with self.assertRaisesRegex(release.ReleaseError, "already exists"):
             release.smoke_archive(archive, workspace)
+
+    def test_smoke_refuses_a_redirected_workspace_parent(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        external = self.scratch / "external-smoke"
+        external.mkdir()
+        redirected = self.scratch / "redirected-smoke"
+        _make_directory_redirect(redirected, external)
+        try:
+            with self.assertRaisesRegex(
+                release.ReleaseError, "unredirected|redirected components"
+            ):
+                release.smoke_archive(archive, redirected / "workspace")
+            self.assertEqual([], list(external.iterdir()))
+        finally:
+            _remove_directory_redirect(redirected)
 
 
 class TestVerification(ReleaseTestCase):

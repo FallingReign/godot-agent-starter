@@ -1,69 +1,41 @@
 @echo off
 setlocal
 set "KIT_ROOT=%~dp0"
+set "KIT_ENTRY=%KIT_ROOT%tools\managed_launcher.py"
+set "KIT_ENTRY_SHA256=29011c9082810c964a56ab908c701819ed6af21d62f874b8a26e4c8e97d55785"
+set "KIT_BOOTSTRAP_B64=ZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwppbXBvcnQgaGFzaGxpYgppbXBvcnQgb3MKaW1wb3J0IHN0YXQKaW1wb3J0IHN5cwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKCk1BWF9MQVVOQ0hFUl9CWVRFUyA9IDUxMiAqIDEwMjQKCmRlZiBfcmVwYXJzZShpbmZvOiBvYmplY3QpIC0+IGJvb2w6CiAgICBtYXJrZXIgPSBpbnQoZ2V0YXR0cihzdGF0LCAiRklMRV9BVFRSSUJVVEVfUkVQQVJTRV9QT0lOVCIsIDB4MDQwMCkpCiAgICByZXR1cm4gYm9vbChpbnQoZ2V0YXR0cihpbmZvLCAic3RfZmlsZV9hdHRyaWJ1dGVzIiwgMCkpICYgbWFya2VyKQoKZGVmIF9pZGVudGl0eShpbmZvOiBvYmplY3QpIC0+IHR1cGxlW29iamVjdCwgLi4uXToKICAgIHJldHVybiB0dXBsZShnZXRhdHRyKGluZm8sIGZpZWxkLCBOb25lKSBmb3IgZmllbGQgaW4gKAogICAgICAgICJzdF9kZXYiLCAic3RfaW5vIiwgInN0X21vZGUiLCAic3Rfc2l6ZSIsICJzdF9tdGltZV9ucyIsICJzdF9ubGluayIKICAgICkpCgpkZWYgX2xvYWQoKSAtPiB0dXBsZVtQYXRoLCBieXRlc106CiAgICBpZiBsZW4oc3lzLmFyZ3YpIDwgMzoKICAgICAgICByYWlzZSBWYWx1ZUVycm9yKCJsYXVuY2hlciBwYXRoIG9yIGlkZW50aXR5IGlzIG1pc3NpbmciKQogICAgcGF0aCA9IFBhdGgoc3lzLmFyZ3ZbMV0pCiAgICBleHBlY3RlZCA9IHN5cy5hcmd2WzJdCiAgICBpZiBub3QgcGF0aC5pc19hYnNvbHV0ZSgpOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImxhdW5jaGVyIHBhdGggaXMgbm90IGFic29sdXRlIikKICAgIGlmIGxlbihleHBlY3RlZCkgIT0gNjQgb3IgYW55KHZhbHVlIG5vdCBpbiAiMDEyMzQ1Njc4OWFiY2RlZiIgZm9yIHZhbHVlIGluIGV4cGVjdGVkKToKICAgICAgICByYWlzZSBWYWx1ZUVycm9yKCJsYXVuY2hlciBpZGVudGl0eSBpcyBtYWxmb3JtZWQiKQogICAgcGF0aCA9IFBhdGgob3MucGF0aC5hYnNwYXRoKHBhdGgpKQogICAgcGFyZW50ID0gcGF0aC5wYXJlbnQKICAgIHBhcmVudF9pbmZvID0gcGFyZW50LmxzdGF0KCkKICAgIGlmIChzdGF0LlNfSVNMTksocGFyZW50X2luZm8uc3RfbW9kZSkgb3IgX3JlcGFyc2UocGFyZW50X2luZm8pCiAgICAgICAgICAgIG9yIG5vdCBzdGF0LlNfSVNESVIocGFyZW50X2luZm8uc3RfbW9kZSkpOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImxhdW5jaGVyIGZvbGRlciBpcyByZWRpcmVjdGVkIikKICAgIGlmIHBhcmVudC5yZXNvbHZlKHN0cmljdD1UcnVlKSAhPSBwYXJlbnQ6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigibGF1bmNoZXIgZm9sZGVyIGhhcyByZWRpcmVjdGVkIGNvbXBvbmVudHMiKQogICAgYmVmb3JlX3BhdGggPSBwYXRoLmxzdGF0KCkKICAgIGlmIChzdGF0LlNfSVNMTksoYmVmb3JlX3BhdGguc3RfbW9kZSkgb3IgX3JlcGFyc2UoYmVmb3JlX3BhdGgpCiAgICAgICAgICAgIG9yIG5vdCBzdGF0LlNfSVNSRUcoYmVmb3JlX3BhdGguc3RfbW9kZSkKICAgICAgICAgICAgb3IgaW50KGdldGF0dHIoYmVmb3JlX3BhdGgsICJzdF9ubGluayIsIDEpKSAhPSAxKToKICAgICAgICByYWlzZSBWYWx1ZUVycm9yKCJsYXVuY2hlciBpcyByZWRpcmVjdGVkIG9yIGhhcmRsaW5rZWQiKQogICAgaWYgYmVmb3JlX3BhdGguc3Rfc2l6ZSA+IE1BWF9MQVVOQ0hFUl9CWVRFUyBvciBwYXRoLnJlc29sdmUoc3RyaWN0PVRydWUpICE9IHBhdGg6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigibGF1bmNoZXIgcGF0aCBvciBzaXplIGlzIHVuc2FmZSIpCiAgICBmbGFncyA9IG9zLk9fUkRPTkxZIHwgZ2V0YXR0cihvcywgIk9fQklOQVJZIiwgMCkgfCBnZXRhdHRyKG9zLCAiT19OT0ZPTExPVyIsIDApCiAgICBkZXNjcmlwdG9yID0gb3Mub3BlbihwYXRoLCBmbGFncykKICAgIHRyeToKICAgICAgICBvcGVuZWQgPSBvcy5mc3RhdChkZXNjcmlwdG9yKQogICAgICAgIGNodW5rczogbGlzdFtieXRlc10gPSBbXQogICAgICAgIHJlbWFpbmluZyA9IE1BWF9MQVVOQ0hFUl9CWVRFUyArIDEKICAgICAgICB3aGlsZSByZW1haW5pbmc6CiAgICAgICAgICAgIGNodW5rID0gb3MucmVhZChkZXNjcmlwdG9yLCBtaW4oNjU1MzYsIHJlbWFpbmluZykpCiAgICAgICAgICAgIGlmIG5vdCBjaHVuazoKICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgIGNodW5rcy5hcHBlbmQoY2h1bmspCiAgICAgICAgICAgIHJlbWFpbmluZyAtPSBsZW4oY2h1bmspCiAgICAgICAgYWZ0ZXJfaGFuZGxlID0gb3MuZnN0YXQoZGVzY3JpcHRvcikKICAgIGZpbmFsbHk6CiAgICAgICAgb3MuY2xvc2UoZGVzY3JpcHRvcikKICAgIGNvbnRlbnQgPSBiIiIuam9pbihjaHVua3MpCiAgICBhZnRlcl9wYXRoID0gcGF0aC5sc3RhdCgpCiAgICBhZnRlcl9wYXJlbnQgPSBwYXJlbnQubHN0YXQoKQogICAgaWYgKF9pZGVudGl0eShiZWZvcmVfcGF0aCkgIT0gX2lkZW50aXR5KG9wZW5lZCkKICAgICAgICAgICAgb3IgX2lkZW50aXR5KG9wZW5lZCkgIT0gX2lkZW50aXR5KGFmdGVyX2hhbmRsZSkKICAgICAgICAgICAgb3IgX2lkZW50aXR5KGFmdGVyX2hhbmRsZSkgIT0gX2lkZW50aXR5KGFmdGVyX3BhdGgpCiAgICAgICAgICAgIG9yIF9pZGVudGl0eShwYXJlbnRfaW5mbykgIT0gX2lkZW50aXR5KGFmdGVyX3BhcmVudCkKICAgICAgICAgICAgb3IgX3JlcGFyc2UoYWZ0ZXJfcGF0aCkgb3IgX3JlcGFyc2UoYWZ0ZXJfcGFyZW50KQogICAgICAgICAgICBvciBwYXJlbnQucmVzb2x2ZShzdHJpY3Q9VHJ1ZSkgIT0gcGFyZW50CiAgICAgICAgICAgIG9yIGxlbihjb250ZW50KSAhPSBiZWZvcmVfcGF0aC5zdF9zaXplKToKICAgICAgICByYWlzZSBWYWx1ZUVycm9yKCJsYXVuY2hlciBjaGFuZ2VkIHdoaWxlIGl0IHdhcyByZWFkIikKICAgIGlmIGhhc2hsaWIuc2hhMjU2KGNvbnRlbnQpLmhleGRpZ2VzdCgpICE9IGV4cGVjdGVkOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImxhdW5jaGVyIGlkZW50aXR5IGRvZXMgbm90IG1hdGNoIHRoaXMga2l0IikKICAgIHJldHVybiBwYXRoLCBjb250ZW50Cgp0cnk6CiAgICBfcGF0aCwgX2NvbnRlbnQgPSBfbG9hZCgpCmV4Y2VwdCAoT1NFcnJvciwgVmFsdWVFcnJvcikgYXMgZXhjOgogICAgcHJpbnQoZiJraXQ6IHJlZnVzZWQgdW5zYWZlIGxhdW5jaGVyOiB7ZXhjfSIsIGZpbGU9c3lzLnN0ZGVycikKICAgIHJhaXNlIFN5c3RlbUV4aXQoMykKCnN5cy5hcmd2ID0gW3N0cihfcGF0aCksICpzeXMuYXJndlszOl1dCl9zY29wZSA9IHsKICAgICJfX25hbWVfXyI6ICJfX21haW5fXyIsCiAgICAiX19maWxlX18iOiBzdHIoX3BhdGgpLAogICAgIl9fY2FjaGVkX18iOiBOb25lLAogICAgIl9fcGFja2FnZV9fIjogTm9uZSwKICAgICJfX3NwZWNfXyI6IE5vbmUsCn0KZXhlYyhjb21waWxlKF9jb250ZW50LCBzdHIoX3BhdGgpLCAiZXhlYyIpLCBfc2NvcGUsIF9zY29wZSkK"
+set "KIT_BOOTSTRAP_CODE=import base64,os;exec(compile(base64.b64decode(os.environ.pop('KIT_BOOTSTRAP_B64'),validate=True),'<kit-bootstrap>','exec'))"
 set "PYTHONDONTWRITEBYTECODE=1"
 
-if exist "%KIT_ROOT%.agent-kit\launcher.py" goto use_managed_launcher
-if exist "%KIT_ROOT%.agent-kit" goto managed_launcher_missing
-set "KIT_ENTRY=%KIT_ROOT%tools\managed_launcher.py"
-goto launcher_selected
-
-:use_managed_launcher
-set "KIT_ENTRY=%KIT_ROOT%.agent-kit\launcher.py"
-goto launcher_selected
-
-:managed_launcher_missing
-echo kit: the managed kit launcher is missing; restore or roll back the interrupted kit change. 1>&2
-exit /b 3
-
-:launcher_selected
-if exist "%KIT_ENTRY%" goto launcher_exists
-echo kit: the kit launcher is missing. 1>&2
-exit /b 3
-
-:launcher_exists
-
+if exist "%KIT_ROOT%.agent-kit" goto managed_change_incomplete
+for %%I in ("%KIT_ROOT%.agent-kit") do if not "%%~aI"=="" goto managed_change_incomplete
+if not exist "%KIT_ENTRY%" goto launcher_missing
 if defined KIT_PYTHON goto use_kit_python
+if exist "%SystemRoot%\py.exe" goto use_system_py
+echo kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter. 1>&2
+exit /b 3
 
-where py >nul 2>&1
-if not errorlevel 1 goto use_py
-where python3 >nul 2>&1
-if not errorlevel 1 goto use_python3
-where python >nul 2>&1
-if not errorlevel 1 goto use_python
+:managed_change_incomplete
+echo kit: a managed kit change is incomplete; use its recovery action. 1>&2
+exit /b 3
 
-echo kit: its internal runtime is unavailable; Python 3.10 or newer is required. 1>&2
+:launcher_missing
+echo kit: the kit launcher is missing. 1>&2
 exit /b 3
 
 :use_kit_python
 for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_RESOLVED=%%~fI"
-if /I "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_absolute
+if /I not "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_invalid
+if not exist "%KIT_PYTHON%" goto kit_python_invalid
+for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
+if /I "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_invalid
+"%KIT_PYTHON%" -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
+exit /b %errorlevel%
+
+:kit_python_invalid
 echo kit: KIT_PYTHON must name one absolute interpreter file. 1>&2
 exit /b 3
 
-:kit_python_absolute
-if exist "%KIT_PYTHON%" goto kit_python_exists
-echo kit: KIT_PYTHON does not name an existing interpreter file. 1>&2
-exit /b 3
-
-:kit_python_exists
-for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
-if /I not "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_file
-echo kit: KIT_PYTHON must name a file, not a directory. 1>&2
-exit /b 3
-
-:kit_python_file
-"%KIT_PYTHON%" "%KIT_ENTRY%" %*
-exit /b %errorlevel%
-
-:use_py
-py -3 "%KIT_ENTRY%" %*
-exit /b %errorlevel%
-
-:use_python3
-python3 "%KIT_ENTRY%" %*
-exit /b %errorlevel%
-
-:use_python
-python "%KIT_ENTRY%" %*
+:use_system_py
+"%SystemRoot%\py.exe" -3 -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
 exit /b %errorlevel%

@@ -40,6 +40,18 @@ MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_MEMBERS = 512
 
+ENTRYPOINT_BOOTSTRAP = (
+    "import os,sys\n"
+    "path=sys.argv[1]\n"
+    "source=sys.stdin.buffer.read(4194305)\n"
+    "if len(source)>4194304: raise SystemExit('kit: entry point is too large')\n"
+    "sys.argv=[path,*sys.argv[2:]]\n"
+    "sys.path[0]=os.path.dirname(path)\n"
+    "scope={'__name__':'__main__','__file__':path,'__cached__':None,"
+    "'__package__':None,'__spec__':None}\n"
+    "exec(compile(source,path,'exec'),scope,scope)\n"
+)
+
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\Z")
@@ -720,13 +732,24 @@ def launch(arguments: Sequence[str] | None = None) -> int:
     project = _project_argument(forwarded) or str(_default_project())
     installation = resolve_installation(project)
     entrypoint = _member_file(installation.core_root, ("kit.py",))
-    _require_regular_file(entrypoint, "kit entry point", maximum=MAX_MEMBER_BYTES)
+    entrypoint_content = _require_regular_file(
+        entrypoint, "kit entry point", maximum=MAX_MEMBER_BYTES
+    )
     environment = bound_environment(installation)
     try:
         completed = subprocess.run(
-            [sys.executable, str(entrypoint), *forwarded],
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                ENTRYPOINT_BOOTSTRAP,
+                str(entrypoint),
+                *forwarded,
+            ],
             cwd=installation.project_root,
             env=environment,
+            input=entrypoint_content,
             check=False,
         )
     except OSError as exc:

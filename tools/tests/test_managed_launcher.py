@@ -514,12 +514,46 @@ class ProcessBoundary(unittest.TestCase):
 
             self.assertEqual(17, result)
             self.assertEqual(sys.executable, observed["command"][0])
-            self.assertEqual(str(core / "kit.py"), observed["command"][1])
+            self.assertEqual(["-I", "-S", "-c"], observed["command"][1:4])
+            self.assertEqual(launcher.ENTRYPOINT_BOOTSTRAP, observed["command"][4])
+            self.assertEqual(str(core / "kit.py"), observed["command"][5])
+            self.assertEqual((core / "kit.py").read_bytes(), observed["input"])
             self.assertEqual(root, observed["cwd"])
             self.assertEqual(str(root), observed["env"][launcher.PROJECT_ROOT_ENV])
             self.assertEqual(str(core), observed["env"][launcher.CORE_ROOT_ENV])
             self.assertEqual("1", observed["env"]["PYTHONDONTWRITEBYTECODE"])
             self.assertFalse(observed["check"])
+
+    def test_launch_executes_captured_entrypoint_bytes_only(self) -> None:
+        with _scratch() as root:
+            _flat(root)
+            marker = root / "executed.txt"
+            entrypoint = root / "kit.py"
+            original = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('captured', encoding='utf-8')\n"
+            ).encode("utf-8")
+            replacement = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('reopened', encoding='utf-8')\n"
+            ).encode("utf-8")
+            entrypoint.write_bytes(original)
+            stable_reader = launcher._require_regular_file
+
+            def capture_then_replace(path: Path, label: str, **kwargs):
+                content = stable_reader(path, label, **kwargs)
+                if label == "kit entry point":
+                    entrypoint.write_bytes(replacement)
+                return content
+
+            with mock.patch.object(
+                launcher, "_require_regular_file", side_effect=capture_then_replace
+            ):
+                self.assertEqual(
+                    0, launcher.launch(["--project", str(root)])
+                )
+
+            self.assertEqual("captured", marker.read_text(encoding="utf-8"))
 
     def test_existing_environment_binding_cannot_select_another_project(self) -> None:
         with _scratch() as root:

@@ -12,6 +12,7 @@ Project/game state and runtime retrospective state are never candidates.
 from __future__ import annotations
 
 import argparse
+import base64
 import binascii
 import hashlib
 import io
@@ -334,22 +335,126 @@ INSTALL_BLOCK_END = "<!-- END GODOT AGENT KIT -->"
 INSTALL_TEXT_BEGIN = "# BEGIN GODOT AGENT KIT"
 INSTALL_TEXT_END = "# END GODOT AGENT KIT"
 
-# The project launchers are deliberately smaller and more stable than the
-# release they select.  They start the self-contained managed launcher, which
-# authenticates current.json and every active release member before importing
-# the release's kit.py.
-MANAGED_UNIX_LAUNCHER = b"""#!/bin/sh
+# This validator is embedded in every stable launcher. It authenticates and
+# compiles captured bytes before any project-controlled Python can run.
+LAUNCHER_BOOTSTRAP_SOURCE = b'''from __future__ import annotations
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+MAX_LAUNCHER_BYTES = 512 * 1024
+
+def _reparse(info: object) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+def _identity(info: object) -> tuple[object, ...]:
+    return tuple(getattr(info, field, None) for field in (
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_nlink"
+    ))
+
+def _load() -> tuple[Path, bytes]:
+    if len(sys.argv) < 3:
+        raise ValueError("launcher path or identity is missing")
+    path = Path(sys.argv[1])
+    expected = sys.argv[2]
+    if not path.is_absolute():
+        raise ValueError("launcher path is not absolute")
+    if len(expected) != 64 or any(value not in "0123456789abcdef" for value in expected):
+        raise ValueError("launcher identity is malformed")
+    path = Path(os.path.abspath(path))
+    parent = path.parent
+    parent_info = parent.lstat()
+    if (stat.S_ISLNK(parent_info.st_mode) or _reparse(parent_info)
+            or not stat.S_ISDIR(parent_info.st_mode)):
+        raise ValueError("launcher folder is redirected")
+    if parent.resolve(strict=True) != parent:
+        raise ValueError("launcher folder has redirected components")
+    before_path = path.lstat()
+    if (stat.S_ISLNK(before_path.st_mode) or _reparse(before_path)
+            or not stat.S_ISREG(before_path.st_mode)
+            or int(getattr(before_path, "st_nlink", 1)) != 1):
+        raise ValueError("launcher is redirected or hardlinked")
+    if before_path.st_size > MAX_LAUNCHER_BYTES or path.resolve(strict=True) != path:
+        raise ValueError("launcher path or size is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = MAX_LAUNCHER_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after_handle = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    after_path = path.lstat()
+    after_parent = parent.lstat()
+    if (_identity(before_path) != _identity(opened)
+            or _identity(opened) != _identity(after_handle)
+            or _identity(after_handle) != _identity(after_path)
+            or _identity(parent_info) != _identity(after_parent)
+            or _reparse(after_path) or _reparse(after_parent)
+            or parent.resolve(strict=True) != parent
+            or len(content) != before_path.st_size):
+        raise ValueError("launcher changed while it was read")
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ValueError("launcher identity does not match this kit")
+    return path, content
+
+try:
+    _path, _content = _load()
+except (OSError, ValueError) as exc:
+    print(f"kit: refused unsafe launcher: {exc}", file=sys.stderr)
+    raise SystemExit(3)
+
+sys.argv = [str(_path), *sys.argv[3:]]
+_scope = {
+    "__name__": "__main__",
+    "__file__": str(_path),
+    "__cached__": None,
+    "__package__": None,
+    "__spec__": None,
+}
+exec(compile(_content, str(_path), "exec"), _scope, _scope)
+'''
+
+BOOTSTRAP_STUB = (
+    "import base64,os;exec(compile(base64.b64decode("
+    "os.environ.pop('KIT_BOOTSTRAP_B64'),validate=True),"
+    "'<kit-bootstrap>','exec'))"
+)
+
+
+def _launcher_material(launcher_content: bytes) -> tuple[str, str]:
+    encoded = base64.b64encode(LAUNCHER_BOOTSTRAP_SOURCE).decode("ascii")
+    return encoded, hashlib.sha256(launcher_content).hexdigest()
+
+
+def _managed_unix_launcher(launcher_content: bytes) -> bytes:
+    encoded, digest = _launcher_material(launcher_content)
+    return f'''#!/bin/sh
 set -eu
 
 export PYTHONDONTWRITEBYTECODE=1
+export KIT_BOOTSTRAP_B64='{encoded}'
+KIT_BOOTSTRAP_CODE="{BOOTSTRAP_STUB}"
 KIT_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KIT_MANAGED_LAUNCHER="$KIT_PROJECT_ROOT/.agent-kit/launcher.py"
+KIT_MANAGED_LAUNCHER_SHA256="{digest}"
 
 if [ ! -f "$KIT_MANAGED_LAUNCHER" ]; then
     echo "kit: the managed launcher is missing; use the kit change recovery action." >&2
     exit 3
 fi
-if [ -n "${KIT_PYTHON:-}" ]; then
+if [ -n "${{KIT_PYTHON:-}}" ]; then
     case "$KIT_PYTHON" in
         /*) ;;
         *) echo "kit: KIT_PYTHON must name one absolute interpreter file." >&2; exit 3 ;;
@@ -358,22 +463,27 @@ if [ -n "${KIT_PYTHON:-}" ]; then
         echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
         exit 3
     fi
-    exec "$KIT_PYTHON" "$KIT_MANAGED_LAUNCHER" "$@"
+    exec "$KIT_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
 fi
-if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$KIT_MANAGED_LAUNCHER" "$@"
-fi
-if command -v python >/dev/null 2>&1; then
-    exec python "$KIT_MANAGED_LAUNCHER" "$@"
-fi
-echo "kit: its internal runtime is unavailable; Python 3.10 or newer is required." >&2
+for KIT_SYSTEM_PYTHON in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -f "$KIT_SYSTEM_PYTHON" ] && [ -x "$KIT_SYSTEM_PYTHON" ]; then
+        exec "$KIT_SYSTEM_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
+    fi
+done
+echo "kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter." >&2
 exit 3
-"""
+'''.encode("utf-8")
 
-MANAGED_WINDOWS_LAUNCHER = br"""@echo off
+
+def _managed_windows_launcher(launcher_content: bytes) -> bytes:
+    encoded, digest = _launcher_material(launcher_content)
+    return f'''@echo off
 setlocal
 set "KIT_PROJECT_ROOT=%~dp0"
-set "KIT_MANAGED_LAUNCHER=%KIT_PROJECT_ROOT%.agent-kit\launcher.py"
+set "KIT_MANAGED_LAUNCHER=%KIT_PROJECT_ROOT%.agent-kit\\launcher.py"
+set "KIT_MANAGED_LAUNCHER_SHA256={digest}"
+set "KIT_BOOTSTRAP_B64={encoded}"
+set "KIT_BOOTSTRAP_CODE={BOOTSTRAP_STUB}"
 set "PYTHONDONTWRITEBYTECODE=1"
 
 if exist "%KIT_MANAGED_LAUNCHER%" goto launcher_exists
@@ -382,13 +492,8 @@ exit /b 3
 
 :launcher_exists
 if defined KIT_PYTHON goto use_kit_python
-where py >nul 2>&1
-if not errorlevel 1 goto use_py
-where python3 >nul 2>&1
-if not errorlevel 1 goto use_python3
-where python >nul 2>&1
-if not errorlevel 1 goto use_python
-echo kit: its internal runtime is unavailable; Python 3.10 or newer is required. 1>&2
+if exist "%SystemRoot%\\py.exe" goto use_system_py
+echo kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter. 1>&2
 exit /b 3
 
 :use_kit_python
@@ -397,23 +502,104 @@ if /I not "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_invalid
 if not exist "%KIT_PYTHON%" goto kit_python_invalid
 for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
 if /I "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_invalid
-"%KIT_PYTHON%" "%KIT_MANAGED_LAUNCHER%" %*
+"%KIT_PYTHON%" -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
 exit /b %errorlevel%
 
 :kit_python_invalid
 echo kit: KIT_PYTHON must name one absolute interpreter file. 1>&2
 exit /b 3
 
-:use_py
-py -3 "%KIT_MANAGED_LAUNCHER%" %*
+:use_system_py
+"%SystemRoot%\\py.exe" -3 -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
 exit /b %errorlevel%
-:use_python3
-python3 "%KIT_MANAGED_LAUNCHER%" %*
+'''.encode("utf-8")
+
+
+def _flat_unix_launcher(launcher_content: bytes) -> bytes:
+    encoded, digest = _launcher_material(launcher_content)
+    return f'''#!/bin/sh
+set -eu
+
+export PYTHONDONTWRITEBYTECODE=1
+export KIT_BOOTSTRAP_B64='{encoded}'
+KIT_BOOTSTRAP_CODE="{BOOTSTRAP_STUB}"
+KIT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+KIT_ENTRY="$KIT_ROOT/tools/managed_launcher.py"
+KIT_ENTRY_SHA256="{digest}"
+
+if [ -e "$KIT_ROOT/.agent-kit" ] || [ -L "$KIT_ROOT/.agent-kit" ]; then
+    echo "kit: a managed kit change is incomplete; use its recovery action." >&2
+    exit 3
+fi
+if [ ! -f "$KIT_ENTRY" ]; then
+    echo "kit: the kit launcher is missing." >&2
+    exit 3
+fi
+if [ -n "${{KIT_PYTHON:-}}" ]; then
+    case "$KIT_PYTHON" in
+        /*) ;;
+        *) echo "kit: KIT_PYTHON must name one absolute interpreter file." >&2; exit 3 ;;
+    esac
+    if [ ! -f "$KIT_PYTHON" ] || [ ! -x "$KIT_PYTHON" ]; then
+        echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
+        exit 3
+    fi
+    exec "$KIT_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+fi
+for KIT_SYSTEM_PYTHON in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -f "$KIT_SYSTEM_PYTHON" ] && [ -x "$KIT_SYSTEM_PYTHON" ]; then
+        exec "$KIT_SYSTEM_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+    fi
+done
+echo "kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter." >&2
+exit 3
+'''.encode("utf-8")
+
+
+def _flat_windows_launcher(launcher_content: bytes) -> bytes:
+    encoded, digest = _launcher_material(launcher_content)
+    return f'''@echo off
+setlocal
+set "KIT_ROOT=%~dp0"
+set "KIT_ENTRY=%KIT_ROOT%tools\\managed_launcher.py"
+set "KIT_ENTRY_SHA256={digest}"
+set "KIT_BOOTSTRAP_B64={encoded}"
+set "KIT_BOOTSTRAP_CODE={BOOTSTRAP_STUB}"
+set "PYTHONDONTWRITEBYTECODE=1"
+
+if exist "%KIT_ROOT%.agent-kit" goto managed_change_incomplete
+for %%I in ("%KIT_ROOT%.agent-kit") do if not "%%~aI"=="" goto managed_change_incomplete
+if not exist "%KIT_ENTRY%" goto launcher_missing
+if defined KIT_PYTHON goto use_kit_python
+if exist "%SystemRoot%\\py.exe" goto use_system_py
+echo kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter. 1>&2
+exit /b 3
+
+:managed_change_incomplete
+echo kit: a managed kit change is incomplete; use its recovery action. 1>&2
+exit /b 3
+
+:launcher_missing
+echo kit: the kit launcher is missing. 1>&2
+exit /b 3
+
+:use_kit_python
+for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_RESOLVED=%%~fI"
+if /I not "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_invalid
+if not exist "%KIT_PYTHON%" goto kit_python_invalid
+for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
+if /I "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_invalid
+"%KIT_PYTHON%" -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
 exit /b %errorlevel%
-:use_python
-python "%KIT_MANAGED_LAUNCHER%" %*
+
+:kit_python_invalid
+echo kit: KIT_PYTHON must name one absolute interpreter file. 1>&2
+exit /b 3
+
+:use_system_py
+"%SystemRoot%\\py.exe" -3 -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
 exit /b %errorlevel%
-"""
+'''.encode("utf-8")
 
 MANAGED_AGENT_BLOCK_BODY = """# Managed Godot Agent Kit
 
@@ -768,6 +954,62 @@ def _is_reparse_point(path: Path) -> bool:
         return False
     flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
     return bool(flag and attributes & flag)
+
+
+def _directory_identity(path: Path, *, label: str) -> tuple[object, ...]:
+    """Return the stable identity of one existing unredirected directory."""
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or _is_reparse_point(absolute)
+            or not stat.S_ISDIR(info.st_mode)
+        ):
+            raise ReleaseError(f"{label} must be an unredirected directory")
+        resolved = absolute.resolve(strict=True)
+    except ReleaseError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ReleaseError(f"cannot inspect {label}: {exc}") from exc
+    if resolved != absolute:
+        raise ReleaseError(f"{label} uses redirected components")
+    return tuple(getattr(info, field, None) for field in ("st_dev", "st_ino", "st_mode"))
+
+
+def _prepare_unredirected_directory(
+    path: Path, *, label: str, create: bool
+) -> tuple[Path, tuple[object, ...]]:
+    """Create missing components if requested, then bind one directory identity."""
+    absolute = path.absolute()
+    missing: list[Path] = []
+    cursor = absolute
+    while not (cursor.exists() or cursor.is_symlink() or _is_reparse_point(cursor)):
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            raise ReleaseError(f"{label} has no existing directory ancestor")
+        cursor = parent
+    _directory_identity(cursor, label=f"{label} ancestor")
+    if missing and not create:
+        raise ReleaseError(f"{label} is unavailable: {absolute}")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ReleaseError(f"cannot create {label}: {exc}") from exc
+        _directory_identity(directory, label=label)
+    return absolute, _directory_identity(absolute, label=label)
+
+
+def _require_directory_identity(
+    path: Path, expected: tuple[object, ...], *, label: str
+) -> None:
+    """Fail if an output directory was redirected or replaced during one write."""
+    if _directory_identity(path, label=label) != expected:
+        raise ReleaseError(f"{label} changed while writing")
 
 
 def _safe_member_path(name: str) -> str:
@@ -1527,6 +1769,7 @@ def _generated_install_release_files(
     marker = _member_content(members, ".agent-kit.json")
     if marker != b'{"kind":"portable-agent-kit-root","schema":1}\n':
         raise ReleaseError(".agent-kit.json is not the canonical managed marker")
+    launcher_content = _member_content(members, "tools/managed_launcher.py")
     generated = {
         "install/agents.block.md": _managed_block(
             INSTALL_BLOCK_BEGIN, MANAGED_AGENT_BLOCK_BODY, INSTALL_BLOCK_END
@@ -1544,8 +1787,8 @@ def _generated_install_release_files(
             _member_content(members, ".gitignore"),
             INSTALL_TEXT_END,
         ),
-        "install/kit": MANAGED_UNIX_LAUNCHER,
-        "install/kit.cmd": MANAGED_WINDOWS_LAUNCHER,
+        "install/kit": _managed_unix_launcher(launcher_content),
+        "install/kit.cmd": _managed_windows_launcher(launcher_content),
         "install/kit.config.default.json": _canonical_json(DEFAULT_KIT_CONFIG),
         INSTALL_MANIFEST_PATH: _canonical_json(manifest),
     }
@@ -1708,8 +1951,9 @@ def build_release(root: Path, output: Path) -> dict:
                 "release output must be outside the source repository or inside its "
                 "configured private runtime_root"
             ) from exc
-    if output.exists() and (output.is_symlink() or _is_reparse_point(output)):
-        raise ReleaseError(f"release output is a link or reparse point: {output}")
+    if output.exists() or output.is_symlink() or _is_reparse_point(output):
+        if output.is_symlink() or _is_reparse_point(output) or not output.is_file():
+            raise ReleaseError(f"release output is linked or not a regular file: {output}")
 
     kind = _archive_kind(output)
     source_before, status_before = _git_state(root)
@@ -1744,9 +1988,11 @@ def build_release(root: Path, output: Path) -> dict:
                for release_file in files}
     members[MANIFEST_PATH] = (_canonical_json(manifest), 0o644)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output_parent, parent_identity = _prepare_unredirected_directory(
+        output.parent, label="release output parent", create=True
+    )
     fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+        prefix=f".{output.name}.", suffix=".tmp", dir=output_parent)
     os.close(fd)
     temporary = Path(temporary_name)
     try:
@@ -1754,9 +2000,19 @@ def build_release(root: Path, output: Path) -> dict:
             _write_zip(temporary, members)
         else:
             _write_tar(temporary, members, compressed=kind == "tar.gz")
+        _require_directory_identity(
+            output_parent, parent_identity, label="release output parent"
+        )
         os.replace(temporary, output)
+        _require_directory_identity(
+            output_parent, parent_identity, label="release output parent"
+        )
     finally:
-        if temporary.exists():
+        if (
+            _directory_identity(output_parent, label="release output parent")
+            == parent_identity
+            and temporary.exists()
+        ):
             temporary.unlink()
     return verify_archive(output)
 
@@ -2184,14 +2440,9 @@ def materialize_verified_directory_zip(root: Path, output: Path) -> dict:
         raise ReleaseError("materialized release ZIP must be outside the verified directory")
     if output.suffix.lower() != ".zip":
         raise ReleaseError("materialized release output must end in .zip")
-    parent = output.parent.absolute()
-    if not parent.is_dir() or parent.is_symlink() or _is_reparse_point(parent):
-        raise ReleaseError("materialized release parent must be an unredirected directory")
-    try:
-        if parent.resolve(strict=True) != parent:
-            raise ReleaseError("materialized release parent uses redirected components")
-    except OSError as exc:
-        raise ReleaseError(f"cannot resolve materialized release parent: {exc}") from exc
+    parent, parent_identity = _prepare_unredirected_directory(
+        output.parent, label="materialized release parent", create=False
+    )
     payload = _zip_payload({
         name: (member.content, member.mode if member.mode is not None else 0o644)
         for name, member in members.items()
@@ -2216,9 +2467,19 @@ def materialize_verified_directory_zip(root: Path, output: Path) -> dict:
             target.write(payload)
             target.flush()
             os.fsync(target.fileno())
+        _require_directory_identity(
+            parent, parent_identity, label="materialized release parent"
+        )
         os.replace(temporary, output)
+        _require_directory_identity(
+            parent, parent_identity, label="materialized release parent"
+        )
     finally:
-        if temporary.exists():
+        if (
+            _directory_identity(parent, label="materialized release parent")
+            == parent_identity
+            and temporary.exists()
+        ):
             temporary.unlink()
     verified = verify_archive(output)
     if verified["archive_sha256"] != report["archive_sha256"]:
@@ -2238,12 +2499,19 @@ def smoke_archive(path: Path, workspace: Path) -> dict:
     workspace = workspace.absolute()
     if workspace.exists() or workspace.is_symlink() or _is_reparse_point(workspace):
         raise ReleaseError(f"release smoke workspace already exists: {workspace}")
-    if not workspace.parent.is_dir():
-        raise ReleaseError(
-            f"release smoke workspace parent is unavailable: {workspace.parent}"
-        )
+    workspace_parent, parent_identity = _prepare_unredirected_directory(
+        workspace.parent, label="release smoke workspace parent", create=False
+    )
     try:
         workspace.mkdir()
+        _require_directory_identity(
+            workspace_parent,
+            parent_identity,
+            label="release smoke workspace parent",
+        )
+        workspace_identity = _directory_identity(
+            workspace, label="release smoke workspace"
+        )
         for name, member in sorted(members.items()):
             target = workspace.joinpath(*name.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2253,6 +2521,12 @@ def smoke_archive(path: Path, workspace: Path) -> dict:
                 target.chmod(member.mode)
     except OSError as exc:
         raise ReleaseError(f"could not extract verified release for smoke test: {exc}") from exc
+    _require_directory_identity(
+        workspace_parent, parent_identity, label="release smoke workspace parent"
+    )
+    _require_directory_identity(
+        workspace, workspace_identity, label="release smoke workspace"
+    )
 
     if os.name == "nt":
         command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "kit.cmd", "--help"]

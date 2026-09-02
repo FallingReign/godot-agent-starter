@@ -67,10 +67,7 @@ def _canonical_json(value: dict) -> bytes:
 
 
 def _write_managed_install(root: Path) -> tuple[Path, str]:
-    release_sha = hashlib.sha256(b"managed archive").hexdigest()
     source_commit = "a" * 40
-    core = root / ".agent-kit" / "releases" / release_sha
-    core.mkdir(parents=True)
     install_manifest_content = b'{"schema":1}\n'
     contents = {
         "INSTALL-MANIFEST.json": install_manifest_content,
@@ -79,9 +76,6 @@ def _write_managed_install(root: Path) -> tuple[Path, str]:
     }
     entries = []
     for relative, content in sorted(contents.items()):
-        target = core / relative
-        target.write_bytes(content)
-        target.chmod(0o755 if relative.endswith(".py") else 0o644)
         entries.append({
             "path": relative,
             "bytes": len(content),
@@ -107,6 +101,18 @@ def _write_managed_install(root: Path) -> tuple[Path, str]:
         "files": entries,
     }
     manifest_content = _canonical_json(manifest)
+    archive_members = {
+        relative: (content, 0o755 if relative.endswith(".py") else 0o644)
+        for relative, content in contents.items()
+    }
+    archive_members["RELEASE-MANIFEST.json"] = (manifest_content, 0o644)
+    release_sha = context.managed_launcher._canonical_archive_sha256(archive_members)
+    core = root / ".agent-kit" / "releases" / release_sha
+    core.mkdir(parents=True)
+    for relative, content in sorted(contents.items()):
+        target = core / relative
+        target.write_bytes(content)
+        target.chmod(0o755 if relative.endswith(".py") else 0o644)
     manifest_path = core / "RELEASE-MANIFEST.json"
     manifest_path.write_bytes(manifest_content)
     manifest_path.chmod(0o644)

@@ -77,6 +77,19 @@ silently reclaimed by changing the install record.
 The active release pointer changes last. Exact prior bytes are stored before the
 first project-facing write.
 
+## Safety boundary
+
+The lifecycle refuses existing redirected paths, links, altered kit files and
+case collisions. It rechecks exact bytes before each change and before Restore.
+Review sessions and journals use checksums to detect accidental damage; they do
+not prove who wrote a file.
+
+Another process running as the same operating-system user can still rewrite
+files during an already-running command. That is outside this kit's security
+boundary. Do not run two kit changes or another file-writing agent against the
+same project at once. The lifecycle lock prevents two cooperating kit changes;
+it cannot contain unrelated software that ignores the lock.
+
 ## Result states
 
 | State | Meaning | Next action |
