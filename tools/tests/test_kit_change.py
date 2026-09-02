@@ -619,6 +619,39 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual(original, agents.read_bytes())
         self.assertFalse((self.root / ".agent-kit").exists())
 
+    def test_interrupted_created_core_removal_resumes_from_exact_subset(self) -> None:
+        original = b"# Human project rules\n"
+        _write(self.root, "AGENTS.md", original)
+        result = self._preview_and_apply()
+        removed: list[str] = []
+
+        def crash(name: str) -> None:
+            if name.startswith("after-core-member:"):
+                removed.append(name.removeprefix("after-core-member:"))
+                raise SimulatedCrash(name)
+
+        with mock.patch.object(kit_change, "_failpoint", side_effect=crash):
+            with self.assertRaises(SimulatedCrash):
+                kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual(1, len(removed))
+        core = (
+            self.root
+            / ".agent-kit"
+            / "releases"
+            / str(self.fixture[0]["archive_sha256"])
+        )
+        self.assertTrue(core.is_dir())
+        self.assertFalse(core.joinpath(*removed[0].split("/")).exists())
+
+        recovered = kit_change.resume(self.root)
+
+        self.assertEqual("rolled_back", recovered["status"])
+        self.assertEqual(original, (self.root / "AGENTS.md").read_bytes())
+        self.assertFalse((self.root / "kit.cmd").exists())
+        self.assertFalse((self.root / ".agent-kit.json").exists())
+        self.assertFalse((self.root / ".agent-kit").exists())
+
     def test_case_collision_blocks_preview(self) -> None:
         _write(self.root, "agents.md", b"different spelling by case\n")
 

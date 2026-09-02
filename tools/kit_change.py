@@ -2401,26 +2401,44 @@ def _restore_entry(root: Path, entry: dict[str, Any], backup: dict[str, Any]) ->
         raise KitChangeError("rollback-failed", f"restored bytes did not verify: {relative}")
 
 
-def _core_matches_journal(core: Path, members: list[dict[str, Any]]) -> bool:
+def _core_matches_journal(
+    core: Path,
+    members: list[dict[str, Any]],
+    *,
+    allow_missing: bool = False,
+) -> bool:
     if core.is_symlink() or _is_reparse(core) or not core.is_dir():
         return False
     expected = [str(member["path"]) for member in members]
+    expected_directories: set[str] = set()
+    for relative in expected:
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() != ".":
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
     actual: list[str] = []
+    actual_directories: list[str] = []
     for current, directories, filenames in os.walk(core, topdown=True, followlinks=False):
         base = Path(current)
         for name in list(directories):
             child = base / name
             if child.is_symlink() or _is_reparse(child) or not child.is_dir():
                 return False
+            actual_directories.append(child.relative_to(core).as_posix())
         for name in filenames:
             child = base / name
             if child.is_symlink() or _is_reparse(child) or not child.is_file():
                 return False
             actual.append(child.relative_to(core).as_posix())
-    if sorted(actual) != expected:
+    if not set(actual_directories).issubset(expected_directories):
+        return False
+    if allow_missing:
+        if not set(actual).issubset(expected):
+            return False
+    elif sorted(actual) != expected or set(actual_directories) != expected_directories:
         return False
     by_path = {str(member["path"]): member for member in members}
-    for relative in expected:
+    for relative in actual:
         path = core.joinpath(*PurePosixPath(relative).parts)
         expected_member = by_path[relative]
         try:
@@ -2440,6 +2458,15 @@ def _core_matches_journal(core: Path, members: list[dict[str, Any]]) -> bool:
     return True
 
 
+def _rollback_started(journal: dict[str, Any]) -> bool:
+    return any(
+        isinstance(item, dict)
+        and item.get("state") == "rolling_back"
+        and item.get("code") == "rollback-started"
+        for item in journal.get("history", [])
+    )
+
+
 def _remove_created_core(root: Path, journal: dict[str, Any]) -> None:
     core_state = journal["core"]["state"]
     if core_state == "reused":
@@ -2449,14 +2476,21 @@ def _remove_created_core(root: Path, journal: dict[str, Any]) -> None:
     if not core.exists():
         return
     members = journal["core"]["members"]
-    if not _core_matches_journal(core, members):
+    if not _core_matches_journal(
+        core,
+        members,
+        allow_missing=_rollback_started(journal),
+    ):
         raise KitChangeError(
             "rollback-conflict", "new managed core changed after Apply"
         )
     for member in reversed(members):
         path = core.joinpath(*PurePosixPath(str(member["path"])).parts)
+        if not path.exists():
+            continue
         try:
             path.unlink()
+            _failpoint(f"after-core-member:{member['path']}")
         except OSError as exc:
             raise KitChangeError(
                 "rollback-failed", f"cannot remove managed core member {member['path']}: {exc}"
@@ -2472,8 +2506,11 @@ def _remove_created_core(root: Path, journal: dict[str, Any]) -> None:
         key=lambda value: (-len(PurePosixPath(value).parts), value),
     )
     for directory in directories:
+        path = core.joinpath(*PurePosixPath(directory).parts)
+        if not path.exists():
+            continue
         try:
-            core.joinpath(*PurePosixPath(directory).parts).rmdir()
+            path.rmdir()
         except OSError as exc:
             raise KitChangeError(
                 "rollback-failed", f"cannot remove managed core directory {directory}: {exc}"
@@ -2492,7 +2529,11 @@ def _rollback_locked(root: Path, path: Path, journal: dict[str, Any]) -> dict[st
         if (
             journal["core"]["state"] != "reused"
             and core.exists()
-            and not _core_matches_journal(core, journal["core"]["members"])
+            and not _core_matches_journal(
+                core,
+                journal["core"]["members"],
+                allow_missing=_rollback_started(journal),
+            )
         ):
             raise KitChangeError(
                 "rollback-conflict", "new managed core changed after Apply"
