@@ -67,10 +67,35 @@ bounded native retry.
 | `kit retro run --confirm-spend` | Invoke an automatic analyzer | Explicit external-provider action |
 | `kit retro publish` | Validate findings, refresh both views and transactionally close the exact evidence snapshot | No worker dispatch |
 | `kit release build PATH` | Build and verify a sanitized archive | Local archive only; never publishes |
+| `kit install TARGET [--release PATH]` | Review adding the kit to an existing project | No project-facing change before Apply |
+| `kit upgrade TARGET [--release PATH]` | Review replacing only managed kit parts | Authenticates existing ownership before Apply |
+| `kit recover SESSION_ID` | Continue or restore an interrupted kit change | Uses the exact durable session and journal |
 
 All commands accept `--project PATH` and `--json`. A kit root is the nearest
 ancestor containing `.agent-kit.json`; layout and private runtime paths come from
 `kit.config.json`, never from the current directory by inference.
+
+## Install and upgrade
+
+Do not copy the kit repository over an existing project. Build a release, then
+use the bounded review:
+
+```text
+kit release build PATH/agent-kit-0.3.0.zip
+kit install PATH/TO/PROJECT --release PATH/agent-kit-0.3.0.zip
+kit upgrade PATH/TO/PROJECT --release PATH/agent-kit-0.3.0.zip
+```
+
+`install` and `upgrade` print one exact local review link. The review shows what
+will be created, changed, preserved, or removed. **Apply** writes a journal and
+backup first, changes the active release last, and runs offline kit and project
+checks. **Restore** puts exact prior project bytes back. Existing project gaps
+remain visible as **Adoption required**; they are not called fixed and do not
+authorize a project rewrite.
+
+If work stops between durable steps, run `kit recover FULL_SESSION_ID` from the
+same incoming kit. See [Install and upgrade the kit](docs/LIFECYCLE.md) for the
+complete short runbook and preservation boundaries.
 
 ## Explicit setup
 

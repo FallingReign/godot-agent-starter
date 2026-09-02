@@ -13,6 +13,11 @@ launchers use only that file and fail closed if it is relative, missing or not a
 file; they never fall back to another Python. It is runtime input, not kit
 configuration. Ordinary developer setup should leave it unset.
 
+Adding the kit to an existing project or upgrading an installed kit is a separate
+reviewed lifecycle, not a setup repair or folder copy. Use `kit install TARGET`,
+`kit upgrade TARGET`, and `kit recover SESSION_ID` as described in
+[`docs/LIFECYCLE.md`](docs/LIFECYCLE.md).
+
 ---
 
 ## 1. Detect
