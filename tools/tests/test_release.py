@@ -807,6 +807,18 @@ class TestSourcePathSafety(ReleaseTestCase):
             with self.assertRaisesRegex(release.ReleaseError, "source is a reparse point"):
                 release.collect_files(root)
 
+    def test_allowlisted_source_hardlink_is_refused(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        readme = root / "README.md"
+        alias = root / "README-hardlink.md"
+        try:
+            os.link(readme, alias)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+        with self.assertRaisesRegex(release.ReleaseError, "hard link"):
+            release.collect_files(root)
+
     def test_missing_reviewed_surface_refuses_incomplete_release(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
         (root / "tools" / "tests" / "test_engine_boundary.py").unlink()
@@ -862,6 +874,58 @@ class TestArchivePathSafety(ReleaseTestCase):
                 self._tar_with("README.md", symlink=True)):
             with self.subTest(archive=archive.name):
                 with self.assertRaisesRegex(release.ReleaseError, "symlink"):
+                    release.inspect_archive(archive)
+
+    def test_hardlinked_archive_is_refused(self) -> None:
+        archive = self._zip_with("README.md")
+        alias = self.scratch / "archive-hardlink.zip"
+        try:
+            os.link(archive, alias)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+        with self.assertRaisesRegex(release.ReleaseError, "hard link"):
+            release.inspect_archive(alias)
+
+    def test_archive_growth_during_read_is_refused(self) -> None:
+        archive = self._zip_with("README.md")
+        original_fstat = release.os.fstat
+        calls = 0
+
+        def changed_fstat(descriptor: int):
+            nonlocal calls
+            calls += 1
+            info = original_fstat(descriptor)
+            if calls == 2:
+                changed = mock.Mock(wraps=info)
+                changed.st_size = info.st_size + 1
+                return changed
+            return info
+
+        with mock.patch.object(release.os, "fstat", side_effect=changed_fstat):
+            with self.assertRaisesRegex(release.ReleaseError, "changed while reading"):
+                release.inspect_archive(archive)
+
+    def test_archive_replacement_during_read_is_refused(self) -> None:
+        archive = self._zip_with("README.md")
+        path_type = type(archive)
+        original_lstat = path_type.lstat
+        calls = 0
+
+        def replaced_lstat(path: Path):
+            nonlocal calls
+            info = original_lstat(path)
+            if path == archive:
+                calls += 1
+                if calls == 2:
+                    replaced = mock.Mock(wraps=info)
+                    replaced.st_ino = info.st_ino + 1
+                    return replaced
+            return info
+
+        with mock.patch.object(release, "_is_reparse_point", return_value=False):
+            with mock.patch.object(path_type, "lstat", autospec=True, side_effect=replaced_lstat):
+                with self.assertRaisesRegex(release.ReleaseError, "changed while reading"):
                     release.inspect_archive(archive)
 
 

@@ -206,6 +206,8 @@ TOOL_FILES = frozenset({
     "tools/gdls.py",
     "tools/gen_gdscript_doc.py",
     "tools/kit_change.py",
+    "tools/kit_change_check.py",
+    "tools/kit_change_controller.py",
     "tools/kit_change_html.py",
     "tools/managed_launcher.py",
     "tools/md.py",
@@ -241,6 +243,7 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_authored_scope.py",
     "tools/tests/test_bootstrap.py",
     "tools/tests/test_brownfield.py",
+    "tools/tests/test_brownfield_gate.py",
     "tools/tests/test_cockpit.py",
     "tools/tests/test_design_conformance.py",
     "tools/tests/test_design_governance.py",
@@ -252,6 +255,9 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_gd_signature.py",
     "tools/tests/test_integration.py",
     "tools/tests/test_kit_change.py",
+    "tools/tests/test_kit_change_board.py",
+    "tools/tests/test_kit_change_check.py",
+    "tools/tests/test_kit_change_controller.py",
     "tools/tests/test_kit_change_html.py",
     "tools/tests/test_kit_cli.py",
     "tools/tests/test_layout_consumers.py",
@@ -656,10 +662,16 @@ LEGACY_0_2_0_PRESERVED_PATHS = frozenset({
 MANAGED_LIFECYCLE_SOURCE_FILES = frozenset({
     "tools/brownfield.py",
     "tools/kit_change.py",
+    "tools/kit_change_check.py",
+    "tools/kit_change_controller.py",
     "tools/kit_change_html.py",
     "tools/managed_launcher.py",
     "tools/tests/test_brownfield.py",
+    "tools/tests/test_brownfield_gate.py",
     "tools/tests/test_kit_change.py",
+    "tools/tests/test_kit_change_board.py",
+    "tools/tests/test_kit_change_check.py",
+    "tools/tests/test_kit_change_controller.py",
     "tools/tests/test_kit_change_html.py",
     "tools/tests/test_managed_launcher.py",
 })
@@ -781,22 +793,63 @@ def _source_path(root: Path, relative: str) -> Path:
 
 
 def _read_stable(path: Path, relative: str) -> bytes:
-    try:
-        with path.open("rb") as source:
-            before = os.fstat(source.fileno())
-            content = source.read(MAX_FILE_BYTES + 1)
-            after = os.fstat(source.fileno())
-    except OSError as exc:
-        raise ReleaseError(f"cannot read allowlisted source {relative}: {exc}") from exc
-    if len(content) > MAX_FILE_BYTES:
-        raise ReleaseError(f"allowlisted source exceeds {MAX_FILE_BYTES} bytes: {relative}")
-    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
-        raise ReleaseError(f"allowlisted source changed while reading: {relative}")
+    content = _read_regular_bytes(
+        path,
+        label=f"allowlisted source {relative}",
+        limit=MAX_FILE_BYTES,
+    )
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ReleaseError(f"allowlisted source is not UTF-8 text: {relative}") from exc
     return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def _read_regular_bytes(path: Path, *, label: str, limit: int) -> bytes:
+    """Read one exact regular file once, rejecting redirects, links and races."""
+    try:
+        path_before = path.lstat()
+        if (
+            stat.S_ISLNK(path_before.st_mode)
+            or _is_reparse_point(path)
+            or not stat.S_ISREG(path_before.st_mode)
+        ):
+            raise ReleaseError(f"{label} is linked or not a regular file: {path}")
+        if int(getattr(path_before, "st_nlink", 1)) != 1:
+            raise ReleaseError(f"{label} may not be a hard link: {path}")
+        if path_before.st_size > limit:
+            raise ReleaseError(f"{label} exceeds {limit} bytes: {path}")
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            content = source.read(limit + 1)
+            after = os.fstat(source.fileno())
+        path_after = path.lstat()
+    except ReleaseError:
+        raise
+    except OSError as exc:
+        raise ReleaseError(f"cannot read {label}: {exc}") from exc
+    if len(content) > limit:
+        raise ReleaseError(f"{label} exceeds {limit} bytes: {path}")
+
+    path_fields = (
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_nlink",
+    )
+    handle_fields = (
+        "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink",
+    )
+    cross_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink")
+    if (
+        tuple(getattr(path_before, key, None) for key in path_fields)
+        != tuple(getattr(path_after, key, None) for key in path_fields)
+        or tuple(getattr(path_before, key, None) for key in cross_fields)
+        != tuple(getattr(before, key, None) for key in cross_fields)
+        or tuple(getattr(before, key, None) for key in handle_fields)
+        != tuple(getattr(after, key, None) for key in handle_fields)
+        or _is_reparse_point(path)
+        or len(content) != before.st_size
+    ):
+        raise ReleaseError(f"{label} changed while reading: {path}")
+    return content
 
 
 def _candidate_paths(root: Path) -> list[str]:
@@ -1693,22 +1746,11 @@ def build_release(root: Path, output: Path) -> dict:
     return verify_archive(output)
 
 
-def _bounded_archive(path: Path) -> None:
-    if path.is_symlink() or _is_reparse_point(path):
-        raise ReleaseError(f"archive is a link or reparse point: {path}")
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise ReleaseError(f"cannot read archive: {exc}") from exc
-    if size > MAX_ARCHIVE_BYTES:
-        raise ReleaseError(f"archive exceeds {MAX_ARCHIVE_BYTES} bytes")
-
-
-def _read_zip(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
+def _read_zip(content: bytes) -> tuple[str, dict[str, ArchiveMember]]:
     members: dict[str, ArchiveMember] = {}
     total = 0
     try:
-        with zipfile.ZipFile(path, "r") as archive:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
             infos = archive.infolist()
             if len(infos) > MAX_MEMBERS:
                 raise ReleaseError(f"archive has more than {MAX_MEMBERS} members")
@@ -1741,11 +1783,11 @@ def _read_zip(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
     return "zip", members
 
 
-def _read_tar(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
+def _read_tar(content: bytes, *, name: str) -> tuple[str, dict[str, ArchiveMember]]:
     members: dict[str, ArchiveMember] = {}
     total = 0
     try:
-        with tarfile.open(path, "r:*") as archive:
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:*") as archive:
             infos = archive.getmembers()
             if len(infos) > MAX_MEMBERS:
                 raise ReleaseError(f"archive has more than {MAX_MEMBERS} members")
@@ -1773,17 +1815,28 @@ def _read_tar(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
         if isinstance(exc, ReleaseError):
             raise
         raise ReleaseError(f"invalid tar archive: {exc}") from exc
-    kind = "tar.gz" if path.name.lower().endswith((".tar.gz", ".tgz")) else "tar"
+    kind = "tar.gz" if name.lower().endswith((".tar.gz", ".tgz")) else "tar"
     return kind, members
 
 
-def _read_archive(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
-    _bounded_archive(path)
-    if zipfile.is_zipfile(path):
-        return _read_zip(path)
-    if tarfile.is_tarfile(path):
-        return _read_tar(path)
+def _read_archive_material(path: Path) -> tuple[str, dict[str, ArchiveMember], bytes]:
+    content = _read_regular_bytes(path, label="archive", limit=MAX_ARCHIVE_BYTES)
+    if zipfile.is_zipfile(io.BytesIO(content)):
+        kind, members = _read_zip(content)
+        return kind, members, content
+    try:
+        kind, members = _read_tar(content, name=path.name)
+    except ReleaseError as exc:
+        if "invalid tar archive" not in str(exc):
+            raise
+    else:
+        return kind, members, content
     raise ReleaseError("file is neither a readable zip nor tar archive")
+
+
+def _read_archive(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
+    kind, members, _content = _read_archive_material(path)
+    return kind, members
 
 
 def _parse_manifest(member: ArchiveMember) -> dict:
@@ -1959,8 +2012,8 @@ def _verify_member_set(
 
 def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     """Return a verification report and the exact members it authenticated."""
-    kind, members = _read_archive(path)
-    archive_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    kind, members, content = _read_archive_material(path)
+    archive_hash = hashlib.sha256(content).hexdigest()
     return _verify_member_set(kind, members, archive_hash)
 
 
