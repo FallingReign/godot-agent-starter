@@ -5,15 +5,28 @@ copying a repository over that project.
 
 ## Quick read
 
-1. Build or obtain one verified kit release.
-2. Run `kit install TARGET` or `kit upgrade TARGET` from that release.
-3. Open the exact local review link printed by the command.
-4. Review the affected files, then choose **Add kit** or **Upgrade kit**.
-5. Keep the result, or choose **Restore** to put the prior project bytes back.
+1. Start with a real Godot 4.7.2 GDScript project and close Godot.
+2. Build or obtain one verified kit release.
+3. Run `kit install TARGET` or `kit upgrade TARGET` from that release.
+4. Open the exact local review link printed by the command.
+5. Review the affected files, then choose **Add kit** or **Upgrade kit**.
+6. Keep the result, or choose **Restore** to put the prior project bytes back.
 
 The review does not change game files, design, project instructions, Git, or the
 active kit. It may retain the release and review session in private `.kit/runtime`
 storage so an interrupted review can be recovered.
+
+## Project requirement
+
+The target must already contain one regular `project.godot` at the project root,
+or one unique `project.godot` in a nested game folder. An empty folder is not a
+project and is refused. The kit never invents or edits `project.godot`.
+
+For a new game:
+
+1. Create a blank Godot 4.7.2 project using GDScript.
+2. Close Godot.
+3. Install the kit into that project.
 
 ## Build a release
 
@@ -28,7 +41,7 @@ proposal, retrospective state, private runtime, and other project-specific data.
 
 ## Install into an existing project
 
-From a built or extracted release:
+From the incoming extracted release:
 
 ```text
 kit install PATH/TO/PROJECT
@@ -43,6 +56,12 @@ kit install PATH/TO/PROJECT --release PATH/TO/agent-kit-0.3.0.zip
 If the project contains more than one possible `project.godot`, the review asks
 one D1 question. Choosing a folder creates a new exact review; it does not edit
 the project.
+
+The kit running the command must be the exact incoming extracted release, or a
+clean source checkout that produces that exact release. A different version or
+a changed source checkout is refused before any project or review-session file
+is written. Run the command from the incoming extracted release, or from its
+matching clean source checkout.
 
 ## Upgrade an installed kit
 
@@ -61,6 +80,10 @@ kit upgrade PATH/TO/PROJECT --release PATH/TO/agent-kit-0.3.0.zip
 Upgrade authenticates the old active core and its ownership record before it
 trusts any file as kit-owned. A human-edited file or managed section is never
 silently reclaimed by changing the install record.
+
+The project's older active kit cannot control an upgrade to a newer release.
+Run the upgrade from the incoming extracted release, or from the clean source
+checkout that produces it.
 
 ## What the Apply stage may change
 

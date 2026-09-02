@@ -4,9 +4,9 @@ A reusable, cross-platform control kit for agent-assisted Godot 4.7.2 projects.
 It keeps planning, verification, retrospective evidence and maintenance decisions
 auditable while leaving the game itself project-owned.
 
-The kit supports GDScript projects whose `project.godot` is either at the
-repository root or under `src/`. It does not assume a genre, multiplayer, 2D or
-3D, procedural content, or a custom persistence format.
+The kit supports Godot 4.7.2 GDScript projects whose `project.godot` is at the
+project root or in one unique nested game folder. It does not assume a genre,
+multiplayer, 2D or 3D, procedural content, or a custom persistence format.
 
 ## Safe start
 
@@ -85,6 +85,16 @@ kit release build PATH/agent-kit-0.3.0.zip
 kit install PATH/TO/PROJECT --release PATH/agent-kit-0.3.0.zip
 kit upgrade PATH/TO/PROJECT --release PATH/agent-kit-0.3.0.zip
 ```
+
+The target must already be a real Godot 4.7.2 GDScript project with a regular
+`project.godot` at the project root or in one unique nested game folder. An empty
+folder is refused because the kit never invents or edits `project.godot`. For a
+new game, create and close a blank Godot project first, then install the kit.
+
+The kit running the change must be the exact incoming extracted release, or a
+clean source checkout that produces that exact release. A mismatch is refused
+before any project or review-session file is written. Run the command from the
+incoming extracted release, or from its matching clean source checkout.
 
 `install` and `upgrade` print one exact local review link. The review shows what
 will be created, changed, preserved, or removed. **Apply** writes a journal and

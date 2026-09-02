@@ -18,6 +18,18 @@ reviewed lifecycle, not a setup repair or folder copy. Use `kit install TARGET`,
 `kit upgrade TARGET`, and `kit recover SESSION_ID` as described in
 [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md).
 
+The install target must already be a real Godot 4.7.2 GDScript project with a
+regular `project.godot` at the project root or in one unique nested game folder.
+The kit refuses an empty folder because it never invents or edits
+`project.godot`. For a new game, create and close a blank Godot project first,
+then install the kit.
+
+Run install, upgrade and recovery from the exact incoming extracted release, or
+from a clean source checkout that produces that exact release. A different or
+changed kit is refused before any project or review-session file is written.
+Move to the incoming extracted release, or its matching clean source checkout,
+and run the command again.
+
 ---
 
 ## 1. Detect
