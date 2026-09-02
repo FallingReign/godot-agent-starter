@@ -1273,15 +1273,15 @@ class TestSourcePathSafety(ReleaseTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         manifest = REPOSITORY / release.MANIFEST_PATH
-        cls.installed_release = (
+        # The launcher authenticates a packaged release before self-test. By
+        # this point earlier tests may legitimately have created .git or the
+        # private runtime, so this check identifies the layout without trying
+        # to prove that the already-used disposable copy is still pristine.
+        cls.packaged_layout = (
             manifest.exists()
             or manifest.is_symlink()
             or release._is_reparse_point(manifest)
         )
-        if cls.installed_release:
-            report, _members = release.read_verified_directory(REPOSITORY)
-            if not report["ok"]:
-                raise AssertionError("installed release did not authenticate")
 
     def test_canonical_release_surface_sets_are_complete_and_exact(self) -> None:
         actual_tools = {
@@ -1308,7 +1308,7 @@ class TestSourcePathSafety(ReleaseTestCase):
         }
         present_source_only = (
             set()
-            if self.installed_release
+            if self.packaged_layout
             else set(release.SOURCE_ONLY_VALIDATION_FILES)
         )
         self.assertEqual(actual_tests, packaged_tests | present_source_only)
@@ -1325,7 +1325,7 @@ class TestSourcePathSafety(ReleaseTestCase):
         }
         self.assertEqual(
             present,
-            not self.installed_release,
+            not self.packaged_layout,
             "source checkout must discover the lifecycle E2E; installed release "
             "must exclude it",
         )
