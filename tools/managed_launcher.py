@@ -234,6 +234,75 @@ def _member_file(core: Path, parts: tuple[str, ...]) -> Path:
     return result
 
 
+def _validate_core_tree(core: Path, manifest_paths: Sequence[str]) -> None:
+    """Reject anything in the selected core that the manifest did not name."""
+    expected_files = set(manifest_paths) | {MANIFEST_NAME}
+    expected_directories: set[str] = set()
+    for relative in expected_files:
+        parent = PurePosixPath(relative).parent
+        while str(parent) != ".":
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    pending: list[tuple[Path, str]] = [(core, "")]
+    inspected = 0
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise LauncherError(
+                f"release core cannot be enumerated: {directory}: {exc}"
+            ) from exc
+        folded: set[str] = set()
+        for child in children:
+            inspected += 1
+            if inspected > MAX_MEMBERS * 4:
+                raise LauncherError("release core contains too many entries")
+            if child.name.casefold() in folded:
+                raise LauncherError(
+                    f"release core contains a case collision: {child.name}"
+                )
+            folded.add(child.name.casefold())
+            relative = f"{prefix}/{child.name}" if prefix else child.name
+            info = _lstat(child, f"release core entry {relative}")
+            if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+                raise LauncherError(
+                    f"release core entry must not be redirected: {relative}"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                actual_directories.add(relative)
+                pending.append((child, relative))
+            elif stat.S_ISREG(info.st_mode):
+                if int(getattr(info, "st_nlink", 1)) != 1:
+                    raise LauncherError(
+                        f"release core entry may not be a hard link: {relative}"
+                    )
+                actual_files.add(relative)
+            else:
+                raise LauncherError(
+                    f"release core contains a non-regular entry: {relative}"
+                )
+
+    extra_files = sorted(actual_files - expected_files)
+    missing_files = sorted(expected_files - actual_files)
+    extra_directories = sorted(actual_directories - expected_directories)
+    missing_directories = sorted(expected_directories - actual_directories)
+    if extra_files or missing_files or extra_directories or missing_directories:
+        details: list[str] = []
+        if extra_files:
+            details.append("unlisted file " + extra_files[0])
+        if missing_files:
+            details.append("missing file " + missing_files[0])
+        if extra_directories:
+            details.append("unlisted directory " + extra_directories[0])
+        if missing_directories:
+            details.append("missing directory " + missing_directories[0])
+        raise LauncherError("release core member set differs: " + "; ".join(details))
+
+
 def _validate_manifest(core: Path, release: dict, manifest_path: Path) -> dict:
     manifest_content = _require_regular_file(
         manifest_path, "release manifest", maximum=MAX_MANIFEST_BYTES
@@ -318,6 +387,8 @@ def _validate_manifest(core: Path, release: dict, manifest_path: Path) -> dict:
             or any(not isinstance(item, str) or item not in LEGAL_FILES or item not in paths
                    for item in licenses)):
         raise LauncherError("release legal metadata is malformed")
+
+    _validate_core_tree(core, paths)
 
     for entry, parts in entries:
         rendered = "/".join(parts)

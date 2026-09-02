@@ -194,6 +194,38 @@ class InstallationSelection(unittest.TestCase):
                 current["active_release"]["source_commit"], selected.source_commit
             )
 
+    def test_managed_release_refuses_unlisted_core_content(self) -> None:
+        with _scratch() as root:
+            core, _current_path, _current = _managed(root)
+            (core / "json.py").write_text("raise RuntimeError('shadowed')\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(launcher.LauncherError, "unlisted file json.py"):
+                launcher.resolve_installation(root)
+
+        with _scratch() as root:
+            core, _current_path, _current = _managed(root)
+            (core / "empty-extra-directory").mkdir()
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError, "unlisted directory empty-extra-directory"
+            ):
+                launcher.resolve_installation(root)
+
+    def test_managed_release_refuses_a_hardlinked_member(self) -> None:
+        with _scratch() as root:
+            core, _current_path, _current = _managed(root)
+            member = core / "kit.py"
+            source = root / "hardlink-source.py"
+            source.write_bytes(member.read_bytes())
+            member.unlink()
+            try:
+                os.link(source, member)
+            except OSError as exc:
+                self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+            with self.assertRaisesRegex(launcher.LauncherError, "hard link"):
+                launcher.resolve_installation(root)
+
     def test_partial_managed_directory_never_falls_back_to_flat(self) -> None:
         with _scratch() as root:
             _flat(root)
@@ -379,7 +411,9 @@ class InstallationSelection(unittest.TestCase):
                 return info
 
             with mock.patch.object(Path, "lstat", autospec=True, side_effect=fake_lstat):
-                with self.assertRaisesRegex(launcher.LauncherError, "regular file"):
+                with self.assertRaisesRegex(
+                    launcher.LauncherError, "redirected|regular file"
+                ):
                     launcher.resolve_installation(root)
 
 

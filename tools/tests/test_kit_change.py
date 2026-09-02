@@ -437,6 +437,14 @@ class KitChangeTest(unittest.TestCase):
         self.assertFalse((self.root / "kit.cmd").exists())
         self.assertFalse((self.root / ".agent-kit.json").exists())
         self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+        self.assertFalse((self.root / ".agent-kit").exists())
+
+        next_preview = kit_change.preview(self.root, self.archive)
+        self.assertTrue(next_preview["approval"]["approvable"])
+        reapplied = kit_change.apply(
+            self.root, self.archive, str(next_preview["approval"]["sha256"])
+        )
+        self.assertEqual("applied", reapplied["status"])
 
     def test_crash_during_project_writes_resumes_by_rolling_back(self) -> None:
         original = b"# Human project rules\n"
@@ -460,6 +468,7 @@ class KitChangeTest(unittest.TestCase):
         self.assertFalse((self.root / "kit.cmd").exists())
         self.assertFalse((self.root / ".agent-kit.json").exists())
         self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+        self.assertFalse((self.root / ".agent-kit").exists())
 
     def test_crash_after_activation_resumes_forward(self) -> None:
         _write(self.root, "AGENTS.md", b"# Human project rules\n")
@@ -500,6 +509,22 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual((self.root / "AGENTS.md").read_bytes(), original)
         self.assertFalse((self.root / "kit.cmd").exists())
         self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+        self.assertFalse((self.root / ".agent-kit").exists())
+
+    def test_rollback_refuses_a_modified_new_core_before_restoring_project_files(self) -> None:
+        original = b"# Human project rules\n"
+        _write(self.root, "AGENTS.md", original)
+        result = self._preview_and_apply()
+        installed_agents = (self.root / "AGENTS.md").read_bytes()
+        core_file = self.root / ".agent-kit" / "releases" / ("a" * 64) / "kit.py"
+        core_file.write_bytes(b"tampered core\n")
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("rollback-conflict", raised.exception.code)
+        self.assertEqual(installed_agents, (self.root / "AGENTS.md").read_bytes())
+        self.assertTrue((self.root / ".agent-kit" / "current.json").is_file())
 
     def test_rollback_refuses_a_third_version(self) -> None:
         _write(self.root, "AGENTS.md", b"# Human project rules\n")
@@ -545,6 +570,89 @@ class KitChangeTest(unittest.TestCase):
             "redirected-path",
             {blocker["code"] for blocker in decision["material"]["blockers"]},
         )
+
+    def test_hardlinked_managed_target_blocks_preview(self) -> None:
+        agents = _write(self.root, "AGENTS.md", b"# Human project rules\n")
+        alias = self.root / "agents-hardlink-source.md"
+        try:
+            os.link(agents, alias)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertIn(
+            "unsafe-hardlink",
+            {blocker["code"] for blocker in decision["material"]["blockers"]},
+        )
+
+    def test_hardlinked_managed_core_blocks_reuse(self) -> None:
+        result = self._preview_and_apply()
+        self.assertEqual(result["status"], "applied")
+        core = self.root / ".agent-kit" / "releases" / ("a" * 64)
+        member = core / "kit.py"
+        source = self.root / "core-hardlink-source.py"
+        source.write_bytes(member.read_bytes())
+        member.unlink()
+        try:
+            os.link(source, member)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertIn(
+            "managed-core-modified",
+            {blocker["code"] for blocker in decision["material"]["blockers"]},
+        )
+
+    def test_exact_transaction_can_be_inspected_after_apply(self) -> None:
+        decision = kit_change.preview(self.root, self.archive)
+        result = kit_change.apply(
+            self.root, self.archive, str(decision["approval"]["sha256"])
+        )
+
+        inspected = kit_change.inspect_transaction(
+            self.root,
+            preview_sha256=str(decision["approval"]["sha256"]),
+            target_scope_sha256=str(decision["material"]["target_scope_sha256"]),
+        )
+
+        self.assertEqual("applied", inspected["status"])
+        self.assertEqual(result["transaction_id"], inspected["transaction_id"])
+        self.assertEqual(decision["approval"]["sha256"], inspected["preview_sha256"])
+
+    def test_transaction_inspection_refuses_missing_or_ambiguous_matches(self) -> None:
+        decision = kit_change.preview(self.root, self.archive)
+        with self.assertRaises(kit_change.KitChangeError) as missing:
+            kit_change.inspect_transaction(
+                self.root,
+                preview_sha256=str(decision["approval"]["sha256"]),
+                target_scope_sha256=str(decision["material"]["target_scope_sha256"]),
+            )
+        self.assertEqual("transaction-missing", missing.exception.code)
+
+        kit_change.apply(
+            self.root, self.archive, str(decision["approval"]["sha256"])
+        )
+        transactions = self.root / ".kit" / "runtime" / "upgrade" / "transactions"
+        original = next(transactions.glob("*/journal.json"))
+        duplicate_id = "f" * 32
+        duplicate = transactions / duplicate_id / "journal.json"
+        duplicate.parent.mkdir()
+        value = json.loads(original.read_text(encoding="utf-8"))
+        value["transaction_id"] = duplicate_id
+        duplicate.write_bytes(_canonical(value))
+
+        with self.assertRaises(kit_change.KitChangeError) as ambiguous:
+            kit_change.inspect_transaction(
+                self.root,
+                preview_sha256=str(decision["approval"]["sha256"]),
+                target_scope_sha256=str(decision["material"]["target_scope_sha256"]),
+            )
+        self.assertEqual("transaction-ambiguous", ambiguous.exception.code)
 
     def test_traversal_in_install_manifest_is_rejected(self) -> None:
         report, members = _release_fixture(owned_path="../outside.cmd")

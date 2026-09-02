@@ -53,7 +53,7 @@ INSTALL_SCHEMA = 1
 PREVIEW_SCHEMA = 1
 STATE_SCHEMA = 1
 BACKUP_SCHEMA = 1
-JOURNAL_SCHEMA = 1
+JOURNAL_SCHEMA = 2
 MAX_MANAGED_FILE_BYTES = 4 * 1024 * 1024
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 MAX_BACKUP_ENTRIES = 1024
@@ -418,15 +418,72 @@ def _select_game_root(
 
 def _stable_bytes(path: Path, *, limit: int = MAX_MANAGED_FILE_BYTES) -> bytes:
     try:
+        path_before = path.lstat()
+        if (
+            stat.S_ISLNK(path_before.st_mode)
+            or _is_reparse(path)
+            or not stat.S_ISREG(path_before.st_mode)
+        ):
+            raise KitChangeError(
+                "unsafe-path", f"managed target is not a regular file: {path}"
+            )
+        if int(getattr(path_before, "st_nlink", 1)) != 1:
+            raise KitChangeError(
+                "unsafe-hardlink", f"managed target may not be a hard link: {path}"
+            )
         with path.open("rb") as handle:
             before = os.fstat(handle.fileno())
             content = handle.read(limit + 1)
             after = os.fstat(handle.fileno())
+        path_after = path.lstat()
+    except KitChangeError:
+        raise
     except OSError as exc:
         raise KitChangeError("file-unreadable", f"cannot read {path}: {exc}") from exc
     if len(content) > limit:
         raise KitChangeError("file-too-large", f"managed file exceeds {limit} bytes: {path}")
-    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+    path_identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_nlink",
+    )
+    handle_identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_nlink",
+    )
+    stable_path_identity_fields = (*path_identity_fields, "st_ctime_ns")
+    stable_handle_identity_fields = (*handle_identity_fields, "st_ctime_ns")
+    path_before_identity = tuple(
+        getattr(path_before, field, None) for field in stable_path_identity_fields
+    )
+    path_handle_identity = tuple(
+        getattr(path_before, field, None) for field in handle_identity_fields
+    )
+    before_path_identity = tuple(
+        getattr(before, field, None) for field in handle_identity_fields
+    )
+    before_identity = tuple(
+        getattr(before, field, None) for field in stable_handle_identity_fields
+    )
+    after_identity = tuple(
+        getattr(after, field, None) for field in stable_handle_identity_fields
+    )
+    path_after_identity = tuple(
+        getattr(path_after, field, None) for field in stable_path_identity_fields
+    )
+    if (
+        path_before_identity != path_after_identity
+        or path_handle_identity != before_path_identity
+        or before_identity != after_identity
+        or _is_reparse(path)
+        or len(content) != before.st_size
+    ):
         raise KitChangeError("file-changed", f"file changed while being read: {path}")
     return content
 
@@ -1846,6 +1903,15 @@ def _journal_for(
                 else None
             ),
         })
+    core_members = [
+        {
+            "path": str(name),
+            "bytes": len(_member_bytes(plan.members, str(name))),
+            "sha256": _sha256(_member_bytes(plan.members, str(name))),
+            "mode": format(_member_mode(plan.members, str(name)), "04o"),
+        }
+        for name in sorted(plan.members)
+    ]
     journal = {
         "schema": JOURNAL_SCHEMA,
         "kind": "agent-kit-change-transaction",
@@ -1859,7 +1925,12 @@ def _journal_for(
         "core": {
             "path": plan.preview["material"]["core"]["path"],
             "archive_sha256": plan.preview["material"]["core"]["archive_sha256"],
-            "state": "absent",
+            "state": (
+                "create_pending"
+                if plan.preview["material"]["core"]["action"] == "create"
+                else "reused"
+            ),
+            "members": core_members,
         },
         "entries": entries,
         "history": [],
@@ -1990,14 +2061,44 @@ def _load_journal(path: Path) -> dict[str, Any]:
     ):
         raise KitChangeError("journal-invalid", "transaction journal is malformed")
     core = value["core"]
-    if not isinstance(core, dict) or set(core) != {"path", "archive_sha256", "state"}:
+    if not isinstance(core, dict) or set(core) != {
+        "path", "archive_sha256", "state", "members"
+    }:
         raise KitChangeError("journal-invalid", "transaction core state is malformed")
     _safe_relative(core["path"])
     if not SHA256_RE.fullmatch(str(core["archive_sha256"] or "")) or core["state"] not in {
-        "absent",
-        "staged",
+        "create_pending",
+        "created",
+        "reused",
     }:
         raise KitChangeError("journal-invalid", "transaction core identity is malformed")
+    members = core["members"]
+    if not isinstance(members, list) or not members or len(members) > MAX_BACKUP_ENTRIES:
+        raise KitChangeError("journal-invalid", "transaction core members are malformed")
+    member_paths: list[str] = []
+    for member in members:
+        if not isinstance(member, dict) or set(member) != {
+            "path", "bytes", "sha256", "mode"
+        }:
+            raise KitChangeError("journal-invalid", "transaction core member is malformed")
+        member_path = _safe_relative(member["path"], label="transaction core member")
+        if (
+            not isinstance(member["bytes"], int)
+            or isinstance(member["bytes"], bool)
+            or not 0 <= member["bytes"] <= getattr(
+                release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES
+            )
+            or SHA256_RE.fullmatch(str(member["sha256"] or "")) is None
+            or member["mode"] not in {"0644", "0755"}
+        ):
+            raise KitChangeError(
+                "journal-invalid", "transaction core member values are malformed"
+            )
+        member_paths.append(member_path)
+    if member_paths != sorted(member_paths) or len(member_paths) != len(set(member_paths)):
+        raise KitChangeError(
+            "journal-invalid", "transaction core members must be sorted and unique"
+        )
     sequences: list[int] = []
     paths: list[str] = []
     for raw in value["entries"]:
@@ -2129,9 +2230,102 @@ def _restore_entry(root: Path, entry: dict[str, Any], backup: dict[str, Any]) ->
         raise KitChangeError("rollback-failed", f"restored bytes did not verify: {relative}")
 
 
+def _core_matches_journal(core: Path, members: list[dict[str, Any]]) -> bool:
+    if core.is_symlink() or _is_reparse(core) or not core.is_dir():
+        return False
+    expected = [str(member["path"]) for member in members]
+    actual: list[str] = []
+    for current, directories, filenames in os.walk(core, topdown=True, followlinks=False):
+        base = Path(current)
+        for name in list(directories):
+            child = base / name
+            if child.is_symlink() or _is_reparse(child) or not child.is_dir():
+                return False
+        for name in filenames:
+            child = base / name
+            if child.is_symlink() or _is_reparse(child) or not child.is_file():
+                return False
+            actual.append(child.relative_to(core).as_posix())
+    if sorted(actual) != expected:
+        return False
+    by_path = {str(member["path"]): member for member in members}
+    for relative in expected:
+        path = core.joinpath(*PurePosixPath(relative).parts)
+        expected_member = by_path[relative]
+        try:
+            content = _stable_bytes(
+                path,
+                limit=getattr(release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES),
+            )
+        except KitChangeError:
+            return False
+        if (
+            len(content) != expected_member["bytes"]
+            or _sha256(content) != expected_member["sha256"]
+        ):
+            return False
+        if os.name != "nt" and format(stat.S_IMODE(path.stat().st_mode), "04o") != expected_member["mode"]:
+            return False
+    return True
+
+
+def _remove_created_core(root: Path, journal: dict[str, Any]) -> None:
+    core_state = journal["core"]["state"]
+    if core_state == "reused":
+        return
+    relative = str(journal["core"]["path"])
+    core = _target(root, relative, leaf="directory")
+    if not core.exists():
+        return
+    members = journal["core"]["members"]
+    if not _core_matches_journal(core, members):
+        raise KitChangeError(
+            "rollback-conflict", "new managed core changed after Apply"
+        )
+    for member in reversed(members):
+        path = core.joinpath(*PurePosixPath(str(member["path"])).parts)
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise KitChangeError(
+                "rollback-failed", f"cannot remove managed core member {member['path']}: {exc}"
+            ) from exc
+    directory_set: set[str] = set()
+    for member in members:
+        parent = PurePosixPath(str(member["path"])).parent
+        while parent.as_posix() != ".":
+            directory_set.add(parent.as_posix())
+            parent = parent.parent
+    directories = sorted(
+        directory_set,
+        key=lambda value: (-len(PurePosixPath(value).parts), value),
+    )
+    for directory in directories:
+        try:
+            core.joinpath(*PurePosixPath(directory).parts).rmdir()
+        except OSError as exc:
+            raise KitChangeError(
+                "rollback-failed", f"cannot remove managed core directory {directory}: {exc}"
+            ) from exc
+    try:
+        core.rmdir()
+        _sync_directory(core.parent)
+    except OSError as exc:
+        raise KitChangeError("rollback-failed", f"cannot remove managed core: {exc}") from exc
+
+
 def _rollback_locked(root: Path, path: Path, journal: dict[str, Any]) -> dict[str, Any]:
     try:
         backup = _load_backup(root, journal)
+        core = _target(root, str(journal["core"]["path"]), leaf="directory")
+        if (
+            journal["core"]["state"] != "reused"
+            and core.exists()
+            and not _core_matches_journal(core, journal["core"]["members"])
+        ):
+            raise KitChangeError(
+                "rollback-conflict", "new managed core changed after Apply"
+            )
         for entry in journal["entries"]:
             current = _snapshot(_target(root, entry["path"]))
             if current not in (entry["before"], entry["after"]):
@@ -2145,6 +2339,8 @@ def _rollback_locked(root: Path, path: Path, journal: dict[str, Any]) -> dict[st
         ]
         for entry in [*reversed(project_entries), *reversed(activation_entries)]:
             _restore_entry(root, entry, backup)
+
+        _remove_created_core(root, journal)
 
         for relative in sorted(
             backup["created_directories"],
@@ -2225,7 +2421,8 @@ def apply(
         try:
             _failpoint("after-prepared")
             _stage_core(plan, transaction_id)
-            journal["core"]["state"] = "staged"
+            if journal["core"]["state"] == "create_pending":
+                journal["core"]["state"] = "created"
             _history(journal, "core_staged", "verified-core-staged")
             _journal_write(journal_path, journal)
             _failpoint("after-core-staged")
@@ -2334,3 +2531,44 @@ def resume(root: Path) -> dict[str, Any]:
                 "verification": "pending",
             }
         raise KitChangeError("transaction-invalid", f"cannot resume transaction state {state}")
+
+
+def inspect_transaction(
+    root: Path,
+    *,
+    preview_sha256: str,
+    target_scope_sha256: str,
+) -> dict[str, Any]:
+    """Find one exact durable transaction after a controller interruption."""
+    if SHA256_RE.fullmatch(str(preview_sha256 or "")) is None:
+        raise KitChangeError("preview-invalid", "transaction lookup needs a full Preview SHA-256")
+    if SHA256_RE.fullmatch(str(target_scope_sha256 or "")) is None:
+        raise KitChangeError("scope-invalid", "transaction lookup needs a full target-scope SHA-256")
+    canonical_root = _canonical_root(root)
+    with _change_guard(canonical_root):
+        matches: list[dict[str, Any]] = []
+        for path in _journal_files(canonical_root):
+            journal = _load_journal(path)
+            if (
+                hmac.compare_digest(journal["preview_sha256"], preview_sha256)
+                and hmac.compare_digest(
+                    journal["target_scope_sha256"], target_scope_sha256
+                )
+            ):
+                matches.append(journal)
+        if not matches:
+            raise KitChangeError(
+                "transaction-missing", "no transaction matches the exact reviewed change"
+            )
+        if len(matches) != 1:
+            raise KitChangeError(
+                "transaction-ambiguous", "more than one transaction matches the reviewed change"
+            )
+        journal = matches[0]
+        return {
+            "ok": True,
+            "status": journal["state"],
+            "transaction_id": journal["transaction_id"],
+            "preview_sha256": journal["preview_sha256"],
+            "target_scope_sha256": journal["target_scope_sha256"],
+        }
