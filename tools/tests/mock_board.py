@@ -198,6 +198,7 @@ class Handler(board.Handler):
                          "pid": 0, "started": "2026-08-19T00:00:00Z",
                          "instance_id": self.server.instance_id,
                          "repository_scope_id": self.server.repository_scope_id,
+                         "controller_runtime_id": self.server.controller_runtime_id,
                          "schema": board.SCHEMA, "version": board.BOARD_VERSION}
         if method == "GET" and path == "/api/state":
             return 200, state_payload()

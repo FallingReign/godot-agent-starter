@@ -114,6 +114,8 @@ class TestMockRealParity(BoardTestCase):
         self.assertSameKeys(real, mock, "/api/health")
         self.assertEqual(real["schema"], mock["schema"])
         self.assertEqual(real["version"], mock["version"])
+        self.assertEqual(real["controller_runtime_id"],
+                         mock["controller_runtime_id"])
 
     def test_state_top_level_agrees(self) -> None:
         real, mock = self.both("/api/state")
