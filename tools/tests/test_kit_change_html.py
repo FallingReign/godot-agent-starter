@@ -24,6 +24,7 @@ def preview(**changes: object) -> dict:
         "project": {"name": "Brownfield Game", "path": r"C:\Games\Brownfield"},
         "current_version": "",
         "incoming_version": "0.3.0",
+        "session_id": "c" * 64,
         "plan_sha256": DIGEST,
         "counts": {
             "kit_files": 81,
@@ -54,7 +55,7 @@ def preview(**changes: object) -> dict:
             "action": "Add kit section",
             "reason": "Connect the shared kit rules.",
         }],
-        "review_url": "http://127.0.0.1:54321/kit-change.html",
+        "review_url": "http://127.0.0.1:54321/kit-change.html?session=" + "c" * 64,
         "plan_url": "http://127.0.0.1:54322/plan.html",
     }
     value.update(changes)
@@ -95,16 +96,46 @@ class ReviewRenderer(unittest.TestCase):
         self.assertIn("0.2.0 → 0.3.0", page)
         self.assertIn(">Upgrade kit</button>", page)
 
+    def test_adoption_is_not_presented_as_full_completion(self) -> None:
+        page = self.render(
+            status="adoption_required",
+            decisions=[],
+            existing_gaps={"count": 6, "status": "checked"},
+            result_sha256=RESULT_DIGEST,
+        )
+        self.assertIn("Kit works; project cleanup remains", page)
+        self.assertIn('<dt>Existing problems</dt><dd id="kit-change-gap-count">6</dd>', page)
+        self.assertIn(">Cleanup remains</dd>", page)
+        self.assertIn("Restore previous state", page)
+
+    def test_game_folder_decision_is_actionable_without_hiding_other_blockers(self) -> None:
+        game_root = self.render(
+            status="blocked",
+            blockers=["[game-root-ambiguous] Choose the game folder."],
+        )
+        self.assertIn('data-kit-change-status="needs_decision"', game_root)
+        self.assertNotIn("Cannot continue", game_root)
+
+        another_blocker = self.render(
+            status="blocked",
+            blockers=[
+                "[game-root-ambiguous] Choose the game folder.",
+                "[unsafe-path] A managed path is redirected.",
+            ],
+        )
+        self.assertIn('data-kit-change-status="blocked"', another_blocker)
+        self.assertIn("Cannot continue", another_blocker)
+
     def test_quick_read_uses_plain_exact_labels(self) -> None:
         page = self.render()
         for label in (
             "Project", "Kit version", "Game files", "Recovery", "Design",
-            "Existing gaps",
+            "Existing problems",
         ):
             self.assertIn(f"<dt>{label}</dt>", page)
         self.assertIn('<dd class="safe">No changes</dd>', page)
         self.assertIn("Missing — agents cannot build", page)
-        self.assertIn("This change records 24 existing gaps", page)
+        self.assertIn("This change records 24 existing problems", page)
         self.assertIn("It does not hide them or mark them as fixed.", page)
 
     def test_decisions_use_native_keyboard_order_and_explain_choices(self) -> None:
@@ -163,11 +194,8 @@ class ReviewRenderer(unittest.TestCase):
     def test_file_and_no_javascript_guidance_are_complete(self) -> None:
         page = self.render()
         self.assertIn("Review only — the cockpit is not connected", page)
-        self.assertIn(
-            '<a href="http://127.0.0.1:54321/kit-change.html">'
-            "http://127.0.0.1:54321/kit-change.html</a>",
-            page,
-        )
+        review_url = "http://127.0.0.1:54321/kit-change.html?session=" + "c" * 64
+        self.assertIn(f'<a href="{review_url}">{review_url}</a>', page)
         self.assertIn("Review only — JavaScript is unavailable", page)
         self.assertIn("A decision is still needed. Tell your agent your choice first.", page)
         self.assertIn("ask your agent to reopen this kit review", page)
@@ -191,8 +219,11 @@ class ReviewRenderer(unittest.TestCase):
         self.assertEqual(1, len(fetch_calls), "only the shared Board client may fetch")
         self.assertIn("unresolvedDecisionCount()", page)
         self.assertIn("statusLabel.textContent = unresolved ?", page)
-        self.assertIn('kitFilesCheck.textContent = status === "complete"', page)
+        self.assertIn('status === "complete" || status === "adoption_required"', page)
         self.assertIn("safePlanUrl(nextPlanUrl)", page)
+        self.assertIn("session_id:sessionId", page)
+        self.assertIn('String(next.session_id || "") === sessionId', page)
+        self.assertIn("gapCount.textContent", page)
 
     def test_all_statuses_have_one_current_step_and_plain_label(self) -> None:
         fixtures = {
@@ -203,6 +234,7 @@ class ReviewRenderer(unittest.TestCase):
             "applying": "Applying",
             "checking": "Checking",
             "complete": "Complete",
+            "adoption_required": "Kit works; project cleanup remains",
             "restored": "Previous state restored",
             "failed": "Could not finish",
         }

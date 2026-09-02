@@ -29,6 +29,7 @@ STATUS_LABELS = {
     "applying": "Applying",
     "checking": "Checking",
     "complete": "Complete",
+    "adoption_required": "Kit works; project cleanup remains",
     "restored": "Previous state restored",
     "failed": "Could not finish",
 }
@@ -41,6 +42,7 @@ STATUS_STEP = {
     "applying": "apply",
     "checking": "check",
     "complete": "check",
+    "adoption_required": "check",
     "restored": "check",
     "failed": "check",
 }
@@ -62,6 +64,7 @@ COUNT_FIELDS = (
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_KIT_REVIEW_URL = re.compile(
     r"http://127\.0\.0\.1:(?P<port>[0-9]{1,5})/kit-change\.html"
+    r"(?:\?session=(?P<session>[0-9a-f]{64}))?"
 )
 _SAFE_PLAN_URL = re.compile(
     r"(?:plan\.html|http://127\.0\.0\.1:(?P<port>[0-9]{1,5})/plan\.html)"
@@ -330,7 +333,8 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var active = {applying:"Applying",checking:"Checking"};
   var labels = __LABELS__;
   var steps = {scanning:"scan",ready:"review",needs_decision:"review",blocked:"review",
-               applying:"apply",checking:"check",complete:"check",restored:"check",failed:"check"};
+               applying:"apply",checking:"check",complete:"check",adoption_required:"check",
+               restored:"check",failed:"check"};
   var controls = document.getElementById("kit-change-controls");
   var applyButton = document.getElementById("kit-change-apply");
   var restoreButton = document.getElementById("kit-change-restore");
@@ -340,8 +344,11 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var statusNote = document.getElementById("kit-change-status-note");
   var kitFilesCheck = document.getElementById("kit-change-kit-files-check");
   var newWorkCheck = document.getElementById("kit-change-new-work-check");
+  var gapCount = document.getElementById("kit-change-gap-count");
+  var gapNote = document.getElementById("kit-change-gap-note");
   var resultSha = String(STATIC.result_sha256 || "");
   var planUrl = String(STATIC.plan_url || "");
+  var sessionId = String(STATIC.session_id || "");
 
   function decisionValues(){
     var values = {}, groups = document.querySelectorAll("[data-decision]");
@@ -375,6 +382,13 @@ def _client_script(static: Mapping[str, Any]) -> str:
     var port = Number(match[1]);
     return port >= 1 && port <= 65535 && String(port) === match[1] ? value : "";
   }
+  function safeReviewUrl(value){
+    value = String(value || "");
+    var match = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/kit-change\.html\?session=([0-9a-f]{64})$/.exec(value);
+    if(!match) return "";
+    var port = Number(match[1]);
+    return port >= 1 && port <= 65535 && String(port) === match[1] ? value : "";
+  }
   function labelFor(value, count){
     if(value === "needs_decision"){
       return String(count || 1) + ((count || 1) === 1 ? " decision needed" : " decisions needed");
@@ -395,7 +409,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
   function updateActions(){
     var live = window.Board && Board.mode() === "live";
     var reviewable = status === "ready" || status === "needs_decision";
-    var complete = status === "complete";
+    var complete = status === "complete" || status === "adoption_required";
     var ended = status === "restored" || status === "failed";
     var unresolved = unresolvedDecisionCount();
     if(status === "needs_decision"){
@@ -428,17 +442,34 @@ def _client_script(static: Mapping[str, Any]) -> str:
       var nextPlanUrl = String(state.plan_url || planUrl || "");
       resultSha = safeDigest(nextResult) ? nextResult : "";
       planUrl = safePlanUrl(nextPlanUrl);
+      var gaps = state.existing_gaps;
+      if(gaps && typeof gaps === "object"){
+        var count = Math.max(0,Number(gaps.count) || 0);
+        var checkedGaps = String(gaps.status || "") === "checked";
+        gapCount.textContent = checkedGaps ? (count ? String(count) : "None") : "Not checked";
+        gapNote.hidden = !(checkedGaps && count);
+        gapNote.textContent = checkedGaps && count
+          ? "This change records " + String(count) + " existing "
+            + (count === 1 ? "problem" : "problems")
+            + ". It does not hide them or mark them as fixed."
+          : "";
+      }
     }
-    kitFilesCheck.textContent = status === "complete" ? "Checked" : "Not checked";
-    newWorkCheck.textContent = status === "complete" ? "Ready" : "Not checked";
+    var checked = status === "complete" || status === "adoption_required";
+    kitFilesCheck.textContent = checked ? "Checked" : "Not checked";
+    newWorkCheck.textContent = status === "complete" ? "Ready" :
+      (status === "adoption_required" ? "Cleanup remains" : "Not checked");
     applyStep(status);
     updateActions();
   }
   function stateFrom(state){
-    return state && state.kit_change ? state.kit_change : null;
+    var next = state && state.kit_change ? state.kit_change : null;
+    return next && String(next.session_id || "") === sessionId ? next : null;
   }
   function acceptResponse(result){
     if(!result || !result.ok){ Board.reportIfFailed(result); return; }
+    var nextReview = safeReviewUrl(result.data && result.data.review_url);
+    if(nextReview){ location.href = nextReview; return; }
     var next = stateFrom(result.data) || result.data || {};
     setStatus(String(next.status || status),String(next.detail || ""),next);
     Board.refresh();
@@ -446,14 +477,14 @@ def _client_script(static: Mapping[str, Any]) -> str:
   function applyChange(){
     return Board.guard(applyButton,"Applying\u2026",function(){
       return Board.request("/api/kit-change/apply",{method:"POST",body:{
-        plan_sha256:STATIC.plan_sha256,choices:decisionValues()
+        session_id:sessionId,plan_sha256:STATIC.plan_sha256,choices:decisionValues()
       }}).then(acceptResponse);
     });
   }
   function restoreChange(){
     return Board.guard(restoreButton,"Restoring\u2026",function(){
       return Board.request("/api/kit-change/restore",{method:"POST",body:{
-        result_sha256:resultSha
+        session_id:sessionId,result_sha256:resultSha
       }}).then(acceptResponse);
     });
   }
@@ -502,7 +533,15 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         for item in data.get("blockers", [])
         if _text(item)
     ] if isinstance(data.get("blockers"), list) else []
-    blockers = safety_blockers + supplied_blockers
+    decision_blockers = [
+        item for item in supplied_blockers if item.startswith("[game-root-ambiguous]")
+    ]
+    other_blockers = [item for item in supplied_blockers if item not in decision_blockers]
+    if missing_decisions and decision_blockers and not safety_blockers and not other_blockers:
+        status = "needs_decision"
+        blockers: list[str] = []
+    else:
+        blockers = safety_blockers + supplied_blockers
     if blockers:
         status = "blocked"
 
@@ -519,6 +558,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
             "applying": "Applying the reviewed kit change.",
             "checking": "Checking the result without starting Godot.",
             "complete": "The reviewed kit change was applied and checked.",
+            "adoption_required": "The kit works. Existing project cleanup remains.",
             "restored": "The project is back to its previous state.",
             "failed": "The kit change did not finish.",
         }[status]
@@ -531,8 +571,10 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     gaps_value = data.get("existing_gaps")
     if isinstance(gaps_value, Mapping):
         gap_count = _integer(gaps_value.get("count"))
+        gaps_checked = _text(gaps_value.get("status"), "not_checked") == "checked"
     else:
         gap_count = _integer(gaps_value)
+        gaps_checked = True
     recovery = _text(data.get("recovery"), "Previous state will be saved")
     review_url = _text(board_url_hint or data.get("review_url"))
     review_link = _safe_review_link(review_url)
@@ -555,12 +597,12 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     )
     game_label = "No changes" if count_values["game_files"] == 0 else str(count_values["game_files"])
     game_class = "safe" if count_values["game_files"] == 0 else "warning"
-    gaps_label = "None" if gap_count == 0 else str(gap_count)
-    gap_note = ""
-    if gap_count:
-        noun = "gap" if gap_count == 1 else "gaps"
+    gaps_label = ("None" if gap_count == 0 else str(gap_count)) if gaps_checked else "Not checked"
+    gap_note = '<p class="gap-note" id="kit-change-gap-note" hidden></p>'
+    if gap_count and gaps_checked:
+        noun = "problem" if gap_count == 1 else "problems"
         gap_note = (
-            '<p class="gap-note">'
+            '<p class="gap-note" id="kit-change-gap-note">'
             f"This change records {gap_count} existing {noun}. "
             "It does not hide them or mark them as fixed.</p>"
         )
@@ -579,6 +621,11 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     static = {
         "status": status,
         "detail": detail,
+        "session_id": (
+            _text(data.get("session_id")).lower()
+            if _DIGEST_RE.fullmatch(_text(data.get("session_id")).lower())
+            else ""
+        ),
         "plan_sha256": digest,
         "result_sha256": result_sha if _DIGEST_RE.fullmatch(result_sha) else "",
         "plan_url": plan_url,
@@ -631,7 +678,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
       <div><dt>Game files</dt><dd class="{game_class}">{_esc(game_label)}</dd></div>
       <div><dt>Recovery</dt><dd>{_esc(recovery)}</dd></div>
       <div><dt>Design</dt><dd>{_esc(design)}</dd></div>
-      <div><dt>Existing gaps</dt><dd>{_esc(gaps_label)}</dd></div>
+      <div><dt>Existing problems</dt><dd id="kit-change-gap-count">{_esc(gaps_label)}</dd></div>
     </dl>
   </section>
   {_decision_html(decisions)}
@@ -643,8 +690,8 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
   <section class="section" aria-labelledby="check-title">
     <h2 id="check-title">Check result</h2>
     <dl class="check-list">
-      <div><dt>Kit files</dt><dd id="kit-change-kit-files-check">{"Checked" if status == "complete" else "Not checked"}</dd></div>
-      <div><dt>New-work protection</dt><dd id="kit-change-new-work-check">{"Ready" if status == "complete" else "Not checked"}</dd></div>
+      <div><dt>Kit files</dt><dd id="kit-change-kit-files-check">{"Checked" if status in {"complete", "adoption_required"} else "Not checked"}</dd></div>
+      <div><dt>New-work protection</dt><dd id="kit-change-new-work-check">{"Ready" if status == "complete" else "Cleanup remains" if status == "adoption_required" else "Not checked"}</dd></div>
       <div><dt>Godot check</dt><dd>Not run; separate approval required</dd></div>
     </dl>
     {gap_note}

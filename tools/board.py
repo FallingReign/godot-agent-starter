@@ -35,8 +35,10 @@ describes the user workflow without duplicating this endpoint inventory:
     POST /api/finding/defer       {slug, reason}  -> record, never dispatch
     POST /api/retro/run           start the retrospective model (spends quota)
     GET  /api/runs/<run_id>       status, exit code, silence, log tail
+    POST /api/kit-change/apply    apply one exact registered kit review
+    POST /api/kit-change/restore  restore one exact checked kit result
 
-Those seven are the whole surface. `/api/dispatch/prepare`, `/api/dispatch/run`
+Those routes are the whole API surface. `/api/dispatch/prepare`, `/api/dispatch/run`
 and `/api/decision` were deleted rather than left as dead paths: a stale page
 hitting one gets `{"code": "no_such_endpoint"}` and says so, and there is
 exactly one approval path instead of two.
@@ -52,6 +54,11 @@ leaves this server.
 
     kit serve                                      start or reuse the board and
                                                    print its authenticated URL
+
+An install or upgrade controller can register one private review with
+``--ensure --kit-change-session``.  The board then generates only that exact
+``/kit-change.html?session=...`` page in memory; it never serves session JSON,
+release bytes, or arbitrary project files.
 
 Low-level serve and migration switches are internal implementation details;
 the public workflow never asks a developer to invoke this file directly.
@@ -82,6 +89,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import webbrowser
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -102,6 +110,8 @@ import session_digest  # noqa: E402
 import session_evidence  # noqa: E402  (stable repository scope identity)
 import board_client    # noqa: E402  (CSS/JS constants only, zero project imports of its own)
 import run_result      # noqa: E402  (structured worker outcome verification)
+import kit_change_controller  # noqa: E402  (bounded install/upgrade session API)
+import kit_change_html  # noqa: E402  (pure install/upgrade review renderer)
 
 CONTEXT = project_context.load_active_context(CORE_ROOT)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
@@ -116,6 +126,7 @@ DECISION_LOCK_DIR = _RUNTIME.runtime / "retro" / "ledger-locks"
 SCHEMA = board_client.PROTOCOL_SCHEMA
 BOARD_VERSION = board_client.protocol_version()
 MAX_REQUEST_BODY = 64 * 1024
+KIT_CHANGE_SESSION_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Finding states reported by /api/state. `stale` is orthogonal to all of them.
 STATES = ("awaiting_review", "approved", "queued", "working", "done", "blocked",
@@ -193,6 +204,9 @@ def migrate_state(value: dict) -> tuple[dict, bool]:
     state.setdefault("repository_scope_id", None)
     state.setdefault("schema", None)
     state.setdefault("version", None)
+    if "kit_change_session" not in state:
+        state["kit_change_session"] = None
+        changed = True
     state["runs"] = runs
     return state, changed
 
@@ -204,6 +218,7 @@ def load_state() -> dict:
                 "port": None, "pid": None, "started": None,
                 "instance_id": None, "repository_scope_id": None,
                 "schema": None, "version": None, "runs": [],
+                "kit_change_session": None,
             }
         try:
             d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -2158,6 +2173,206 @@ def _error(code: int, message: str, kind: str = "error", **extra) -> tuple[int, 
     return code, payload
 
 
+def _board_url(server=None) -> str:
+    if server is not None:
+        port = int(server.server_address[1])
+    else:
+        port = load_state().get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return ""
+    return f"http://127.0.0.1:{port}/"
+
+
+def _kit_change_review_url(base_url: str, session_id: str) -> str:
+    if not base_url or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None:
+        return ""
+    return f"{base_url}kit-change.html?session={session_id}"
+
+
+def _kit_change_error(exc: Exception) -> tuple[int, dict]:
+    """Translate controller failures without publishing paths or retained data."""
+    code = getattr(exc, "code", "kit-change-unavailable")
+    print(f"{_now_iso()} kit change blocked: {code}", file=sys.stderr, flush=True)
+    if code == "session-id-invalid":
+        return _error(400, "The kit review link is malformed.", "invalid_session")
+    if code in {"file-unreadable", "session-missing"}:
+        return _error(404, "This kit review is not available in this cockpit.", "unknown_session")
+    if code in {"approval-invalid", "result-invalid"}:
+        return _error(400, "A full review fingerprint is required.", "invalid_fingerprint")
+    if code == "decision-invalid":
+        return _error(400, "The selected game folder is not valid.", "invalid_choices")
+    if code == "decision-not-available":
+        return _error(409, "That decision is no longer available.", "decision_not_available")
+    if code in {
+        "approval-mismatch", "result-mismatch", "preview-changed", "session-tampered",
+        "release-tampered", "release-changed",
+    }:
+        return _error(409, "This kit review is stale. Prepare and review it again.", "stale_review")
+    if code == "preview-blocked":
+        return _error(409, "This kit review still needs a decision.", "decision_required")
+    if code == "restore-not-available":
+        return _error(409, "There is no applied kit change to restore.", "restore_not_available")
+    if code == "controller-busy":
+        return _error(409, "Another kit change is still running.", "kit_change_busy")
+    return _error(409, "This kit review cannot continue safely.", "kit_change_unavailable")
+
+
+def _kit_change_status(session_id: str, *, base_url: str = "") -> dict:
+    if not isinstance(session_id, str) or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None:
+        raise kit_change_controller.KitChangeControllerError(
+            "session-id-invalid", "session id must be a full SHA-256"
+        )
+    result = kit_change_controller.status(
+        _RUNTIME.runtime,
+        session_id,
+        plan_url="",
+    )
+    view = dict(result["kit_change"])
+    view["session_id"] = session_id
+    decisions = view.get("decisions")
+    blockers = view.get("blockers")
+    if (
+        view.get("status") == "blocked"
+        and isinstance(decisions, list)
+        and any(isinstance(item, dict) and item.get("id") == "D1" for item in decisions)
+        and isinstance(blockers, list)
+        and bool(blockers)
+        and all(
+            isinstance(item, str) and item.startswith("[game-root-ambiguous]")
+            for item in blockers
+        )
+    ):
+        view["status"] = "needs_decision"
+    if view.get("status") == "adoption_required":
+        existing = view.get("existing_gaps")
+        count = int(existing.get("count") or 0) if isinstance(existing, dict) else 0
+        noun = "problem" if count == 1 else "problems"
+        view["detail"] = f"The kit works. {count} existing project {noun} remain."
+    project = view.get("project") if isinstance(view.get("project"), dict) else {}
+    project_path = str(project.get("path") or "")
+    try:
+        is_this_project = bool(project_path) and Path(project_path).resolve(
+            strict=True
+        ) == ROOT.resolve(strict=True)
+    except OSError:
+        is_this_project = False
+    view["plan_url"] = f"{base_url}plan.html" if base_url and is_this_project else ""
+    return {**result, "kit_change": view}
+
+
+def register_kit_change_session(session_id: str, *, base_url: str = "") -> dict:
+    """Validate one exact private-runtime session, then make only its id active."""
+    result = _kit_change_status(session_id, base_url=base_url)
+    mutate_state(lambda state: state.update({"kit_change_session": session_id}))
+    return result
+
+
+def _active_kit_change(server=None) -> dict | None:
+    state = load_state()
+    session_id = state.get("kit_change_session")
+    if not isinstance(session_id, str) or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None:
+        return None
+    try:
+        return _kit_change_status(session_id, base_url=_board_url(server))["kit_change"]
+    except kit_change_controller.KitChangeControllerError as exc:
+        print(
+            f"{_now_iso()} active kit review unavailable: {exc.code}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _exact_kit_change_body(
+    body: dict, fields: set[str], *, fingerprint: str
+) -> tuple[dict | None, tuple[int, dict] | None]:
+    if set(body) != fields:
+        return None, _error(400, "Kit change request fields are not exact.", "invalid_request")
+    session_id = body.get("session_id")
+    digest = body.get(fingerprint)
+    if (
+        not isinstance(session_id, str)
+        or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None
+        or not isinstance(digest, str)
+        or KIT_CHANGE_SESSION_RE.fullmatch(digest) is None
+    ):
+        return None, _error(400, "Full review fingerprints are required.", "invalid_fingerprint")
+    return body, None
+
+
+def api_kit_change_apply(body: dict, server=None) -> tuple[int, dict]:
+    value, rejected = _exact_kit_change_body(
+        body,
+        {"session_id", "plan_sha256", "choices"},
+        fingerprint="plan_sha256",
+    )
+    if rejected is not None:
+        return rejected
+    assert value is not None
+    choices = value.get("choices")
+    if not isinstance(choices, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in choices.items()
+    ):
+        return _error(400, "Kit change choices are malformed.", "invalid_choices")
+    if choices and set(choices) != {"D1"}:
+        return _error(400, "Only the shown game-folder decision is accepted.", "invalid_choices")
+    base_url = _board_url(server)
+    try:
+        current = _kit_change_status(str(value["session_id"]), base_url=base_url)
+        current_view = current["kit_change"]
+        if not secrets.compare_digest(
+            str(current_view.get("plan_sha256") or ""), str(value["plan_sha256"])
+        ):
+            return _error(409, "This kit review is stale. Prepare it again.", "stale_review")
+        if choices:
+            decisions = current_view.get("decisions")
+            has_d1 = isinstance(decisions, list) and any(
+                isinstance(item, dict) and item.get("id") == "D1" for item in decisions
+            )
+            if not has_d1:
+                return _error(409, "This review has no game-folder decision.", "decision_not_available")
+            prepared = kit_change_controller.reprepare(
+                _RUNTIME.runtime, str(value["session_id"]), choices
+            )
+            next_id = str(prepared["session_id"])
+            refreshed = register_kit_change_session(next_id, base_url=base_url)
+            review_url = _kit_change_review_url(base_url, next_id)
+            return 200, {
+                "ok": True,
+                "reprepared": True,
+                "review_url": review_url,
+                **refreshed,
+            }
+        applied = kit_change_controller.apply(
+            _RUNTIME.runtime, str(value["session_id"]), str(value["plan_sha256"])
+        )
+        refreshed = _kit_change_status(str(applied["session_id"]), base_url=base_url)
+        return 200, {"ok": True, **refreshed}
+    except kit_change_controller.KitChangeControllerError as exc:
+        return _kit_change_error(exc)
+
+
+def api_kit_change_restore(body: dict, server=None) -> tuple[int, dict]:
+    value, rejected = _exact_kit_change_body(
+        body,
+        {"session_id", "result_sha256"},
+        fingerprint="result_sha256",
+    )
+    if rejected is not None:
+        return rejected
+    assert value is not None
+    base_url = _board_url(server)
+    try:
+        restored = kit_change_controller.restore(
+            _RUNTIME.runtime, str(value["session_id"]), str(value["result_sha256"])
+        )
+        refreshed = _kit_change_status(str(restored["session_id"]), base_url=base_url)
+        return 200, {"ok": True, **refreshed}
+    except kit_change_controller.KitChangeControllerError as exc:
+        return _kit_change_error(exc)
+
+
 def _validated_slug(value: object) -> tuple[str | None, tuple[int, dict] | None]:
     if not isinstance(value, str) or not value.strip():
         return None, _error(400, "slug is required", "bad_request")
@@ -2304,7 +2519,7 @@ def finding_states(silence: float | None = None) -> list[dict]:
     return out
 
 
-def api_state() -> tuple[int, dict]:
+def api_state(server=None) -> tuple[int, dict]:
     silence = _silence_minutes()
     state = load_state()
     runs = [describe_run(r, silence) for r in state.get("runs", [])]
@@ -2349,6 +2564,9 @@ def api_state() -> tuple[int, dict]:
             for r in runs
         ],
     }
+    kit_change = _active_kit_change(server)
+    if kit_change is not None:
+        payload["kit_change"] = kit_change
     return 200, _sanitize_public_payload(payload)
 
 
@@ -2820,16 +3038,8 @@ def _server_value(handler: http.server.BaseHTTPRequestHandler,
     return getattr(handler.server, name, default)
 
 
-def _serve_html(handler: http.server.BaseHTTPRequestHandler,
-                name: str | Path) -> None:
-    path = name if isinstance(name, Path) else ROOT / name
-    display = path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else path.name
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        _json(handler, 404, {"ok": False, "code": "not_found",
-                             "error": f"generated page is missing: {display}"})
-        return
+def _serve_html_text(handler: http.server.BaseHTTPRequestHandler, text: str) -> None:
+    """Serve generated HTML with the board's in-memory capability and CSP."""
     token = str(_server_value(handler, "capability_token"))
     instance = str(_server_value(handler, "instance_id"))
     nonce = secrets.token_urlsafe(18)
@@ -2850,6 +3060,62 @@ def _serve_html(handler: http.server.BaseHTTPRequestHandler,
     _security_headers(handler, nonce)
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _serve_html(handler: http.server.BaseHTTPRequestHandler,
+                name: str | Path) -> None:
+    path = name if isinstance(name, Path) else ROOT / name
+    display = path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else path.name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        _json(handler, 404, {"ok": False, "code": "not_found",
+                             "error": f"generated page is missing: {display}"})
+        return
+    _serve_html_text(handler, text)
+
+
+def _kit_change_session_from_query(query: str) -> tuple[str | None, tuple[int, dict] | None]:
+    if not query:
+        session_id = load_state().get("kit_change_session")
+        if not isinstance(session_id, str) or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None:
+            return None, _error(
+                404, "No kit review is active in this cockpit.", "kit_change_not_registered"
+            )
+        return session_id, None
+    try:
+        values = urllib.parse.parse_qs(
+            query, keep_blank_values=True, strict_parsing=True, max_num_fields=2
+        )
+    except ValueError:
+        return None, _error(400, "The kit review link is malformed.", "invalid_session")
+    if set(values) != {"session"} or len(values["session"]) != 1:
+        return None, _error(400, "The kit review link is malformed.", "invalid_session")
+    session_id = values["session"][0]
+    if KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None:
+        return None, _error(400, "The kit review link is malformed.", "invalid_session")
+    return session_id, None
+
+
+def _serve_kit_change(
+    handler: http.server.BaseHTTPRequestHandler, query: str
+) -> None:
+    session_id, rejected = _kit_change_session_from_query(query)
+    if rejected is not None:
+        _json(handler, rejected[0], rejected[1])
+        return
+    assert session_id is not None
+    base_url = _board_url(handler.server)
+    review_url = _kit_change_review_url(base_url, session_id)
+    try:
+        result = _kit_change_status(session_id, base_url=base_url)
+    except kit_change_controller.KitChangeControllerError as exc:
+        code, payload = _kit_change_error(exc)
+        _json(handler, code, payload)
+        return
+    view = dict(result["kit_change"])
+    view["review_url"] = review_url
+    _serve_html_text(handler, kit_change_html.render(view, review_url))
 
 
 def _serve_static(handler: http.server.BaseHTTPRequestHandler, name: str,
@@ -3068,7 +3334,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/health":
                 return api_health(self.server)
             if path == "/api/state":
-                return api_state()
+                return api_state(self.server)
             if path.startswith("/api/finding/"):
                 return api_finding(path[len("/api/finding/"):])
             if path.startswith("/api/runs/"):
@@ -3090,6 +3356,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     body.get("fingerprint", ""),
                     body.get("comment", ""),
                 )
+            if path == "/api/kit-change/apply":
+                return api_kit_change_apply(body, self.server)
+            if path == "/api/kit-change/restore":
+                return api_kit_change_restore(body, self.server)
             if path == "/api/board/stop":
                 return api_board_stop(self.server)
         if path.startswith("/api/"):
@@ -3097,7 +3367,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return None
 
     def _handle(self, method: str) -> None:
-        path, _, _query = self.path.partition("?")
+        path, _, query = self.path.partition("?")
         rejected = _validate_host(self)
         if rejected is not None:
             if method == "POST":
@@ -3133,6 +3403,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _serve_html(self, "plan.html")
             elif method == "GET" and path == "/retro.html":
                 _serve_html(self, "retro.html")
+            elif method == "GET" and path == "/kit-change.html":
+                _serve_kit_change(self, query)
             elif method == "GET" and path.startswith("/tools/vendor/"):
                 _serve_vendor(self, path)
             elif method == "GET" and _serve_cockpit_asset(self, path):
@@ -3218,6 +3490,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serve", action="store_true", help="run the HTTP server (internal)")
     ap.add_argument("--ensure", action="store_true", help="start if needed, print the URL")
+    ap.add_argument(
+        "--kit-change-session", default="", metavar="SESSION_ID",
+        help="register one exact private kit review while ensuring the cockpit",
+    )
     ap.add_argument("--status", action="store_true", help="report the current lifecycle state")
     ap.add_argument("--open", action="store_true", help="start if needed and explicitly open plan.html")
     ap.add_argument("--stop", action="store_true", help="safely stop the recorded cockpit")
@@ -3229,6 +3505,9 @@ def main() -> int:
     ap.add_argument("--repository-scope-id", default="", help=argparse.SUPPRESS)
     ap.add_argument("--started", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.kit_change_session and (not args.ensure or args.open):
+        ap.error("--kit-change-session requires --ensure and cannot be combined with --open")
 
     if args.migrate:
         n = migrate_accepted_file()
@@ -3257,6 +3536,19 @@ def main() -> int:
             "url": url,
             "review_url": url + "plan.html" if url else None,
         }
+        if url and args.kit_change_session:
+            try:
+                registered = register_kit_change_session(
+                    args.kit_change_session, base_url=url
+                )
+            except kit_change_controller.KitChangeControllerError as exc:
+                _code, failure = _kit_change_error(exc)
+                payload = {**failure, "status": "review-unavailable", "url": url}
+            else:
+                payload.update({
+                    "session_id": registered["session_id"],
+                    "review_url": _kit_change_review_url(url, registered["session_id"]),
+                })
         if args.open and url:
             opened = bool(webbrowser.open(url + "plan.html"))
             payload["opened"] = opened
@@ -3264,7 +3556,7 @@ def main() -> int:
                 payload["ok"] = False
                 payload["status"] = "open-failed"
         print(json.dumps(payload) if args.json else (url or "board: could not start"))
-        return 0 if payload["ok"] else 1
+        return 0 if payload.get("ok") else 1
     print("nothing to do: pass --serve (internal), --ensure, --status, --open or --stop",
           file=sys.stderr)
     return 2
