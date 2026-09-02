@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 import uuid
@@ -71,6 +72,33 @@ class KitCliTest(unittest.TestCase):
         returncode: int = 0, stdout: str = "", stderr: str = ""
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def wait_for_server_stop(
+        self, project: Path, pid: int, *, timeout: float = 10.0
+    ) -> dict:
+        """Wait for public stopped state and the recorded process to exit."""
+        deadline = time.monotonic() + timeout
+        last_output = "serve status did not run"
+        while time.monotonic() < deadline:
+            code, last_output = self.invoke(
+                "serve", "status", "--project", str(project), "--json"
+            )
+            try:
+                payload = json.loads(last_output)
+            except json.JSONDecodeError:
+                payload = {}
+            process_state = kit.process_supervisor.pid_liveness(pid)
+            if (
+                code == kit.EXIT_OK
+                and payload.get("status") == "stopped"
+                and process_state == kit.process_supervisor.PID_DEAD
+            ):
+                return payload
+            time.sleep(0.05)
+        self.fail(
+            "review server did not reach stopped state with a closed process "
+            f"within {timeout:.1f}s: {last_output}"
+        )
 
     def assert_isolated_script(
         self, command: list[str], script: Path, *arguments: str
@@ -1641,6 +1669,7 @@ class KitCliTest(unittest.TestCase):
             before_release = tree(extracted)
             before_target = tree(target)
             stopped = False
+            board_pid: int | None = None
             hostile = {
                 "PYTHONPATH": f"{target}{os.pathsep}{poison}",
                 "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
@@ -1670,6 +1699,19 @@ class KitCliTest(unittest.TestCase):
                             encoding="utf-8", errors="replace"
                         )
                     self.assertEqual(kit.EXIT_OK, code, detail)
+                    status_code, status_output = self.invoke(
+                        "serve",
+                        "status",
+                        "--project",
+                        str(extracted),
+                        "--json",
+                    )
+                    running = json.loads(status_output)
+                    self.assertEqual(kit.EXIT_OK, status_code, status_output)
+                    self.assertEqual("running", running["status"], status_output)
+                    reported_pid = running["board"]["pid"]
+                    self.assertIsInstance(reported_pid, int)
+                    board_pid = reported_pid
                     with urllib.request.urlopen(
                         payload["review_url"], timeout=5
                     ) as response:
@@ -1682,10 +1724,12 @@ class KitCliTest(unittest.TestCase):
                         str(extracted),
                         "--json",
                     )
-                    stopped = stop_code == kit.EXIT_OK
+                    self.assertEqual(kit.EXIT_OK, stop_code, stop_output)
                     self.assertEqual(
                         "stopping", json.loads(stop_output)["status"], stop_output
                     )
+                    self.wait_for_server_stop(extracted, board_pid)
+                    stopped = True
                 finally:
                     if not stopped:
                         self.invoke(
@@ -1695,6 +1739,8 @@ class KitCliTest(unittest.TestCase):
                             str(extracted),
                             "--json",
                         )
+                        if board_pid is not None:
+                            self.wait_for_server_stop(extracted, board_pid)
 
             payload = json.loads(output)
             runtime = user_state / str(report["archive_sha256"]) / "runtime"
