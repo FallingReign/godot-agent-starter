@@ -283,43 +283,85 @@ def _public_issues(values: object) -> list[dict[str, object]]:
         raise KitChangeCheckError(f"brownfield evaluation is invalid: {exc}") from exc
 
 
+def _rebound_baseline(
+    stored_issues: object,
+    current_binding: Mapping[str, str],
+) -> dict[str, object]:
+    if not isinstance(stored_issues, list):
+        raise KitChangeCheckError("brownfield evaluation existing gaps are malformed")
+    document: dict[str, object] = {
+        "schema": brownfield.SCHEMA,
+        "kind": brownfield.KIND,
+        "binding": {
+            "installation_id": str(current_binding.get("installation_id") or ""),
+            "release_sha256": str(current_binding.get("release_sha256") or ""),
+        },
+        "issues": stored_issues,
+    }
+    try:
+        content = brownfield.canonical_json(document)
+        return brownfield.validate_baseline(
+            content,
+            installation_id=str(current_binding.get("installation_id") or ""),
+            release_sha256=str(current_binding.get("release_sha256") or ""),
+        )
+    except ValueError as exc:
+        raise KitChangeCheckError(f"brownfield baseline cannot be rebound: {exc}") from exc
+
+
 def _baseline_plan(
     target: Path,
     session: Mapping[str, Any],
     current_issues: list[dict[str, object]],
     current_binding: Mapping[str, str],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
+) -> tuple[dict[str, object], list[dict[str, object]], int]:
     request = session.get("request")
     mode = str(request.get("mode") or "") if isinstance(request, Mapping) else ""
     if mode == "install":
-        return current_issues, [], 0
+        try:
+            baseline = brownfield.build_baseline(
+                target,
+                current_issues,
+                installation_id=str(current_binding.get("installation_id") or ""),
+                release_sha256=str(current_binding.get("release_sha256") or ""),
+            )
+        except ValueError as exc:
+            raise KitChangeCheckError(f"brownfield baseline cannot be built: {exc}") from exc
+        return baseline, [], 0
     if mode != "upgrade":
         raise KitChangeCheckError("kit change mode is missing or invalid")
     prior_content = _prior_baseline_content(session)
     if prior_content is None:
-        return [], current_issues, 0
+        return _rebound_baseline([], current_binding), current_issues, 0
     prior_binding = _prior_binding(prior_content)
     if prior_binding["installation_id"] != current_binding.get("installation_id"):
         raise KitChangeCheckError("approved prior baseline belongs to another installation")
     reviewed_release = _reviewed_prior_release(session)
     if not reviewed_release or prior_binding["release_sha256"] != reviewed_release:
         raise KitChangeCheckError("approved prior baseline is not bound to the reviewed release")
-    try:
-        evaluation = brownfield.evaluate_baseline(
-            target,
-            prior_content,
-            current_issues,
-            installation_id=prior_binding["installation_id"],
-            release_sha256=prior_binding["release_sha256"],
-        )
-    except ValueError as exc:
-        raise KitChangeCheckError(f"approved prior baseline cannot be evaluated: {exc}") from exc
+    def evaluate() -> dict[str, object]:
+        try:
+            return brownfield.evaluate_baseline(
+                target,
+                prior_content,
+                current_issues,
+                installation_id=prior_binding["installation_id"],
+                release_sha256=prior_binding["release_sha256"],
+            )
+        except ValueError as exc:
+            raise KitChangeCheckError(
+                f"approved prior baseline cannot be evaluated: {exc}"
+            ) from exc
+
+    evaluate()
+    _failpoint("after-upgrade-evaluation")
+    evaluation = evaluate()
     counts = evaluation.get("counts")
     resolved = counts.get("resolved") if isinstance(counts, Mapping) else None
     if not isinstance(resolved, int) or isinstance(resolved, bool) or resolved < 0:
         raise KitChangeCheckError("brownfield evaluation counts are malformed")
     return (
-        _public_issues(evaluation.get("existing_gaps")),
+        _rebound_baseline(evaluation.get("existing_gaps"), current_binding),
         _public_issues(evaluation.get("failing_gaps")),
         resolved,
     )
@@ -466,17 +508,11 @@ def run(
         if binding["release_sha256"] != installation.release_sha256:
             raise KitChangeCheckError("managed current pointer changed during offline checks")
         scan_issues = list(scan_document["issues"])
-        carried_issues, failing_issues, resolved_count = _baseline_plan(
+        baseline, failing_issues, resolved_count = _baseline_plan(
             installation.project_root,
             session,
             scan_issues,
             binding,
-        )
-        baseline = brownfield.build_baseline(
-            installation.project_root,
-            carried_issues,
-            installation_id=binding["installation_id"],
-            release_sha256=binding["release_sha256"],
         )
         baseline_content = brownfield.canonical_json(baseline)
         if baseline_ready is not None:

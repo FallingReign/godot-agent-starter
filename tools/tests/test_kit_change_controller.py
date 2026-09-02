@@ -988,7 +988,7 @@ class KitChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(prior, path.read_bytes())
 
-    def test_manual_restore_refuses_a_third_baseline_version_before_rollback(self) -> None:
+    def test_manual_restore_waits_for_a_third_baseline_version_to_be_resolved(self) -> None:
         prepared = self._prepare()
         generated = b"generated baseline\n"
 
@@ -1014,13 +1014,118 @@ class KitChangeControllerTest(unittest.TestCase):
         path.write_bytes(b"third version\n")
         controller.kit_change.rollback.reset_mock()
 
-        with self.assertRaises(controller.KitChangeControllerError) as raised:
-            controller.restore(
-                self.runtime, prepared["session_id"], applied["kit_change"]["result_sha256"]
+        paused = controller.restore(
+            self.runtime,
+            prepared["session_id"],
+            applied["kit_change"]["result_sha256"],
+        )
+
+        self.assertEqual("recovery_required", paused["kit_change"]["status"])
+        self.assertEqual(b"third version\n", path.read_bytes())
+        controller.kit_change.rollback.assert_not_called()
+        path.write_bytes(generated)
+
+        restored = controller.restore(
+            self.runtime,
+            prepared["session_id"],
+            applied["kit_change"]["result_sha256"],
+        )
+
+        self.assertEqual("restored", restored["kit_change"]["status"])
+        self.assertFalse(path.exists())
+        controller.kit_change.rollback.assert_called_once()
+
+    def test_manual_restore_retries_a_transient_baseline_permission_error(self) -> None:
+        path = self.target / ".agent-kit" / "brownfield.json"
+        path.parent.mkdir(parents=True)
+        prior = b"prior baseline\n"
+        generated = b"generated baseline\n"
+        path.write_bytes(prior)
+        prepared = self._prepare()
+
+        def good(_target: Path, _session: object) -> dict[str, object]:
+            path.write_bytes(generated)
+            return {
+                "kit_ok": True,
+                "project_ok": True,
+                "existing_issues": [],
+                "detail": "passed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        applied = controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=good,
+        )
+        original_atomic = controller.kit_change._atomic_bytes
+        failed = False
+
+        def flaky_atomic(
+            target: Path, content: bytes, mode: str | None = None
+        ) -> None:
+            nonlocal failed
+            if Path(target) == path and not failed:
+                failed = True
+                raise PermissionError("baseline is temporarily locked")
+            original_atomic(target, content, mode)
+
+        with mock.patch.object(
+            controller.kit_change, "_atomic_bytes", side_effect=flaky_atomic
+        ):
+            paused = controller.restore(
+                self.runtime,
+                prepared["session_id"],
+                applied["kit_change"]["result_sha256"],
+            )
+            restored = controller.restore(
+                self.runtime,
+                prepared["session_id"],
+                applied["kit_change"]["result_sha256"],
             )
 
-        self.assertEqual("baseline-changed", raised.exception.code)
-        controller.kit_change.rollback.assert_not_called()
+        self.assertEqual("recovery_required", paused["kit_change"]["status"])
+        self.assertEqual("restored", restored["kit_change"]["status"])
+        self.assertEqual(prior, path.read_bytes())
+        controller.kit_change.rollback.assert_called_once()
+
+    def test_failed_check_retries_an_exact_transaction_rollback_conflict(self) -> None:
+        prepared = self._prepare()
+        failed_check = lambda _target, _session: {
+            "kit_ok": False,
+            "project_ok": False,
+            "existing_issues": [],
+            "detail": "self-test failed",
+        }
+        rolled_back = {
+            "ok": True,
+            "status": "rolled_back",
+            "transaction_id": "1" * 32,
+            "preview_sha256": prepared["kit_change"]["plan_sha256"],
+        }
+        controller.kit_change.rollback.side_effect = [
+            controller.kit_change.KitChangeError(
+                "transaction-conflict", "project bytes changed after apply"
+            ),
+            rolled_back,
+        ]
+
+        paused = controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=failed_check,
+        )
+        recovered = controller.recover(
+            self.runtime,
+            prepared["session_id"],
+            post_apply_check=failed_check,
+        )
+
+        self.assertEqual("recovery_required", paused["kit_change"]["status"])
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.assertEqual(2, controller.kit_change.rollback.call_count)
 
     def test_check_crash_after_baseline_write_recovers_deterministically(self) -> None:
         prepared = self._prepare()

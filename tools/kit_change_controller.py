@@ -40,6 +40,7 @@ MAX_ATTEMPTS = 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MODES = {"install", "upgrade"}
 OPEN_STATES = {"ready", "blocked"}
+RECOVERY_STATES = {"recovery_required"}
 FINAL_STATES = {
     "complete",
     "adoption_required",
@@ -47,9 +48,10 @@ FINAL_STATES = {
     "restored",
     "failed",
 }
-STATES = OPEN_STATES | FINAL_STATES | {"applying", "checking"}
+STATES = OPEN_STATES | RECOVERY_STATES | FINAL_STATES | {"applying", "checking"}
 ISSUE_KEYS = {"stage", "code", "path", "line", "message_sha256"}
 BASELINE_SNAPSHOT_KEYS = {"exists", "sha256", "content_base64"}
+RECOVERY_DETAIL_MARKER = " Restore is still required: "
 
 
 class KitChangeView(TypedDict):
@@ -635,6 +637,7 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
         "blocked": "Resolve the listed blockers, then prepare a new review.",
         "applying": "Applying the exact reviewed kit change.",
         "checking": "Checking the installed kit without starting Godot.",
+        "recovery_required": "The kit change is safe, but restoring the previous state still needs to finish.",
         "complete": "The kit change passed its offline checks.",
         "adoption_required": "The kit works. Existing project gaps still need adoption work.",
         "restored_failure": "The kit check failed, so the previous project state was restored.",
@@ -676,6 +679,8 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
         "recovery": (
             "Previous state restored"
             if state in {"restored", "restored_failure"}
+            else "Previous state is saved; recovery still needs to finish"
+            if state == "recovery_required"
             else (
                 "Previous state is saved and can be restored"
                 if session.get("transaction_id") is not None
@@ -1084,6 +1089,71 @@ def _finish(
     )
 
 
+def _base_recovery_check(session: Mapping[str, Any]) -> dict[str, Any]:
+    stored = session.get("check")
+    if not isinstance(stored, Mapping):
+        raise KitChangeControllerError(
+            "session-invalid", "recovery requires the stored offline check"
+        )
+    required = {"kit_ok", "project_ok", "existing_issues", "detail"}
+    candidate = {key: stored.get(key) for key in required}
+    if stored.get("baseline_sha256"):
+        candidate["baseline_sha256"] = stored.get("baseline_sha256")
+    check = _check_result(candidate)
+    check["detail"] = str(check["detail"]).split(RECOVERY_DETAIL_MARKER, 1)[0]
+    return check
+
+
+def _attempt_rollback(session: Mapping[str, Any]) -> Mapping[str, Any]:
+    transaction_id = session.get("transaction_id")
+    _baseline_restore_precheck(session)
+    _restore_prior_baseline(session)
+    if transaction_id is not None:
+        return kit_change.rollback(
+            Path(str(session["target"]["path"])), str(transaction_id)
+        )
+    return {
+        "status": "rolled_back",
+        "transaction_id": None,
+        "preview_sha256": session["preview"]["sha256"],
+    }
+
+
+def _restore_or_require(
+    runtime: Path,
+    session: Mapping[str, Any],
+    check: Mapping[str, Any],
+    *,
+    manual: bool,
+) -> dict[str, Any]:
+    base = dict(check)
+    base["detail"] = str(base.get("detail") or "").split(
+        RECOVERY_DETAIL_MARKER, 1
+    )[0]
+    try:
+        rollback = _attempt_rollback(session)
+    except (kit_change.KitChangeError, KitChangeControllerError) as exc:
+        failed = dict(base)
+        failed["detail"] = (
+            f"{base['detail']}{RECOVERY_DETAIL_MARKER}{exc.detail}"
+        )[:MAX_DETAIL_CHARS]
+        return _transition(
+            runtime,
+            session,
+            "recovery_required",
+            check=failed,
+        )
+    if manual:
+        return _transition(
+            runtime,
+            session,
+            "restored",
+            check=base,
+            restore=_lifecycle(rollback),
+        )
+    return _finish(runtime, session, "restored_failure", base, rollback)
+
+
 def _run_check(
     runtime: Path, session: Mapping[str, Any], hook: PostApplyCheck
 ) -> dict[str, Any]:
@@ -1141,27 +1211,7 @@ def _run_check(
         return _finish(
             runtime, session, "complete" if check["project_ok"] else "adoption_required", check
         )
-    transaction_id = session.get("transaction_id")
-    try:
-        _baseline_restore_precheck(session)
-        _restore_prior_baseline(session)
-        rollback = (
-            kit_change.rollback(Path(str(session["target"]["path"])), str(transaction_id))
-            if transaction_id is not None
-            else {
-                "status": "rolled_back",
-                "transaction_id": None,
-                "preview_sha256": session["preview"]["sha256"],
-            }
-        )
-    except (kit_change.KitChangeError, KitChangeControllerError) as exc:
-        failed = dict(check)
-        detail = exc.detail
-        failed["detail"] = f"{check['detail']}; restore failed: {detail}"[:MAX_DETAIL_CHARS]
-        if isinstance(exc, KitChangeControllerError) and exc.code == "baseline-changed":
-            return _transition(runtime, session, "checking", check=failed)
-        return _finish(runtime, session, "failed", failed)
-    return _finish(runtime, session, "restored_failure", check, rollback)
+    return _restore_or_require(runtime, session, check, manual=False)
 
 
 def apply(
@@ -1182,7 +1232,7 @@ def apply(
                 raise KitChangeControllerError("approval-mismatch", "review fingerprint does not match")
             if session["state"] in FINAL_STATES:
                 return _public(session)
-            if session["state"] in {"applying", "checking"}:
+            if session["state"] in {"applying", "checking", "recovery_required"}:
                 return _public(_recover(runtime, session, post_apply_check or default_post_apply_check))
             if session["state"] == "blocked":
                 raise KitChangeControllerError("preview-blocked", "the review still has blockers")
@@ -1232,24 +1282,20 @@ def restore(runtime_root: Path, session_id: str, result_sha256: str) -> Controll
                 raise KitChangeControllerError("result-mismatch", "result fingerprint does not match")
             if session["state"] == "restored":
                 return _public(session)
-            if session["state"] not in {"complete", "adoption_required"}:
+            if session["state"] not in {
+                "complete",
+                "adoption_required",
+                "recovery_required",
+            }:
                 raise KitChangeControllerError("restore-not-available", "no applied change can be restored")
-            transaction_id = session.get("transaction_id")
-            try:
-                _baseline_restore_precheck(session)
-                _restore_prior_baseline(session)
-                rolled_back = (
-                    kit_change.rollback(Path(str(session["target"]["path"])), str(transaction_id))
-                    if transaction_id is not None
-                    else {
-                        "status": "rolled_back",
-                        "transaction_id": None,
-                        "preview_sha256": session["preview"]["sha256"],
-                    }
+            return _public(
+                _restore_or_require(
+                    runtime,
+                    session,
+                    _base_recovery_check(session),
+                    manual=True,
                 )
-            except kit_change.KitChangeError as exc:
-                raise KitChangeControllerError(exc.code, exc.detail) from exc
-            return _public(_transition(runtime, session, "restored", restore=_lifecycle(rolled_back)))
+            )
     except process_supervisor.ExclusiveLockUnavailable as exc:
         raise KitChangeControllerError("controller-busy", str(exc)) from exc
 
@@ -1257,6 +1303,19 @@ def restore(runtime_root: Path, session_id: str, result_sha256: str) -> Controll
 def _recover(
     runtime: Path, session: Mapping[str, Any], hook: PostApplyCheck
 ) -> dict[str, Any]:
+    if session["state"] == "recovery_required":
+        result = session.get("result")
+        manual = (
+            isinstance(result, Mapping)
+            and result.get("status") in {"complete", "adoption_required"}
+            and bool(session.get("result_sha256"))
+        )
+        return _restore_or_require(
+            runtime,
+            session,
+            _base_recovery_check(session),
+            manual=manual,
+        )
     if session["state"] in FINAL_STATES | OPEN_STATES:
         return dict(session)
     if session["state"] == "checking":

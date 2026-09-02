@@ -301,6 +301,30 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertEqual([], self._stored_baseline()["issues"])
         self.assertIn("new or changed", str(result["detail"]))
 
+    def test_upgrade_rechecks_a_file_changed_after_its_first_evaluation(self) -> None:
+        issue = {
+            "stage": "lint",
+            "code": "legacy-warning",
+            "path": "game/player.gd",
+            "line": 1,
+            "message_sha256": "c" * 64,
+        }
+        self.issues = [issue]
+        self._set_upgrade_prior([issue])
+        self.returncodes["verify"] = 1
+
+        def mutate(name: str) -> None:
+            if name == "after-upgrade-evaluation":
+                self.game.write_text("extends Node\n# changed in race\n", encoding="utf-8")
+
+        with mock.patch.object(check, "_failpoint", side_effect=mutate):
+            result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertEqual([], self._stored_baseline()["issues"])
+        self.assertIn("were not added to the baseline", str(result["detail"]))
+
     def test_self_test_failure_stops_before_scan_and_baseline(self) -> None:
         self.returncodes["self-test"] = 1
 
