@@ -108,6 +108,72 @@ class ReviewRenderer(unittest.TestCase):
         self.assertIn(">Cleanup remains</dd>", page)
         self.assertIn("Restore previous state", page)
 
+    def test_recovery_state_shows_one_plain_retry_action(self) -> None:
+        automatic = self.render(
+            status="recovery_required",
+            decisions=[],
+            detail="The check failed. Restore is still required: file is busy.",
+            recovery="Previous state is saved; recovery still needs to finish",
+            result_sha256="",
+        )
+        self.assertIn(">Recovery needed</p>", automatic)
+        self.assertIn(
+            "Next: Retry recovery. This only finishes restoring the previous state.",
+            automatic,
+        )
+        recover_tag = re.search(
+            r'<button[^>]+id="kit-change-recover"[^>]*>', automatic
+        )
+        self.assertIsNotNone(recover_tag)
+        self.assertNotIn(" hidden", recover_tag.group(0))
+        automatic_restore = re.search(
+            r'<button[^>]+id="kit-change-restore"[^>]*>', automatic
+        )
+        automatic_apply = re.search(
+            r'<button[^>]+id="kit-change-apply"[^>]*>', automatic
+        )
+        self.assertIsNotNone(automatic_restore)
+        self.assertIsNotNone(automatic_apply)
+        self.assertIn(" hidden", automatic_restore.group(0))
+        self.assertIn(" hidden", automatic_apply.group(0))
+        self.assertIn('Board.request("/api/kit-change/recover"', automatic)
+        self.assertIn("body:{\n        session_id:sessionId", automatic)
+
+        manual = self.render(
+            status="recovery_required",
+            decisions=[],
+            result_sha256=RESULT_DIGEST,
+        )
+        self.assertIn(
+            "Next: Retry restore. This only finishes restoring the previous state.",
+            manual,
+        )
+        restore_tag = re.search(
+            r'<button[^>]+id="kit-change-restore"[^>]*>', manual
+        )
+        self.assertIsNotNone(restore_tag)
+        self.assertNotIn(" hidden", restore_tag.group(0))
+        manual_recover = re.search(
+            r'<button[^>]+id="kit-change-recover"[^>]*>', manual
+        )
+        manual_apply = re.search(
+            r'<button[^>]+id="kit-change-apply"[^>]*>', manual
+        )
+        self.assertIsNotNone(manual_recover)
+        self.assertIsNotNone(manual_apply)
+        self.assertIn(" hidden", manual_recover.group(0))
+        self.assertIn(" hidden", manual_apply.group(0))
+        self.assertIn(">Retry restore</button>", manual)
+
+    def test_malformed_recovery_fingerprint_fails_closed(self) -> None:
+        page = self.render(
+            status="recovery_required",
+            decisions=[],
+            result_sha256="short",
+        )
+        self.assertIn('data-kit-change-status="blocked"', page)
+        self.assertIn("The exact recovery fingerprint is malformed.", page)
+
     def test_game_folder_decision_is_actionable_without_hiding_other_blockers(self) -> None:
         game_root = self.render(
             status="blocked",
@@ -235,6 +301,7 @@ class ReviewRenderer(unittest.TestCase):
             "checking": "Checking",
             "complete": "Complete",
             "adoption_required": "Kit works; project cleanup remains",
+            "recovery_required": "Recovery needed",
             "restored": "Previous state restored",
             "failed": "Could not finish",
         }

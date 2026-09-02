@@ -2300,6 +2300,20 @@ def _exact_kit_change_body(
     return body, None
 
 
+def _exact_kit_change_session_body(
+    body: dict,
+) -> tuple[dict | None, tuple[int, dict] | None]:
+    if set(body) != {"session_id"}:
+        return None, _error(400, "Kit recovery request fields are not exact.", "invalid_request")
+    session_id = body.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or KIT_CHANGE_SESSION_RE.fullmatch(session_id) is None
+    ):
+        return None, _error(400, "A full kit review session is required.", "invalid_session")
+    return body, None
+
+
 def api_kit_change_apply(body: dict, server=None) -> tuple[int, dict]:
     value, rejected = _exact_kit_change_body(
         body,
@@ -2368,6 +2382,31 @@ def api_kit_change_restore(body: dict, server=None) -> tuple[int, dict]:
             _RUNTIME.runtime, str(value["session_id"]), str(value["result_sha256"])
         )
         refreshed = _kit_change_status(str(restored["session_id"]), base_url=base_url)
+        return 200, {"ok": True, **refreshed}
+    except kit_change_controller.KitChangeControllerError as exc:
+        return _kit_change_error(exc)
+
+
+def api_kit_change_recover(body: dict, server=None) -> tuple[int, dict]:
+    value, rejected = _exact_kit_change_session_body(body)
+    if rejected is not None:
+        return rejected
+    assert value is not None
+    session_id = str(value["session_id"])
+    base_url = _board_url(server)
+    try:
+        current = _kit_change_status(session_id, base_url=base_url)
+        view = current["kit_change"]
+        if view.get("status") != "recovery_required":
+            return _error(409, "This kit review does not need recovery.", "recovery_not_required")
+        if view.get("result_sha256"):
+            return _error(
+                409,
+                "Retry restore with the exact result fingerprint shown by this review.",
+                "restore_retry_required",
+            )
+        recovered = kit_change_controller.recover(_RUNTIME.runtime, session_id)
+        refreshed = _kit_change_status(str(recovered["session_id"]), base_url=base_url)
         return 200, {"ok": True, **refreshed}
     except kit_change_controller.KitChangeControllerError as exc:
         return _kit_change_error(exc)
@@ -3358,6 +3397,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
             if path == "/api/kit-change/apply":
                 return api_kit_change_apply(body, self.server)
+            if path == "/api/kit-change/recover":
+                return api_kit_change_recover(body, self.server)
             if path == "/api/kit-change/restore":
                 return api_kit_change_restore(body, self.server)
             if path == "/api/board/stop":

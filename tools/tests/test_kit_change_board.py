@@ -121,6 +121,12 @@ class KitChangeBoard(unittest.TestCase):
             self.states[session_id] = _view(session_id, plan, "restored")
             return self.states[session_id]
 
+        def recover(runtime: Path, session_id: str) -> dict:
+            self.assertEqual(self.runtime, runtime)
+            plan = self.states[session_id]["kit_change"]["plan_sha256"]
+            self.states[session_id] = _view(session_id, plan, "restored")
+            return self.states[session_id]
+
         def reprepare(runtime: Path, session_id: str, choices: dict) -> dict:
             self.assertEqual(self.runtime, runtime)
             self.assertEqual(SESSION_A, session_id)
@@ -135,6 +141,9 @@ class KitChangeBoard(unittest.TestCase):
         ).start()
         self.restore = mock.patch.object(
             board.kit_change_controller, "restore", side_effect=restore
+        ).start()
+        self.recover = mock.patch.object(
+            board.kit_change_controller, "recover", side_effect=recover
         ).start()
         self.reprepare = mock.patch.object(
             board.kit_change_controller, "reprepare", side_effect=reprepare, create=True
@@ -340,6 +349,74 @@ class KitChangeBoard(unittest.TestCase):
         })
         self.assertEqual(200, code)
         self.assertEqual("restored", restored["kit_change"]["status"])
+
+    def test_retry_recovery_uses_the_same_session_and_no_result_digest(self) -> None:
+        self.states[SESSION_A] = _view(SESSION_A, PLAN_A, "recovery_required")
+        self.states[SESSION_A]["kit_change"].update({
+            "detail": "Restore is still required: file is busy.",
+            "recovery": "Previous state is saved; recovery still needs to finish",
+            "result_sha256": "",
+        })
+        self.activate()
+
+        code, page = self.get_text(f"kit-change.html?session={SESSION_A}")
+        self.assertEqual(200, code)
+        self.assertIn("Recovery needed", page)
+        self.assertIn("Retry recovery", page)
+        code, recovered = self.post("api/kit-change/recover", {
+            "session_id": SESSION_A,
+        })
+
+        self.assertEqual(200, code)
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.recover.assert_called_once_with(self.runtime, SESSION_A)
+        self.restore.assert_not_called()
+
+    def test_retry_manual_restore_keeps_the_exact_result_digest(self) -> None:
+        self.states[SESSION_A] = _view(SESSION_A, PLAN_A, "recovery_required")
+        self.states[SESSION_A]["kit_change"]["result_sha256"] = RESULT_A
+        self.activate()
+
+        code, page = self.get_text(f"kit-change.html?session={SESSION_A}")
+        self.assertEqual(200, code)
+        self.assertIn("Retry restore", page)
+        code, wrong_action = self.post("api/kit-change/recover", {
+            "session_id": SESSION_A,
+        })
+        self.assertEqual(409, code)
+        self.assertEqual("restore_retry_required", wrong_action["code"])
+        self.recover.assert_not_called()
+
+        code, restored = self.post("api/kit-change/restore", {
+            "session_id": SESSION_A,
+            "result_sha256": RESULT_A,
+        })
+        self.assertEqual(200, code)
+        self.assertEqual("restored", restored["kit_change"]["status"])
+        self.restore.assert_called_once_with(self.runtime, SESSION_A, RESULT_A)
+
+    def test_retry_recovery_requires_exact_body_capability_and_origin(self) -> None:
+        self.states[SESSION_A] = _view(SESSION_A, PLAN_A, "recovery_required")
+        self.activate()
+        code, payload = self.post("api/kit-change/recover", {
+            "session_id": SESSION_A,
+            "result_sha256": "",
+        })
+        self.assertEqual(400, code)
+        self.assertEqual("invalid_request", payload["code"])
+        code, payload = self.post(
+            "api/kit-change/recover", {"session_id": SESSION_A}, token="wrong"
+        )
+        self.assertEqual(403, code)
+        self.assertEqual("invalid_capability", payload["code"])
+        code, payload = self.post(
+            "api/kit-change/recover",
+            {"session_id": SESSION_A},
+            origin="https://attacker.invalid",
+        )
+        self.assertEqual(403, code)
+        self.assertEqual("invalid_origin", payload["code"])
+        self.recover.assert_not_called()
 
     def test_exact_body_capability_origin_and_stale_digest_fail_closed(self) -> None:
         self.activate()

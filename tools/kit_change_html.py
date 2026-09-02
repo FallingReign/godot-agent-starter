@@ -30,6 +30,7 @@ STATUS_LABELS = {
     "checking": "Checking",
     "complete": "Complete",
     "adoption_required": "Kit works; project cleanup remains",
+    "recovery_required": "Recovery needed",
     "restored": "Previous state restored",
     "failed": "Could not finish",
 }
@@ -43,6 +44,7 @@ STATUS_STEP = {
     "checking": "check",
     "complete": "check",
     "adoption_required": "check",
+    "recovery_required": "check",
     "restored": "check",
     "failed": "check",
 }
@@ -288,6 +290,7 @@ gap:8px;color:var(--dim);padding:10px;border-bottom:3px solid var(--line)}
 .status-card,.section,.connection-guidance{background:var(--card);border:1px solid var(--line);
 border-radius:10px;padding:18px;margin:14px 0}.status-card{border-left:5px solid var(--accent)}
 .status-label{font-size:1.35rem;font-weight:800;margin:0}.status-note{color:var(--dim);margin:5px 0 0}
+.status-next{font-weight:750;margin:10px 0 0}
 .facts,.check-list{display:grid;grid-template-columns:minmax(130px,1fr) minmax(180px,2fr);
 margin:0;gap:0}.facts div,.check-list div{display:contents}.facts dt,.facts dd,.check-list dt,
 .check-list dd{padding:9px 0;border-bottom:1px solid var(--line);margin:0}.facts dt,.check-list dt{color:var(--dim)}
@@ -334,19 +337,22 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var labels = __LABELS__;
   var steps = {scanning:"scan",ready:"review",needs_decision:"review",blocked:"review",
                applying:"apply",checking:"check",complete:"check",adoption_required:"check",
-               restored:"check",failed:"check"};
+               recovery_required:"check",restored:"check",failed:"check"};
   var controls = document.getElementById("kit-change-controls");
   var applyButton = document.getElementById("kit-change-apply");
+  var recoverButton = document.getElementById("kit-change-recover");
   var restoreButton = document.getElementById("kit-change-restore");
   var reviewButton = document.getElementById("kit-change-review-again");
   var openButton = document.getElementById("kit-change-open-plan");
   var statusLabel = document.getElementById("kit-change-status-label");
   var statusNote = document.getElementById("kit-change-status-note");
+  var nextStep = document.getElementById("kit-change-next-step");
   var kitFilesCheck = document.getElementById("kit-change-kit-files-check");
   var newWorkCheck = document.getElementById("kit-change-new-work-check");
   var gapCount = document.getElementById("kit-change-gap-count");
   var gapNote = document.getElementById("kit-change-gap-note");
   var resultSha = String(STATIC.result_sha256 || "");
+  var recoveryAction = String(STATIC.recovery_action || "");
   var planUrl = String(STATIC.plan_url || "");
   var sessionId = String(STATIC.session_id || "");
 
@@ -410,6 +416,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
     var live = window.Board && Board.mode() === "live";
     var reviewable = status === "ready" || status === "needs_decision";
     var complete = status === "complete" || status === "adoption_required";
+    var recovering = status === "recovery_required";
     var ended = status === "restored" || status === "failed";
     var unresolved = unresolvedDecisionCount();
     if(status === "needs_decision"){
@@ -418,13 +425,20 @@ def _client_script(static: Mapping[str, Any]) -> str:
         ? "Answer the choices below before continuing."
         : "The exact kit change is ready for review.";
     }
-    controls.disabled = !live || !(reviewable || complete || ended);
+    controls.disabled = !live || !(reviewable || complete || recovering || ended);
     var radios = document.querySelectorAll("[data-decision-id]");
     for(var i=0;i<radios.length;i++) radios[i].disabled = !live || !reviewable;
     applyButton.hidden = !reviewable;
     applyButton.disabled = !live || unresolved !== 0 || !allDecisionsAnswered();
-    restoreButton.hidden = !complete;
+    recoverButton.hidden = !(recovering && recoveryAction === "recover");
+    recoverButton.disabled = !live || !sessionId;
+    restoreButton.hidden = !(complete || (recovering && recoveryAction === "restore"));
     restoreButton.disabled = !live || !resultSha;
+    restoreButton.textContent = recovering ? "Retry restore" : "Restore previous state";
+    nextStep.hidden = !recovering;
+    nextStep.textContent = recoveryAction === "restore"
+      ? "Next: Retry restore. This only finishes restoring the previous state."
+      : "Next: Retry recovery. This only finishes restoring the previous state.";
     openButton.hidden = !complete || !planUrl;
     openButton.disabled = !live || !planUrl;
     reviewButton.hidden = !ended;
@@ -441,6 +455,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
       var nextResult = String(state.result_sha256 || resultSha || "");
       var nextPlanUrl = String(state.plan_url || planUrl || "");
       resultSha = safeDigest(nextResult) ? nextResult : "";
+      recoveryAction = next === "recovery_required" ? (resultSha ? "restore" : "recover") : "";
       planUrl = safePlanUrl(nextPlanUrl);
       var gaps = state.existing_gaps;
       if(gaps && typeof gaps === "object"){
@@ -488,7 +503,15 @@ def _client_script(static: Mapping[str, Any]) -> str:
       }}).then(acceptResponse);
     });
   }
+  function recoverChange(){
+    return Board.guard(recoverButton,"Recovering\u2026",function(){
+      return Board.request("/api/kit-change/recover",{method:"POST",body:{
+        session_id:sessionId
+      }}).then(acceptResponse);
+    });
+  }
   applyButton.addEventListener("click",applyChange);
+  recoverButton.addEventListener("click",recoverChange);
   restoreButton.addEventListener("click",restoreChange);
   reviewButton.addEventListener("click",function(){ location.reload(); });
   openButton.addEventListener("click",function(){ if(planUrl) location.href = planUrl; });
@@ -521,6 +544,8 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     current_version = _text(data.get("current_version"), "Not installed")
     incoming_version = _text(data.get("incoming_version"), "Not supplied")
     digest = _text(data.get("plan_sha256")).lower()
+    raw_result_sha = _text(data.get("result_sha256")).lower()
+    result_sha = raw_result_sha if _DIGEST_RE.fullmatch(raw_result_sha) else ""
     counts = _object(data.get("counts"))
     count_values = {name: _integer(counts.get(name)) for name, _label in COUNT_FIELDS}
     decisions = _items(data.get("decisions"))
@@ -544,6 +569,9 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         blockers = safety_blockers + supplied_blockers
     if blockers:
         status = "blocked"
+    if status == "recovery_required" and raw_result_sha and not result_sha:
+        status = "blocked"
+        blockers.append("The exact recovery fingerprint is malformed.")
 
     title = "Add kit to this project" if mode == "install" else "Upgrade this kit"
     action = "Add kit" if mode == "install" else "Upgrade kit"
@@ -559,6 +587,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
             "checking": "Checking the result without starting Godot.",
             "complete": "The reviewed kit change was applied and checked.",
             "adoption_required": "The kit works. Existing project cleanup remains.",
+            "recovery_required": "The previous project state still needs to be restored.",
             "restored": "The project is back to its previous state.",
             "failed": "The kit change did not finish.",
         }[status]
@@ -580,7 +609,11 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     review_link = _safe_review_link(review_url)
     plan_url = _safe_plan_url(data.get("plan_url"))
     files = _items(data.get("files"))
-    result_sha = _text(data.get("result_sha256")).lower()
+    recovery_action = (
+        "restore" if status == "recovery_required" and result_sha
+        else "recover" if status == "recovery_required"
+        else ""
+    )
 
     blocker_html = ""
     if blockers:
@@ -608,15 +641,22 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         )
 
     link_copy = review_link or "the loopback link printed by your agent"
-    no_script_decision = (
-        "A decision is still needed. Tell your agent your choice first. "
-        "It will refresh this review before applying anything."
-        if missing_decisions
-        else (
+    if recovery_action:
+        retry_name = "restore" if recovery_action == "restore" else "recovery"
+        no_script_decision = (
+            f"Recovery is still needed. Tell your agent to retry {retry_name}. "
+            "The retry only finishes restoring the previous state."
+        )
+    elif missing_decisions:
+        no_script_decision = (
+            "A decision is still needed. Tell your agent your choice first. "
+            "It will refresh this review before applying anything."
+        )
+    else:
+        no_script_decision = (
             "Tell Codex or Copilot that you approve this exact kit change. "
             "The agent can apply it without asking you to run a command."
         )
-    )
 
     static = {
         "status": status,
@@ -628,8 +668,20 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         ),
         "plan_sha256": digest,
         "result_sha256": result_sha if _DIGEST_RE.fullmatch(result_sha) else "",
+        "recovery_action": recovery_action,
         "plan_url": plan_url,
     }
+    recovery_next = (
+        "Next: Retry restore. This only finishes restoring the previous state."
+        if recovery_action == "restore"
+        else "Next: Retry recovery. This only finishes restoring the previous state."
+    )
+    next_hidden = "" if recovery_action else " hidden"
+    apply_hidden = "" if status in {"ready", "needs_decision"} else " hidden"
+    recover_hidden = "" if recovery_action == "recover" else " hidden"
+    restore_visible = status in {"complete", "adoption_required"} or recovery_action == "restore"
+    restore_hidden = "" if restore_visible else " hidden"
+    restore_label = "Retry restore" if recovery_action == "restore" else "Restore previous state"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -668,6 +720,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
   <section class="status-card" role="status" aria-live="polite" aria-atomic="true">
     <p class="status-label" id="kit-change-status-label">{_esc(status_label)}</p>
     <p class="status-note" id="kit-change-status-note">{_esc(detail)}</p>
+    <p class="status-next" id="kit-change-next-step"{next_hidden}>{_esc(recovery_next)}</p>
   </section>
   {blocker_html}
   <section class="section" aria-labelledby="quick-read-title">
@@ -699,9 +752,10 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
   <fieldset id="kit-change-controls" class="interactive-actions section" disabled>
     <legend class="eyebrow">Action</legend>
     <div class="actions">
-      <button type="button" class="primary" id="kit-change-apply" data-board-control disabled>{_esc(action)}</button>
+      <button type="button" class="primary" id="kit-change-apply" data-board-control disabled{apply_hidden}>{_esc(action)}</button>
+      <button type="button" class="primary" id="kit-change-recover" data-board-control disabled{recover_hidden}>Retry recovery</button>
       <button type="button" class="primary" id="kit-change-open-plan" data-board-control disabled hidden>Open project plan</button>
-      <button type="button" class="secondary" id="kit-change-restore" data-board-control disabled hidden>Restore previous state</button>
+      <button type="button" class="secondary" id="kit-change-restore" data-board-control disabled{restore_hidden}>{_esc(restore_label)}</button>
       <button type="button" class="secondary" id="kit-change-review-again" data-board-control disabled hidden>Review again</button>
     </div>
   </fieldset>
