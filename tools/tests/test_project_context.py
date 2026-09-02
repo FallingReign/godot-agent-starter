@@ -208,7 +208,7 @@ class ProjectRootDiscovery(unittest.TestCase):
                 (project / ".kit" / "private-runtime").resolve(), found.runtime_root
             )
 
-    def test_configured_context_fails_closed_on_invalid_or_linked_config(self) -> None:
+    def test_configured_context_fails_closed_on_invalid_config(self) -> None:
         with _scratch() as project:
             _write_marker(project)
             config = project / context.CONFIG_NAME
@@ -219,6 +219,10 @@ class ProjectRootDiscovery(unittest.TestCase):
             with self.assertRaisesRegex(context.ProjectContextError, "game root"):
                 context.load_configured_context(project)
 
+    def test_configured_context_rejects_a_redirected_config(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            config = project / context.CONFIG_NAME
             config.write_text(
                 '{"schema":1,"game_root":".","runtime_root":".kit/runtime"}\n',
                 encoding="utf-8",
@@ -239,6 +243,66 @@ class ProjectRootDiscovery(unittest.TestCase):
                 path_type, "lstat", autospec=True, side_effect=fake_lstat
             ):
                 with self.assertRaisesRegex(context.ProjectContextError, "regular file"):
+                    context.load_configured_context(project)
+
+    def test_configured_context_rejects_duplicate_json_keys(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            (project / context.CONFIG_NAME).write_text(
+                '{"schema":1,"schema":1,"game_root":".",'
+                '"runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                context.ProjectContextError, "not readable JSON"
+            ):
+                context.load_configured_context(project)
+
+    def test_configured_context_rejects_a_hardlinked_config(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            source = project / "config-source.json"
+            source.write_text(
+                '{"schema":1,"game_root":".",'
+                '"runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            config = project / context.CONFIG_NAME
+            try:
+                os.link(source, config)
+            except OSError as exc:
+                self.skipTest(f"hardlinks unavailable on this host: {exc}")
+
+            with self.assertRaisesRegex(context.ProjectContextError, "regular file"):
+                context.load_configured_context(project)
+
+    def test_configured_context_rejects_a_change_during_read(self) -> None:
+        with _scratch() as project:
+            _write_marker(project)
+            config = project / context.CONFIG_NAME
+            config.write_text(
+                '{"schema":1,"game_root":".",'
+                '"runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            original_read_bytes = Path.read_bytes
+            changed = False
+
+            def change_after_read(path: Path) -> bytes:
+                nonlocal changed
+                content = original_read_bytes(path)
+                if path == config and not changed:
+                    changed = True
+                    path.write_bytes(content + b" ")
+                return content
+
+            with mock.patch.object(
+                Path, "read_bytes", autospec=True, side_effect=change_after_read
+            ):
+                with self.assertRaisesRegex(
+                    context.ProjectContextError, "changed while it was being read"
+                ):
                     context.load_configured_context(project)
 
     def test_missing_or_invalid_marker_fails_at_the_nearest_candidate(self) -> None:

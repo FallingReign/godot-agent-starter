@@ -24,6 +24,7 @@ SCHEMA = managed_launcher.MARKER_SCHEMA
 MARKER_NAME = managed_launcher.MARKER_NAME
 MARKER_KIND = managed_launcher.MARKER_KIND
 CONFIG_NAME = "kit.config.json"
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
 # Kept as common presets for older callers.  It is no longer a whitelist.
 GAME_LAYOUTS = (".", "src")
 DEFAULT_RUNTIME_ROOT = ".kit/runtime"
@@ -400,8 +401,33 @@ def _load_installation_config(
         raise ProjectContextError(
             f"kit configuration must be an unredirected regular file: {config_path}"
         )
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        content = managed_launcher._require_regular_file(
+            config_path,
+            "kit configuration",
+            maximum=MAX_CONFIG_BYTES,
+        )
+    except managed_launcher.LauncherError as exc:
+        detail = str(exc)
+        if "cannot be read" in detail:
+            raise ProjectContextError(
+                f"kit configuration is not readable JSON: {config_path}"
+            ) from exc
+        raise ProjectContextError(detail) from exc
+    try:
+        config = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=unique_object,
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         raise ProjectContextError(
             f"kit configuration is not readable JSON: {config_path}"
