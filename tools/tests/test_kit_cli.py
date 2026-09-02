@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import kit  # noqa: E402
+import tools.tests.test_release as release_test_support  # noqa: E402
 
 
 class KitCliTest(unittest.TestCase):
@@ -1250,6 +1251,7 @@ class KitCliTest(unittest.TestCase):
             cwd=ROOT.resolve(),
             timeout=60,
             allow_child_breakaway=True,
+            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
         )
 
     def test_serve_human_output_prints_the_complete_review_url(self) -> None:
@@ -1272,6 +1274,7 @@ class KitCliTest(unittest.TestCase):
             cwd=ROOT.resolve(),
             timeout=60,
             allow_child_breakaway=True,
+            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
         )
 
     @staticmethod
@@ -1368,6 +1371,70 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual("release_required", payload["status"])
         prepare.assert_not_called()
 
+    def test_extracted_release_prepares_without_mutating_its_tree(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-cli-extracted-") as temporary:
+            base = Path(temporary).resolve()
+            source, _commit = release_test_support._fixture_repository(base)
+            archive = base / "built" / "kit.zip"
+            report = kit.release_tool.build_release(source, archive)
+            extracted = base / "extracted"
+            extracted.mkdir()
+            release_test_support._extract_exact(archive, extracted)
+            target = base / "brownfield"
+            target.mkdir()
+            (target / "project.godot").write_text(
+                '[application]\nconfig/name="Brownfield"\n',
+                encoding="utf-8",
+            )
+            user_state = base / "user-state"
+
+            def tree(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+                return tuple(
+                    (
+                        path.relative_to(root).as_posix(),
+                        "directory" if path.is_dir() else "file",
+                        None if path.is_dir() else path.read_bytes(),
+                    )
+                    for path in sorted(root.rglob("*"))
+                )
+
+            before_release = tree(extracted)
+            before_target = tree(target)
+
+            def board(
+                _project: Path,
+                _target: Path,
+                _runtime: Path,
+                session_id: str,
+            ) -> tuple[str, dict, subprocess.CompletedProcess[str]]:
+                url = f"http://127.0.0.1:43123/kit-change.html?session={session_id}"
+                return url, {"ok": True, "review_url": url}, self.completed()
+
+            with mock.patch.object(
+                kit, "CORE_ROOT", extracted
+            ), mock.patch.object(
+                kit, "_user_controller_root", return_value=user_state
+            ), mock.patch.object(
+                kit, "_register_kit_change_board", side_effect=board
+            ):
+                code, output = self.invoke(
+                    "install",
+                    str(target),
+                    "--project",
+                    str(extracted),
+                    "--json",
+                )
+
+            payload = json.loads(output)
+            runtime = user_state / str(report["archive_sha256"]) / "runtime"
+            self.assertEqual(kit.EXIT_OK, code)
+            self.assertEqual("ready", payload["status"])
+            self.assertEqual(str(target), payload["target"])
+            self.assertTrue(payload["review_url"].endswith(payload["session_id"]))
+            self.assertTrue(runtime.is_dir())
+            self.assertEqual(before_release, tree(extracted))
+            self.assertEqual(before_target, tree(target))
+
     def test_upgrade_routes_the_explicit_target_and_game_root(self) -> None:
         session_id = "9" * 64
         prepared = self._kit_change_result(session_id)
@@ -1451,7 +1518,23 @@ class KitCliTest(unittest.TestCase):
 
         self.assertEqual(ROOT / "tools" / "board.py", tool)
         self.assertEqual(ROOT.resolve(), cwd)
-        self.assertIsNone(environment)
+        self.assertEqual({"AGENT_KIT_CONTROLLER_RUNTIME": ""}, environment)
+
+    def test_extracted_review_binds_the_exact_external_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-board-runtime-") as temporary:
+            runtime = Path(temporary).resolve() / "controller"
+            runtime.mkdir()
+
+            tool, cwd, environment = kit._board_target(
+                ROOT.resolve(), ROOT.resolve() / "target", runtime
+            )
+
+        self.assertEqual(ROOT / "tools" / "board.py", tool)
+        self.assertEqual(ROOT.resolve(), cwd)
+        self.assertEqual(
+            {kit.runtime_paths.CONTROLLER_RUNTIME_ENV: str(runtime)},
+            environment,
+        )
 
     def test_upgrade_session_stays_in_initiating_runtime_for_same_launcher_recover(self) -> None:
         incoming_runtime = ROOT / ".kit" / "runtime"
@@ -1500,6 +1583,7 @@ class KitCliTest(unittest.TestCase):
             cwd=ROOT.resolve(),
             timeout=60,
             allow_child_breakaway=False,
+            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
         )
 
     def test_retro_status_is_deterministic_and_routes_to_due_tool(self) -> None:

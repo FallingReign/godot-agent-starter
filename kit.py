@@ -1670,6 +1670,7 @@ def _serve(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
         cwd=project,
         timeout=60,
         allow_child_breakaway=operation in ("start", "open"),
+        environment={runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
     )
     output = (result.stdout or "") + (result.stderr or "")
     state = _final_json_object(result.stdout or "")
@@ -1996,6 +1997,29 @@ def _verified_release_source(args: argparse.Namespace) -> Path:
 
 
 def _source_controller_runtime(project: Path) -> Path:
+    if project == CORE_ROOT:
+        try:
+            report, _members = release_tool.read_verified_directory(CORE_ROOT)
+        except release_tool.ReleaseError:
+            pass
+        else:
+            identity = str(report.get("archive_sha256") or "")
+            if _VERIFY_SECRET.fullmatch(identity) is None:
+                raise CliError(
+                    "the extracted release has no valid identity",
+                    code=EXIT_REFUSED,
+                    status="release_invalid",
+                )
+            runtime = _user_controller_root() / identity / "runtime"
+            try:
+                runtime.relative_to(CORE_ROOT)
+            except ValueError:
+                return runtime
+            raise CliError(
+                "user-local kit-change storage overlaps the extracted release",
+                code=EXIT_REFUSED,
+                status="runtime_unavailable",
+            )
     try:
         return runtime_paths.resolve(project, create=True).runtime
     except (OSError, ValueError, runtime_paths.RuntimeConfigError) as exc:
@@ -2004,6 +2028,42 @@ def _source_controller_runtime(project: Path) -> Path:
             code=EXIT_REFUSED,
             status="runtime_unavailable",
         ) from exc
+
+
+def _user_controller_root() -> Path:
+    try:
+        if os.name == "nt":
+            configured = str(os.environ.get("LOCALAPPDATA") or "").strip()
+            base = (
+                Path(configured).expanduser()
+                if configured
+                else Path.home() / "AppData" / "Local"
+            )
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support"
+        else:
+            configured = str(os.environ.get("XDG_STATE_HOME") or "").strip()
+            base = (
+                Path(configured).expanduser()
+                if configured
+                else Path.home() / ".local" / "state"
+            )
+        if not base.is_absolute():
+            raise RuntimeError("configured user-local directory is not absolute")
+        absolute = base.absolute()
+    except (OSError, RuntimeError) as exc:
+        raise CliError(
+            f"user-local kit-change storage is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+    if not absolute.is_absolute():
+        raise CliError(
+            "user-local kit-change storage must be an absolute path",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        )
+    return absolute / "GodotAgentKit" / "controller"
 
 
 def _kit_change_runtime(project: Path, target: Path, mode: str) -> Path:
@@ -2016,10 +2076,33 @@ def _board_target(
     target: Path,
     runtime: Path,
 ) -> tuple[Path, Path, dict[str, str] | None]:
-    del target, runtime
+    del target
     # The review belongs to the initiating incoming kit. The target's active
     # core may be an older release which cannot understand this session.
-    return _script(project, "tools", "board.py"), project, None
+    try:
+        configured = runtime_paths.resolve(project, create=False).runtime
+        environment = {
+            runtime_paths.CONTROLLER_RUNTIME_ENV: (
+                str(runtime) if runtime != configured else ""
+            ),
+        }
+        selected = runtime_paths.resolve_controller(
+            project,
+            environment=environment,
+        ).runtime
+    except (OSError, ValueError, runtime_paths.RuntimeConfigError) as exc:
+        raise CliError(
+            f"configured review storage is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+    if selected != runtime:
+        raise CliError(
+            "controller and review storage do not match",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        )
+    return _script(project, "tools", "board.py"), project, environment
 
 
 def _exact_kit_change_url(value: object, session_id: str) -> str:
