@@ -2447,7 +2447,7 @@ def materialize_verified_directory_zip(root: Path, output: Path) -> dict:
         name: (member.content, member.mode if member.mode is not None else 0o644)
         for name, member in members.items()
     })
-    if output.exists():
+    if output.exists() or output.is_symlink() or _is_reparse_point(output):
         if output.is_symlink() or _is_reparse_point(output) or not output.is_file():
             raise ReleaseError("materialized release output is not a regular file")
         try:

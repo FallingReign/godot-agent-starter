@@ -1018,6 +1018,19 @@ class TestVerifiedDirectory(ReleaseTestCase):
         self.assertEqual(report["archive_sha256"],
                          release.verify_archive(archive)["archive_sha256"])
 
+    def test_directory_materialization_refuses_a_dangling_output_redirect(self) -> None:
+        _archive, directory = self._directory()
+        target = self.scratch / "removed-output-target"
+        target.mkdir()
+        output = self.scratch / "materialized.zip"
+        _make_directory_redirect(output, target)
+        target.rmdir()
+        try:
+            with self.assertRaisesRegex(release.ReleaseError, "not a regular file"):
+                release.materialize_verified_directory_zip(directory, output)
+        finally:
+            _remove_directory_redirect(output)
+
 
 class TestSemanticIsolation(ReleaseTestCase):
     def test_project_name_cannot_leak_into_reviewed_kit_text(self) -> None:
