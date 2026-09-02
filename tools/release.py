@@ -1946,8 +1946,21 @@ def inspect_archive(path: Path) -> dict:
     }
 
 
+def _canonical_release_sha256(members: dict[str, ArchiveMember]) -> str:
+    """Hash the one canonical container for an authenticated member set."""
+    payload = _zip_payload({
+        name: (member.content, member.mode if member.mode is not None else 0o644)
+        for name, member in members.items()
+    })
+    if len(payload) > MAX_ARCHIVE_BYTES:
+        raise ReleaseError(f"canonical release ZIP exceeds {MAX_ARCHIVE_BYTES} bytes")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _verify_member_set(
-        kind: str, members: dict[str, ArchiveMember], identity_sha256: str
+        kind: str,
+        members: dict[str, ArchiveMember],
+        container_sha256: str | None,
 ) -> tuple[dict, dict[str, ArchiveMember]]:
     """Authenticate one already bounded member set."""
     manifest_member = members.get(MANIFEST_PATH)
@@ -1994,6 +2007,12 @@ def _verify_member_set(
         if not members[license_path].content.strip():
             raise ReleaseError(f"archive legal metadata is empty: {license_path}")
     install_manifest = _validate_install_bundle(manifest["version"], members)
+    identity_sha256 = _canonical_release_sha256(members)
+    # 0.2.0 predates canonical cross-container identity. Keep the exact known
+    # archive bound to its historical identity even if a future ZIP writer
+    # changes its canonical representation.
+    if container_sha256 == LEGACY_0_2_0_ARCHIVE_SHA256:
+        identity_sha256 = LEGACY_0_2_0_ARCHIVE_SHA256
     report = {
         "ok": True,
         "format": kind,
@@ -2002,6 +2021,7 @@ def _verify_member_set(
         "authority_evidence": manifest["authority_evidence"],
         "files": len(expected),
         "archive_sha256": identity_sha256,
+        "container_sha256": container_sha256,
         "install_schema": (
             install_manifest["install_schema"]
             if install_manifest is not None else None
@@ -2013,8 +2033,8 @@ def _verify_member_set(
 def _verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     """Return a verification report and the exact members it authenticated."""
     kind, members, content = _read_archive_material(path)
-    archive_hash = hashlib.sha256(content).hexdigest()
-    return _verify_member_set(kind, members, archive_hash)
+    container_sha256 = hashlib.sha256(content).hexdigest()
+    return _verify_member_set(kind, members, container_sha256)
 
 
 def _directory_member(path: Path, relative: str) -> ArchiveMember:
@@ -2134,15 +2154,7 @@ def read_verified_archive(path: Path) -> tuple[dict, dict[str, ArchiveMember]]:
 def read_verified_directory(root: Path) -> tuple[dict, dict[str, ArchiveMember]]:
     """Verify an exact extracted release without Git or the original archive."""
     members = _read_release_directory(root)
-    payload = _zip_payload({
-        name: (member.content, member.mode if member.mode is not None else 0o644)
-        for name, member in members.items()
-    })
-    if len(payload) > MAX_ARCHIVE_BYTES:
-        raise ReleaseError(f"canonical release ZIP exceeds {MAX_ARCHIVE_BYTES} bytes")
-    return _verify_member_set(
-        "directory", members, hashlib.sha256(payload).hexdigest()
-    )
+    return _verify_member_set("directory", members, None)
 
 
 def materialize_verified_directory_zip(root: Path, output: Path) -> dict:

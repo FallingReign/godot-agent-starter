@@ -2,6 +2,7 @@
 """Production-shaped tests for deterministic sanitized release archives."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -386,6 +387,35 @@ class TestDeterministicBuild(ReleaseTestCase):
                             and member.uname == "" and member.gname == ""
                             for member in members))
 
+    def test_all_containers_share_one_lifecycle_identity_and_keep_raw_digests(
+            self,
+    ) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        outputs = [
+            self.scratch / "out" / "kit.zip",
+            self.scratch / "out" / "kit.tar",
+            self.scratch / "out" / "kit.tgz",
+        ]
+
+        reports = [release.build_release(root, output) for output in outputs]
+        directory = self.scratch / "extracted"
+        directory.mkdir()
+        _extract_exact(outputs[0], directory)
+        directory_report, _members = release.read_verified_directory(directory)
+
+        identities = {
+            report["archive_sha256"]
+            for report in [*reports, directory_report]
+        }
+        self.assertEqual(1, len(identities))
+        raw_digests = []
+        for output, report in zip(outputs, reports, strict=True):
+            expected = hashlib.sha256(output.read_bytes()).hexdigest()
+            self.assertEqual(expected, report["container_sha256"])
+            raw_digests.append(expected)
+        self.assertEqual(3, len(set(raw_digests)))
+        self.assertIsNone(directory_report["container_sha256"])
+
     def test_gzip_wrapper_uses_canonical_stored_deflate_blocks(self) -> None:
         self.assertEqual(
             "1f8b08000000000000ff010300fcff616263c241243503000000",
@@ -549,6 +579,30 @@ class TestManagedInstallContract(ReleaseTestCase):
         self.assertIsNone(verified["install_schema"])
         self.assertEqual(verified["version"], "0.2.0")
 
+    def test_exact_historic_container_keeps_its_bound_identity(self) -> None:
+        canonical = _historic_0_2_archive(self.scratch)
+        inspected = release.inspect_archive(canonical)
+        modes = {
+            item["path"]: int(item["mode"], 8)
+            for item in inspected["members"]
+        }
+        repacked = self.scratch / "historic-repacked.zip"
+        with zipfile.ZipFile(repacked, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, content in sorted(_member_contents(canonical).items()):
+                info = zipfile.ZipInfo(name, (2001, 2, 3, 4, 5, 6))
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | modes[name]) << 16
+                archive.writestr(info, content, compress_type=zipfile.ZIP_STORED)
+        raw_digest = hashlib.sha256(repacked.read_bytes()).hexdigest()
+
+        with mock.patch.object(
+            release, "LEGACY_0_2_0_ARCHIVE_SHA256", raw_digest
+        ):
+            verified = release.verify_archive(repacked)
+
+        self.assertEqual(raw_digest, verified["archive_sha256"])
+        self.assertEqual(raw_digest, verified["container_sha256"])
+
     def test_generated_install_source_cannot_be_reauthorized_by_release_manifest(self) -> None:
         archive = _synthetic_smoke_archive(self.scratch)
         contents = _member_contents(archive)
@@ -603,6 +657,10 @@ class TestManagedInstallContract(ReleaseTestCase):
         manifest = release._install_manifest_document("0.3.0")
 
         self.assertEqual([], release._definition_errors(manifest))
+        self.assertEqual(
+            "b5a2f7dafd4a21db099d30f295caceea3a20d4303e9b885d1e0fe24873f5e4dc",
+            release.LEGACY_0_2_0_ARCHIVE_SHA256,
+        )
         self.assertEqual(30, len(release.LEGACY_0_2_0_SURFACE_SHA256))
         self.assertEqual(83, len(release.LEGACY_0_2_0_RETIRED_SHA256))
         retired = set(release.LEGACY_0_2_0_RETIRED_SHA256)
