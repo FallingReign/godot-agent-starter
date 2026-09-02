@@ -6,7 +6,7 @@ export KIT_BOOTSTRAP_B64='ZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwppbXBvcn
 KIT_BOOTSTRAP_CODE="import base64,os;exec(compile(base64.b64decode(os.environ.pop('KIT_BOOTSTRAP_B64'),validate=True),'<kit-bootstrap>','exec'))"
 KIT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KIT_ENTRY="$KIT_ROOT/tools/managed_launcher.py"
-KIT_ENTRY_SHA256="29011c9082810c964a56ab908c701819ed6af21d62f874b8a26e4c8e97d55785"
+KIT_ENTRY_SHA256="cf9be725c64375094ad69f106d5e3a674bbd3b9397fa28509c9d21234c2939ef"
 
 if [ -e "$KIT_ROOT/.agent-kit" ] || [ -L "$KIT_ROOT/.agent-kit" ]; then
     echo "kit: a managed kit change is incomplete; use its recovery action." >&2
@@ -25,11 +25,11 @@ if [ -n "${KIT_PYTHON:-}" ]; then
         echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
         exit 3
     fi
-    exec "$KIT_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+    exec "$KIT_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
 fi
 for KIT_SYSTEM_PYTHON in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     if [ -f "$KIT_SYSTEM_PYTHON" ] && [ -x "$KIT_SYSTEM_PYTHON" ]; then
-        exec "$KIT_SYSTEM_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+        exec "$KIT_SYSTEM_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
     fi
 done
 echo "kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter." >&2

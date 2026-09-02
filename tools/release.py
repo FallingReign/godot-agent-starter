@@ -263,6 +263,7 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_kit_change_html.py",
     "tools/tests/test_kit_cli.py",
     "tools/tests/test_layout_consumers.py",
+    "tools/tests/test_lifecycle_e2e.py",
     "tools/tests/test_managed_launcher.py",
     "tools/tests/test_native_engine.py",
     "tools/tests/test_native_process_containment.py",
@@ -463,11 +464,11 @@ if [ -n "${{KIT_PYTHON:-}}" ]; then
         echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
         exit 3
     fi
-    exec "$KIT_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
+    exec "$KIT_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
 fi
 for KIT_SYSTEM_PYTHON in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     if [ -f "$KIT_SYSTEM_PYTHON" ] && [ -x "$KIT_SYSTEM_PYTHON" ]; then
-        exec "$KIT_SYSTEM_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
+        exec "$KIT_SYSTEM_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_MANAGED_LAUNCHER" "$KIT_MANAGED_LAUNCHER_SHA256" "$@"
     fi
 done
 echo "kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter." >&2
@@ -502,7 +503,7 @@ if /I not "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_invalid
 if not exist "%KIT_PYTHON%" goto kit_python_invalid
 for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
 if /I "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_invalid
-"%KIT_PYTHON%" -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
+"%KIT_PYTHON%" -B -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
 exit /b %errorlevel%
 
 :kit_python_invalid
@@ -510,7 +511,7 @@ echo kit: KIT_PYTHON must name one absolute interpreter file. 1>&2
 exit /b 3
 
 :use_system_py
-"%SystemRoot%\\py.exe" -3 -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
+"%SystemRoot%\\py.exe" -3 -B -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_MANAGED_LAUNCHER%" "%KIT_MANAGED_LAUNCHER_SHA256%" %*
 exit /b %errorlevel%
 '''.encode("utf-8")
 
@@ -544,11 +545,11 @@ if [ -n "${{KIT_PYTHON:-}}" ]; then
         echo "kit: KIT_PYTHON does not name an executable interpreter file." >&2
         exit 3
     fi
-    exec "$KIT_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+    exec "$KIT_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
 fi
 for KIT_SYSTEM_PYTHON in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     if [ -f "$KIT_SYSTEM_PYTHON" ] && [ -x "$KIT_SYSTEM_PYTHON" ]; then
-        exec "$KIT_SYSTEM_PYTHON" -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
+        exec "$KIT_SYSTEM_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE" "$KIT_ENTRY" "$KIT_ENTRY_SHA256" "$@"
     fi
 done
 echo "kit: its internal runtime is unavailable; set KIT_PYTHON to one absolute Python 3.10+ interpreter." >&2
@@ -589,7 +590,7 @@ if /I not "%KIT_PYTHON%"=="%KIT_PYTHON_RESOLVED%" goto kit_python_invalid
 if not exist "%KIT_PYTHON%" goto kit_python_invalid
 for %%I in ("%KIT_PYTHON%") do set "KIT_PYTHON_ATTRIBUTES=%%~aI"
 if /I "%KIT_PYTHON_ATTRIBUTES:~0,1%"=="d" goto kit_python_invalid
-"%KIT_PYTHON%" -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
+"%KIT_PYTHON%" -B -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
 exit /b %errorlevel%
 
 :kit_python_invalid
@@ -597,7 +598,7 @@ echo kit: KIT_PYTHON must name one absolute interpreter file. 1>&2
 exit /b 3
 
 :use_system_py
-"%SystemRoot%\\py.exe" -3 -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
+"%SystemRoot%\\py.exe" -3 -B -I -S -c "%KIT_BOOTSTRAP_CODE%" "%KIT_ENTRY%" "%KIT_ENTRY_SHA256%" %*
 exit /b %errorlevel%
 '''.encode("utf-8")
 

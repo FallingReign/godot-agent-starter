@@ -740,6 +740,7 @@ def launch(arguments: Sequence[str] | None = None) -> int:
         completed = subprocess.run(
             [
                 sys.executable,
+                "-B",
                 "-I",
                 "-S",
                 "-c",

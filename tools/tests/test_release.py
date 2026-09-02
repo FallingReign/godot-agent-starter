@@ -678,6 +678,17 @@ class TestManagedInstallContract(ReleaseTestCase):
         self.assertEqual(3, outcome.returncode, outcome.stdout + outcome.stderr)
         self.assertFalse((linked / "executed").exists())
 
+    def test_every_stable_launcher_disables_bytecode_writes(self) -> None:
+        launcher_content = b"print('managed launcher')\n"
+        for rendered in (
+            release._managed_unix_launcher(launcher_content),
+            release._managed_windows_launcher(launcher_content),
+            release._flat_unix_launcher(launcher_content),
+            release._flat_windows_launcher(launcher_content),
+        ):
+            with self.subTest(platform="windows" if b"@echo off" in rendered else "unix"):
+                self.assertIn(b"-B -I -S -c", rendered)
+
     def test_generated_launcher_refuses_redirected_launcher_folder(self) -> None:
         source = (
             b"from pathlib import Path\n"

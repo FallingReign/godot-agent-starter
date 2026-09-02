@@ -514,9 +514,9 @@ class ProcessBoundary(unittest.TestCase):
 
             self.assertEqual(17, result)
             self.assertEqual(sys.executable, observed["command"][0])
-            self.assertEqual(["-I", "-S", "-c"], observed["command"][1:4])
-            self.assertEqual(launcher.ENTRYPOINT_BOOTSTRAP, observed["command"][4])
-            self.assertEqual(str(core / "kit.py"), observed["command"][5])
+            self.assertEqual(["-B", "-I", "-S", "-c"], observed["command"][1:5])
+            self.assertEqual(launcher.ENTRYPOINT_BOOTSTRAP, observed["command"][5])
+            self.assertEqual(str(core / "kit.py"), observed["command"][6])
             self.assertEqual((core / "kit.py").read_bytes(), observed["input"])
             self.assertEqual(root, observed["cwd"])
             self.assertEqual(str(root), observed["env"][launcher.PROJECT_ROOT_ENV])
