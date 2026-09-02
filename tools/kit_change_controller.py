@@ -12,16 +12,20 @@ import hmac
 import json
 import os
 import re
+import base64
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
 import kit_change
+import kit_change_check
 import process_supervisor
+import project_context
 import release
+import brownfield
 
 
-SESSION_SCHEMA = 1
+SESSION_SCHEMA = 2
 SESSION_KIND = "agent-kit-change-session"
 RESULT_SCHEMA = 1
 RESULT_KIND = "agent-kit-change-result"
@@ -32,6 +36,7 @@ LOCK_PATH = f"{CONTROLLER_ROOT}/controller.lock"
 MAX_SESSION_BYTES = 16 * 1024 * 1024
 MAX_DETAIL_CHARS = 2048
 MAX_ISSUES = 4096
+MAX_ATTEMPTS = 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MODES = {"install", "upgrade"}
 OPEN_STATES = {"ready", "blocked"}
@@ -44,9 +49,11 @@ FINAL_STATES = {
 }
 STATES = OPEN_STATES | FINAL_STATES | {"applying", "checking"}
 ISSUE_KEYS = {"stage", "code", "path", "line", "message_sha256"}
+BASELINE_SNAPSHOT_KEYS = {"exists", "sha256", "content_base64"}
 
 
 class KitChangeView(TypedDict):
+    session_id: str
     mode: str
     status: str
     project: dict[str, str]
@@ -130,14 +137,41 @@ def _inside(path: Path, parent: Path) -> bool:
 
 
 def _separate_roots(runtime_root: Path, target_root: Path) -> tuple[Path, Path]:
-    runtime = _runtime(runtime_root)
     target = _root(target_root, "target project")
-    if _inside(runtime, target) or _inside(target, runtime):
+    runtime_candidate = runtime_root.absolute()
+    overlap_allowed = False
+    if _inside(runtime_candidate, target):
+        try:
+            context = project_context.load_configured_context(target)
+        except project_context.ProjectContextError:
+            context = None
+        overlap_allowed = bool(
+            context is not None
+            and context.install_mode == "managed"
+            and runtime_candidate == context.runtime_root.absolute()
+        )
+    if (_inside(runtime_candidate, target) or _inside(target, runtime_candidate)) and not overlap_allowed:
         raise KitChangeControllerError(
             "runtime-overlap",
             "controller runtime and target project must be separate directories",
         )
+    runtime = _runtime(runtime_candidate)
     return runtime, target
+
+
+def _validate_runtime_target_pair(runtime: Path, target: Path) -> None:
+    if not (_inside(runtime, target) or _inside(target, runtime)):
+        return
+    try:
+        context = project_context.load_configured_context(target)
+    except project_context.ProjectContextError as exc:
+        raise KitChangeControllerError(
+            "runtime-overlap", "controller runtime overlaps the target project"
+        ) from exc
+    if context.install_mode != "managed" or runtime != context.runtime_root:
+        raise KitChangeControllerError(
+            "runtime-overlap", "controller runtime overlaps the target project"
+        )
 
 
 def _directory(runtime: Path, relative: str) -> Path:
@@ -170,10 +204,13 @@ def _stable(path: Path, limit: int, label: str) -> bytes:
         raise KitChangeControllerError(exc.code, f"{label}: {exc.detail}") from exc
 
 
-def _archive_payload(path: Path, expected_sha256: str) -> bytes:
+def _archive_payload(path: Path, expected_container_sha256: str) -> bytes:
     limit = int(getattr(release, "MAX_ARCHIVE_BYTES", 512 * 1024 * 1024))
     content = _stable(path, limit, "release archive")
-    if not hmac.compare_digest(_sha256(content), expected_sha256):
+    if (
+        SHA256_RE.fullmatch(expected_container_sha256) is None
+        or not hmac.compare_digest(_sha256(content), expected_container_sha256)
+    ):
         raise KitChangeControllerError(
             "release-changed", "release archive changed after verification"
         )
@@ -187,39 +224,38 @@ def _archive_path(runtime: Path, digest: str) -> Path:
 
 
 def _retain_release(runtime: Path, source: Path) -> tuple[dict[str, Any], int, Path]:
+    source_is_directory = source.is_dir()
     try:
-        if source.is_dir():
-            report, members = release.read_verified_directory(source)
-            digest = str(report.get("archive_sha256") or "")
+        if source_is_directory:
+            source_report, _source_members = release.read_verified_directory(source)
+            digest = str(source_report.get("archive_sha256") or "")
             stored = _archive_path(runtime, digest)
-            materialized = release.materialize_verified_directory_zip(source, stored)
-            if (
-                materialized.get("archive_sha256") != digest
-                or materialized.get("version") != report.get("version")
-            ):
-                raise KitChangeControllerError(
-                    "release-changed", "release changed while it was retained"
-                )
+            if not stored.exists():
+                release.materialize_verified_directory_zip(source, stored)
         else:
-            report, members = release.read_verified_archive(source)
-            digest = str(report.get("archive_sha256") or "")
-            content = _archive_payload(source, digest)
+            source_report, _source_members = release.read_verified_archive(source)
+            digest = str(source_report.get("archive_sha256") or "")
+            source_container = str(source_report.get("container_sha256") or "")
+            content = _archive_payload(source, source_container)
             stored = _archive_path(runtime, digest)
-            if stored.exists():
-                if _stable(stored, len(content), "retained release") != content:
-                    raise KitChangeControllerError(
-                        "release-conflict", "retained release does not match its identity"
-                    )
-            else:
+            wrote_source = not stored.exists()
+            if wrote_source:
                 _atomic(stored, content)
-            verified = release.verify_archive(stored)
-            if (
-                verified.get("archive_sha256") != digest
-                or verified.get("version") != report.get("version")
-            ):
-                raise KitChangeControllerError(
-                    "release-changed", "retained release differs from its source"
-                )
+        report, members = release.read_verified_archive(stored)
+        container = str(report.get("container_sha256") or "")
+        _archive_payload(stored, container)
+        if (
+            report.get("archive_sha256") != digest
+            or report.get("version") != source_report.get("version")
+            or (
+                not source_is_directory
+                and wrote_source
+                and container != source_container
+            )
+        ):
+            raise KitChangeControllerError(
+                "release-changed", "retained release differs from its source"
+            )
     except release.ReleaseError as exc:
         raise KitChangeControllerError("release-invalid", str(exc)) from exc
     return dict(report), len(members), stored
@@ -230,16 +266,22 @@ def _verify_release(runtime: Path, session: Mapping[str, Any]) -> Path:
     if not isinstance(release_state, Mapping):
         raise KitChangeControllerError("session-invalid", "release state is missing")
     digest = str(release_state.get("archive_sha256") or "")
+    container = str(release_state.get("container_sha256") or "")
     stored = _archive_path(runtime, digest)
     expected = stored.relative_to(runtime).as_posix()
     if release_state.get("archive") != expected:
         raise KitChangeControllerError("session-invalid", "release path is not canonical")
-    _archive_payload(stored, digest)
+    _archive_payload(stored, container)
     try:
-        report = release.verify_archive(stored)
+        report, members = release.read_verified_archive(stored)
     except release.ReleaseError as exc:
         raise KitChangeControllerError("release-tampered", str(exc)) from exc
-    if report.get("version") != release_state.get("version"):
+    if (
+        report.get("archive_sha256") != digest
+        or report.get("container_sha256") != container
+        or report.get("version") != release_state.get("version")
+        or len(members) != release_state.get("member_count")
+    ):
         raise KitChangeControllerError("release-tampered", "retained release metadata changed")
     return stored
 
@@ -251,6 +293,7 @@ def _session_id(
     mode: str,
     requested_game_root: str | None,
     selected_game_root: object,
+    attempt: int,
 ) -> str:
     return _sha256(_canonical({
         "target": str(target),
@@ -259,6 +302,7 @@ def _session_id(
         "mode": mode,
         "requested_game_root": requested_game_root,
         "selected_game_root": selected_game_root,
+        "attempt": attempt,
     }))
 
 
@@ -299,7 +343,7 @@ def _parse_session(content: bytes) -> dict[str, Any]:
     expected = {
         "schema", "kind", "session_id", "target", "release", "request",
         "preview", "state", "sequence", "transaction_id", "check", "result",
-        "result_sha256", "restore", "session_sha256",
+        "result_sha256", "restore", "baseline", "attempt", "session_sha256",
     }
     if set(value) != expected or value["schema"] != SESSION_SCHEMA or value["kind"] != SESSION_KIND:
         raise KitChangeControllerError("session-invalid", "session fields are not exact")
@@ -310,11 +354,18 @@ def _parse_session(content: bytes) -> dict[str, Any]:
         supplied, _sha256(_canonical(unsigned))
     ):
         raise KitChangeControllerError("session-tampered", "session fingerprint changed")
-    if value["state"] not in STATES or not isinstance(value["sequence"], int):
+    if (
+        value["state"] not in STATES
+        or not isinstance(value["sequence"], int)
+        or not isinstance(value["attempt"], int)
+        or isinstance(value["attempt"], bool)
+        or not 0 <= value["attempt"] < MAX_ATTEMPTS
+    ):
         raise KitChangeControllerError("session-invalid", "session state is malformed")
     for key in ("target", "release", "request", "preview"):
         if not isinstance(value[key], Mapping):
             raise KitChangeControllerError("session-invalid", f"session {key} is malformed")
+    _validate_preview_binding(value)
     plan_sha = str(value["preview"].get("sha256") or "")
     archive_sha = str(value["release"].get("archive_sha256") or "")
     mode = value["request"].get("mode")
@@ -324,6 +375,7 @@ def _parse_session(content: bytes) -> dict[str, Any]:
     expected_id = _session_id(
         target, archive_sha, plan_sha, str(mode), value["request"].get("game_root"),
         value["request"].get("selected_game_root"),
+        value["attempt"],
     )
     if not hmac.compare_digest(str(value["session_id"]), expected_id):
         raise KitChangeControllerError("session-tampered", "session identity changed")
@@ -337,7 +389,114 @@ def _parse_session(content: bytes) -> dict[str, Any]:
         or not hmac.compare_digest(result_sha, _sha256(_canonical(value["result"])))
     ):
         raise KitChangeControllerError("session-tampered", "result fingerprint changed")
+    _validate_baseline_state(value["baseline"])
     return value
+
+
+def _validate_preview_binding(session: Mapping[str, Any]) -> None:
+    target = session["target"]
+    release_state = session["release"]
+    request = session["request"]
+    preview = session["preview"]
+    if set(target) != {"path"} or not isinstance(target.get("path"), str):
+        raise KitChangeControllerError("session-invalid", "target fields are not exact")
+    release_keys = {
+        "archive",
+        "archive_sha256",
+        "container_sha256",
+        "version",
+        "member_count",
+    }
+    if (
+        set(release_state) != release_keys
+        or not isinstance(release_state.get("archive"), str)
+        or SHA256_RE.fullmatch(str(release_state.get("container_sha256") or "")) is None
+        or not isinstance(release_state.get("version"), str)
+        or not isinstance(release_state.get("member_count"), int)
+        or isinstance(release_state.get("member_count"), bool)
+        or int(release_state.get("member_count") or 0) <= 0
+    ):
+        raise KitChangeControllerError("session-invalid", "release fields are not exact")
+    if set(request) != {"mode", "game_root", "selected_game_root"}:
+        raise KitChangeControllerError("session-invalid", "request fields are not exact")
+    if request.get("mode") not in MODES:
+        raise KitChangeControllerError("session-invalid", "request mode is malformed")
+    for field in ("game_root", "selected_game_root"):
+        if request.get(field) is not None and not isinstance(request.get(field), str):
+            raise KitChangeControllerError("session-invalid", f"request {field} is malformed")
+    if set(preview) != {"sha256", "raw"} or not isinstance(preview.get("raw"), Mapping):
+        raise KitChangeControllerError("session-invalid", "preview fields are not exact")
+    raw = preview["raw"]
+    if (
+        set(raw) != {"schema", "kind", "material", "approval"}
+        or raw.get("schema") != kit_change.PREVIEW_SCHEMA
+        or raw.get("kind") != "agent-kit-change-preview"
+        or not isinstance(raw.get("material"), Mapping)
+        or not isinstance(raw.get("approval"), Mapping)
+    ):
+        raise KitChangeControllerError("session-invalid", "preview contract is malformed")
+    material = raw["material"]
+    approval = raw["approval"]
+    if set(approval) != {"algorithm", "sha256", "approvable"}:
+        raise KitChangeControllerError("session-invalid", "preview approval fields are not exact")
+    material_sha = _sha256(_canonical(material))
+    if (
+        approval.get("algorithm") != "sha256-canonical-json-v1"
+        or not isinstance(approval.get("approvable"), bool)
+        or not hmac.compare_digest(str(approval.get("sha256") or ""), material_sha)
+        or not hmac.compare_digest(str(preview.get("sha256") or ""), material_sha)
+    ):
+        raise KitChangeControllerError("session-tampered", "preview fingerprint is not exact")
+    blockers = material.get("blockers")
+    if not isinstance(blockers, list) or bool(approval["approvable"]) != (not blockers):
+        raise KitChangeControllerError("session-tampered", "preview blockers and approval disagree")
+    if material.get("operation") != request.get("mode"):
+        raise KitChangeControllerError("session-tampered", "preview operation changed")
+    game_state = material.get("game_root")
+    if not isinstance(game_state, Mapping) or game_state.get("value") != request.get("selected_game_root"):
+        raise KitChangeControllerError("session-tampered", "preview game folder binding changed")
+    if request.get("game_root") is not None and request.get("game_root") != game_state.get("value"):
+        raise KitChangeControllerError("session-tampered", "requested game folder binding changed")
+    target_release = material.get("target_release")
+    if (
+        not isinstance(target_release, Mapping)
+        or target_release.get("archive_sha256") != release_state.get("archive_sha256")
+        or target_release.get("kit_version") != release_state.get("version")
+    ):
+        raise KitChangeControllerError("session-tampered", "preview release binding changed")
+
+
+def _validate_baseline_snapshot(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != BASELINE_SNAPSHOT_KEYS:
+        raise KitChangeControllerError("session-invalid", "baseline snapshot fields are not exact")
+    exists = value.get("exists")
+    digest = value.get("sha256")
+    encoded = value.get("content_base64")
+    if not isinstance(exists, bool) or not isinstance(digest, str) or not isinstance(encoded, str):
+        raise KitChangeControllerError("session-invalid", "baseline snapshot is malformed")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeError, ValueError) as exc:
+        raise KitChangeControllerError("session-invalid", "baseline snapshot is not canonical base64") from exc
+    if len(content) > brownfield.MAX_DOCUMENT_BYTES:
+        raise KitChangeControllerError("session-invalid", "baseline snapshot is too large")
+    if exists:
+        if SHA256_RE.fullmatch(digest) is None or _sha256(content) != digest:
+            raise KitChangeControllerError("session-invalid", "baseline snapshot identity is malformed")
+    elif digest or content:
+        raise KitChangeControllerError("session-invalid", "absent baseline snapshot carries content")
+    return {"exists": exists, "sha256": digest, "content_base64": encoded}
+
+
+def _validate_baseline_state(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != {"prior", "generated"}:
+        raise KitChangeControllerError("session-invalid", "baseline state fields are not exact")
+    return {
+        "prior": _validate_baseline_snapshot(value.get("prior")),
+        "generated": _validate_baseline_snapshot(value.get("generated")),
+    }
 
 
 def _preview(session: Mapping[str, Any], archive: Path) -> dict[str, Any]:
@@ -369,9 +528,12 @@ def _load(
     session = _parse_session(_stable(
         _session_path(runtime, session_id), MAX_SESSION_BYTES, "controller session"
     ))
+    if not hmac.compare_digest(str(session["session_id"]), session_id):
+        raise KitChangeControllerError(
+            "session-tampered", "session content does not match the requested file"
+        )
     target = _root(Path(str(session["target"]["path"])), "target project")
-    if _inside(runtime, target) or _inside(target, runtime):
-        raise KitChangeControllerError("runtime-overlap", "controller runtime overlaps the target")
+    _validate_runtime_target_pair(runtime, target)
     archive = _verify_release(runtime, session)
     if refresh_open and session["state"] in OPEN_STATES:
         _preview(session, archive)
@@ -465,7 +627,7 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
             ],
         })
     state = str(session["state"])
-    display = "complete" if state == "adoption_required" else "restored" if state == "restored_failure" else state
+    display = "restored" if state == "restored_failure" else state
     check = session.get("check") if isinstance(session.get("check"), Mapping) else None
     issue_count = int(check.get("existing_issue_count") or 0) if check else 0
     details = {
@@ -487,6 +649,7 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
         for item in blocker_values
     ]
     return {
+        "session_id": str(session["session_id"]),
         "mode": str(session["request"]["mode"]),
         "status": display,
         "project": {
@@ -506,13 +669,18 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
         "existing_gaps": {
             "count": issue_count,
             "status": "checked" if check is not None else "not_checked",
+            "issues": list(check.get("existing_issues", [])) if check else [],
         },
         "decisions": decisions,
         "files": files,
         "recovery": (
             "Previous state restored"
             if state in {"restored", "restored_failure"}
-            else "Previous state is saved and can be restored"
+            else (
+                "Previous state is saved and can be restored"
+                if session.get("transaction_id") is not None
+                else "Apply will save the previous state before changing project files"
+            )
         ),
         "blockers": blockers,
         "detail": str(check.get("detail") or details[state]) if check else details[state],
@@ -572,15 +740,38 @@ def prepare(
             game_state = material.get("game_root")
             selected = game_state.get("value") if isinstance(game_state, Mapping) else None
             digest = str(report.get("archive_sha256") or "")
-            session_id = _session_id(target, digest, plan_sha, requested_mode, game_root, selected)
+            attempt = 0
+            while attempt < MAX_ATTEMPTS:
+                session_id = _session_id(
+                    target,
+                    digest,
+                    plan_sha,
+                    requested_mode,
+                    game_root,
+                    selected,
+                    attempt,
+                )
+                path = _session_path(runtime, session_id)
+                if not path.exists():
+                    break
+                existing = load(runtime, session_id)
+                if existing["state"] not in {"restored", "restored_failure", "failed"}:
+                    return _public(existing)
+                attempt += 1
+            if attempt >= MAX_ATTEMPTS:
+                raise KitChangeControllerError(
+                    "attempt-limit", "this exact kit change has too many prior attempts"
+                )
             session: dict[str, Any] = {
                 "schema": SESSION_SCHEMA,
                 "kind": SESSION_KIND,
                 "session_id": session_id,
+                "attempt": attempt,
                 "target": {"path": str(target)},
                 "release": {
                     "archive": archive.relative_to(runtime).as_posix(),
                     "archive_sha256": digest,
+                    "container_sha256": str(report.get("container_sha256") or ""),
                     "version": str(report.get("version") or ""),
                     "member_count": member_count,
                 },
@@ -597,14 +788,54 @@ def prepare(
                 "result": None,
                 "result_sha256": "",
                 "restore": None,
+                "baseline": {"prior": None, "generated": None},
                 "session_sha256": "",
             }
-            path = _session_path(runtime, session_id)
-            if path.exists():
-                return _public(load(runtime, session_id))
             return _public(_save(runtime, session))
     except process_supervisor.ExclusiveLockUnavailable as exc:
         raise KitChangeControllerError("controller-busy", str(exc)) from exc
+
+
+def reprepare(
+    runtime_root: Path,
+    session_id: str,
+    choices: Mapping[str, str],
+) -> ControllerResult:
+    """Create a new read-only review for one exact advertised D1 choice."""
+    _runtime_value, session, archive = _load(runtime_root, session_id, refresh_open=True)
+    if session["state"] != "blocked":
+        raise KitChangeControllerError("decision-not-available", "this review has no open decision")
+    if not isinstance(choices, Mapping) or set(choices) != {"D1"}:
+        raise KitChangeControllerError("decision-invalid", "choices must contain only D1")
+    selected = choices.get("D1")
+    if not isinstance(selected, str) or not selected:
+        raise KitChangeControllerError("decision-invalid", "D1 must select one advertised folder")
+    view = _simple_state(session)
+    decisions = view.get("decisions")
+    if not isinstance(decisions, list) or len(decisions) != 1 or decisions[0].get("id") != "D1":
+        raise KitChangeControllerError("decision-not-available", "D1 is not advertised by this review")
+    advertised = {
+        str(item.get("value"))
+        for item in decisions[0].get("choices", [])
+        if isinstance(item, Mapping)
+    }
+    if selected not in advertised:
+        raise KitChangeControllerError("decision-invalid", "D1 choice was not advertised")
+    blockers = session["preview"]["raw"]["material"].get("blockers", [])
+    if any(
+        not isinstance(item, Mapping) or item.get("code") != "game-root-ambiguous"
+        for item in blockers
+    ):
+        raise KitChangeControllerError(
+            "decision-not-available", "this review has another blocker that D1 cannot resolve"
+        )
+    return prepare(
+        runtime_root,
+        Path(str(session["target"]["path"])),
+        archive,
+        str(session["request"]["mode"]),
+        game_root=selected,
+    )
 
 
 def _transition(
@@ -617,20 +848,158 @@ def _transition(
     return _save(runtime, value)
 
 
-def default_post_apply_check(
-    _target: Path, _session: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    """Fail closed until the caller connects the installed-core static scan."""
+def _failpoint(_name: str) -> None:
+    """Test-only crash boundary around durable cross-module transitions."""
+
+
+def _baseline_snapshot(target: Path) -> dict[str, object]:
+    try:
+        content = brownfield.read_baseline_file(target)
+    except (OSError, ValueError) as exc:
+        raise KitChangeControllerError("baseline-unsafe", str(exc)) from exc
+    if content is None:
+        return {"exists": False, "sha256": "", "content_base64": ""}
     return {
-        "kit_ok": False,
-        "project_ok": False,
-        "existing_issues": [],
-        "detail": "checking_not_configured",
+        "exists": True,
+        "sha256": _sha256(content),
+        "content_base64": base64.b64encode(content).decode("ascii"),
     }
 
 
+def _content_snapshot(content: bytes) -> dict[str, object]:
+    if len(content) > brownfield.MAX_DOCUMENT_BYTES:
+        raise KitChangeControllerError("check-invalid", "generated baseline is too large")
+    return {
+        "exists": True,
+        "sha256": _sha256(content),
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def _record_baseline_intent(
+    runtime: Path,
+    session: Mapping[str, Any],
+    content: bytes,
+) -> dict[str, Any]:
+    intended = _content_snapshot(content)
+    baseline = _validate_baseline_state(session.get("baseline"))
+    prior = baseline.get("prior")
+    if prior is None:
+        raise KitChangeControllerError("session-invalid", "prior baseline snapshot is missing")
+    generated = baseline.get("generated")
+    if isinstance(generated, Mapping):
+        if not _same_snapshot(generated, intended):
+            raise KitChangeControllerError(
+                "baseline-changed",
+                "brownfield scan changed after its generated baseline was recorded",
+            )
+        return dict(session)
+    return _transition(
+        runtime,
+        session,
+        "checking",
+        baseline={"prior": prior, "generated": intended},
+    )
+
+
+def _snapshot_content(snapshot: Mapping[str, object]) -> bytes | None:
+    validated = _validate_baseline_snapshot(snapshot)
+    assert validated is not None
+    if not validated["exists"]:
+        return None
+    return base64.b64decode(str(validated["content_base64"]).encode("ascii"), validate=True)
+
+
+def _same_snapshot(first: Mapping[str, object], second: Mapping[str, object]) -> bool:
+    return (
+        first.get("exists") == second.get("exists")
+        and first.get("sha256") == second.get("sha256")
+    )
+
+
+def _record_generated_baseline(
+    runtime: Path,
+    session: Mapping[str, Any],
+    expected_sha256: str,
+) -> dict[str, Any]:
+    if SHA256_RE.fullmatch(expected_sha256) is None:
+        raise KitChangeControllerError("check-invalid", "generated baseline identity is malformed")
+    target = Path(str(session["target"]["path"]))
+    generated = _baseline_snapshot(target)
+    if not generated["exists"] or generated["sha256"] != expected_sha256:
+        raise KitChangeControllerError("baseline-changed", "generated baseline changed before it was recorded")
+    baseline = _validate_baseline_state(session.get("baseline"))
+    prior_generated = baseline.get("generated")
+    if isinstance(prior_generated, Mapping) and not _same_snapshot(prior_generated, generated):
+        raise KitChangeControllerError("baseline-changed", "generated baseline no longer matches this session")
+    return _transition(
+        runtime,
+        session,
+        "checking",
+        baseline={"prior": baseline["prior"], "generated": generated},
+    )
+
+
+def _baseline_restore_precheck(session: Mapping[str, Any]) -> None:
+    baseline = _validate_baseline_state(session.get("baseline"))
+    generated = baseline.get("generated")
+    if generated is None:
+        return
+    current = _baseline_snapshot(Path(str(session["target"]["path"])))
+    prior = baseline.get("prior")
+    if (
+        not _same_snapshot(current, generated)
+        and not (isinstance(prior, Mapping) and _same_snapshot(current, prior))
+    ):
+        raise KitChangeControllerError(
+            "baseline-changed",
+            "brownfield baseline changed after the kit check; restore was refused",
+        )
+
+
+def _restore_prior_baseline(session: Mapping[str, Any]) -> None:
+    baseline = _validate_baseline_state(session.get("baseline"))
+    prior = baseline.get("prior")
+    generated = baseline.get("generated")
+    if prior is None or generated is None:
+        return
+    assert isinstance(prior, Mapping) and isinstance(generated, Mapping)
+    target = Path(str(session["target"]["path"]))
+    current = _baseline_snapshot(target)
+    if _same_snapshot(current, prior):
+        return
+    if not _same_snapshot(current, generated):
+        raise KitChangeControllerError(
+            "baseline-changed",
+            "brownfield baseline has a third version; automatic restore was refused",
+        )
+    path = kit_change._target(target, brownfield.BASELINE_RELATIVE)  # noqa: SLF001
+    content = _snapshot_content(prior)
+    try:
+        if content is None:
+            path.unlink()
+        else:
+            kit_change._atomic_bytes(path, content, "0644")  # noqa: SLF001
+    except (FileNotFoundError, OSError, kit_change.KitChangeError) as exc:
+        # Missing is acceptable only for the previously absent baseline.
+        if not (content is None and isinstance(exc, FileNotFoundError)):
+            detail = exc.detail if isinstance(exc, kit_change.KitChangeError) else str(exc)
+            raise KitChangeControllerError("baseline-restore-failed", detail) from exc
+    restored = _baseline_snapshot(target)
+    if not _same_snapshot(restored, prior):
+        raise KitChangeControllerError("baseline-restore-failed", "prior baseline was not restored exactly")
+
+
+def default_post_apply_check(
+    target: Path, session: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Run the real engine-free proof supplied by the installed core."""
+    return kit_change_check.run(target, session)
+
+
 def _check_result(value: Mapping[str, Any]) -> dict[str, Any]:
-    if set(value) != {"kit_ok", "project_ok", "existing_issues", "detail"}:
+    allowed = {"kit_ok", "project_ok", "existing_issues", "detail"}
+    if set(value) not in (allowed, allowed | {"baseline_sha256"}):
         raise KitChangeControllerError("check-invalid", "check fields are not exact")
     if not isinstance(value["kit_ok"], bool) or not isinstance(value["project_ok"], bool):
         raise KitChangeControllerError("check-invalid", "check outcomes must be true or false")
@@ -664,12 +1033,16 @@ def _check_result(value: Mapping[str, Any]) -> dict[str, Any]:
         count = len(issues)
     else:
         raise KitChangeControllerError("check-invalid", "existing_issues is malformed")
+    baseline_sha256 = str(value.get("baseline_sha256") or "")
+    if baseline_sha256 and SHA256_RE.fullmatch(baseline_sha256) is None:
+        raise KitChangeControllerError("check-invalid", "baseline identity is malformed")
     return {
         "kit_ok": value["kit_ok"],
         "project_ok": value["project_ok"],
         "existing_issues": issues,
         "existing_issue_count": count,
         "detail": detail,
+        "baseline_sha256": baseline_sha256,
     }
 
 
@@ -715,7 +1088,24 @@ def _run_check(
     runtime: Path, session: Mapping[str, Any], hook: PostApplyCheck
 ) -> dict[str, Any]:
     try:
-        raw = hook(Path(str(session["target"]["path"])), session)
+        if hook is default_post_apply_check:
+            active_session = dict(session)
+
+            def record_intent(content: bytes) -> Mapping[str, Any]:
+                nonlocal active_session
+                active_session = _record_baseline_intent(
+                    runtime, active_session, content
+                )
+                return active_session
+
+            raw = kit_change_check.run(
+                Path(str(session["target"]["path"])),
+                active_session,
+                baseline_ready=record_intent,
+            )
+            session = active_session
+        else:
+            raw = hook(Path(str(session["target"]["path"])), session)
         if not isinstance(raw, Mapping):
             raise KitChangeControllerError("check-invalid", "check returned no result")
         check = _check_result(raw)
@@ -727,13 +1117,34 @@ def _run_check(
             "existing_issues": [],
             "existing_issue_count": 0,
             "detail": str(detail)[:MAX_DETAIL_CHARS],
+            "baseline_sha256": "",
         }
+    baseline_sha256 = str(check.get("baseline_sha256") or "")
+    if baseline_sha256:
+        try:
+            session = _record_generated_baseline(
+                runtime, session, baseline_sha256
+            )
+        except KitChangeControllerError as exc:
+            check = {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "existing_issue_count": 0,
+                "detail": exc.detail[:MAX_DETAIL_CHARS],
+                "baseline_sha256": "",
+            }
+            if exc.code == "baseline-changed":
+                return _transition(runtime, session, "checking", check=check)
+            return _finish(runtime, session, "failed", check)
     if check["kit_ok"]:
         return _finish(
             runtime, session, "complete" if check["project_ok"] else "adoption_required", check
         )
     transaction_id = session.get("transaction_id")
     try:
+        _baseline_restore_precheck(session)
+        _restore_prior_baseline(session)
         rollback = (
             kit_change.rollback(Path(str(session["target"]["path"])), str(transaction_id))
             if transaction_id is not None
@@ -743,9 +1154,12 @@ def _run_check(
                 "preview_sha256": session["preview"]["sha256"],
             }
         )
-    except kit_change.KitChangeError as exc:
+    except (kit_change.KitChangeError, KitChangeControllerError) as exc:
         failed = dict(check)
-        failed["detail"] = f"{check['detail']}; restore failed: {exc.detail}"[:MAX_DETAIL_CHARS]
+        detail = exc.detail
+        failed["detail"] = f"{check['detail']}; restore failed: {detail}"[:MAX_DETAIL_CHARS]
+        if isinstance(exc, KitChangeControllerError) and exc.code == "baseline-changed":
+            return _transition(runtime, session, "checking", check=failed)
         return _finish(runtime, session, "failed", failed)
     return _finish(runtime, session, "restored_failure", check, rollback)
 
@@ -772,7 +1186,13 @@ def apply(
                 return _public(_recover(runtime, session, post_apply_check or default_post_apply_check))
             if session["state"] == "blocked":
                 raise KitChangeControllerError("preview-blocked", "the review still has blockers")
-            session = _transition(runtime, session, "applying")
+            baseline = _validate_baseline_state(session.get("baseline"))
+            if baseline["prior"] is None:
+                baseline = {
+                    "prior": _baseline_snapshot(Path(str(session["target"]["path"]))),
+                    "generated": None,
+                }
+            session = _transition(runtime, session, "applying", baseline=baseline)
             try:
                 changed = kit_change.apply(
                     Path(str(session["target"]["path"])),
@@ -780,6 +1200,7 @@ def apply(
                     plan_sha256,
                     game_root=session["request"].get("game_root"),
                 )
+                _failpoint("after-lifecycle-apply")
             except kit_change.KitChangeError as exc:
                 check = {
                     "kit_ok": False,
@@ -787,6 +1208,7 @@ def apply(
                     "existing_issues": [],
                     "existing_issue_count": 0,
                     "detail": exc.detail[:MAX_DETAIL_CHARS],
+                    "baseline_sha256": "",
                 }
                 state = "restored_failure" if exc.code == "apply-failed" else "failed"
                 return _public(_finish(runtime, session, state, check))
@@ -814,6 +1236,8 @@ def restore(runtime_root: Path, session_id: str, result_sha256: str) -> Controll
                 raise KitChangeControllerError("restore-not-available", "no applied change can be restored")
             transaction_id = session.get("transaction_id")
             try:
+                _baseline_restore_precheck(session)
+                _restore_prior_baseline(session)
                 rolled_back = (
                     kit_change.rollback(Path(str(session["target"]["path"])), str(transaction_id))
                     if transaction_id is not None
@@ -837,6 +1261,47 @@ def _recover(
         return dict(session)
     if session["state"] == "checking":
         return _run_check(runtime, session, hook)
+    raw = session["preview"].get("raw")
+    material = raw.get("material") if isinstance(raw, Mapping) else None
+    target_scope = str(material.get("target_scope_sha256") or "") if isinstance(material, Mapping) else ""
+    inspected: Mapping[str, Any] | None = None
+    try:
+        inspected = kit_change.inspect_transaction(
+            Path(str(session["target"]["path"])),
+            preview_sha256=str(session["preview"]["sha256"]),
+            target_scope_sha256=target_scope,
+        )
+    except kit_change.KitChangeError as exc:
+        if exc.code != "transaction-missing":
+            check = {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "existing_issue_count": 0,
+                "detail": exc.detail[:MAX_DETAIL_CHARS],
+                "baseline_sha256": "",
+            }
+            return _finish(runtime, session, "failed", check)
+    if inspected is not None and inspected.get("status") == "applied":
+        session = _transition(
+            runtime,
+            session,
+            "checking",
+            transaction_id=inspected.get("transaction_id"),
+        )
+        return _run_check(runtime, session, hook)
+    if inspected is not None and inspected.get("status") == "rolled_back":
+        check = {
+            "kit_ok": False,
+            "project_ok": False,
+            "existing_issues": [],
+            "existing_issue_count": 0,
+            "detail": "Interrupted kit change was restored before checking.",
+            "baseline_sha256": "",
+        }
+        value = dict(session)
+        value["transaction_id"] = inspected.get("transaction_id")
+        return _finish(runtime, value, "restored_failure", check, inspected)
     try:
         lifecycle = kit_change.resume(Path(str(session["target"]["path"])))
     except kit_change.KitChangeError as exc:
@@ -846,6 +1311,7 @@ def _recover(
             "existing_issues": [],
             "existing_issue_count": 0,
             "detail": exc.detail[:MAX_DETAIL_CHARS],
+            "baseline_sha256": "",
         }
         return _finish(runtime, session, "failed", check)
     if lifecycle.get("status") == "rolled_back":
@@ -855,6 +1321,7 @@ def _recover(
             "existing_issues": [],
             "existing_issue_count": 0,
             "detail": "Interrupted kit change was restored before checking.",
+            "baseline_sha256": "",
         }
         value = dict(session)
         value["transaction_id"] = lifecycle.get("transaction_id")

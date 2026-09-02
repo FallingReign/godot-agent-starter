@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -1272,6 +1273,214 @@ class KitCliTest(unittest.TestCase):
             timeout=60,
             allow_child_breakaway=True,
         )
+
+    @staticmethod
+    def _kit_change_result(session_id: str, *, status: str = "ready") -> dict:
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "session_sha256": "d" * 64,
+            "kit_change": {
+                "session_id": session_id,
+                "mode": "install",
+                "status": status,
+                "project": {"name": "brownfield", "path": "C:/brownfield"},
+                "current_version": "",
+                "incoming_version": "0.3.0",
+                "plan_sha256": "e" * 64,
+                "counts": {
+                    "kit_files": 1,
+                    "shared_files": 0,
+                    "removed_files": 0,
+                    "game_files": 0,
+                },
+                "design": "Not part of this kit change",
+                "existing_gaps": {"count": 0, "status": "not_checked"},
+                "decisions": [],
+                "files": [],
+                "recovery": "Previous state is saved and can be restored",
+                "blockers": [],
+                "detail": "ready",
+                "result_sha256": "",
+                "plan_url": "",
+            },
+        }
+
+    def test_install_prepares_unmarked_target_read_only_and_returns_exact_review_url(self) -> None:
+        session_id = "a" * 64
+        with tempfile.TemporaryDirectory(prefix="kit-cli-install-") as temporary:
+            target = Path(temporary).resolve() / "brownfield"
+            target.mkdir()
+            game = target / "old.gd"
+            game.write_text("extends Node\n", encoding="utf-8")
+            release = Path(temporary).resolve() / "release.zip"
+            release.write_bytes(b"release")
+            runtime = Path(temporary).resolve() / "runtime"
+            prepared = self._kit_change_result(session_id)
+            ready = self._kit_change_result(session_id)
+            review_url = (
+                "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+            )
+            ready["kit_change"]["plan_url"] = review_url
+            process = self.completed()
+            before = game.read_bytes()
+            with mock.patch.object(
+                kit, "_kit_change_runtime", return_value=runtime
+            ), mock.patch.object(
+                kit.kit_change_controller, "prepare", return_value=prepared
+            ) as prepare, mock.patch.object(
+                kit,
+                "_register_kit_change_board",
+                return_value=(review_url, {"ok": True}, process),
+            ) as board, mock.patch.object(
+                kit.kit_change_controller, "status", return_value=ready
+            ) as status:
+                code, output = self.invoke(
+                    "install",
+                    str(target),
+                    "--release",
+                    str(release),
+                    "--json",
+                )
+            after = game.read_bytes()
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual(review_url, payload["review_url"])
+        self.assertEqual(session_id, payload["session_id"])
+        self.assertEqual(before, after)
+        prepare.assert_called_once_with(runtime, target, release, "install", game_root=None)
+        board.assert_called_once_with(ROOT.resolve(), target, runtime, session_id)
+        status.assert_called_once_with(runtime, session_id, plan_url=review_url)
+
+    def test_source_checkout_requires_an_explicit_built_release(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-cli-release-") as temporary:
+            target = Path(temporary).resolve()
+            with mock.patch.object(
+                kit.release_tool,
+                "read_verified_directory",
+                side_effect=kit.release_tool.ReleaseError("not a release"),
+            ), mock.patch.object(kit.kit_change_controller, "prepare") as prepare:
+                code, output = self.invoke("install", str(target), "--json")
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_REFUSED, code)
+        self.assertEqual("release_required", payload["status"])
+        prepare.assert_not_called()
+
+    def test_upgrade_routes_the_explicit_target_and_game_root(self) -> None:
+        session_id = "9" * 64
+        prepared = self._kit_change_result(session_id)
+        prepared["kit_change"]["mode"] = "upgrade"
+        url = "http://127.0.0.1:44444/kit-change.html?session=" + session_id
+        process = self.completed()
+        target = ROOT.resolve()
+        runtime = ROOT / ".kit" / "runtime"
+        archive = ROOT / ".kit" / "runtime" / "incoming.zip"
+        with mock.patch.object(
+            kit, "_kit_change_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "prepare", return_value=prepared
+        ) as prepare, mock.patch.object(
+            kit,
+            "_register_kit_change_board",
+            return_value=(url, {"ok": True}, process),
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", return_value=prepared
+        ):
+            code, output = self.invoke(
+                "upgrade",
+                str(target),
+                "--release",
+                str(archive),
+                "--game-root",
+                "game",
+                "--json",
+            )
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("upgrade", json.loads(output)["command"])
+        prepare.assert_called_once_with(
+            runtime, target, archive, "upgrade", game_root="game"
+        )
+
+    def test_board_registration_uses_exact_session_command_and_url(self) -> None:
+        session_id = "b" * 64
+        url = "http://127.0.0.1:41234/kit-change.html?session=" + session_id
+        tool = ROOT / "tools" / "board.py"
+        result = self.completed(stdout=json.dumps({
+            "ok": True,
+            "status": "running",
+            "url": "http://127.0.0.1:41234/",
+            "review_url": url,
+        }))
+        with mock.patch.object(
+            kit, "_board_target", return_value=(tool, ROOT.resolve(), None)
+        ), mock.patch.object(kit, "_run_process", return_value=result) as run:
+            actual, board, process = kit._register_kit_change_board(
+                ROOT.resolve(), ROOT.resolve() / "target", ROOT.resolve() / ".runtime", session_id
+            )
+
+        self.assertEqual(url, actual)
+        self.assertTrue(board["ok"])
+        self.assertIs(result, process)
+        run.assert_called_once_with(
+            [
+                sys.executable,
+                str(tool),
+                "--ensure",
+                "--kit-change-session",
+                session_id,
+                "--json",
+            ],
+            cwd=ROOT.resolve(),
+            timeout=60,
+            allow_child_breakaway=True,
+            environment=None,
+        )
+
+    def test_upgrade_review_always_uses_incoming_board_not_old_target_core(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-old-target-") as temporary:
+            target = Path(temporary).resolve() / "old-project"
+            (target / ".agent-kit" / "releases" / ("1" * 64)).mkdir(parents=True)
+            incoming_runtime = ROOT / ".kit" / "runtime"
+
+            tool, cwd, environment = kit._board_target(
+                ROOT.resolve(), target, incoming_runtime
+            )
+
+        self.assertEqual(ROOT / "tools" / "board.py", tool)
+        self.assertEqual(ROOT.resolve(), cwd)
+        self.assertIsNone(environment)
+
+    def test_upgrade_session_stays_in_initiating_runtime_for_same_launcher_recover(self) -> None:
+        incoming_runtime = ROOT / ".kit" / "runtime"
+        target = ROOT / "old-target"
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=incoming_runtime
+        ) as source_runtime, mock.patch.object(
+            kit.project_context, "load_configured_context"
+        ) as target_context:
+            selected = kit._kit_change_runtime(ROOT.resolve(), target, "upgrade")
+
+        self.assertEqual(incoming_runtime, selected)
+        source_runtime.assert_called_once_with(ROOT.resolve())
+        target_context.assert_not_called()
+
+    def test_recover_uses_current_private_runtime_and_real_controller_default(self) -> None:
+        session_id = "c" * 64
+        runtime = ROOT / ".kit" / "runtime"
+        recovered = self._kit_change_result(session_id, status="complete")
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "recover", return_value=recovered
+        ) as recover:
+            code, output = self.invoke("recover", session_id, "--json")
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("complete", json.loads(output)["status"])
+        recover.assert_called_once_with(runtime, session_id)
 
     def test_serve_status_does_not_regenerate_or_open(self) -> None:
         tool = ROOT / "tools" / "board.py"

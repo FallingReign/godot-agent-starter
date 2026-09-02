@@ -25,6 +25,7 @@ import re
 import secrets
 import subprocess
 import sys
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -39,6 +40,8 @@ import cockpit  # noqa: E402
 import runtime_paths  # noqa: E402
 import native_engine  # noqa: E402
 import process_supervisor  # noqa: E402
+import kit_change_controller  # noqa: E402
+import release as release_tool  # noqa: E402
 
 ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
 DEFAULT_PROJECT_ROOT = ACTIVE_INSTALLATION.project_root
@@ -347,6 +350,31 @@ def build_parser() -> argparse.ArgumentParser:
         _add_common_options(release_command)
         release_command.add_argument("archive", help=archive_help)
         release_command.set_defaults(action="release")
+
+    for name, help_text in (
+        ("install", "review installing this kit into an existing project"),
+        ("upgrade", "review upgrading a project that already uses this kit"),
+    ):
+        lifecycle = commands.add_parser(name, help=help_text)
+        _add_common_options(lifecycle)
+        lifecycle.add_argument("target", help="project directory to install or upgrade")
+        lifecycle.add_argument(
+            "--release",
+            dest="release_source",
+            help="verified release archive or exact extracted release",
+        )
+        lifecycle.add_argument(
+            "--game-root",
+            help="project-relative folder containing project.godot",
+        )
+        lifecycle.set_defaults(action="kit_change_prepare", lifecycle_mode=name)
+
+    recover = commands.add_parser(
+        "recover", help="continue or restore one interrupted kit change"
+    )
+    _add_common_options(recover)
+    recover.add_argument("session_id", help="full kit change session identity")
+    recover.set_defaults(action="kit_change_recover")
     return parser
 
 
@@ -1938,6 +1966,203 @@ def _release(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, An
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
+def _explicit_path(value: str, label: str) -> Path:
+    raw = Path(value).expanduser()
+    candidate = raw if raw.is_absolute() else Path.cwd() / raw
+    try:
+        return candidate.absolute()
+    except OSError as exc:
+        raise CliError(
+            f"cannot resolve {label} {candidate}: {exc}",
+            code=EXIT_REFUSED,
+            status=f"{label.replace(' ', '_')}_unavailable",
+        ) from exc
+
+
+def _verified_release_source(args: argparse.Namespace) -> Path:
+    supplied = str(getattr(args, "release_source", "") or "").strip()
+    if supplied:
+        return _explicit_path(supplied, "release")
+    try:
+        release_tool.read_verified_directory(CORE_ROOT)
+    except release_tool.ReleaseError as exc:
+        raise CliError(
+            "this is a source checkout, not a built release; build a release archive "
+            "and pass it with --release",
+            code=EXIT_REFUSED,
+            status="release_required",
+        ) from exc
+    return CORE_ROOT
+
+
+def _source_controller_runtime(project: Path) -> Path:
+    try:
+        return runtime_paths.resolve(project, create=True).runtime
+    except (OSError, ValueError, runtime_paths.RuntimeConfigError) as exc:
+        raise CliError(
+            f"private kit-change storage is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+
+
+def _kit_change_runtime(project: Path, target: Path, mode: str) -> Path:
+    del target, mode
+    return _source_controller_runtime(project)
+
+
+def _board_target(
+    project: Path,
+    target: Path,
+    runtime: Path,
+) -> tuple[Path, Path, dict[str, str] | None]:
+    del target, runtime
+    # The review belongs to the initiating incoming kit. The target's active
+    # core may be an older release which cannot understand this session.
+    return _script(project, "tools", "board.py"), project, None
+
+
+def _exact_kit_change_url(value: object, session_id: str) -> str:
+    rendered = str(value or "")
+    try:
+        parsed = urllib.parse.urlsplit(rendered)
+        queries = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        port = parsed.port
+    except (UnicodeError, ValueError) as exc:
+        raise CliError(
+            "the review server returned an invalid URL",
+            status="board_failed",
+        ) from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/kit-change.html"
+        or parsed.fragment
+        or queries != {"session": [session_id]}
+        or rendered
+        != f"http://127.0.0.1:{port}/kit-change.html?session={session_id}"
+    ):
+        raise CliError(
+            "the review server did not return the exact local kit-change page",
+            status="board_failed",
+        )
+    return rendered
+
+
+def _register_kit_change_board(
+    project: Path,
+    target: Path,
+    runtime: Path,
+    session_id: str,
+) -> tuple[str, dict[str, Any], subprocess.CompletedProcess[str]]:
+    tool, cwd, environment = _board_target(project, target, runtime)
+    result = _run_process(
+        [
+            sys.executable,
+            str(tool),
+            "--ensure",
+            "--kit-change-session",
+            session_id,
+            "--json",
+        ],
+        cwd=cwd,
+        timeout=60,
+        allow_child_breakaway=True,
+        environment=environment,
+    )
+    board = _final_json_object(result.stdout or "")
+    if result.returncode != 0 or not isinstance(board, dict) or not board.get("ok"):
+        output = (result.stdout or "") + (result.stderr or "")
+        detail = "; ".join(_output_tail(output, limit=4)) or "review server failed"
+        raise CliError(detail, status="board_failed")
+    review_url = _exact_kit_change_url(board.get("review_url"), session_id)
+    return review_url, board, result
+
+
+def _kit_change_prepare(
+    project: Path, args: argparse.Namespace
+) -> tuple[int, dict[str, Any], list[str]]:
+    mode = str(args.lifecycle_mode)
+    target = _explicit_path(str(args.target), "target project")
+    release_source = _verified_release_source(args)
+    runtime = _kit_change_runtime(project, target, mode)
+    try:
+        prepared = kit_change_controller.prepare(
+            runtime,
+            target,
+            release_source,
+            mode,
+            game_root=getattr(args, "game_root", None),
+        )
+        session_id = prepared["session_id"]
+        review_url, board, process = _register_kit_change_board(
+            project, target, runtime, session_id
+        )
+        prepared = kit_change_controller.status(
+            runtime, session_id, plan_url=review_url
+        )
+    except kit_change_controller.KitChangeControllerError as exc:
+        raise CliError(
+            exc.detail,
+            code=EXIT_REFUSED,
+            status=exc.code.replace("-", "_"),
+        ) from exc
+    state = prepared["kit_change"]
+    status = "needs_decision" if state["status"] == "blocked" else "ready"
+    try:
+        runtime.relative_to(target)
+        review_storage = "target_private_runtime_only"
+    except ValueError:
+        review_storage = "initiating_kit_private_runtime"
+    payload = {
+        "ok": True,
+        "command": mode,
+        "status": status,
+        "target": str(target),
+        "session_id": session_id,
+        "review_url": review_url,
+        "review_storage": review_storage,
+        "project_files_changed": False,
+        "kit_change": state,
+        "board": board,
+        "process": _process_summary(process),
+    }
+    human = [f"{mode}: {status.replace('_', ' ')}", f"  {review_url}"]
+    return EXIT_OK, payload, human
+
+
+def _kit_change_recover(
+    project: Path, args: argparse.Namespace
+) -> tuple[int, dict[str, Any], list[str]]:
+    runtime = _source_controller_runtime(project)
+    try:
+        recovered = kit_change_controller.recover(runtime, str(args.session_id))
+    except kit_change_controller.KitChangeControllerError as exc:
+        raise CliError(
+            exc.detail,
+            code=EXIT_REFUSED,
+            status=exc.code.replace("-", "_"),
+        ) from exc
+    state = recovered["kit_change"]
+    ok = state["status"] in {
+        "ready", "blocked", "complete", "adoption_required", "restored"
+    }
+    payload = {
+        "ok": ok,
+        "command": "recover",
+        "status": state["status"],
+        "session_id": recovered["session_id"],
+        "kit_change": state,
+    }
+    human = [f"recover: {state['status'].replace('_', ' ')}"]
+    if state.get("plan_url"):
+        human.append(f"  {state['plan_url']}")
+    return (EXIT_OK if ok else EXIT_FAILED), payload, human
+
+
 _HANDLERS = {
     "doctor": _doctor,
     "setup": _setup,
@@ -1956,6 +2181,8 @@ _HANDLERS = {
     "retro_run": _retro_run,
     "retro_publish": _retro_publish,
     "release": _release,
+    "kit_change_prepare": _kit_change_prepare,
+    "kit_change_recover": _kit_change_recover,
 }
 _COMMAND_LABELS = {
     "doctor": "doctor",
@@ -1974,6 +2201,8 @@ _COMMAND_LABELS = {
     "retro_run": "retro run",
     "retro_publish": "retro publish",
     "release": "release",
+    "kit_change_prepare": "kit change",
+    "kit_change_recover": "recover",
 }
 
 

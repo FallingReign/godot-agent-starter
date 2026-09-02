@@ -46,7 +46,8 @@ class KitChangeControllerTest(unittest.TestCase):
             "ok": True,
             "format": "zip",
             "version": "0.3.0",
-            "archive_sha256": _sha256(self.payload),
+            "archive_sha256": "a" * 64,
+            "container_sha256": _sha256(self.payload),
         }
         self.members = {"one": object(), "two": object(), "three": object()}
         self.operation = "install"
@@ -218,6 +219,10 @@ class KitChangeControllerTest(unittest.TestCase):
         self.assertEqual("ready", result["kit_change"]["status"])
         self.assertEqual("Not part of this kit change", result["kit_change"]["design"])
         self.assertEqual(0, result["kit_change"]["counts"]["game_files"])
+        self.assertEqual(
+            "Apply will save the previous state before changing project files",
+            result["kit_change"]["recovery"],
+        )
         self.assertFalse((self.target / ".agent-kit").exists())
 
     def test_archive_and_extracted_directory_resolve_to_same_session(self) -> None:
@@ -266,6 +271,55 @@ class KitChangeControllerTest(unittest.TestCase):
             controller.load(self.runtime, result["session_id"])
         self.assertEqual("session-tampered", raised.exception.code)
 
+    def test_final_session_rejects_rechecksummed_preview_tampering(self) -> None:
+        prepared = self._prepare()
+        controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+        path = (
+            self.runtime
+            / controller.SESSIONS_ROOT
+            / f"{prepared['session_id']}.json"
+        )
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["preview"]["raw"]["material"]["operation"] = "upgrade"
+        value = controller._signed(value)
+        path.write_bytes(_canonical(value))
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller.load(self.runtime, prepared["session_id"])
+        self.assertEqual("session-tampered", raised.exception.code)
+
+    def test_valid_session_copied_under_another_id_is_rejected(self) -> None:
+        result = self._prepare()
+        original = (
+            self.runtime
+            / controller.SESSIONS_ROOT
+            / f"{result['session_id']}.json"
+        )
+        copied_id = "f" * 64
+        copied = self.runtime / controller.SESSIONS_ROOT / f"{copied_id}.json"
+        copied.write_bytes(original.read_bytes())
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller.load(self.runtime, copied_id)
+        self.assertEqual("session-tampered", raised.exception.code)
+
+    def test_retained_release_member_count_is_rederived(self) -> None:
+        result = self._prepare()
+        session = controller.load(self.runtime, result["session_id"])
+        self.assertEqual(_sha256(self.payload), session["release"]["container_sha256"])
+        changed = dict(session)
+        changed["release"] = {**session["release"], "member_count": 99}
+        controller._save(self.runtime, changed)
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller.load(self.runtime, result["session_id"])
+        self.assertEqual("release-tampered", raised.exception.code)
+
     def test_tampered_retained_archive_is_rejected(self) -> None:
         result = self._prepare()
         session = controller.load(self.runtime, result["session_id"])
@@ -295,6 +349,10 @@ class KitChangeControllerTest(unittest.TestCase):
         )
 
         self.assertEqual("complete", applied["kit_change"]["status"])
+        self.assertEqual(
+            "Previous state is saved and can be restored",
+            applied["kit_change"]["recovery"],
+        )
         self.assertRegex(applied["kit_change"]["result_sha256"], r"^[0-9a-f]{64}$")
         loaded = controller.load(self.runtime, prepared["session_id"])
         self.assertEqual("complete", loaded["state"])
@@ -343,7 +401,7 @@ class KitChangeControllerTest(unittest.TestCase):
             post_apply_check=gaps,
         )
 
-        self.assertEqual("complete", result["kit_change"]["status"])
+        self.assertEqual("adoption_required", result["kit_change"]["status"])
         self.assertEqual(1, result["kit_change"]["existing_gaps"]["count"])
         self.assertEqual("adoption_required", controller.load(self.runtime, prepared["session_id"])["state"])
         controller.kit_change.rollback.assert_not_called()
@@ -368,6 +426,73 @@ class KitChangeControllerTest(unittest.TestCase):
         self.assertEqual(first, second)
         controller.kit_change.rollback.assert_called_once()
 
+    def test_restored_plan_gets_a_new_attempt_and_can_apply_again(self) -> None:
+        first = self._prepare()
+        applied = controller.apply(
+            self.runtime,
+            first["session_id"],
+            first["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+        controller.restore(
+            self.runtime, first["session_id"], applied["kit_change"]["result_sha256"]
+        )
+
+        second = self._prepare()
+        reapplied = controller.apply(
+            self.runtime,
+            second["session_id"],
+            second["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual(
+            first["kit_change"]["plan_sha256"], second["kit_change"]["plan_sha256"]
+        )
+        self.assertEqual("complete", reapplied["kit_change"]["status"])
+        self.assertEqual(2, controller.kit_change.apply.call_count)
+
+    def test_transient_restored_failure_can_prepare_a_new_attempt(self) -> None:
+        first = self._prepare()
+        failed = lambda _target, _session: {
+            "kit_ok": False,
+            "project_ok": False,
+            "existing_issues": [],
+            "detail": "temporary self-test failure",
+        }
+        controller.apply(
+            self.runtime,
+            first["session_id"],
+            first["kit_change"]["plan_sha256"],
+            post_apply_check=failed,
+        )
+
+        second = self._prepare()
+        result = controller.apply(
+            self.runtime,
+            second["session_id"],
+            second["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual("complete", result["kit_change"]["status"])
+
+    def test_complete_plan_reuses_its_finished_attempt(self) -> None:
+        first = self._prepare()
+        controller.apply(
+            self.runtime,
+            first["session_id"],
+            first["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+
+        repeated = self._prepare()
+
+        self.assertEqual(first["session_id"], repeated["session_id"])
+        self.assertEqual("complete", repeated["kit_change"]["status"])
+
     def test_interrupted_apply_recovers_then_checks(self) -> None:
         prepared = self._prepare()
         controller.kit_change.apply.side_effect = SimulatedCrash()
@@ -388,6 +513,50 @@ class KitChangeControllerTest(unittest.TestCase):
 
         self.assertEqual("complete", recovered["kit_change"]["status"])
         controller.kit_change.resume.assert_called_once_with(self.target)
+
+    def test_crash_after_durable_apply_recovers_exact_applied_transaction(self) -> None:
+        prepared = self._prepare()
+        with mock.patch.object(
+            controller, "_failpoint", side_effect=SimulatedCrash()
+        ), self.assertRaises(SimulatedCrash):
+            controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=self._good_check,
+            )
+        self.assertEqual(
+            "applying", controller.load(self.runtime, prepared["session_id"])["state"]
+        )
+        controller.kit_change.resume.reset_mock()
+        with mock.patch.object(
+            controller.kit_change,
+            "inspect_transaction",
+            return_value={
+                "ok": True,
+                "status": "applied",
+                "transaction_id": "1" * 32,
+                "preview_sha256": prepared["kit_change"]["plan_sha256"],
+                "target_scope_sha256": "e" * 64,
+            },
+        ) as inspect:
+            recovered = controller.recover(
+                self.runtime,
+                prepared["session_id"],
+                post_apply_check=self._good_check,
+            )
+
+        self.assertEqual("complete", recovered["kit_change"]["status"])
+        self.assertEqual(
+            "1" * 32,
+            controller.load(self.runtime, prepared["session_id"])["transaction_id"],
+        )
+        inspect.assert_called_once_with(
+            self.target,
+            preview_sha256=prepared["kit_change"]["plan_sha256"],
+            target_scope_sha256="e" * 64,
+        )
+        controller.kit_change.resume.assert_not_called()
 
     def test_repeated_apply_does_not_repeat_lifecycle_write(self) -> None:
         prepared = self._prepare()
@@ -424,6 +593,55 @@ class KitChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(before, self._target_snapshot())
 
+    def test_only_authenticated_managed_runtime_may_overlap_target(self) -> None:
+        runtime = self.target / ".kit" / "runtime"
+        context = mock.Mock(install_mode="managed", runtime_root=runtime)
+        with mock.patch.object(
+            controller.project_context, "load_configured_context", return_value=context
+        ):
+            selected_runtime, selected_target = controller._separate_roots(
+                runtime, self.target
+            )
+        self.assertEqual(runtime, selected_runtime)
+        self.assertEqual(self.target, selected_target)
+
+        unsafe = self.target / "review-runtime"
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller._separate_roots(unsafe, self.target)
+        self.assertEqual("runtime-overlap", raised.exception.code)
+        self.assertFalse(unsafe.exists())
+
+    def test_same_project_preview_writes_only_authenticated_private_runtime(self) -> None:
+        runtime = self.target / ".kit" / "runtime"
+        project_file = self.target / "project.godot"
+        project_file.write_text("[application]\n", encoding="utf-8")
+        context = mock.Mock(install_mode="managed", runtime_root=runtime)
+        before = project_file.read_bytes()
+
+        with mock.patch.object(
+            controller.project_context, "load_configured_context", return_value=context
+        ):
+            result = controller.prepare(
+                runtime, self.target, self.archive, "install"
+            )
+
+        self.assertEqual(before, project_file.read_bytes())
+        self.assertTrue(
+            (
+                runtime
+                / controller.SESSIONS_ROOT
+                / f"{result['session_id']}.json"
+            ).is_file()
+        )
+        changed_outside_runtime = [
+            path
+            for path in self.target.rglob("*")
+            if path.is_file()
+            and runtime not in path.parents
+            and path != project_file
+        ]
+        self.assertEqual([], changed_outside_runtime)
+
     def test_simple_counts_separate_core_shared_and_retired_files(self) -> None:
         result = self._prepare()
         state = result["kit_change"]
@@ -434,6 +652,410 @@ class KitChangeControllerTest(unittest.TestCase):
         )
         self.assertEqual("install", state["mode"])
         self.assertEqual("Not part of this kit change", state["design"])
+
+    def test_d1_reprepare_creates_a_new_read_only_review_and_never_applies(self) -> None:
+        for name in ("first", "second"):
+            directory = self.target / name
+            directory.mkdir()
+            (directory / "project.godot").write_text("[application]\n", encoding="utf-8")
+        self.blockers = [{
+            "code": "game-root-ambiguous",
+            "path": None,
+            "detail": "multiple Godot projects exist; choose game_root explicitly",
+        }]
+        old = self._prepare()
+
+        def selected_preview(_root: Path, _archive: Path, **kwargs: object) -> dict[str, object]:
+            if kwargs.get("game_root") == "second":
+                material = self._material()
+                material["blockers"] = []
+                material["game_root"] = {"value": "second", "source": "explicit"}
+                return {
+                    "schema": 1,
+                    "kind": "agent-kit-change-preview",
+                    "material": material,
+                    "approval": {
+                        "algorithm": "sha256-canonical-json-v1",
+                        "sha256": _sha256(_canonical(material)),
+                        "approvable": True,
+                    },
+                }
+            return self._preview(_root, _archive, **kwargs)
+
+        controller.kit_change.preview.side_effect = selected_preview
+        before = self._target_snapshot()
+
+        new = controller.reprepare(self.runtime, old["session_id"], {"D1": "second"})
+
+        self.assertNotEqual(old["session_id"], new["session_id"])
+        self.assertNotEqual(
+            old["kit_change"]["plan_sha256"], new["kit_change"]["plan_sha256"]
+        )
+        self.assertEqual("ready", new["kit_change"]["status"])
+        self.assertEqual(new["session_id"], new["kit_change"]["session_id"])
+        self.assertEqual(before, self._target_snapshot())
+        controller.kit_change.apply.assert_not_called()
+
+    def test_d1_reprepare_refuses_unadvertised_or_extra_choices(self) -> None:
+        directory = self.target / "only"
+        directory.mkdir()
+        (directory / "project.godot").write_text("[application]\n", encoding="utf-8")
+        self.blockers = [{
+            "code": "game-root-ambiguous",
+            "path": None,
+            "detail": "choose game_root explicitly",
+        }]
+        old = self._prepare()
+
+        for choices in ({"D1": "missing"}, {"D1": "only", "D2": "extra"}):
+            with self.subTest(choices=choices), self.assertRaises(
+                controller.KitChangeControllerError
+            ):
+                controller.reprepare(self.runtime, old["session_id"], choices)
+        controller.kit_change.apply.assert_not_called()
+
+    def test_failed_check_removes_a_fresh_generated_baseline(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+
+        def rollback(_root: Path, transaction_id: str | None = None) -> dict[str, object]:
+            managed = self.target / ".agent-kit"
+            self.assertFalse((managed / "brownfield.json").exists())
+            managed.rmdir()
+            return {
+                "ok": True,
+                "status": "rolled_back",
+                "transaction_id": transaction_id,
+                "preview_sha256": self._preview_sha(),
+            }
+
+        def failed(_target: Path, _session: object) -> dict[str, object]:
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(generated)
+            return {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "detail": "self-test failed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        with mock.patch.object(controller.kit_change, "rollback", side_effect=rollback):
+            result = controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=failed,
+            )
+
+        self.assertEqual("restored", result["kit_change"]["status"])
+        self.assertFalse((self.target / ".agent-kit").exists())
+
+    def test_failed_check_keeps_a_preexisting_managed_directory(self) -> None:
+        managed = self.target / ".agent-kit"
+        managed.mkdir()
+        keep = managed / "keep.txt"
+        keep.write_bytes(b"existing\n")
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+
+        def failed(_target: Path, _session: object) -> dict[str, object]:
+            (managed / "brownfield.json").write_bytes(generated)
+            return {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "detail": "self-test failed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        def rollback(_root: Path, transaction_id: str | None = None) -> dict[str, object]:
+            self.assertFalse((managed / "brownfield.json").exists())
+            self.assertEqual(b"existing\n", keep.read_bytes())
+            return {
+                "ok": True,
+                "status": "rolled_back",
+                "transaction_id": transaction_id,
+                "preview_sha256": self._preview_sha(),
+            }
+
+        with mock.patch.object(controller.kit_change, "rollback", side_effect=rollback):
+            result = controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=failed,
+            )
+
+        self.assertEqual("restored", result["kit_change"]["status"])
+        self.assertTrue(managed.is_dir())
+        self.assertEqual(b"existing\n", keep.read_bytes())
+
+    def test_manual_restore_removes_a_fresh_managed_directory(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+
+        def good(_target: Path, _session: object) -> dict[str, object]:
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(generated)
+            return {
+                "kit_ok": True,
+                "project_ok": True,
+                "existing_issues": [],
+                "detail": "passed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        def rollback(_root: Path, transaction_id: str | None = None) -> dict[str, object]:
+            managed = self.target / ".agent-kit"
+            self.assertFalse((managed / "brownfield.json").exists())
+            managed.rmdir()
+            return {
+                "ok": True,
+                "status": "rolled_back",
+                "transaction_id": transaction_id,
+                "preview_sha256": self._preview_sha(),
+            }
+
+        applied = controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=good,
+        )
+        with mock.patch.object(controller.kit_change, "rollback", side_effect=rollback):
+            restored = controller.restore(
+                self.runtime,
+                prepared["session_id"],
+                applied["kit_change"]["result_sha256"],
+            )
+
+        self.assertEqual("restored", restored["kit_change"]["status"])
+        self.assertFalse((self.target / ".agent-kit").exists())
+
+    def test_default_malformed_static_proof_restores_project_and_baseline(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+
+        def malformed(
+            _target: Path, _session: object, **kwargs: object
+        ) -> dict[str, object]:
+            ready = kwargs["baseline_ready"]
+            assert callable(ready)
+            ready(generated)
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(generated)
+            return {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "detail": "verify returned no readable receipt",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=malformed
+        ) as run:
+            result = controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+            )
+
+        self.assertEqual("restored", result["kit_change"]["status"])
+        self.assertFalse((self.target / ".agent-kit" / "brownfield.json").exists())
+        controller.kit_change.rollback.assert_called_once()
+        run.assert_called_once()
+
+    def test_crash_after_baseline_intent_recovers_when_scan_input_changed(self) -> None:
+        prepared = self._prepare()
+        first = b"first generated baseline\n"
+        changed = b"changed generated baseline\n"
+        calls = 0
+
+        def checking(
+            _target: Path, _session: object, **kwargs: object
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            ready = kwargs["baseline_ready"]
+            assert callable(ready)
+            ready(first if calls == 1 else changed)
+            raise SimulatedCrash()
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=checking
+        ), self.assertRaises(SimulatedCrash):
+            controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+            )
+        stored = controller.load(self.runtime, prepared["session_id"])
+        self.assertEqual("checking", stored["state"])
+        self.assertEqual(_sha256(first), stored["baseline"]["generated"]["sha256"])
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=checking
+        ):
+            recovered = controller.recover(self.runtime, prepared["session_id"])
+
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.assertFalse((self.target / ".agent-kit" / "brownfield.json").exists())
+
+    def test_baseline_swap_after_write_pauses_and_can_recover(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+        calls = 0
+
+        def checking(
+            _target: Path, _session: object, **kwargs: object
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            ready = kwargs["baseline_ready"]
+            assert callable(ready)
+            ready(generated)
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if calls == 1:
+                path.write_bytes(generated)
+                raise SimulatedCrash()
+            return {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "detail": "static proof unavailable",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=checking
+        ), self.assertRaises(SimulatedCrash):
+            controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+            )
+        path = self.target / ".agent-kit" / "brownfield.json"
+        path.write_bytes(b"third version\n")
+        controller.kit_change.rollback.reset_mock()
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=checking
+        ):
+            paused = controller.recover(self.runtime, prepared["session_id"])
+
+        self.assertEqual("checking", paused["kit_change"]["status"])
+        controller.kit_change.rollback.assert_not_called()
+        path.write_bytes(generated)
+
+        with mock.patch.object(
+            controller.kit_change_check, "run", side_effect=checking
+        ):
+            recovered = controller.recover(self.runtime, prepared["session_id"])
+
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.assertFalse(path.exists())
+
+    def test_failed_check_restores_exact_prior_baseline_bytes(self) -> None:
+        path = self.target / ".agent-kit" / "brownfield.json"
+        path.parent.mkdir(parents=True)
+        prior = b"prior baseline\n"
+        generated = b"generated baseline\n"
+        path.write_bytes(prior)
+        prepared = self._prepare()
+
+        def failed(_target: Path, _session: object) -> dict[str, object]:
+            path.write_bytes(generated)
+            return {
+                "kit_ok": False,
+                "project_ok": False,
+                "existing_issues": [],
+                "detail": "self-test failed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=failed,
+        )
+
+        self.assertEqual(prior, path.read_bytes())
+
+    def test_manual_restore_refuses_a_third_baseline_version_before_rollback(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+
+        def good(_target: Path, _session: object) -> dict[str, object]:
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(generated)
+            return {
+                "kit_ok": True,
+                "project_ok": True,
+                "existing_issues": [],
+                "detail": "passed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        applied = controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=good,
+        )
+        path = self.target / ".agent-kit" / "brownfield.json"
+        path.write_bytes(b"third version\n")
+        controller.kit_change.rollback.reset_mock()
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller.restore(
+                self.runtime, prepared["session_id"], applied["kit_change"]["result_sha256"]
+            )
+
+        self.assertEqual("baseline-changed", raised.exception.code)
+        controller.kit_change.rollback.assert_not_called()
+
+    def test_check_crash_after_baseline_write_recovers_deterministically(self) -> None:
+        prepared = self._prepare()
+        generated = b"generated baseline\n"
+        calls = 0
+
+        def checking(_target: Path, _session: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            path = self.target / ".agent-kit" / "brownfield.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(generated)
+            if calls == 1:
+                raise SimulatedCrash()
+            return {
+                "kit_ok": True,
+                "project_ok": True,
+                "existing_issues": [],
+                "detail": "passed",
+                "baseline_sha256": _sha256(generated),
+            }
+
+        with self.assertRaises(SimulatedCrash):
+            controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=checking,
+            )
+
+        recovered = controller.recover(
+            self.runtime, prepared["session_id"], post_apply_check=checking
+        )
+        self.assertEqual("complete", recovered["kit_change"]["status"])
+        self.assertEqual(2, calls)
 
 
 if __name__ == "__main__":
