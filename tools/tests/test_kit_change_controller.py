@@ -90,6 +90,11 @@ class KitChangeControllerTest(unittest.TestCase):
             ),
             mock.patch.object(
                 controller.release,
+                "read_verified_controller",
+                side_effect=lambda _path: (dict(self.release_report), self.members),
+            ),
+            mock.patch.object(
+                controller.release,
                 "materialize_verified_directory_zip",
                 side_effect=self._materialize,
             ),
@@ -227,6 +232,87 @@ class KitChangeControllerTest(unittest.TestCase):
             result["kit_change"]["recovery"],
         )
         self.assertFalse((self.target / ".agent-kit").exists())
+        controller.release.read_verified_controller.assert_called_once_with(
+            controller.release.ROOT
+        )
+
+    def test_mismatched_controller_is_refused_before_release_or_session_write(
+        self,
+    ) -> None:
+        controller.release.read_verified_controller.side_effect = lambda _path: (
+            {**self.release_report, "archive_sha256": "b" * 64},
+            self.members,
+        )
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            self._prepare()
+
+        self.assertEqual("controller-release-mismatch", raised.exception.code)
+        self.assertIn("newer extracted release", raised.exception.detail)
+        self.assertIn("matching clean source checkout", raised.exception.detail)
+        controller.kit_change.preview.assert_not_called()
+        controller.release.materialize_verified_directory_zip.assert_not_called()
+        self.assertFalse(
+            (self.runtime / controller.RELEASES_ROOT).exists(),
+            "the incoming release was retained before controller authentication",
+        )
+        self.assertFalse(
+            (self.runtime / controller.SESSIONS_ROOT).exists(),
+            "session state was written before controller authentication",
+        )
+
+    def test_unauthenticated_controller_is_reported_as_a_release_mismatch(
+        self,
+    ) -> None:
+        controller.release.read_verified_controller.side_effect = (
+            controller.release.ReleaseError("source repository is dirty")
+        )
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            self._prepare()
+
+        self.assertEqual("controller-release-mismatch", raised.exception.code)
+        self.assertIn("could not be authenticated", raised.exception.detail)
+        self.assertIn("matching clean source checkout", raised.exception.detail)
+        controller.kit_change.preview.assert_not_called()
+        self.assertFalse((self.runtime / controller.RELEASES_ROOT).exists())
+        self.assertFalse((self.runtime / controller.SESSIONS_ROOT).exists())
+
+    def test_mismatched_controller_cannot_materialize_a_release_directory(
+        self,
+    ) -> None:
+        extracted = self.base / "extracted-release"
+        extracted.mkdir()
+        controller.release.read_verified_controller.side_effect = lambda _path: (
+            {**self.release_report, "archive_sha256": "b" * 64},
+            self.members,
+        )
+
+        with self.assertRaises(controller.KitChangeControllerError) as raised:
+            controller.prepare(
+                self.runtime,
+                self.target,
+                extracted,
+                self.operation,
+            )
+
+        self.assertEqual("controller-release-mismatch", raised.exception.code)
+        controller.release.materialize_verified_directory_zip.assert_not_called()
+        controller.kit_change.preview.assert_not_called()
+        self.assertFalse((self.runtime / controller.RELEASES_ROOT).exists())
+
+    def test_controller_identity_uses_constant_time_comparison(self) -> None:
+        comparison = mock.Mock(return_value=False)
+        controller.release.read_verified_controller.side_effect = lambda _path: (
+            {**self.release_report, "archive_sha256": "b" * 64},
+            self.members,
+        )
+
+        with mock.patch.object(controller.hmac, "compare_digest", comparison):
+            with self.assertRaises(controller.KitChangeControllerError):
+                controller._require_controller_release(self.release_report)
+
+        comparison.assert_called_once_with("b" * 64, "a" * 64)
 
     def test_archive_and_extracted_directory_resolve_to_same_session(self) -> None:
         first = self._prepare()
@@ -1237,6 +1323,13 @@ class RealControllerRecoveryTest(unittest.TestCase):
             )
             for module in (controller.release, controller.kit_change.release)
         ]
+        self.readers.append(
+            mock.patch.object(
+                controller.release,
+                "read_verified_controller",
+                side_effect=lambda _path: (dict(self.report), self.members),
+            )
+        )
         for reader in self.readers:
             reader.start()
 

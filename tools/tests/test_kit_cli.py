@@ -1492,6 +1492,46 @@ class KitCliTest(unittest.TestCase):
             output,
         )
 
+    def test_install_reports_controller_release_mismatch_before_board_start(
+        self,
+    ) -> None:
+        detail = (
+            "The running kit does not match the selected release. "
+            "Run this command from the newer extracted release, or from a "
+            "matching clean source checkout."
+        )
+        with tempfile.TemporaryDirectory(prefix="kit-cli-controller-match-") as temporary:
+            base = Path(temporary).resolve()
+            target = base / "project"
+            target.mkdir()
+            release_source = base / "release.zip"
+            release_source.write_bytes(b"release")
+            runtime = base / "runtime"
+            with mock.patch.object(
+                kit, "_kit_change_runtime", return_value=runtime
+            ), mock.patch.object(
+                kit.kit_change_controller,
+                "prepare",
+                side_effect=kit.kit_change_controller.KitChangeControllerError(
+                    "controller-release-mismatch", detail
+                ),
+            ), mock.patch.object(
+                kit, "_register_kit_change_board"
+            ) as board:
+                code, output = self.invoke(
+                    "install",
+                    str(target),
+                    "--release",
+                    str(release_source),
+                    "--json",
+                )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_REFUSED, code)
+        self.assertEqual("controller_release_mismatch", payload["status"])
+        self.assertEqual(detail, payload["error"])
+        board.assert_not_called()
+
     def test_install_repeated_prepare_reports_its_terminal_status(self) -> None:
         session_id = "a" * 64
         with tempfile.TemporaryDirectory(prefix="kit-cli-install-terminal-") as temporary:
@@ -1608,6 +1648,8 @@ class KitCliTest(unittest.TestCase):
             }
             with mock.patch.object(kit, "CORE_ROOT", extracted), mock.patch.object(
                 kit, "TOOLS", extracted / "tools"
+            ), mock.patch.object(
+                kit.kit_change_controller.release, "ROOT", extracted
             ), mock.patch.object(
                 kit, "_user_controller_root", return_value=user_state
             ), mock.patch.dict(os.environ, hostile, clear=False):

@@ -1364,15 +1364,46 @@ def _git_state(root: Path) -> tuple[dict, str]:
         raise ReleaseError("trusted Git executable is unavailable") from exc
 
     def run(*arguments: str) -> str:
+        command = [
+            executable,
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.trustExitCode=false",
+            "-c",
+            f"core.attributesFile={os.devnull}",
+            "-C",
+            str(root),
+            *arguments,
+        ]
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        environment.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
         try:
             completed = subprocess.run(
-                [executable, "-C", str(root), *arguments],
+                command,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=environment,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ReleaseError(f"cannot read source Git metadata: {exc}") from exc
@@ -1950,32 +1981,26 @@ def _write_tar(path: Path, members: dict[str, tuple[bytes, int]], compressed: bo
         os.fsync(raw.fileno())
 
 
-def build_release(root: Path, output: Path) -> dict:
-    """Build an atomic deterministic archive and return its verified report."""
+def read_verified_source_checkout(
+    root: Path,
+) -> tuple[dict, dict[str, ArchiveMember]]:
+    """Authenticate the canonical release represented by one clean checkout.
+
+    The result is the exact member set that ``build_release`` would write, but
+    this function performs no filesystem mutation. Source, authority evidence,
+    and Git state are sampled before and after collection so a moving or dirty
+    checkout cannot act as a release controller.
+    """
     root_input = root.absolute()
     if root_input.is_symlink() or _is_reparse_point(root_input):
         raise ReleaseError(f"release root is not a regular directory: {root_input}")
-    root = root.resolve()
-    output = output.absolute()
-    output_resolved = output.resolve(strict=False)
     try:
-        output_resolved.relative_to(root)
-    except ValueError:
-        pass
-    else:
-        runtime = _private_runtime_root(root)
-        try:
-            output_resolved.relative_to(runtime)
-        except ValueError as exc:
-            raise ReleaseError(
-                "release output must be outside the source repository or inside its "
-                "configured private runtime_root"
-            ) from exc
-    if output.exists() or output.is_symlink() or _is_reparse_point(output):
-        if output.is_symlink() or _is_reparse_point(output) or not output.is_file():
-            raise ReleaseError(f"release output is linked or not a regular file: {output}")
+        root = root_input.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReleaseError(f"cannot resolve release root: {exc}") from exc
+    if not root.is_dir():
+        raise ReleaseError(f"release root is not a regular directory: {root}")
 
-    kind = _archive_kind(output)
     source_before, status_before = _git_state(root)
     if source_before["dirty"]:
         raise ReleaseError(
@@ -2004,9 +2029,50 @@ def build_release(root: Path, output: Path) -> dict:
     manifest = _manifest(
         version, legal_paths, files, source_after, authority_after
     )
-    members = {release_file.path: (release_file.content, release_file.mode)
-               for release_file in files}
-    members[MANIFEST_PATH] = (_canonical_json(manifest), 0o644)
+    members = {
+        item.path: ArchiveMember(item.path, item.content, item.mode)
+        for item in files
+    }
+    members[MANIFEST_PATH] = ArchiveMember(
+        MANIFEST_PATH, _canonical_json(manifest), 0o644
+    )
+    return _verify_member_set("source", members, None)
+
+
+def build_release(root: Path, output: Path) -> dict:
+    """Build an atomic deterministic archive and return its verified report."""
+    root_input = root.absolute()
+    if root_input.is_symlink() or _is_reparse_point(root_input):
+        raise ReleaseError(f"release root is not a regular directory: {root_input}")
+    root = root.resolve()
+    output = output.absolute()
+    output_resolved = output.resolve(strict=False)
+    try:
+        output_resolved.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        runtime = _private_runtime_root(root)
+        try:
+            output_resolved.relative_to(runtime)
+        except ValueError as exc:
+            raise ReleaseError(
+                "release output must be outside the source repository or inside its "
+                "configured private runtime_root"
+            ) from exc
+    if output.exists() or output.is_symlink() or _is_reparse_point(output):
+        if output.is_symlink() or _is_reparse_point(output) or not output.is_file():
+            raise ReleaseError(f"release output is linked or not a regular file: {output}")
+
+    kind = _archive_kind(output)
+    _source_report, verified_members = read_verified_source_checkout(root)
+    members = {
+        name: (
+            member.content,
+            member.mode if member.mode is not None else 0o644,
+        )
+        for name, member in verified_members.items()
+    }
 
     output_parent, parent_identity = _prepare_unredirected_directory(
         output.parent, label="release output parent", create=True
@@ -2443,6 +2509,14 @@ def read_verified_directory(root: Path) -> tuple[dict, dict[str, ArchiveMember]]
     """Verify an exact extracted release without Git or the original archive."""
     members = _read_release_directory(root)
     return _verify_member_set("directory", members, None)
+
+
+def read_verified_controller(root: Path) -> tuple[dict, dict[str, ArchiveMember]]:
+    """Authenticate a running extracted release or matching clean checkout."""
+    manifest = root.absolute() / MANIFEST_PATH
+    if manifest.exists() or manifest.is_symlink() or _is_reparse_point(manifest):
+        return read_verified_directory(root)
+    return read_verified_source_checkout(root)
 
 
 def materialize_verified_directory_zip(root: Path, output: Path) -> dict:

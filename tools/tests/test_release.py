@@ -308,6 +308,43 @@ class ReleaseTestCase(unittest.TestCase):
 
 
 class TestDeterministicBuild(ReleaseTestCase):
+    def test_clean_source_checkout_has_the_built_release_identity(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        output = self.scratch / "out" / "kit.zip"
+
+        source_report, source_members = release.read_verified_source_checkout(root)
+        built_report = release.build_release(root, output)
+
+        self.assertEqual("source", source_report["format"])
+        self.assertEqual(
+            built_report["archive_sha256"], source_report["archive_sha256"]
+        )
+        self.assertEqual(
+            set(_member_contents(output)), set(source_members)
+        )
+
+    def test_controller_reader_accepts_matching_source_and_extracted_release(
+        self,
+    ) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        output = self.scratch / "out" / "kit.zip"
+        built = release.build_release(root, output)
+        extracted = self.scratch / "extracted"
+        extracted.mkdir()
+        _extract_exact(output, extracted)
+
+        source_report, _source_members = release.read_verified_controller(root)
+        directory_report, _directory_members = release.read_verified_controller(
+            extracted
+        )
+
+        self.assertEqual("source", source_report["format"])
+        self.assertEqual("directory", directory_report["format"])
+        self.assertEqual(built["archive_sha256"], source_report["archive_sha256"])
+        self.assertEqual(
+            built["archive_sha256"], directory_report["archive_sha256"]
+        )
+
     def test_zip_is_byte_identical_sanitized_and_self_describing(self) -> None:
         root, commit = _fixture_repository(self.scratch)
         output_one = self.scratch / "out" / "kit-one.zip"
@@ -486,10 +523,102 @@ class TestDeterministicBuild(ReleaseTestCase):
 
         with self.assertRaisesRegex(release.ReleaseError, "requires a clean source"):
             release.build_release(root, output)
+        with self.assertRaisesRegex(release.ReleaseError, "requires a clean source"):
+            release.read_verified_source_checkout(root)
 
         self.assertFalse(output.exists())
         source, _porcelain = release._git_state(root)
         self.assertEqual(source, {"commit": commit, "dirty": True})
+
+    def test_source_checkout_change_during_collection_is_refused(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        original = release.collect_files
+
+        def collect_then_change(source: Path) -> tuple[
+            str, list[str], list[release.ReleaseFile]
+        ]:
+            result = original(source)
+            _write(source, "README.md", "# Changed during collection\n")
+            return result
+
+        with mock.patch.object(
+            release, "collect_files", side_effect=collect_then_change
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError, "source repository changed"
+            ):
+                release.read_verified_source_checkout(root)
+
+    def test_git_metadata_child_ignores_inherited_process_controls(self) -> None:
+        calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def completed(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            environment = kwargs.get("env")
+            self.assertIsInstance(environment, dict)
+            calls.append((command, dict(environment)))
+            stdout = "a" * 40 + "\n" if "rev-parse" in command else ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        with mock.patch.object(
+            release.process_supervisor,
+            "resolve_ordinary_executable",
+            return_value="trusted-git",
+        ), mock.patch.object(
+            release.subprocess, "run", side_effect=completed
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": "attacker-repository",
+                "GIT_EXTERNAL_DIFF": "attacker-diff",
+                "GIT_CONFIG_GLOBAL": "attacker-config",
+                "GIT_PAGER": "attacker-pager",
+            },
+        ):
+            source, _fingerprint = release._git_state(self.scratch)
+
+        self.assertEqual({"commit": "a" * 40, "dirty": False}, source)
+        self.assertEqual(2, len(calls))
+        for command, environment in calls:
+            self.assertEqual("trusted-git", command[0])
+            self.assertIn("--no-pager", command)
+            self.assertIn("core.fsmonitor=false", command)
+            self.assertIn(f"core.hooksPath={os.devnull}", command)
+            self.assertIn("diff.external=", command)
+            self.assertIn("diff.trustExitCode=false", command)
+            self.assertIn(f"core.attributesFile={os.devnull}", command)
+            self.assertFalse(
+                [
+                    key
+                    for key in environment
+                    if key.upper().startswith("GIT_")
+                    and key
+                    not in {
+                        "GIT_CONFIG_GLOBAL",
+                        "GIT_CONFIG_NOSYSTEM",
+                        "GIT_OPTIONAL_LOCKS",
+                        "GIT_TERMINAL_PROMPT",
+                    }
+                ]
+            )
+            self.assertEqual(os.devnull, environment["GIT_CONFIG_GLOBAL"])
+            self.assertEqual("1", environment["GIT_CONFIG_NOSYSTEM"])
+            self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+            self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+
+    def test_git_metadata_child_disables_repository_fsmonitor(self) -> None:
+        root, _commit = _fixture_repository(self.scratch)
+        sentinel = root / "fsmonitor-ran.txt"
+        monitor = f'echo fsmonitor-ran > "{sentinel.as_posix()}"'
+        _git(root, "config", "core.fsmonitor", monitor)
+
+        _git(root, "status", "--porcelain=v1", "--untracked-files=all")
+        self.assertTrue(sentinel.is_file(), "fixture did not exercise fsmonitor")
+        sentinel.unlink()
+
+        source, _fingerprint = release._git_state(root)
+
+        self.assertFalse(source["dirty"])
+        self.assertFalse(sentinel.exists())
 
     def test_build_refuses_a_redirected_output_parent(self) -> None:
         root, _commit = _fixture_repository(self.scratch)

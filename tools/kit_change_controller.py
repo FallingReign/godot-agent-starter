@@ -56,6 +56,10 @@ STATES = OPEN_STATES | RECOVERY_STATES | FINAL_STATES | {"applying", "checking"}
 ISSUE_KEYS = {"stage", "code", "path", "line", "message_sha256"}
 BASELINE_SNAPSHOT_KEYS = {"exists", "sha256", "content_base64"}
 RECOVERY_DETAIL_MARKER = " Restore is still required: "
+CONTROLLER_RELEASE_GUIDANCE = (
+    "Run this command from the newer extracted release, or from a matching "
+    "clean source checkout."
+)
 
 
 class KitChangeView(TypedDict):
@@ -268,20 +272,49 @@ def _archive_path(runtime: Path, digest: str) -> Path:
     return _directory(runtime, RELEASES_ROOT) / f"{digest}.zip"
 
 
+def _require_controller_release(incoming_report: Mapping[str, Any]) -> None:
+    """Require the running controller to be the selected release exactly."""
+    incoming = str(incoming_report.get("archive_sha256") or "")
+    try:
+        controller_report, _controller_members = release.read_verified_controller(
+            release.ROOT
+        )
+    except release.ReleaseError as exc:
+        raise KitChangeControllerError(
+            "controller-release-mismatch",
+            "The running kit could not be authenticated. "
+            f"{CONTROLLER_RELEASE_GUIDANCE} Reason: {exc}",
+        ) from exc
+    running = str(controller_report.get("archive_sha256") or "")
+    if (
+        SHA256_RE.fullmatch(incoming) is None
+        or SHA256_RE.fullmatch(running) is None
+        or not hmac.compare_digest(running, incoming)
+    ):
+        raise KitChangeControllerError(
+            "controller-release-mismatch",
+            "The running kit does not match the selected release. "
+            f"{CONTROLLER_RELEASE_GUIDANCE}",
+        )
+
+
 def _retain_release(runtime: Path, source: Path) -> tuple[dict[str, Any], int, Path]:
     source_is_directory = source.is_dir()
     try:
         if source_is_directory:
             source_report, _source_members = release.read_verified_directory(source)
             digest = str(source_report.get("archive_sha256") or "")
-            stored = _archive_path(runtime, digest)
-            if not stored.exists():
-                release.materialize_verified_directory_zip(source, stored)
         else:
             source_report, _source_members = release.read_verified_archive(source)
             digest = str(source_report.get("archive_sha256") or "")
             source_container = str(source_report.get("container_sha256") or "")
             content = _archive_payload(source, source_container)
+        _require_controller_release(source_report)
+        if source_is_directory:
+            stored = _archive_path(runtime, digest)
+            if not stored.exists():
+                release.materialize_verified_directory_zip(source, stored)
+        else:
             stored = _archive_path(runtime, digest)
             wrote_source = not stored.exists()
             if wrote_source:
