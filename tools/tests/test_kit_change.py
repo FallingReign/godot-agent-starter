@@ -225,6 +225,7 @@ class KitChangeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="kit-change-test-")
         self.root = Path(self.temporary.name).resolve()
+        _write(self.root, "src/project.godot", b"[application]\n")
         self.archive = self.root / "release.zip"
         self.fixture = _release_fixture()
         self.reader = mock.patch.object(
@@ -362,6 +363,7 @@ class KitChangeTest(unittest.TestCase):
             },
             "studio_extension": {"enabled": True},
         }
+        _write(self.root, "project.godot", b"[application]\n")
         _write(self.root, "kit.config.json", _canonical(existing))
         _write(self.root, "AGENTS.md", b"# Human project rules\n")
 
@@ -395,6 +397,7 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual((self.root / "project.godot").read_bytes(), b"[application]\n")
 
     def test_one_nested_godot_project_selects_its_parent(self) -> None:
+        (self.root / "src" / "project.godot").unlink()
         _write(self.root, "game/project.godot", b"[application]\n")
 
         decision = kit_change.preview(self.root, self.archive)
@@ -410,6 +413,7 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual(config["game_root"], "game")
 
     def test_multiple_godot_projects_need_an_explicit_game_root(self) -> None:
+        (self.root / "src" / "project.godot").unlink()
         _write(self.root, "first/project.godot", b"[application]\n")
         _write(self.root, "second/project.godot", b"[application]\n")
 
@@ -429,6 +433,8 @@ class KitChangeTest(unittest.TestCase):
         )
 
     def test_explicit_game_root_is_bound_into_the_preview_digest(self) -> None:
+        _write(self.root, "game-a/project.godot", b"[application]\n")
+        _write(self.root, "game-b/project.godot", b"[application]\n")
         decision = kit_change.preview(self.root, self.archive, game_root="game-a")
 
         with self.assertRaises(kit_change.KitChangeError) as raised:
@@ -441,6 +447,108 @@ class KitChangeTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "approval-mismatch")
         self.assertFalse((self.root / "kit.config.json").exists())
+
+    def test_missing_godot_project_blocks_install(self) -> None:
+        (self.root / "src" / "project.godot").unlink()
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["game_root"],
+            {"value": None, "source": "unresolved"},
+        )
+        blocker = next(
+            item
+            for item in decision["material"]["blockers"]
+            if item["code"] == "game-project-missing"
+        )
+        self.assertIsNone(blocker["path"])
+        self.assertIn("Godot 4.7.2 GDScript project", blocker["detail"])
+
+    def test_explicit_game_root_cannot_bypass_a_missing_project(self) -> None:
+        _write(self.root, "game/README.md", b"# Not a Godot project\n")
+
+        decision = kit_change.preview(self.root, self.archive, game_root="game")
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["game_root"],
+            {"value": "game", "source": "explicit"},
+        )
+        self.assertIn(
+            ("game-project-missing", "game/project.godot"),
+            {
+                (blocker["code"], blocker["path"])
+                for blocker in decision["material"]["blockers"]
+            },
+        )
+
+    def test_configured_game_root_cannot_bypass_a_missing_project(self) -> None:
+        _write(
+            self.root,
+            "kit.config.json",
+            _canonical({"schema": 1, "game_root": "game"}),
+        )
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["game_root"],
+            {"value": "game", "source": "existing-config"},
+        )
+        self.assertIn(
+            ("game-project-missing", "game/project.godot"),
+            {
+                (blocker["code"], blocker["path"])
+                for blocker in decision["material"]["blockers"]
+            },
+        )
+
+    def test_upgrade_blocks_when_the_configured_game_project_was_removed(self) -> None:
+        self._preview_and_apply()
+        self._switch_release(
+            _release_fixture(version="0.3.1", source_commit="c" * 40)
+        )
+        (self.root / "src" / "project.godot").unlink()
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertEqual(decision["material"]["operation"], "upgrade")
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["game_root"],
+            {"value": "src", "source": "existing-config"},
+        )
+        self.assertIn(
+            ("game-project-missing", "src/project.godot"),
+            {
+                (blocker["code"], blocker["path"])
+                for blocker in decision["material"]["blockers"]
+            },
+        )
+
+    def test_selected_game_root_requires_exact_project_filename_case(self) -> None:
+        _write(self.root, "game/Project.godot", b"[application]\n")
+
+        explicit = kit_change.preview(self.root, self.archive, game_root="game")
+        _write(
+            self.root,
+            "kit.config.json",
+            _canonical({"schema": 1, "game_root": "game"}),
+        )
+        configured = kit_change.preview(self.root, self.archive)
+
+        for decision in (explicit, configured):
+            self.assertFalse(decision["approval"]["approvable"])
+            self.assertIn(
+                "path-case-collision",
+                {
+                    blocker["code"]
+                    for blocker in decision["material"]["blockers"]
+                },
+            )
 
     def test_schema_json_blocks_an_unsupported_schema_without_editing(self) -> None:
         existing = _canonical({"schema": 99, "game_root": "src"})

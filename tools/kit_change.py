@@ -300,6 +300,28 @@ def _safe_game_root(root: Path, raw: object) -> str:
     return relative
 
 
+def _game_project_blockers(
+    root: Path, game_root: str
+) -> list[dict[str, Any]]:
+    project_path = (
+        "project.godot" if game_root == "." else f"{game_root}/project.godot"
+    )
+    try:
+        project = _target(root, project_path)
+    except KitChangeError as exc:
+        return [{"code": exc.code, "path": project_path, "detail": exc.detail}]
+    if project.exists():
+        return []
+    return [{
+        "code": "game-project-missing",
+        "path": project_path,
+        "detail": (
+            "the game root must contain a regular exact-case project.godot; "
+            "create and close a blank Godot 4.7.2 GDScript project there, then retry"
+        ),
+    }]
+
+
 def _discover_game_root(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     blockers: list[dict[str, Any]] = []
     try:
@@ -372,7 +394,14 @@ def _discover_game_root(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]
         }]
     if candidates:
         return {"value": candidates[0], "source": "unique-project"}, blockers
-    return {"value": "src", "source": "new-project-default"}, blockers
+    return {"value": None, "source": "unresolved"}, [{
+        "code": "game-project-missing",
+        "path": None,
+        "detail": (
+            "no regular exact-case project.godot was found; create and close a blank "
+            "Godot 4.7.2 GDScript project in this folder, then retry"
+        ),
+    }]
 
 
 def _select_game_root(
@@ -399,7 +428,7 @@ def _select_game_root(
             configured = existing.get("game_root")
             if configured is not None:
                 selected = _safe_game_root(root, configured)
-                blockers: list[dict[str, Any]] = []
+                blockers = _game_project_blockers(root, selected)
                 if explicit is not None and explicit != selected:
                     blockers.append({
                         "code": "game-root-choice-conflict",
@@ -412,7 +441,10 @@ def _select_game_root(
                 {"code": exc.code, "path": SCHEMA_JSON_PATH, "detail": exc.detail}
             ]
     if explicit is not None:
-        return {"value": explicit, "source": "explicit"}, []
+        return (
+            {"value": explicit, "source": "explicit"},
+            _game_project_blockers(root, explicit),
+        )
     return _discover_game_root(root)
 
 
