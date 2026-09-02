@@ -241,6 +241,53 @@ def is_authored_game_file(rel: str) -> bool:
     )
 
 
+def scope_owner(
+    scope_rows: List[Dict[str, Any]], path: str
+) -> Dict[str, Any] | None:
+    """Return the one hands-off boundary that owns ``path``.
+
+    A scope entry owns both a path and one exact action.  The most specific
+    matching entry wins, so a broad root allowance cannot silently override a
+    narrower directory or file boundary.
+    """
+
+    candidate_path = str(path or "").strip().replace("\\", "/")
+
+    def matches(boundary: Dict[str, Any]) -> bool:
+        raw = str(boundary.get("path") or "").strip().replace("\\", "/")
+        if boundary.get("kind") == "file":
+            return candidate_path == raw
+        if raw == "(root)":
+            return True
+        return candidate_path == raw or candidate_path.startswith(
+            raw.rstrip("/") + "/"
+        )
+
+    def specificity(boundary: Dict[str, Any]) -> Tuple[int, int]:
+        raw = str(boundary.get("path") or "").strip().replace("\\", "/")
+        if boundary.get("kind") == "file":
+            return (2, len(raw.split("/")))
+        if raw == "(root)":
+            return (0, 0)
+        return (1, len(raw.split("/")))
+
+    matching = [boundary for boundary in scope_rows if matches(boundary)]
+    return max(matching, key=specificity) if matching else None
+
+
+def scope_authorises(
+    scope_rows: List[Dict[str, Any]], path: str, observed_action: str
+) -> bool:
+    """Whether the owning hands-off boundary permits this exact Git action."""
+
+    owner = scope_owner(scope_rows, path)
+    return bool(
+        owner
+        and str(owner.get("action") or "").strip().lower()
+        == str(observed_action or "").strip().lower()
+    )
+
+
 def real_files() -> set:
     """Authored game files relative to ``res://``; kit state is excluded."""
     out = set()
@@ -639,6 +686,7 @@ padding:1.5px 7px;border-radius:9px;border:1px solid var(--line);color:var(--dim
 .tag.new{color:#7fd4ff;border-color:#1d4a63}
 .tag.modified{color:#d8b4fe;border-color:#4a2f63}
 .tag.existing{color:var(--dim);border-color:#333}
+.tag.unknown{color:var(--warn);border-color:#5a4410}
 .tag.act{color:var(--dim);border-color:#333;text-transform:none}
 .why{color:#b9c2cc;font-size:12px;margin:2px 0 0 4px;line-height:1.45}
 .why.warn{color:#8a7a52;font-style:italic}
@@ -794,7 +842,8 @@ padding:10px 14px;border-bottom:1px solid var(--line)}
 .arch-graph-shell{position:relative;height:500px;overflow:hidden;background:#0d1016}
 .arch-graph{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
 .arch-graph:active{cursor:grabbing}.arch-edge{stroke:#747b86;stroke-width:1;opacity:.48}
-.arch-edge[data-relation="uses"]{stroke:#5884ad;stroke-dasharray:3 4;opacity:.3}
+.arch-edge[data-relation="depends-on"]{stroke:#5884ad;opacity:.42}
+.arch-edge[data-relation="may-depend-on"]{stroke:#b78cff;stroke-dasharray:2 5;opacity:.42}
 .arch-edge[data-provenance="planned"]{stroke:#b78cff;stroke-dasharray:2 5}
 .arch-edge[data-connected="true"]{opacity:.95;stroke-width:1.8}
 .arch-viewport[data-focus="true"] .arch-edge[data-connected="false"]{opacity:.09}
@@ -1009,7 +1058,7 @@ def state_tag(state: str) -> str:
     """
     label = {"built": "built", "missing": "to do", "extra": "unproposed",
              "modified": "modified", "new": "new", "existing": "existing",
-             "deleted": "deleted"}[state]
+             "deleted": "deleted", "unknown": "not known"}[state]
     return f'<span class="tag {state}">{label}</span>'
 
 
@@ -1089,7 +1138,8 @@ def approved_history() -> Dict[str, Any]:
 
 
 def file_state(path: str, prop_files: Dict[str, Any], built: set,
-               approved_before: set | None = None) -> str:
+               approved_before: set | None = None,
+               comparison_known: bool = True) -> str:
     """Which badge a file row gets.
 
     "built" hid whether the file was created or changed, which is the first
@@ -1103,6 +1153,8 @@ def file_state(path: str, prop_files: Dict[str, Any], built: set,
         if approved_before and path in approved_before:
             return "existing"
         return "extra"
+    if not comparison_known:
+        return "unknown"
     act = str(meta.get("action", "") or "")
     if act == "delete" and path not in built:
         return "deleted"
@@ -1327,74 +1379,173 @@ def architecture_map_model(
     involvement: str = "function",
     function_changes: Dict[Tuple[str, str], Dict[str, str]] | None = None,
 ) -> Dict[str, Any]:
-    """Build the complete source map without turning observation into intent."""
+    """Build a source map whose plan, Git and inventory claims stay separate."""
 
     def normalise(value: Any) -> str:
         return str(value or "").strip().replace("\\", "/")
 
+    def authored_file(value: Any) -> str:
+        path = normalise(value)
+        return path if path and is_authored_game_file(path) else ""
+
+    def authored_module(value: Any) -> str:
+        path = normalise(value).rstrip("/")
+        if path == "(root)":
+            return path
+        if authored_scope.normalize_directory(path) != path:
+            return ""
+        return path if is_authored_game_file(path + "/__architecture_item__") else ""
+
+    # ``built`` is retained in the call signature for older consumers.  It is
+    # deliberately not evidence here: it used to mean both "present" and
+    # "changed", which made a failed baseline comparison look successful.
+    _ = built
     proposal_files = {
-        normalise(item.get("path")): item
+        authored_file(item.get("path")): item
         for item in rows(prop, "files")
-        if normalise(item.get("path"))
+        if authored_file(item.get("path"))
     }
     proposal_modules = {
-        normalise(item.get("path")).rstrip("/"): item
+        authored_module(item.get("path")): item
         for item in rows(prop, "modules")
-        if normalise(item.get("path"))
+        if authored_module(item.get("path"))
     }
+    proposal_function_files = {
+        authored_file(item.get("file"))
+        for item in rows(prop, "functions")
+        if authored_file(item.get("file"))
+    }
+    scope_rows = [
+        item for item in rows(prop, "scope")
+        if str(item.get("action") or "").strip().lower()
+        in ("new", "modify", "delete")
+    ]
     observed_actions = {
-        normalise(path): str(action or "").strip().lower()
+        authored_file(path): str(action or "").strip().lower()
         for path, action in (changed_actions or {}).items()
-        if normalise(path)
+        if authored_file(path)
+        and str(action or "").strip().lower() in ("new", "modify", "delete")
     }
     comparison_known = changed_actions is not None
+    present_known = present is not None
     baseline_known = baseline_files is not None
     function_comparison_known = function_changes is not None
-    observed_function_changes = function_changes or {}
+    observed_function_changes = {
+        (authored_file(path), str(identity)): evidence
+        for (path, identity), evidence in (function_changes or {}).items()
+        if authored_file(path) and isinstance(evidence, dict)
+    }
     baseline_set = {
-        normalise(path) for path in (baseline_files or set()) if normalise(path)
+        authored_file(path)
+        for path in (baseline_files or set())
+        if authored_file(path)
     }
-    inferred_present = {
-        normalise(path) for path in tree if normalise(path)
-    } | {
-        normalise(path) for path in built if normalise(path)
+    current_files = {
+        authored_file(path) for path in (present or set()) if authored_file(path)
     }
-    current_files = (
-        {normalise(path) for path in present if normalise(path)}
-        if present is not None
-        else inferred_present
-    )
+    tree_files = {
+        authored_file(path) for path in tree if authored_file(path)
+    }
     observed_tree = {
-        normalise(path): value
+        authored_file(path): value
         for path, value in tree.items()
         if (
-            normalise(path)
+            authored_file(path)
             and isinstance(value, dict)
-            and (present is None or normalise(path) in current_files)
+            and (not present_known or authored_file(path) in current_files)
         )
     }
     all_files = (
         current_files
+        | (tree_files if not present_known else tree_files & current_files)
         | set(proposal_files)
+        | proposal_function_files
         | set(observed_actions)
     )
 
-    design_reasons = [
-        str(item.get("why") or "").strip()
-        for item in rows(prop, "design_refs")
-        if str(item.get("why") or "").strip()
-    ]
     view_state = cockpit_state or {}
     plan_status = str(view_state.get("status") or prop.get("status") or "").strip()
     authority = view_state.get("design_authority")
-    if not isinstance(authority, dict):
-        authority = prop.get("design_authority")
     if not isinstance(authority, dict):
         authority = {}
     authority_value = str(
         authority.get("authority") or authority.get("status") or ""
     ).strip()
     approval_required = bool(view_state.get("approval_required", plan_status == "draft"))
+    authority_validation = str(authority.get("validation") or "not-checked").strip()
+    implementation_eligible = bool(authority.get("implementation_eligible", False))
+    design_documents = {
+        normalise(item.get("path")): str(item.get("sha256") or "").strip().lower()
+        for item in (
+            view_state.get("design_documents")
+            if isinstance(view_state.get("design_documents"), list)
+            else []
+        )
+        if isinstance(item, dict) and normalise(item.get("path"))
+    }
+    design_references: List[Dict[str, str]] = []
+    for reference in rows(prop, "design_refs"):
+        section = normalise(reference.get("section"))
+        if not section:
+            continue
+        declared_sha = str(reference.get("sha256") or "").strip().lower()
+        current_sha = design_documents.get(section, "")
+        digest_status = (
+            "matches"
+            if declared_sha and current_sha and declared_sha == current_sha
+            else "does not match"
+            if declared_sha and current_sha
+            else "missing"
+            if authority_validation == "current" and not current_sha
+            else "not checked"
+        )
+        design_references.append({
+            "section": section,
+            "why": str(reference.get("why") or "").strip(),
+            "declared_sha256": declared_sha,
+            "current_sha256": current_sha,
+            "digest_status": digest_status,
+        })
+    digests_match = bool(design_references) and all(
+        item["digest_status"] == "matches" for item in design_references
+    )
+    exact_approval = (
+        view_state.get("exact_approval")
+        if isinstance(view_state.get("exact_approval"), dict)
+        else {}
+    )
+    plan_approved = bool(
+        cockpit_state is not None
+        and str(view_state.get("status") or "") == "approved"
+        and not approval_required
+        and bool(exact_approval.get("approved", True))
+    )
+    proposal_approval = (
+        "approved"
+        if plan_approved
+        else "recorded reversible work; not human approval"
+        if str(view_state.get("status") or "") == "recorded" and not approval_required
+        else "approval required"
+        if approval_required
+        else "not known"
+    )
+    design_evidence = {
+        "references": [item["section"] for item in design_references],
+        "digest": (
+            "all cited digests match current design"
+            if digests_match
+            else "; ".join(
+                f"{item['section']}: {item['digest_status']}"
+                for item in design_references
+            )
+            if design_references
+            else "no design reference"
+        ),
+        "authority": (
+            f"{authority_value or 'not recorded'}; validation {authority_validation}"
+        ),
+        "proposal": proposal_approval,
+    }
 
     reversibility = prop.get("reversibility")
     if not isinstance(reversibility, dict):
@@ -1428,6 +1579,42 @@ def architecture_map_model(
         "delete": "removing",
     }
 
+    def authorization_fields(
+        declared: str,
+        observed: str,
+        source: str,
+        source_kind: str,
+        *,
+        exact_action: bool = True,
+    ) -> Dict[str, Any]:
+        if not source or not declared:
+            status = "no plan source"
+        else:
+            active = bool(
+                cockpit_state is not None and not approval_required
+                and (
+                    str(view_state.get("status") or "") == "approved"
+                    or (
+                        source_kind == "scope"
+                        and str(view_state.get("status") or "") == "recorded"
+                    )
+                )
+            )
+            if not active:
+                status = "not active"
+            elif exact_action and observed and observed != declared:
+                status = "does not authorize the observed action"
+            else:
+                status = "active"
+        return {
+            "declared_action": declared or "none",
+            "observed_action": observed or (
+                "not checked" if not comparison_known else "none"
+            ),
+            "authorization_source": source or "none",
+            "authorization_status": status,
+        }
+
     def under(folder: str, path: str) -> bool:
         if folder == "(root)":
             return "/" not in path
@@ -1459,7 +1646,7 @@ def architecture_map_model(
         state: str,
         declared: str,
         observed: str,
-        exists: bool,
+        exists: bool | None,
         known: bool,
     ) -> str:
         if state == "existing":
@@ -1473,17 +1660,17 @@ def architecture_map_model(
                 "surrounding structure clear."
             )
         if state == "conflict":
-            if declared == "new" and not observed and exists:
+            if declared == "new" and not observed and exists is True:
                 return (
                     "The plan says new, but the item already existed at the baseline. "
                     "This is not a new addition."
                 )
-            if declared == "modify" and not observed and not exists:
+            if declared == "modify" and not observed and exists is False:
                 return (
                     "The plan says modify, but the item was absent at the baseline "
                     "and is absent now. There is nothing to modify."
                 )
-            if declared == "delete" and not observed and not exists:
+            if declared == "delete" and not observed and exists is False:
                 return (
                     "The plan says delete, but the item was absent at the baseline "
                     "and is absent now. Git does not show a removal to perform."
@@ -1503,20 +1690,25 @@ def architecture_map_model(
                 "so implementation progress is unknown."
             )
         if declared == "new":
-            if observed == "new" and exists:
+            if observed == "new" and exists is True:
                 return "The planned addition is present in the working tree."
             return "The planned addition has not been observed since the baseline."
         if declared == "modify":
-            if observed == "modify" and exists:
+            if observed == "modify" and exists is True:
                 return "The planned change is present in the working tree."
             return "The planned change has not been observed since the baseline."
         if declared == "delete":
-            if observed == "delete" and not exists:
+            if observed == "delete" and exists is False:
                 return "The planned removal is complete."
-            if not exists:
+            if exists is False:
                 return (
                     "The item is absent now, but Git does not show a deletion from "
                     "the baseline. The planned removal is not proven."
+                )
+            if exists is None:
+                return (
+                    "The plan says delete, but the current file inventory is "
+                    "unavailable, so removal progress is not known."
                 )
             return "The item is planned for removal and is still present."
         return "No implementation claim is available."
@@ -1532,27 +1724,39 @@ def architecture_map_model(
                 "This is context outside the active change. The map makes no "
                 "design-alignment claim for it."
             )
-        if not design_reasons:
+        if not design_references:
             return "No design reference is recorded for this slice."
-        reason = " ".join(design_reasons[:3])
+        reason = " ".join(
+            item["why"] for item in design_references[:3] if item["why"]
+        )
         if (
-            plan_status == "approved"
+            plan_approved
+            and digests_match
             and authority_value == "human-confirmed"
-            and not approval_required
+            and authority_validation == "current"
+            and implementation_eligible
         ):
-            return "Yes. The approved plan cites this player outcome: " + reason
+            return "Yes. Every independent design and plan check is current." + (
+                " It serves: " + reason if reason else ""
+            )
+        if not digests_match:
+            return (
+                "Not established. At least one cited design digest is missing, "
+                "unchecked, or does not match."
+            )
+        if authority_validation != "current" or not implementation_eligible:
+            return "Not established. Current design authority validation is unavailable."
         if authority_value == "human-confirmed":
             return (
-                "The cited design is human-confirmed, but this exact plan is not "
-                "currently approved. It serves: " + reason
+                "Not yet. The cited design is human-confirmed, but this exact "
+                "proposal is not currently approved."
             )
         if authority_value == "agent-provisional":
             return (
-                "Not yet. The cited design is agent-provisional and serves: " + reason
+                "Not yet. The cited design remains agent-provisional."
             )
         return (
-            "The proposal cites this outcome, but validated design authority is "
-            "not available: " + reason
+            "Not established. Validated design authority is not available."
         )
 
     def risk_text(state: str) -> str:
@@ -1585,23 +1789,31 @@ def architecture_map_model(
         return "No safe undo boundary is recorded in the proposal."
 
     observed_dependencies = {
-        normalise(item.get("path")).rstrip("/"): {
-            normalise(dep).rstrip("/")
+        authored_module(item.get("path")): {
+            authored_module(dep)
             for dep in (item.get("depends_on") or [])
-            if normalise(dep)
+            if authored_module(dep)
         }
         for item in mods
-        if normalise(item.get("path"))
+        if authored_module(item.get("path"))
     }
     planned_dependencies = {
         path: {
-            normalise(dep).rstrip("/")
+            authored_module(dep)
             for dep in (meta.get("may_depend_on") or [])
-            if normalise(dep)
+            if authored_module(dep)
         }
         for path, meta in proposal_modules.items()
     }
-    module_paths = set(observed_dependencies) | set(proposal_modules)
+    dependency_targets = {
+        dependency
+        for dependency_map in (observed_dependencies, planned_dependencies)
+        for dependencies in dependency_map.values()
+        for dependency in dependencies
+    }
+    module_paths = (
+        set(observed_dependencies) | set(proposal_modules) | dependency_targets
+    )
     folder_paths: set[str] = set(module_paths)
     for path in all_files:
         parts = path.split("/")[:-1]
@@ -1609,18 +1821,43 @@ def architecture_map_model(
             folder_paths.add("/".join(parts[:index]))
     if any("/" not in path for path in all_files):
         folder_paths.add("(root)")
-    allowed_dependency_targets = folder_paths | module_paths
-    for dependencies in list(observed_dependencies.values()) + list(
-        planned_dependencies.values()
-    ):
-        for dependency in dependencies:
-            if dependency in allowed_dependency_targets:
-                folder_paths.add(dependency)
+    for module in list(module_paths):
+        if module == "(root)":
+            continue
+        parts = module.split("/")
+        for index in range(1, len(parts)):
+            folder_paths.add("/".join(parts[:index]))
 
     def module_existed_at_baseline(folder: str) -> bool | None:
         if not baseline_known:
             return None
         return any(under(folder, path) for path in baseline_set)
+
+    def path_exists_now(path: str) -> bool | None:
+        if present_known:
+            return path in current_files
+        if path in observed_tree:
+            return True
+        observed = observed_actions.get(path, "")
+        if observed == "delete":
+            return False
+        if observed in ("new", "modify"):
+            return True
+        return None
+
+    def module_exists_now(folder: str) -> bool | None:
+        if present_known:
+            return any(under(folder, path) for path in current_files)
+        touched = [
+            action
+            for path, action in observed_actions.items()
+            if under(folder, path)
+        ]
+        if touched and all(action == "delete" for action in touched):
+            return None
+        if touched:
+            return True
+        return None
 
     def aggregate_module_action(folder: str) -> str:
         if not comparison_known:
@@ -1649,39 +1886,54 @@ def architecture_map_model(
         for target in dependencies:
             incoming_planned.setdefault(target, set()).add(source)
 
-    def dependency_text(module: str, containing: bool = False) -> str:
+    def dependency_evidence(module: str, containing: bool = False) -> Dict[str, str]:
         if not module:
-            return (
-                "No owning module is recorded, so reverse dependencies cannot "
-                "be attributed."
+            unavailable = "No owning module is recorded, so this is not known."
+            return {"dependencies": unavailable, "dependents": unavailable}
+
+        prefix = (
+            f"This item is inside {module}; only module-level evidence is available. "
+            if containing
+            else ""
+        )
+        current_dependencies = sorted(observed_dependencies.get(module, set()))
+        planned_dependencies_for_module = sorted(
+            planned_dependencies.get(module, set())
+        )
+        current_dependents = sorted(incoming_observed.get(module, set()))
+        planned_dependents = sorted(incoming_planned.get(module, set()))
+
+        dependencies_parts = [prefix] if prefix else []
+        dependencies_parts.append(
+            "Current dependencies: "
+            + (", ".join(current_dependencies) if current_dependencies else "none mapped")
+            + "."
+        )
+        dependencies_parts.append(
+            "Proposed allowed dependencies: "
+            + (
+                ", ".join(planned_dependencies_for_module)
+                if planned_dependencies_for_module
+                else "none recorded"
             )
-        current = sorted(incoming_observed.get(module, set()))
-        planned = sorted(incoming_planned.get(module, set()))
-        parts: List[str] = []
-        subject = f"the containing module {module}" if containing else "it"
-        if containing:
-            parts.append(
-                f"Only module-level dependency evidence is available; this item is inside {module}."
-            )
-        if current:
-            parts.append(
-                "Current modules that depend on "
-                + subject
-                + ": "
-                + ", ".join(current)
-                + "."
-            )
-        if planned:
-            parts.append(
-                "Planned modules allowed to depend on "
-                + subject
-                + ": "
-                + ", ".join(planned)
-                + "."
-            )
-        if len(parts) == (1 if containing else 0):
-            parts.append(f"No mapped module is recorded as depending on {subject}.")
-        return " ".join(parts)
+            + "."
+        )
+
+        dependents_parts = [prefix] if prefix else []
+        dependents_parts.append(
+            "Current dependents: "
+            + (", ".join(current_dependents) if current_dependents else "none mapped")
+            + "."
+        )
+        dependents_parts.append(
+            "Proposed allowed dependents: "
+            + (", ".join(planned_dependents) if planned_dependents else "none recorded")
+            + "."
+        )
+        return {
+            "dependencies": " ".join(dependencies_parts),
+            "dependents": " ".join(dependents_parts),
+        }
 
     module_info: Dict[str, Dict[str, str]] = {}
     for folder in module_paths:
@@ -1697,6 +1949,7 @@ def architecture_map_model(
             "declared": declared,
             "observed": observed,
             "state": state,
+            "source": f"proposal.modules[{folder}]" if meta else "",
         }
 
     def owning_module(path: str, explicit: str = "") -> str:
@@ -1719,7 +1972,12 @@ def architecture_map_model(
         meta = proposal_modules.get(folder)
         info = module_info.get(
             folder,
-            {"declared": "", "observed": "", "state": "existing"},
+            {
+                "declared": "",
+                "observed": "",
+                "state": "existing",
+                "source": "",
+            },
         )
         declared = info["declared"]
         observed = info["observed"]
@@ -1730,9 +1988,10 @@ def architecture_map_model(
             if parent_path in folder_paths
             else None
         )
-        exists = any(under(folder, path) for path in current_files)
+        exists = module_exists_now(folder)
         role = str((meta or {}).get("role") or "").strip()
         why = str((meta or {}).get("why") or "").strip()
+        dependency = dependency_evidence(folder)
         add_node({
             "id": f"folder:{folder}",
             "label": "res://" if folder == "(root)" else folder,
@@ -1740,7 +1999,12 @@ def architecture_map_model(
             "kind": "folder",
             "architecture_module": folder in module_paths,
             "state": state,
-            "action": declared or observed,
+            **authorization_fields(
+                declared,
+                observed,
+                info.get("source", ""),
+                "module",
+            ),
             "parent": parent,
             "what": role or f"A source folder in the game architecture: {folder}.",
             "changing": change_text(
@@ -1758,7 +2022,8 @@ def architecture_map_model(
                 else "No reason is recorded for this module change."
             ),
             "design": design_text(state),
-            "depends": dependency_text(folder),
+            "design_evidence": design_evidence,
+            **dependency,
             "risk": risk_text(state),
             "undo": undo_text(state),
             "check": check_text,
@@ -1768,7 +2033,9 @@ def architecture_map_model(
 
     proposal_functions: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for item in rows(prop, "functions"):
-        file_path = normalise(item.get("file"))
+        file_path = authored_file(item.get("file"))
+        if not file_path:
+            continue
         raw_signature = str(item.get("signature") or "")
         try:
             parsed = gd_signature.parse_proposal_signature(raw_signature)
@@ -1785,33 +2052,61 @@ def architecture_map_model(
 
     for file_path in sorted(all_files):
         direct_meta = proposal_files.get(file_path)
-        explicit_module = normalise((direct_meta or {}).get("module")).rstrip("/")
+        explicit_module = authored_module((direct_meta or {}).get("module"))
         owner = owning_module(file_path, explicit_module)
-        inherited_module = (
-            proposal_modules.get(owner)
-            if involvement == "module" and direct_meta is None
+        observed = observed_actions.get(file_path, "")
+        inherited_module = proposal_modules.get(owner) if involvement == "module" else None
+        owned_scope = (
+            scope_owner(scope_rows, file_path)
+            if involvement == "hands-off" and observed
             else None
         )
-        meta = direct_meta or inherited_module
-        if inherited_module is not None:
-            info = module_info.get(
-                owner,
-                {"declared": "", "observed": "", "state": "existing"},
+        exact_action = True
+        if owned_scope is not None:
+            meta = owned_scope
+            declared = str(owned_scope.get("action") or "").strip().lower()
+            source = (
+                "proposal.scope["
+                + str(owned_scope.get("kind") or "boundary")
+                + ":"
+                + normalise(owned_scope.get("path"))
+                + "]"
             )
-            declared = info["declared"]
-            observed = info["observed"]
-            state = info["state"]
-            change_known = comparison_known
-        else:
-            declared = str((meta or {}).get("action") or "").strip().lower()
-            observed = observed_actions.get(file_path, "")
+            source_kind = "scope"
             state = state_for(
                 declared,
                 observed,
                 before_exists=(file_path in baseline_set if baseline_known else None),
             )
-            change_known = comparison_known
-        exists = file_path in current_files
+        elif direct_meta is not None:
+            meta = direct_meta
+            declared = str((meta or {}).get("action") or "").strip().lower()
+            source = f"proposal.files[{file_path}]"
+            source_kind = "file"
+            state = state_for(
+                declared,
+                observed,
+                before_exists=(file_path in baseline_set if baseline_known else None),
+            )
+        elif inherited_module is not None:
+            meta = inherited_module
+            declared = str(inherited_module.get("action") or "").strip().lower()
+            source = f"proposal.modules[{owner}]"
+            source_kind = "module"
+            exact_action = False
+            state = action_states.get(observed, "existing")
+        else:
+            meta = None
+            declared = ""
+            source = ""
+            source_kind = ""
+            state = state_for(
+                declared,
+                observed,
+                before_exists=(file_path in baseline_set if baseline_known else None),
+            )
+        change_known = comparison_known
+        exists = path_exists_now(file_path)
         parent_path = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
         parent = (
             f"folder:{parent_path}"
@@ -1821,16 +2116,23 @@ def architecture_map_model(
             else None
         )
         why = str((meta or {}).get("why") or "").strip()
-        add_node({
-            "id": f"file:{file_path}",
-            "label": Path(file_path).name,
-            "path": file_path,
-            "kind": "file",
-            "state": state,
-            "action": declared or observed,
-            "parent": parent,
-            "what": f"The authored game file {file_path}.",
-            "changing": change_text(
+        authorization = authorization_fields(
+            declared,
+            observed,
+            source,
+            source_kind,
+            exact_action=exact_action,
+        )
+        if inherited_module is not None and direct_meta is None and owned_scope is None:
+            changing = (
+                f"Git reports {observed} inside the declared module boundary {owner}."
+                if observed
+                else "No change is observed for this file."
+                if comparison_known
+                else "File-level change comparison is not known."
+            )
+        else:
+            changing = change_text(
                 file_path,
                 "file",
                 state,
@@ -1838,14 +2140,26 @@ def architecture_map_model(
                 observed,
                 exists,
                 change_known,
-            ),
+            )
+        dependency = dependency_evidence(owner, containing=True)
+        add_node({
+            "id": f"file:{file_path}",
+            "label": Path(file_path).name,
+            "path": file_path,
+            "kind": "file",
+            "state": state,
+            **authorization,
+            "parent": parent,
+            "what": f"The authored game file {file_path}.",
+            "changing": changing,
             "why": why or (
                 "No change is proposed for this file."
                 if state == "existing"
                 else "This file changed without a recorded plan reason."
             ),
             "design": design_text(state),
-            "depends": dependency_text(owner, containing=True),
+            "design_evidence": design_evidence,
+            **dependency,
             "risk": risk_text(state),
             "undo": undo_text(state),
             "check": check_text,
@@ -1875,7 +2189,7 @@ def architecture_map_model(
                 "path": file_path,
                 "kind": "module",
                 "state": state,
-                "action": declared or observed,
+                **authorization,
                 "parent": f"file:{file_path}",
                 "what": f"The GDScript class {class_name}, declared in {file_path}.",
                 "changing": change_text(
@@ -1893,7 +2207,8 @@ def architecture_map_model(
                     else "The proposal records the enclosing boundary reason."
                 ),
                 "design": design_text(state),
-                "depends": dependency_text(owner, containing=True),
+                "design_evidence": design_evidence,
+                **dependency,
                 "risk": risk_text(state),
                 "undo": undo_text(state),
                 "check": check_text,
@@ -1937,6 +2252,17 @@ def architecture_map_model(
                 and function_action in ("new", "modify")
                 and not planned_matches
             )
+            inherited_function_meta: Dict[str, Any] | None = None
+            inherited_function_source = ""
+            inherited_function_kind = ""
+            if planned is None and involvement == "module" and inherited_module:
+                inherited_function_meta = inherited_module
+                inherited_function_source = f"proposal.modules[{owner}]"
+                inherited_function_kind = "module"
+            elif planned is None and involvement == "file" and direct_meta:
+                inherited_function_meta = direct_meta
+                inherited_function_source = f"proposal.files[{file_path}]"
+                inherited_function_kind = "file"
             if planned:
                 function_state = state_for(
                     function_action,
@@ -1944,6 +2270,8 @@ def architecture_map_model(
                     before_exists=bool(baseline_signature),
                     known=function_comparison_known,
                 )
+            elif inherited_function_meta is not None:
+                function_state = action_states.get(actual_action, "existing")
             elif actual_action in action_states:
                 function_state = "unplanned"
             elif not function_comparison_known and observed_actions.get(file_path):
@@ -1983,6 +2311,11 @@ def architecture_map_model(
                         "The exact planned signature is present, but baseline function "
                         "comparison is unavailable."
                     )
+            elif inherited_function_meta is not None and actual_action:
+                changing = (
+                    f"Git reports {actual_action} inside the declared "
+                    f"{inherited_function_kind} boundary."
+                )
             elif function_state == "unplanned" and actual_action:
                 changing = (
                     f"Git reports an unplanned {actual_action} to this function. "
@@ -2005,6 +2338,24 @@ def architecture_map_model(
                 else f"file:{file_path}"
             )
             function_why = str((planned or {}).get("why") or "").strip()
+            if not function_why and inherited_function_meta is not None:
+                function_why = str(
+                    inherited_function_meta.get("why") or ""
+                ).strip()
+            function_authorization = authorization_fields(
+                function_action
+                or str(
+                    (inherited_function_meta or {}).get("action") or ""
+                ).strip().lower(),
+                actual_action,
+                (
+                    f"proposal.functions[{file_path}::{identity}]"
+                    if planned
+                    else inherited_function_source
+                ),
+                "function" if planned else inherited_function_kind,
+                exact_action=planned is not None,
+            )
             observed_node_id = f"function:{file_path}::{identity}"
             if signature_mismatch:
                 observed_node_id += "::observed"
@@ -2015,7 +2366,7 @@ def architecture_map_model(
                 "path": file_path,
                 "kind": "function",
                 "state": function_state,
-                "action": function_action or actual_action,
+                **function_authorization,
                 "parent": parent_id,
                 "what": f"The typed function {raw_signature} in {file_path}.",
                 "changing": changing,
@@ -2030,7 +2381,12 @@ def architecture_map_model(
                     )
                 ),
                 "design": design_text(function_state),
-                "depends": (
+                "design_evidence": design_evidence,
+                "dependencies": (
+                    "Function-level dependencies are not available from the "
+                    "architecture index."
+                ),
+                "dependents": (
                     "Function-level callers are not available from the "
                     "architecture index."
                 ),
@@ -2056,6 +2412,9 @@ def architecture_map_model(
             baseline_signature = str(
                 evidence.get("baseline_signature") or ""
             ).strip()
+            current_signature = str(
+                evidence.get("current_signature") or ""
+            ).strip()
             state = state_for(
                 action,
                 actual_action,
@@ -2066,6 +2425,24 @@ def architecture_map_model(
                 ),
                 known=function_comparison_known,
             )
+            evidence_matches = False
+            if current_signature:
+                try:
+                    evidence_matches = (
+                        gd_signature.parse_proposal_signature(
+                            current_signature
+                        ).canonical
+                        == str(planned.get("canonical") or "")
+                    )
+                except gd_signature.SignatureError:
+                    evidence_matches = False
+            signature_conflict = bool(
+                action in ("new", "modify")
+                and current_signature
+                and not evidence_matches
+            )
+            if signature_conflict:
+                state = "conflict"
             class_scope = str(planned.get("class_scope") or "").strip()
             parent_id = (
                 f"class:{file_path}::{class_scope}"
@@ -2076,8 +2453,20 @@ def architecture_map_model(
                 planned.get("canonical") or planned.get("signature") or ""
             )
             why = str(planned.get("why") or "").strip()
+            function_inventory_known = bool(
+                function_comparison_known
+                or file_path in observed_tree
+                or path_exists_now(file_path) is False
+            )
             if action == "delete":
-                if actual_action == "delete" and function_comparison_known:
+                proven_delete = bool(
+                    state != "conflict"
+                    and function_comparison_known
+                    and actual_action == "delete"
+                    and baseline_signature
+                    and not str(evidence.get("current_signature") or "").strip()
+                )
+                if proven_delete:
                     changing = "The planned function removal is complete."
                 elif state == "conflict":
                     changing = change_text(
@@ -2089,13 +2478,29 @@ def architecture_map_model(
                         False,
                         function_comparison_known,
                     )
+                elif function_inventory_known and not function_comparison_known:
+                    changing = (
+                        "The function is absent now, but baseline function comparison "
+                        "is unavailable, so the planned removal is not proven."
+                    )
+                elif function_inventory_known:
+                    changing = (
+                        "The function is absent now, but exact baseline evidence "
+                        "does not prove the planned removal."
+                    )
                 else:
                     changing = (
-                        "The function is absent, but baseline function comparison is "
-                        "unavailable, so the planned removal is not proven."
+                        "Current function inventory and baseline comparison are "
+                        "unavailable, so presence and removal progress are not known."
                     )
             elif action == "new":
                 changing = (
+                    "The observed signature does not match the planned signature: "
+                    + signature
+                    if signature_conflict
+                    else "The exact planned function addition is present in source."
+                    if actual_action == "new" and evidence_matches
+                    else
                     change_text(
                         signature,
                         "function",
@@ -2107,9 +2512,20 @@ def architecture_map_model(
                     )
                     if state == "conflict"
                     else "The planned function is not present in source yet."
+                    if function_inventory_known
+                    else (
+                        "Current function inventory is unavailable, so whether "
+                        "the planned function is present is not known."
+                    )
                 )
             elif action == "modify":
                 changing = (
+                    "The observed signature does not match the planned signature: "
+                    + signature
+                    if signature_conflict
+                    else "The exact planned function change is present in source."
+                    if actual_action == "modify" and evidence_matches
+                    else
                     change_text(
                         signature,
                         "function",
@@ -2121,9 +2537,20 @@ def architecture_map_model(
                     )
                     if state == "conflict"
                     else "The planned function signature is not present in source yet."
+                    if function_inventory_known
+                    else (
+                        "Current function inventory is unavailable, so whether "
+                        "the planned signature is present is not known."
+                    )
                 )
             else:
                 changing = "No implementation claim is available."
+            function_authorization = authorization_fields(
+                action,
+                actual_action,
+                f"proposal.functions[{file_path}::{identity}]",
+                "function",
+            )
             add_node({
                 "id": f"function:{file_path}::{identity}",
                 "label": identity.rsplit(".", 1)[-1],
@@ -2131,13 +2558,18 @@ def architecture_map_model(
                 "path": file_path,
                 "kind": "function",
                 "state": state,
-                "action": action,
+                **function_authorization,
                 "parent": parent_id,
                 "what": f"The typed function {signature} in {file_path}.",
                 "changing": changing,
                 "why": why or "No function-level reason is recorded.",
                 "design": design_text(state),
-                "depends": (
+                "design_evidence": design_evidence,
+                "dependencies": (
+                    "Function-level dependencies are not available from the "
+                    "architecture index."
+                ),
+                "dependents": (
                     "Function-level callers are not available from the "
                     "architecture index."
                 ),
@@ -2168,57 +2600,121 @@ def architecture_map_model(
                 or evidence.get("signature")
                 or ""
             )
+            deleted_scope = identity.rsplit(".", 1)[0] if "." in identity else ""
+            deleted_parent = (
+                f"class:{file_path}::{deleted_scope}"
+                if f"class:{file_path}::{deleted_scope}" in node_ids
+                else f"file:{file_path}"
+            )
+            inherited_delete_meta: Dict[str, Any] | None = None
+            inherited_delete_source = ""
+            inherited_delete_kind = ""
+            if involvement == "module" and inherited_module:
+                inherited_delete_meta = inherited_module
+                inherited_delete_source = f"proposal.modules[{owner}]"
+                inherited_delete_kind = "module"
+            elif involvement == "file" and direct_meta:
+                inherited_delete_meta = direct_meta
+                inherited_delete_source = f"proposal.files[{file_path}]"
+                inherited_delete_kind = "file"
+            deleted_state = "removing" if inherited_delete_meta else "unplanned"
             add_node({
                 "id": f"function:{file_path}::{identity}::deleted",
                 "label": identity.rsplit(".", 1)[-1],
                 "signature": signature,
                 "path": file_path,
                 "kind": "function",
-                "state": "unplanned",
-                "action": "delete",
-                "parent": f"file:{file_path}",
+                "state": deleted_state,
+                **authorization_fields(
+                    str((inherited_delete_meta or {}).get("action") or "")
+                    .strip()
+                    .lower(),
+                    "delete",
+                    inherited_delete_source,
+                    inherited_delete_kind or "function",
+                    exact_action=False,
+                ),
+                "parent": deleted_parent,
                 "what": f"The deleted function {signature} from {file_path}.",
                 "changing": (
-                    "Git reports an unplanned delete of this function. It is "
+                    f"Git reports a delete inside the declared {inherited_delete_kind} boundary."
+                    if inherited_delete_meta
+                    else "Git reports an unplanned delete of this function. It is "
                     "outside the recorded function-level plan."
                 ),
-                "why": "No function-level reason is recorded for this deletion.",
-                "design": design_text("unplanned"),
-                "depends": (
+                "why": (
+                    str(inherited_delete_meta.get("why") or "").strip()
+                    if inherited_delete_meta
+                    else "No function-level reason is recorded for this deletion."
+                ),
+                "design": design_text(deleted_state),
+                "design_evidence": design_evidence,
+                "dependencies": (
+                    "Function-level dependencies are not available from the "
+                    "architecture index."
+                ),
+                "dependents": (
                     "Function-level callers are not available from the "
                     "architecture index."
                 ),
-                "risk": risk_text("unplanned"),
-                "undo": undo_text("unplanned"),
+                "risk": risk_text(deleted_state),
+                "undo": undo_text(deleted_state),
                 "check": check_text,
                 "options": [],
                 "responsibility": "",
             })
 
-    link_index: Dict[Tuple[str, str], set[str]] = {}
-    for provenance, dependency_map in (
-        ("observed", observed_dependencies),
-        ("planned", planned_dependencies),
+    # A module-level reader cannot see hidden file/function nodes.  Carry the
+    # worst descendant evidence up to the module so conflicts and unplanned
+    # work never disappear merely because the view is coarser.
+    for module_node in nodes:
+        if (
+            module_node.get("kind") != "folder"
+            or not module_node.get("architecture_module")
+        ):
+            continue
+        module_path = str(module_node.get("path") or "")
+        descendant_states = {
+            str(node.get("state") or "")
+            for node in nodes
+            if node is not module_node
+            and node.get("kind") in ("file", "function")
+            and under(module_path, str(node.get("path") or ""))
+        }
+        inherited_problem = (
+            "conflict"
+            if "conflict" in descendant_states
+            else "unplanned"
+            if "unplanned" in descendant_states
+            else ""
+        )
+        if inherited_problem and module_node.get("state") != "conflict":
+            module_node["state"] = inherited_problem
+            module_node["changing"] = (
+                "At least one item inside this module conflicts with the plan."
+                if inherited_problem == "conflict"
+                else "At least one item inside this module changed without a plan source."
+            )
+            module_node["design"] = design_text(inherited_problem)
+            module_node["risk"] = risk_text(inherited_problem)
+            module_node["undo"] = undo_text(inherited_problem)
+
+    links: List[Dict[str, str]] = []
+    for provenance, relation, dependency_map in (
+        ("observed", "depends-on", observed_dependencies),
+        ("planned", "may-depend-on", planned_dependencies),
     ):
-        for module_path, dependencies in dependency_map.items():
-            for dependency in dependencies:
+        for module_path, dependencies in sorted(dependency_map.items()):
+            for dependency in sorted(dependencies):
                 source = f"folder:{module_path}"
                 target = f"folder:{dependency}"
-                if (
-                    source in node_ids
-                    and target in node_ids
-                    and target != source
-                ):
-                    link_index.setdefault((source, target), set()).add(provenance)
-    links = [
-        {
-            "source": source,
-            "target": target,
-            "relation": "uses",
-            "provenance": "+".join(sorted(provenance)),
-        }
-        for (source, target), provenance in sorted(link_index.items())
-    ]
+                if source in node_ids and target in node_ids and target != source:
+                    links.append({
+                        "source": source,
+                        "target": target,
+                        "relation": relation,
+                        "provenance": provenance,
+                    })
 
     kind_order = {"folder": 0, "file": 1, "module": 2, "function": 3}
     nodes.sort(key=lambda item: (
@@ -2229,8 +2725,20 @@ def architecture_map_model(
     return {
         "nodes": nodes,
         "links": links,
+        "present_paths": sorted(current_files),
+        "touched_paths": sorted(observed_actions),
+        "baseline_paths": sorted(baseline_set),
+        "present_known": present_known,
         "comparison_known": comparison_known,
+        "baseline_known": baseline_known,
         "function_comparison_known": function_comparison_known,
+        "source_inventory_complete": bool(
+            present_known
+            and all(
+                not path.lower().endswith(".gd") or path in observed_tree
+                for path in current_files
+            )
+        ),
     }
 def _script_json(value: Any) -> str:
     """JSON safe inside an executable script element."""
@@ -2333,18 +2841,26 @@ def architecture_map_html(model: Dict[str, Any], involvement: str) -> str:
         "file": "File-level review",
         "function": "Function-level review",
     }.get(maximum, "Architecture review")
+    present_known = bool(model.get("present_known"))
+    source_complete = bool(model.get("source_inventory_complete"))
+    structure_prefix = "Current and planned" if present_known else "Known and planned"
+    evidence_note = (
+        ""
+        if present_known and source_complete
+        else " The full current source inventory is not known, so no missing item is inferred."
+    )
     structure_copy = {
         "module": (
-            "Start with the coloured changes. The architecture modules and their "
-            "dependencies stay still while you inspect them."
+            f"Start with the coloured changes. {structure_prefix} architecture "
+            f"modules and dependencies stay still while you inspect them.{evidence_note}"
         ),
         "file": (
-            "Start with the coloured changes. The complete folder → file structure "
-            "stays still while you inspect it."
+            f"Start with the coloured changes. {structure_prefix} folder → file "
+            f"structure stays still while you inspect it.{evidence_note}"
         ),
         "function": (
-            "Start with the coloured changes. The complete folder → file → class → "
-            "function structure stays still while you inspect it."
+            f"Start with the coloured changes. {structure_prefix} folder → file → "
+            f"class → function structure stays still while you inspect it.{evidence_note}"
         ),
     }[maximum]
     search_placeholder = {
@@ -2353,9 +2869,9 @@ def architecture_map_html(model: Dict[str, Any], involvement: str) -> str:
         "function": "Folder, file, class or function",
     }[maximum]
     map_heading = {
-        "module": "Architecture modules",
-        "file": "Folder and file structure",
-        "function": "Complete structure",
+        "module": f"{structure_prefix} modules",
+        "file": f"{structure_prefix} files",
+        "function": f"{structure_prefix} structure",
     }[maximum]
     fallback = _architecture_list(nodes)
     noscript = _architecture_list(nodes, interactive=False)
@@ -2385,7 +2901,8 @@ def architecture_map_html(model: Dict[str, Any], involvement: str) -> str:
         '</div></div>',
         '<div class="arch-control"><span class="arch-control-label">Map focus</span>'
         '<div class="arch-buttons" role="group" aria-label="Map focus">'
-        '<button type="button" data-arch-view="complete" aria-pressed="true">Complete</button>'
+        '<button type="button" data-arch-view="complete" aria-pressed="true">'
+        f'{esc(structure_prefix)}</button>'
         '<button type="button" data-arch-view="changes" aria-pressed="false">Changes</button>'
         '</div></div>',
         '<label class="arch-control"><span class="arch-control-label">Find an item</span>'
@@ -2568,7 +3085,7 @@ ARCHITECTURE_MAP_JS = r"""
       if (!node) {
         selectedTitle.textContent = "No items in this view";
         kindTag.textContent = "Item"; stateTag.textContent = "Not affected";
-        inspector.innerHTML = '<p class="empty">Choose Complete to restore the full structure.</p>';
+        inspector.innerHTML = '<p class="empty">Choose Current and planned to restore the known structure.</p>';
         return;
       }
       selectedId = node.id;
@@ -2593,13 +3110,25 @@ ARCHITECTURE_MAP_JS = r"""
         + escapeHtml(node.responsibility || "The proposal does not record a responsibility transfer. Resolve this before approving the removal.")
         + '</p></section>';
     }
+    var designEvidence = node.design_evidence || {};
+    var designReferences = Array.isArray(designEvidence.references) && designEvidence.references.length
+      ? designEvidence.references.join(", ") : "none";
     inspector.innerHTML = '<dl>'
       + '<div><dt>What is this?</dt><dd>' + escapeHtml(node.what) + '</dd></div>'
       + '<div><dt>What is changing?</dt><dd>' + escapeHtml(node.changing) + '</dd></div>'
+      + '<div><dt>Planned action</dt><dd>' + escapeHtml(node.declared_action || "none") + '</dd></div>'
+      + '<div><dt>Observed by Git</dt><dd>' + escapeHtml(node.observed_action || "not checked") + '</dd></div>'
+      + '<div><dt>Plan source</dt><dd>' + escapeHtml(node.authorization_source || "none") + '</dd></div>'
+      + '<div><dt>Plan authority</dt><dd>' + escapeHtml(node.authorization_status || "not known") + '</dd></div>'
       + '<div><dt>Why are we changing it?</dt><dd>' + escapeHtml(node.why) + '</dd></div>'
       + '</dl>' + options + responsibility + '<dl class="arch-special">'
+      + '<div><dt>Design reference</dt><dd>' + escapeHtml(designReferences) + '</dd></div>'
+      + '<div><dt>Design digest</dt><dd>' + escapeHtml(designEvidence.digest || "not checked") + '</dd></div>'
+      + '<div><dt>Design authority</dt><dd>' + escapeHtml(designEvidence.authority || "not known") + '</dd></div>'
+      + '<div><dt>Proposal approval</dt><dd>' + escapeHtml(designEvidence.proposal || "not known") + '</dd></div>'
       + '<div><dt>Does this match the approved design?</dt><dd>' + escapeHtml(node.design) + '</dd></div>'
-      + '<div><dt>What depends on it?</dt><dd>' + escapeHtml(node.depends) + '</dd></div>'
+      + '<div><dt>What does it use?</dt><dd>' + escapeHtml(node.dependencies) + '</dd></div>'
+      + '<div><dt>What uses it?</dt><dd>' + escapeHtml(node.dependents) + '</dd></div>'
       + '<div><dt>What could break?</dt><dd>' + escapeHtml(node.risk) + '</dd></div>'
       + '<div><dt>Can it be safely undone?</dt><dd>' + escapeHtml(node.undo) + '</dd></div>'
       + '<div><dt>How will we check it?</dt><dd>' + escapeHtml(node.check) + '</dd></div>'
@@ -2896,7 +3425,7 @@ ARCHITECTURE_MAP_JS = r"""
       var changes=renderedNodes.filter(function(node){return node.state!=="existing";}).length;
       status.textContent=renderedNodes.length
         ? renderedNodes.length+" items · "+changes+" changes · settled"
-        : "No items in this view · choose Complete";
+        : "No items in this view · choose Current and planned";
       renderInspector(); updateSearch(); updateGraphFocus(); syncRovingTabIndex();
       if (fit) {
         var ids=changeContextIds(); fitNodes(ids.length ? ids : renderedNodes.map(function(node){return node.id;}),1.5);
@@ -3107,48 +3636,34 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         str(f.get("path", "")).strip().replace("\\", "/")
         for f in rows(prop, "files") if f.get("path")
     }
-    front_history = {
-        str(f.get("path", "")).strip().replace("\\", "/")
-        for f in rows(history or {}, "files") if f.get("path")
+    declared_file_actions = {
+        str(item.get("path") or "").strip().replace("\\", "/"):
+        str(item.get("action") or "").strip().lower()
+        for item in rows(prop, "files")
+        if item.get("path")
     }
-    missing_paths = sorted(
-        path for path in front_prop_files
-        if file_state(path, {path: {}}, built, front_history) == "missing"
+    missing_paths = (
+        None
+        if changed_actions is None
+        else sorted(
+            path
+            for path, declared_action in declared_file_actions.items()
+            if str(changed_actions.get(path) or "").strip().lower()
+            != declared_action
+        )
     )
     deleted_paths = set(deleted or ())
     changed_paths = set(changed or ())
     if depth == 0:
         scope_rows = rows(prop, "scope")
 
-        def scope_contains(boundary: Dict[str, Any], path: str) -> bool:
-            raw = str(boundary.get("path") or "").strip().replace("\\", "/")
-            if boundary.get("kind") == "file":
-                return path == raw
-            if raw == "(root)":
-                return True
-            return path == raw or path.startswith(raw.rstrip("/") + "/")
-
-        def scope_specificity(boundary: Dict[str, Any]) -> Tuple[int, int]:
-            raw = str(boundary.get("path") or "").strip().replace("\\", "/")
-            if boundary.get("kind") == "file":
-                return (2, len(raw.split("/")))
-            if raw == "(root)":
-                return (0, 0)
-            return (1, len(raw.split("/")))
-
-        def inside_scope(path: str) -> bool:
-            matching = [
-                boundary for boundary in scope_rows
-                if scope_contains(boundary, path)
-            ]
-            if not matching or changed_actions is None:
-                return False
-            owner = max(matching, key=scope_specificity)
-            declared = str(owner.get("action") or "").strip().lower()
-            return declared == str(changed_actions.get(path) or "").lower()
-
         extra_paths = sorted(
-            path for path in changed_paths if not inside_scope(path)
+            path
+            for path in changed_paths
+            if changed_actions is None
+            or not scope_authorises(
+                scope_rows, path, str(changed_actions.get(path) or "")
+            )
         )
     elif depth == 1:
         declared_modules = {
@@ -3215,7 +3730,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
     a(f'<span class="metric {status_cls}">{esc(status_label)}</span>')
     a(f'<span class="metric{(" bad" if decision_count else " ok")}">'
       f'{decision_count} decision{("" if decision_count == 1 else "s")} needed</span>')
-    if front_prop_files:
+    if front_prop_files and missing_paths is not None:
         a(f'<span class="metric{(" warn" if missing_paths else " ok")}">'
           f'{len(front_prop_files) - len(missing_paths)}/{len(front_prop_files)} '
           'planned changes observed</span>')
@@ -3411,7 +3926,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
 
     # Architecture is a decision aid, so it belongs after the decision and
     # before the audit record. Hands-off work intentionally keeps only its
-    # coarse reversible scope; deeper involvement gets the complete source map
+    # coarse reversible scope; deeper involvement gets the known source map
     # with detail capped at the level the human chose to review.
     if depth > 0:
         architecture = architecture_map_model(
@@ -3532,6 +4047,11 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                   for f in rows(history or {}, "files") if f.get("path")}
     real_mods = {str(m.get("path", "")).strip().replace("\\", "/")
                  for m in mods if m.get("path")}
+    implementation_comparison_known = changed_actions is not None
+
+    if not implementation_comparison_known:
+        a('<p class="empty">Implementation progress is not known because the Git '
+          'baseline comparison is unavailable. The plan is shown without progress claims.</p>')
 
     if depth == 0:
         scope_rows = rows(prop, "scope")
@@ -3539,7 +4059,7 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
             a('<p class="empty">Hands-off: the agent recorded coarse reversible '
               "boundaries rather than asking you to approve modules or files.</p><ul class=f>")
             for boundary in scope_rows:
-                a("<li>" + state_tag("built")
+                a('<li><span class="tag act">recorded boundary</span>'
                   + f'<span class="mono">{esc(boundary.get("path"))}</span>'
                   + f'<span class="tag act">{esc(boundary.get("kind"))} · '
                     f'{esc(boundary.get("action"))}</span>'
@@ -3585,7 +4105,9 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                   + "</li>")
 
     # Every file the view may show: proposed, or built within this slice.
-    candidates = set(prop_files) | built
+    candidates = set(prop_files) | (
+        set(built) if implementation_comparison_known else set()
+    )
     all_mods = sorted(set(prop_mods) | real_mods)
     # Each file belongs to its DEEPEST matching module. Prefix matching would
     # list scripts/data/map_parser.gd under scripts AND scripts/data.
@@ -3604,7 +4126,9 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
         if mod not in prop_mods and not any(owner.get(f) == mod for f in candidates):
             continue
         action = str(meta.get("action") or "")
-        if mod in prop_mods and action == "delete" and mod not in real_mods:
+        if mod in prop_mods and not implementation_comparison_known:
+            st = "unknown"
+        elif mod in prop_mods and action == "delete" and mod not in real_mods:
             st = "deleted"
         elif mod in prop_mods and mod in real_mods:
             st = "built"
@@ -3634,7 +4158,13 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
                 for f in here:
                     shown_files.add(f)
                     file_block(f, prop_files.get(f, {}),
-                               file_state(f, prop_files, built, hist_paths))
+                               file_state(
+                                   f,
+                                   prop_files,
+                                   built,
+                                   hist_paths,
+                                   implementation_comparison_known,
+                               ))
                 a("</ul>")
         a("</div>")
 
@@ -3644,7 +4174,13 @@ def render(shape: Dict[str, Any], prop: Dict[str, Any],
             a("<h2>Files outside a declared module</h2><ul class=f>")
             for f in loose:
                 file_block(f, prop_files.get(f, {}),
-                           file_state(f, prop_files, built, hist_paths))
+                           file_state(
+                               f,
+                               prop_files,
+                               built,
+                               hist_paths,
+                               implementation_comparison_known,
+                           ))
             a("</ul>")
 
     # ---- open questions: the frontier
@@ -3903,7 +4439,9 @@ def main() -> int:
     baseline = str(prop.get("baseline_sha", "") or "").strip()
     scoped = touched_since(baseline)
     baseline_files = files_at_baseline(baseline)
-    built = present if scoped is None else present & scoped
+    # ``built`` is legacy presentation state for the collapsed audit record.
+    # An unavailable baseline comparison proves no implementation progress.
+    built = set() if scoped is None else present & scoped
     deleted = set() if scoped is None else scoped - present
     changed_actions = (
         None

@@ -600,7 +600,7 @@ function exerciseArchitectureNoChanges(env) {
   const complete = doc.querySelector('[data-arch-view="complete"]');
   const settled = doc.getElementById('arch-settled');
   const completeCount = graph ? graph.querySelectorAll('.arch-node').length : 0;
-  check(scenario, 'unchanged architecture starts as a non-empty Complete graph',
+  check(scenario, 'unchanged architecture starts as a non-empty current and planned graph',
         root && root.getAttribute('data-render-mode') === 'graph'
         && completeCount > 0 && settled && !settled.hidden,
         JSON.stringify({mode: root && root.getAttribute('data-render-mode'),
@@ -613,11 +613,11 @@ function exerciseArchitectureNoChanges(env) {
         String(graph.querySelectorAll('.arch-node').length));
   check(scenario, 'the empty Changes view explains how to restore context',
         /No items in this view/.test(status.textContent)
-        && /choose Complete/.test(status.textContent)
+        && /choose Current and planned/.test(status.textContent)
         && title.textContent === 'No items in this view',
         JSON.stringify({status: status.textContent, title: title.textContent}));
   complete.fire('click');
-  check(scenario, 'Complete restores every unchanged architecture node',
+  check(scenario, 'Current and planned restores every unchanged architecture node',
         graph.querySelectorAll('.arch-node').length === completeCount
         && complete.getAttribute('aria-pressed') === 'true',
         JSON.stringify({before: completeCount,

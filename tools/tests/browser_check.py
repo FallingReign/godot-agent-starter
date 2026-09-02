@@ -722,6 +722,8 @@ def browser_fixture():
                 "",
                 tree=fixture_tree,
                 changed_actions=fixture_actions or {},
+                present_files=set(fixture_tree) | set(fixture_built or set()),
+                baseline_files=set(fixture_tree),
                 cockpit_state={
                     "status": "draft",
                     "verification": {
@@ -1181,11 +1183,11 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         complete_count = int(body_attribute(plan, "data-arch-probe-complete-count") or 0)
         changes_count = int(body_attribute(plan, "data-arch-probe-changes-count") or 0)
         restored_count = int(body_attribute(plan, "data-arch-probe-restored-count") or 0)
-        check(s, "Complete is the working default",
+        check(s, "Current and planned is the working default",
               body_attribute(plan, "data-arch-probe-complete-default") == "true"
               and complete_count > 0,
               f"complete={complete_count} body={body_class(plan)}")
-        check(s, "Changes filters unaffected items and Complete restores them",
+        check(s, "Changes filters unaffected items and current context restores them",
               body_attribute(plan, "data-arch-probe-changes-pressed") == "true"
               and body_attribute(plan, "data-arch-probe-complete-restored") == "true"
               and 0 < changes_count < complete_count
@@ -1259,7 +1261,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
         zero_stable = int(body_attribute(
             no_changes_page, "data-zero-stable-count"
         ) or -1)
-        check(s, "Complete still shows the unchanged architecture",
+        check(s, "Current and planned still shows the unchanged architecture",
               zero_complete > 0, f"complete={zero_complete}")
         check(s, "Changes with no changes stays empty without falling back",
               zero_changes == 0 and zero_stable == 0
@@ -1291,15 +1293,15 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               and body_attribute(
                   module_page, "data-involvement-copy"
               ) == (
-                  "Start with the coloured changes. The architecture modules and "
-                  "their dependencies stay still while you inspect them."
+                  "Start with the coloured changes. Current and planned architecture "
+                  "modules and dependencies stay still while you inspect them."
               )
               and body_attribute(
                   module_page, "data-involvement-placeholder"
               ) == "Module"
               and body_attribute(
                   module_page, "data-involvement-heading"
-              ) == "Architecture modules"
+              ) == "Current and planned modules"
               and body_attribute(
                   module_page, "data-involvement-depths"
               ) == "module",
@@ -1327,7 +1329,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               and body_attribute(
                   file_page, "data-involvement-copy"
               ) == (
-                  "Start with the coloured changes. The complete folder to file "
+                  "Start with the coloured changes. Current and planned folder to file "
                   "structure stays still while you inspect it."
               )
               and body_attribute(
@@ -1335,7 +1337,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               ) == "Folder or file"
               and body_attribute(
                   file_page, "data-involvement-heading"
-              ) == "Folder and file structure"
+              ) == "Current and planned files"
               and body_attribute(
                   file_page, "data-involvement-depths"
               ) == "module|file",
@@ -1361,7 +1363,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               and body_attribute(
                   function_page, "data-involvement-copy"
               ) == (
-                  "Start with the coloured changes. The complete folder to file to "
+                  "Start with the coloured changes. Current and planned folder to file to "
                   "class to function structure stays still while you inspect it."
               )
               and body_attribute(
@@ -1369,7 +1371,7 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               ) == "Folder, file, class or function"
               and body_attribute(
                   function_page, "data-involvement-heading"
-              ) == "Complete structure"
+              ) == "Current and planned structure"
               and body_attribute(
                   function_page, "data-involvement-depths"
               ) == "module|file|function"

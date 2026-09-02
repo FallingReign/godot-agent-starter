@@ -833,6 +833,58 @@ class PlanPageBytes(unittest.TestCase):
         self.assertNotIn(f"file:{ghost}", ids)
         self.assertFalse(any(ghost in item for item in ids), ids)
 
+    def test_unknown_inventory_is_explicit_and_never_uses_built_as_proof(self) -> None:
+        path = "scripts/logic/planned.gd"
+        model = plan_html.architecture_map_model(
+            {
+                "status": "draft",
+                "files": [{"path": path, "action": "new", "why": "Add it."}],
+            },
+            {},
+            {path},
+            [],
+            None,
+            {"status": "draft", "approval_required": True},
+            None,
+            None,
+            "file",
+            None,
+        )
+        node = next(item for item in model["nodes"] if item["id"] == f"file:{path}")
+
+        self.assertFalse(model["present_known"])
+        self.assertFalse(model["comparison_known"])
+        self.assertEqual([], model["present_paths"])
+        self.assertIn("progress is unknown", node["changing"])
+        page = plan_html.architecture_map_html(model, "file")
+        self.assertIn("Known and planned", page)
+        self.assertIn("full current source inventory is not known", page)
+        self.assertNotIn(">Complete</button>", page)
+
+    def test_architecture_inventory_carries_full_paths_and_filters_kit_files(self) -> None:
+        game = "scripts/logic/game_service.gd"
+        kit_private = ".kit/runtime/private.json"
+        kit_helper = "tools/validate_resources.gd"
+        model = self._architecture_test_model(
+            {
+                "files": [
+                    {"path": game, "action": "modify", "why": "Change the game."},
+                    {"path": kit_private, "action": "modify", "why": "Never show."},
+                ]
+            },
+            present={game, kit_private, kit_helper},
+            baseline_files={game, kit_private, kit_helper},
+            changed_actions={game: "modify", kit_private: "modify"},
+        )
+        ids = {str(item["id"]) for item in model["nodes"]}
+
+        self.assertEqual([game], model["present_paths"])
+        self.assertEqual([game], model["touched_paths"])
+        self.assertEqual([game], model["baseline_paths"])
+        self.assertIn(f"file:{game}", ids)
+        self.assertFalse(any(".kit" in item for item in ids), ids)
+        self.assertFalse(any("validate_resources" in item for item in ids), ids)
+
     def test_declared_and_observed_action_mismatch_is_a_conflict(self) -> None:
         path = "scripts/logic/conflicted.gd"
         model = self._architecture_test_model(
@@ -854,6 +906,51 @@ class PlanPageBytes(unittest.TestCase):
         self.assertEqual("conflict", node["state"])
         self.assertIn("plan says new", node["changing"])
         self.assertIn("Git reports modify", node["changing"])
+
+    def test_hands_off_scope_keeps_plan_git_and_authority_separate(self) -> None:
+        path = "scripts/logic/new_service.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "recorded",
+                "scope": [
+                    {
+                        "kind": "directory",
+                        "path": "(root)",
+                        "action": "new",
+                        "why": "New authored files are reversible.",
+                    },
+                    {
+                        "kind": "directory",
+                        "path": "scripts/logic",
+                        "action": "modify",
+                        "why": "Existing logic may only be modified.",
+                    },
+                ],
+            },
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            involvement="hands-off",
+            cockpit_state={
+                "status": "recorded",
+                "approval_required": False,
+            },
+        )
+
+        node = next(
+            item for item in model["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertEqual("modify", node["declared_action"])
+        self.assertEqual("new", node["observed_action"])
+        self.assertEqual(
+            "proposal.scope[directory:scripts/logic]",
+            node["authorization_source"],
+        )
+        self.assertEqual("conflict", node["state"])
+        self.assertEqual(
+            "does not authorize the observed action",
+            node["authorization_status"],
+        )
 
     def test_unplanned_observed_file_never_reads_as_planned(self) -> None:
         path = "scripts/logic/unplanned.gd"
@@ -928,6 +1025,91 @@ class PlanPageBytes(unittest.TestCase):
                     item for item in model["nodes"] if item["id"] == f"file:{path}"
                 )
                 self.assertFalse(node["design"].startswith("Yes"), node["design"])
+
+    def test_design_checks_are_independent_and_require_current_digest(self) -> None:
+        path = "scripts/logic/proposed.gd"
+        section = "docs/design/outcome.md"
+        digest = "a" * 64
+        proposal = {
+            "status": "approved",
+            "design_refs": [{
+                "section": section,
+                "why": "The player understands every accepted action.",
+                "sha256": digest,
+            }],
+            "files": [{"path": path, "action": "new", "why": "Show it."}],
+        }
+        cockpit_state = {
+            "status": "approved",
+            "approval_required": False,
+            "exact_approval": {"approved": True},
+            "design_authority": {
+                "authority": "human-confirmed",
+                "validation": "current",
+                "implementation_eligible": True,
+            },
+            "design_documents": [{"path": section, "sha256": digest}],
+        }
+
+        current = self._architecture_test_model(
+            proposal,
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            cockpit_state=cockpit_state,
+        )
+        node = next(item for item in current["nodes"] if item["id"] == f"file:{path}")
+        self.assertTrue(node["design"].startswith("Yes"), node["design"])
+        self.assertEqual([section], node["design_evidence"]["references"])
+        self.assertEqual(
+            "all cited digests match current design",
+            node["design_evidence"]["digest"],
+        )
+        self.assertIn("human-confirmed", node["design_evidence"]["authority"])
+        self.assertEqual("approved", node["design_evidence"]["proposal"])
+
+        stale = self._architecture_test_model(
+            proposal,
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            cockpit_state={
+                **cockpit_state,
+                "design_documents": [{"path": section, "sha256": "b" * 64}],
+            },
+        )
+        stale_node = next(
+            item for item in stale["nodes"] if item["id"] == f"file:{path}"
+        )
+        self.assertFalse(stale_node["design"].startswith("Yes"), stale_node["design"])
+        self.assertIn("does not match", stale_node["design_evidence"]["digest"])
+
+    def test_proposal_cannot_self_authorize_design_or_implementation(self) -> None:
+        path = "scripts/logic/proposed.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "approved",
+                "design_authority": {
+                    "authority": "human-confirmed",
+                    "validation": "current",
+                    "implementation_eligible": True,
+                },
+                "design_refs": [{
+                    "section": "docs/design/outcome.md",
+                    "sha256": "a" * 64,
+                    "why": "The player understands every accepted action.",
+                }],
+                "files": [{"path": path, "action": "new", "why": "Show it."}],
+            },
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            cockpit_state={},
+        )
+        node = next(item for item in model["nodes"] if item["id"] == f"file:{path}")
+        self.assertEqual("not active", node["authorization_status"])
+        self.assertIn("not recorded", node["design_evidence"]["authority"])
+        self.assertFalse(node["design"].startswith("Yes"), node["design"])
 
     def test_go_no_go_reversibility_tells_the_agent_to_stop(self) -> None:
         path = "scripts/logic/commitment.gd"
@@ -1014,12 +1196,28 @@ class PlanPageBytes(unittest.TestCase):
                     "why": "Adjust the module as one boundary.",
                 }],
             },
-            tree={path: {"class_name": "ActionService", "functions": []}},
+            tree={path: {
+                "class_name": "ActionService",
+                "functions": [{
+                    "name": "run",
+                    "identity": "ActionService.run",
+                    "class_scope": "ActionService",
+                    "signature": "func run() -> void",
+                }],
+            }},
             present={path},
             baseline_files={path},
             changed_actions={path: "modify"},
             modules=[{"path": "scripts/logic", "depends_on": []}],
             involvement="module",
+            function_changes={
+                (path, "ActionService.run"): {
+                    "action": "modify",
+                    "signature": "func run() -> void",
+                    "baseline_signature": "func run() -> void",
+                    "current_signature": "func run() -> void",
+                }
+            },
         )
         by_id = {str(item["id"]): item for item in model["nodes"]}
         for node_id in (
@@ -1028,7 +1226,66 @@ class PlanPageBytes(unittest.TestCase):
         ):
             with self.subTest(node=node_id):
                 self.assertEqual("changing", by_id[node_id]["state"])
-                self.assertEqual("modify", by_id[node_id]["action"])
+                self.assertEqual("modify", by_id[node_id]["declared_action"])
+                self.assertEqual("modify", by_id[node_id]["observed_action"])
+                self.assertEqual(
+                    "proposal.modules[scripts/logic]",
+                    by_id[node_id]["authorization_source"],
+                )
+        function = by_id[f"function:{path}::ActionService.run"]
+        self.assertEqual("changing", function["state"])
+        self.assertEqual(
+            "proposal.modules[scripts/logic]", function["authorization_source"]
+        )
+        self.assertEqual("changing", by_id["folder:scripts/logic"]["state"])
+
+    def test_module_summary_carries_hidden_descendant_conflict(self) -> None:
+        path = "scripts/logic/action_service.gd"
+        model = self._architecture_test_model(
+            {
+                "status": "approved",
+                "modules": [{
+                    "path": "scripts/logic",
+                    "action": "modify",
+                    "role": "Owns action decisions.",
+                    "why": "Adjust the module boundary.",
+                }],
+                "files": [{
+                    "path": path,
+                    "action": "new",
+                    "why": "This contradicts the observed modification.",
+                }],
+            },
+            tree={path: {"class_name": "ActionService", "functions": []}},
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+            modules=[{"path": "scripts/logic", "depends_on": []}],
+            involvement="module",
+            cockpit_state={
+                "status": "approved",
+                "approval_required": False,
+                "exact_approval": {"approved": True},
+            },
+        )
+        module = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == "folder:scripts/logic"
+        )
+
+        self.assertEqual("conflict", module["state"])
+        self.assertIn("inside this module conflicts", module["changing"])
+        rendered = plan_html.architecture_map_html(model, "module")
+        payload = rendered.split(
+            "window.__KIT_ARCHITECTURE_MAP__=", 1
+        )[1].split(";</script>", 1)[0]
+        visible_model = json.loads(payload)
+        self.assertEqual(
+            ["folder:scripts/logic"],
+            [node["id"] for node in visible_model["nodes"]],
+        )
+        self.assertEqual("conflict", visible_model["nodes"][0]["state"])
 
     def test_observed_function_changes_mark_unplanned_new_and_modify(self) -> None:
         path = "scripts/logic/service.gd"
@@ -1075,7 +1332,9 @@ class PlanPageBytes(unittest.TestCase):
                     if item["id"] == f"function:{path}::Service.run"
                 )
                 self.assertEqual("unplanned", node["state"])
-                self.assertEqual(action, node["action"])
+                self.assertEqual("none", node["declared_action"])
+                self.assertEqual(action, node["observed_action"])
+                self.assertEqual("none", node["authorization_source"])
                 self.assertIn(f"unplanned {action}", node["changing"])
                 self.assertNotIn("No change is proposed", node["changing"])
 
@@ -1103,9 +1362,11 @@ class PlanPageBytes(unittest.TestCase):
             if item["id"] == f"function:{path}::Service.obsolete::deleted"
         )
         self.assertEqual("unplanned", node["state"])
-        self.assertEqual("delete", node["action"])
+        self.assertEqual("none", node["declared_action"])
+        self.assertEqual("delete", node["observed_action"])
         self.assertIn("unplanned delete", node["changing"])
         self.assertIn("deleted function", node["what"])
+        self.assertEqual(f"class:{path}::Service", node["parent"])
 
     def test_planned_function_delete_requires_proven_baseline_comparison(self) -> None:
         path = "scripts/logic/service.gd"
@@ -1167,6 +1428,110 @@ class PlanPageBytes(unittest.TestCase):
         self.assertIn("not proven", unknown_node["changing"])
         self.assertNotIn("complete", unknown_node["changing"].lower())
 
+    def test_delete_event_without_prior_function_never_counts_as_complete(self) -> None:
+        path = "scripts/logic/service.gd"
+        signature = "func obsolete() -> void"
+        model = self._architecture_test_model(
+            {
+                "status": "approved",
+                "functions": [{
+                    "file": path,
+                    "class_scope": "Service",
+                    "signature": signature,
+                    "action": "delete",
+                    "why": "Remove it.",
+                }],
+            },
+            tree={path: {"class_name": "Service", "functions": []}},
+            present={path},
+            baseline_files={path},
+            changed_actions={path: "modify"},
+            function_changes={
+                (path, "Service.obsolete"): {
+                    "action": "delete",
+                    "signature": signature,
+                    "baseline_signature": "",
+                    "current_signature": "",
+                }
+            },
+        )
+        node = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == f"function:{path}::Service.obsolete"
+        )
+
+        self.assertEqual("conflict", node["state"])
+        self.assertNotIn("complete", node["changing"].lower())
+
+    def test_planned_function_presence_is_unknown_without_source_inventory(self) -> None:
+        path = "scripts/logic/service.gd"
+        model = plan_html.architecture_map_model(
+            {
+                "status": "draft",
+                "functions": [{
+                    "file": path,
+                    "class_scope": "Service",
+                    "signature": "func refresh() -> void",
+                    "action": "new",
+                    "why": "Refresh it.",
+                }],
+            },
+            {},
+            {path},
+            [],
+            None,
+            {"status": "draft", "approval_required": True},
+            None,
+            None,
+            "function",
+            None,
+        )
+        node = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == f"function:{path}::Service.refresh"
+        )
+
+        self.assertEqual("adding", node["state"])
+        self.assertIn("whether the planned function is present is not known", node["changing"])
+        self.assertNotIn("implemented", node["changing"].lower())
+
+    def test_exact_function_evidence_can_prove_presence_without_tree_entry(self) -> None:
+        path = "scripts/logic/service.gd"
+        signature = "func refresh() -> void"
+        model = self._architecture_test_model(
+            {
+                "functions": [{
+                    "file": path,
+                    "class_scope": "Service",
+                    "signature": signature,
+                    "action": "new",
+                    "why": "Refresh it.",
+                }],
+            },
+            tree={},
+            present={path},
+            baseline_files=set(),
+            changed_actions={path: "new"},
+            function_changes={
+                (path, "Service.refresh"): {
+                    "action": "new",
+                    "signature": signature,
+                    "baseline_signature": "",
+                    "current_signature": signature,
+                }
+            },
+        )
+        node = next(
+            item
+            for item in model["nodes"]
+            if item["id"] == f"function:{path}::Service.refresh"
+        )
+
+        self.assertEqual("adding", node["state"])
+        self.assertIn("exact planned function addition is present", node["changing"])
+
     def test_file_and_class_dependencies_name_containing_module_evidence(self) -> None:
         path = "scripts/logic/service.gd"
         model = self._architecture_test_model(
@@ -1182,10 +1547,72 @@ class PlanPageBytes(unittest.TestCase):
         by_id = {str(item["id"]): item for item in model["nodes"]}
         for node_id in (f"file:{path}", f"class:{path}::Service"):
             with self.subTest(node=node_id):
-                evidence = by_id[node_id]["depends"].lower()
-                self.assertIn("module-level dependency evidence", evidence)
-                self.assertIn("containing module scripts/logic", evidence)
-                self.assertIn("scripts/ui", evidence)
+                dependencies = by_id[node_id]["dependencies"].lower()
+                dependents = by_id[node_id]["dependents"].lower()
+                self.assertIn("module-level evidence", dependencies)
+                self.assertIn("inside scripts/logic", dependencies)
+                self.assertIn("current dependencies: none", dependencies)
+                self.assertIn("current dependents", dependents)
+                self.assertIn("scripts/ui", dependents)
+
+    def test_observed_and_proposed_dependency_edges_keep_direction_and_source(self) -> None:
+        model = self._architecture_test_model(
+            {
+                "modules": [
+                    {
+                        "path": "scripts/logic",
+                        "action": "modify",
+                        "may_depend_on": ["scripts/ui"],
+                    },
+                    {
+                        "path": "scripts/gameplay",
+                        "action": "modify",
+                        "may_depend_on": ["scripts/logic"],
+                    },
+                ]
+            },
+            modules=[
+                {"path": "scripts/logic", "depends_on": ["scripts/data"]},
+                {"path": "scripts/data", "depends_on": []},
+                {"path": "scripts/ui", "depends_on": []},
+                {"path": "scripts/presentation", "depends_on": ["scripts/logic"]},
+            ],
+        )
+        logic = next(
+            node for node in model["nodes"] if node["id"] == "folder:scripts/logic"
+        )
+        links = {
+            (
+                link["source"],
+                link["target"],
+                link["relation"],
+                link["provenance"],
+            )
+            for link in model["links"]
+        }
+
+        self.assertIn("Current dependencies: scripts/data", logic["dependencies"])
+        self.assertIn("Proposed allowed dependencies: scripts/ui", logic["dependencies"])
+        self.assertIn("Current dependents: scripts/presentation", logic["dependents"])
+        self.assertIn("Proposed allowed dependents: scripts/gameplay", logic["dependents"])
+        self.assertIn(
+            (
+                "folder:scripts/logic",
+                "folder:scripts/data",
+                "depends-on",
+                "observed",
+            ),
+            links,
+        )
+        self.assertIn(
+            (
+                "folder:scripts/logic",
+                "folder:scripts/ui",
+                "may-depend-on",
+                "planned",
+            ),
+            links,
+        )
 
     def test_no_javascript_list_is_server_filtered_by_involvement(self) -> None:
         fixture = architecture_fixture()
@@ -1270,14 +1697,14 @@ class PlanPageBytes(unittest.TestCase):
         self.assertNotIn("class", module_intro)
         self.assertNotIn("function", module_intro)
         self.assertIn('placeholder="Module"', search_tag(module))
-        self.assertIn("<h3>Architecture modules</h3>", module)
+        self.assertIn("<h3>Current and planned modules</h3>", module)
 
         file_intro = intro(file_level).lower()
         self.assertIn("folder → file", file_intro)
         self.assertNotIn("class", file_intro)
         self.assertNotIn("function", file_intro)
         self.assertIn('placeholder="Folder or file"', search_tag(file_level))
-        self.assertIn("<h3>Folder and file structure</h3>", file_level)
+        self.assertIn("<h3>Current and planned files</h3>", file_level)
 
         function_intro = intro(function).lower()
         self.assertIn("folder → file → class → function", function_intro)
@@ -1285,7 +1712,7 @@ class PlanPageBytes(unittest.TestCase):
             'placeholder="Folder, file, class or function"',
             search_tag(function),
         )
-        self.assertIn("<h3>Complete structure</h3>", function)
+        self.assertIn("<h3>Current and planned structure</h3>", function)
 
     def test_settled_badge_starts_hidden_until_graph_finishes(self) -> None:
         badge = re.search(
@@ -1344,7 +1771,7 @@ class PlanPageBytes(unittest.TestCase):
 
     def test_architecture_focus_defaults_complete_without_false_time_travel(self) -> None:
         self.assertIn(
-            'data-arch-view="complete" aria-pressed="true">Complete',
+            'data-arch-view="complete" aria-pressed="true">Current and planned',
             self.architecture_html,
         )
         self.assertIn(
@@ -1357,10 +1784,19 @@ class PlanPageBytes(unittest.TestCase):
         for label in (
             "What is this?",
             "What is changing?",
+            "Planned action",
+            "Observed by Git",
+            "Plan source",
+            "Plan authority",
             "Why are we changing it?",
             "Why not extend existing code?",
+            "Design reference",
+            "Design digest",
+            "Design authority",
+            "Proposal approval",
             "Does this match the approved design?",
-            "What depends on it?",
+            "What does it use?",
+            "What uses it?",
             "What could break?",
             "Can it be safely undone?",
             "How will we check it?",
