@@ -1025,11 +1025,10 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual(state["active_release"]["archive_sha256"], "c" * 64)
         self.assertEqual(state["previous_release"]["archive_sha256"], "a" * 64)
 
-    @unittest.skipUnless(os.name == "nt", "Windows sharing retry is Windows-specific")
     def test_windows_replace_retries_only_a_sharing_violation(self) -> None:
         sharing = PermissionError("file is in use")
         sharing.winerror = 32
-        with mock.patch.object(
+        with mock.patch.object(kit_change.os, "name", "nt"), mock.patch.object(
             kit_change.os, "replace", side_effect=[sharing, None]
         ) as replace, mock.patch.object(kit_change.time, "sleep") as sleep:
             kit_change._replace_file(Path("temporary"), Path("destination"))

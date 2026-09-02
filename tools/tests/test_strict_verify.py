@@ -649,7 +649,7 @@ class StrictCiContractTests(unittest.TestCase):
             windows.index("if defined KIT_PYTHON"),
             windows.index("where py"),
         )
-        self.assertIn('"%KIT_PYTHON%" "%KIT_ROOT%kit.py" %*', windows)
+        self.assertIn('"%KIT_PYTHON%" "%KIT_ENTRY%" %*', windows)
         self.assertIn("KIT_PYTHON must name one absolute interpreter file", windows)
         self.assertIn("KIT_PYTHON does not name an existing interpreter file", windows)
         self.assertIn("KIT_PYTHON must name a file, not a directory", windows)
@@ -657,7 +657,7 @@ class StrictCiContractTests(unittest.TestCase):
             posix.index('if [ -n "${KIT_PYTHON:-}" ]'),
             posix.index("command -v python3"),
         )
-        self.assertIn('exec "$KIT_PYTHON" "$KIT_ROOT/kit.py" "$@"', posix)
+        self.assertIn('exec "$KIT_PYTHON" "$KIT_ENTRY" "$@"', posix)
         self.assertIn("KIT_PYTHON must name one absolute interpreter file", posix)
         self.assertIn("KIT_PYTHON does not name an executable interpreter file", posix)
 
