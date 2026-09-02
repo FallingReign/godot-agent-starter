@@ -321,7 +321,32 @@ class BrownfieldBaselineTests(unittest.TestCase):
             try:
                 linked.symlink_to(target)
             except OSError:
-                self.skipTest("this host does not allow creating a test symlink")
+                linked.write_bytes(target.read_bytes())
+                path_type = type(linked)
+                original = path_type.lstat
+
+                def redirected_lstat(
+                    path: Path, *args: object, **kwargs: object
+                ):
+                    info = original(path, *args, **kwargs)
+                    if path == linked:
+                        redirected = mock.Mock(wraps=info)
+                        redirected.st_mode = info.st_mode
+                        redirected.st_file_attributes = 0x0400
+                        return redirected
+                    return info
+
+                with mock.patch.object(
+                    path_type,
+                    "lstat",
+                    autospec=True,
+                    side_effect=redirected_lstat,
+                ):
+                    with self.assertRaisesRegex(
+                        brownfield.BrownfieldError, "redirected"
+                    ):
+                        _built(root, [_issue("scripts/linked.gd")])
+                return
             with self.assertRaisesRegex(brownfield.BrownfieldError, "redirected"):
                 _built(root, [_issue("scripts/linked.gd")])
 

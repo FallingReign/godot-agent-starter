@@ -232,14 +232,10 @@ def _safe_relative(raw: object, *, label: str = "path") -> str:
 
 
 def _canonical_root(root: Path) -> Path:
-    absolute = root.absolute()
-    if absolute.is_symlink() or _is_reparse(absolute) or not absolute.is_dir():
-        raise KitChangeError("unsafe-project", f"project root is not a regular directory: {absolute}")
     try:
-        resolved = absolute.resolve(strict=True)
-    except OSError as exc:
-        raise KitChangeError("unsafe-project", f"cannot resolve project root: {exc}") from exc
-    return resolved
+        return managed_launcher.canonical_directory(root, "project root")
+    except managed_launcher.LauncherError as exc:
+        raise KitChangeError("unsafe-project", str(exc)) from exc
 
 
 def _case_checked_child(parent: Path, component: str, relative: str) -> Path:

@@ -69,16 +69,10 @@ def _is_reparse(info: object) -> bool:
 
 
 def _canonical_directory(value: str | Path, label: str) -> Path:
-    raw = Path(value).expanduser()
     try:
-        info = raw.lstat()
-        path = raw.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ProjectContextError(f"{label} is not a readable path: {value!s}") from exc
-    if (stat.S_ISLNK(info.st_mode) or _is_reparse(info)
-            or not stat.S_ISDIR(info.st_mode)):
-        raise ProjectContextError(f"{label} must be an unredirected directory: {path}")
-    return path
+        return managed_launcher.canonical_directory(value, label)
+    except managed_launcher.LauncherError as exc:
+        raise ProjectContextError(str(exc)) from exc
 
 
 def _matching_names(parent: Path, expected: str, label: str) -> list[str]:

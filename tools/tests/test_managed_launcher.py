@@ -354,6 +354,23 @@ class InstallationSelection(unittest.TestCase):
 
     def test_project_path_with_a_redirected_component_is_refused(self) -> None:
         with _scratch() as root:
+            real_parent = root / "real-parent"
+            project = real_parent / "project"
+            project.mkdir(parents=True)
+            _flat(project)
+            redirected_parent = root / "redirected-parent"
+            try:
+                redirected_parent.symlink_to(real_parent, target_is_directory=True)
+            except OSError:
+                pass
+            else:
+                with self.assertRaisesRegex(
+                    launcher.LauncherError, "redirected components"
+                ):
+                    launcher.resolve_installation(redirected_parent / "project")
+                return
+
+        with _scratch() as root:
             _flat(root)
             other = root / "other"
             other.mkdir()

@@ -15,6 +15,11 @@ import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Mapping
 
+try:
+    import managed_launcher
+except ImportError:  # package import in tests and installed cores
+    from tools import managed_launcher  # type: ignore[no-redef]
+
 SCHEMA = 1
 KIND = "agent-kit-brownfield-baseline"
 EVALUATION_KIND = "agent-kit-brownfield-evaluation"
@@ -448,15 +453,10 @@ def _relative_path(value: object) -> str:
 
 
 def _project_root(value: str | Path) -> Path:
-    raw = Path(value)
     try:
-        info = raw.lstat()
-        resolved = raw.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise BrownfieldError(f"project root is not readable: {raw}") from exc
-    if stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISDIR(info.st_mode):
-        raise BrownfieldError("project root must be an unredirected directory")
-    return resolved
+        return managed_launcher.canonical_directory(value, "project root")
+    except managed_launcher.LauncherError as exc:
+        raise BrownfieldError(str(exc)) from exc
 
 
 def _is_reparse(info: object) -> bool:

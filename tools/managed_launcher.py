@@ -184,17 +184,24 @@ def _validate_marker(path: Path) -> None:
         )
 
 
-def _canonical_start(value: str | os.PathLike[str]) -> Path:
+def canonical_directory(
+    value: str | os.PathLike[str], label: str = "directory"
+) -> Path:
+    """Return one existing directory only when no path component redirects it."""
     raw = Path(value).expanduser()
     candidate = (raw if raw.is_absolute() else Path.cwd() / raw).absolute()
-    _require_directory(candidate, "project path")
+    _require_directory(candidate, label)
     try:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise LauncherError(f"project path cannot be resolved: {candidate}: {exc}") from exc
+        raise LauncherError(f"{label} cannot be resolved: {candidate}: {exc}") from exc
     if resolved != candidate:
-        raise LauncherError(f"project path may not use redirected components: {candidate}")
+        raise LauncherError(f"{label} may not use redirected components: {candidate}")
     return resolved
+
+
+def _canonical_start(value: str | os.PathLike[str]) -> Path:
+    return canonical_directory(value, "project path")
 
 
 def locate_project_root(project: str | os.PathLike[str]) -> tuple[Path, Path]:
