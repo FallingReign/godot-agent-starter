@@ -364,6 +364,7 @@ class TestDeterministicBuild(ReleaseTestCase):
             "LICENSE", release.MANIFEST_PATH, *release.GENERATED_INSTALL_FILES,
         }
         self.assertEqual(set(contents), expected)
+        self.assertNotIn("tools/tests/test_lifecycle_e2e.py", contents)
         self.assertNotIn(b"\r", contents["README.md"])
         self.assertEqual(
             contents["ARCHITECTURE.md"], release.CANONICAL_ARCHITECTURE
@@ -1159,9 +1160,31 @@ class TestSourcePathSafety(ReleaseTestCase):
         }
 
         self.assertEqual(actual_tools, set(release.TOOL_FILES))
-        self.assertTrue(actual_tests.issubset(release.VALIDATION_FILES))
+        source_validation_files = (
+            release.VALIDATION_FILES | release.SOURCE_ONLY_VALIDATION_FILES
+        )
+        self.assertTrue(actual_tests.issubset(source_validation_files))
+        self.assertEqual(
+            actual_tests - set(release.VALIDATION_FILES),
+            set(release.SOURCE_ONLY_VALIDATION_FILES),
+        )
         self.assertEqual(actual_skills, set(release.REQUIRED_SKILL_FILES))
         self.assertEqual(actual_agents, set(release.REQUIRED_AGENT_FILES))
+
+    def test_source_only_lifecycle_e2e_is_discoverable_but_not_released(self) -> None:
+        relative = "tools/tests/test_lifecycle_e2e.py"
+
+        self.assertIn(relative, release.SOURCE_ONLY_VALIDATION_FILES)
+        self.assertIn(
+            relative,
+            {
+                path.relative_to(REPOSITORY).as_posix()
+                for path in (REPOSITORY / "tools" / "tests").glob("test_*.py")
+            },
+        )
+        self.assertNotIn(relative, release.VALIDATION_FILES)
+        self.assertNotIn(relative, release.REQUIRED_KIT_FILES)
+        self.assertFalse(release.is_allowlisted(relative))
 
     def test_unreviewed_skill_or_persona_is_not_pattern_allowlisted(self) -> None:
         self.assertFalse(release.is_allowlisted(

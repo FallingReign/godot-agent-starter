@@ -269,7 +269,6 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_kit_change_html.py",
     "tools/tests/test_kit_cli.py",
     "tools/tests/test_layout_consumers.py",
-    "tools/tests/test_lifecycle_e2e.py",
     "tools/tests/test_managed_launcher.py",
     "tools/tests/test_native_engine.py",
     "tools/tests/test_native_process_containment.py",
@@ -285,6 +284,13 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_session_evidence.py",
     "tools/tests/test_signature_consumers.py",
     "tools/tests/test_strict_verify.py",
+})
+
+# These tests depend on source-repository history and remain covered by source
+# self-test/CI discovery.  They cannot ship in a managed release, whose core is
+# an authenticated archive without a source .git directory.
+SOURCE_ONLY_VALIDATION_FILES = frozenset({
+    "tools/tests/test_lifecycle_e2e.py",
 })
 
 FIXED_FILES = ROOT_FILES | DOC_FILES | TOOL_FILES | VALIDATION_FILES
