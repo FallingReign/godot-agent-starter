@@ -1392,6 +1392,15 @@ class TestReleaseSmoke(ReleaseTestCase):
 
 
 class TestVerification(ReleaseTestCase):
+    def test_release_manifest_rejects_duplicate_keys(self) -> None:
+        member = release.ArchiveMember(
+            release.MANIFEST_PATH,
+            b'{"schema":3,"schema":3}\n',
+            0o644,
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate key 'schema'"):
+            release._parse_manifest(member)
+
     def test_manifest_cannot_authorize_project_generated_architecture(self) -> None:
         archive = _synthetic_smoke_archive(self.scratch)
         contents = _member_contents(archive)

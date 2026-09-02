@@ -196,10 +196,18 @@ def _canonical_archive_sha256(
 
 
 def _json_object(content: bytes, label: str) -> dict:
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict:
+        value: dict = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
     try:
-        value = json.loads(content.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise LauncherError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise LauncherError(f"{label} is not unambiguous UTF-8 JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise LauncherError(f"{label} must contain one JSON object")
     return value

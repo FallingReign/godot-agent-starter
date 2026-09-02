@@ -164,6 +164,10 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 
 
 class InstallationSelection(unittest.TestCase):
+    def test_json_objects_reject_duplicate_keys(self) -> None:
+        with self.assertRaisesRegex(launcher.LauncherError, "duplicate key 'schema'"):
+            launcher._json_object(b'{"schema":1,"schema":2}\n', "fixture")
+
     def test_flat_source_uses_marked_project_as_core(self) -> None:
         with _scratch() as root:
             _flat(root)

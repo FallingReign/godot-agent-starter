@@ -2112,10 +2112,7 @@ def _read_archive(path: Path) -> tuple[str, dict[str, ArchiveMember]]:
 
 
 def _parse_manifest(member: ArchiveMember) -> dict:
-    try:
-        manifest = json.loads(member.content.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ReleaseError(f"release manifest is not valid UTF-8 JSON: {exc}") from exc
+    manifest = _strict_json_object(member.content, "release manifest")
     expected_keys = {
         "schema", "version", "source", "authority_evidence", "license_files",
         "normalization", "files",
