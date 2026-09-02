@@ -77,7 +77,10 @@ class ReviewRenderer(unittest.TestCase):
         self.assertIn('data-step="review" aria-current="step"', page)
         self.assertLess(page.index("Quick read"), page.index("Needs your decision"))
         self.assertLess(page.index("Needs your decision"), page.index("What will change"))
-        self.assertLess(page.index("What will change"), page.index("Check result"))
+        self.assertLess(
+            page.index("What will change"),
+            page.index('<h2 id="check-title">Apply-time check</h2>'),
+        )
 
     def test_install_is_the_only_first_use_term(self) -> None:
         page = self.render()
@@ -102,11 +105,33 @@ class ReviewRenderer(unittest.TestCase):
             decisions=[],
             existing_gaps={"count": 6, "status": "checked"},
             result_sha256=RESULT_DIGEST,
+            check_evidence={
+                "state": "apply_time",
+                "checked_at": "2026-09-02T01:02:03Z",
+            },
         )
-        self.assertIn("Kit works; project cleanup remains", page)
+        self.assertIn("Applied; problems recorded at Apply", page)
         self.assertIn('<dt>Existing problems</dt><dd id="kit-change-gap-count">6</dd>', page)
-        self.assertIn(">Cleanup remains</dd>", page)
+        self.assertIn(">Problems recorded at Apply</dd>", page)
+        self.assertIn(">2026-09-02T01:02:03Z</dd>", page)
+        self.assertIn(
+            "This check ran when Apply finished. Later project changes are not included.",
+            page,
+        )
+        self.assertIn("ask your agent to run <code>kit verify --static</code>", page)
         self.assertIn("Restore previous state", page)
+
+    def test_older_finished_session_keeps_apply_time_scope_without_a_time(self) -> None:
+        page = self.render(
+            status="complete",
+            decisions=[],
+            result_sha256=RESULT_DIGEST,
+            check_evidence={"state": "apply_time", "checked_at": ""},
+        )
+
+        self.assertIn("Time not recorded (older session)", page)
+        self.assertIn("Passed at Apply", page)
+        self.assertIn("Later project changes are not included.", page)
 
     def test_recovery_state_shows_one_plain_retry_action(self) -> None:
         automatic = self.render(
@@ -201,8 +226,9 @@ class ReviewRenderer(unittest.TestCase):
             self.assertIn(f"<dt>{label}</dt>", page)
         self.assertIn('<dd class="safe">No changes</dd>', page)
         self.assertIn("Missing — agents cannot build", page)
-        self.assertIn("This change records 24 existing problems", page)
-        self.assertIn("It does not hide them or mark them as fixed.", page)
+        self.assertIn('<dd id="kit-change-gap-count">Not checked</dd>', page)
+        self.assertIn("The Apply-time check has not finished.", page)
+        self.assertNotIn("recorded 24 existing problems", page)
 
     def test_decisions_use_native_keyboard_order_and_explain_choices(self) -> None:
         page = self.render()
@@ -298,9 +324,9 @@ class ReviewRenderer(unittest.TestCase):
             "needs_decision": "1 decision needed",
             "blocked": "Blocked",
             "applying": "Applying",
-            "checking": "Checking",
-            "complete": "Complete",
-            "adoption_required": "Kit works; project cleanup remains",
+            "checking": "Running Apply-time check",
+            "complete": "Applied; Apply-time check passed",
+            "adoption_required": "Applied; problems recorded at Apply",
             "recovery_required": "Recovery needed",
             "restored": "Previous state restored",
             "failed": "Could not finish",

@@ -2332,7 +2332,9 @@ def _kit_change_prepare(
             status=exc.code.replace("-", "_"),
         ) from exc
     state = prepared["kit_change"]
-    status = "needs_decision" if state["status"] == "blocked" else "ready"
+    status = (
+        "needs_decision" if state["status"] == "blocked" else str(state["status"])
+    )
     try:
         runtime.relative_to(target)
         review_storage = "target_private_runtime_only"

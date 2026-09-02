@@ -105,14 +105,18 @@ only records that have first been explicitly made non-restorable.
 | --- | --- | --- |
 | Ready | The exact change can be applied | Review and choose Apply |
 | Needs a decision | One folder choice is unresolved | Answer D1 and review the new plan |
-| Complete | The kit and project checks passed | Continue work |
-| Adoption required | The kit works; existing project gaps were recorded | Keep the kit and address the listed gaps separately |
+| Complete | The Apply-time check passed when Apply finished | Ask your agent to run `kit verify --static` for the current project |
+| Adoption required | Project problems were recorded at Apply | Keep the kit and address the recorded problems separately |
 | Restored | The prior project bytes were restored | Review or retry when ready |
 | Recovery required | Work stopped between durable steps | Run the recovery command below |
 
-An existing project gap is not described as fixed. A new or worsened gap fails
-the check. A valid static project failure can therefore produce **Adoption
-required** while the installed kit itself remains usable.
+The Apply-time check runs once when Apply finishes. Its signed result records
+when it ran. Later project changes are not included. Ask your agent to run
+`kit verify --static` when you need the current project state.
+
+An existing project problem is not described as fixed. A new or worsened
+problem fails the Apply-time check. A valid static project failure can therefore
+produce **Adoption required** while the installed kit itself remains usable.
 
 ## Recover an interrupted change
 

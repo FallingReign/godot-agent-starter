@@ -14,6 +14,7 @@ import os
 import re
 import base64
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -27,7 +28,7 @@ import brownfield
 
 SESSION_SCHEMA = 2
 SESSION_KIND = "agent-kit-change-session"
-RESULT_SCHEMA = 1
+RESULT_SCHEMA = 2
 RESULT_KIND = "agent-kit-change-result"
 CONTROLLER_ROOT = "kit-change-controller"
 RELEASES_ROOT = f"{CONTROLLER_ROOT}/releases"
@@ -38,6 +39,9 @@ MAX_DETAIL_CHARS = 2048
 MAX_ISSUES = 4096
 MAX_ATTEMPTS = 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHECKED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 MODES = {"install", "upgrade"}
 OPEN_STATES = {"ready", "blocked"}
 RECOVERY_STATES = {"recovery_required"}
@@ -71,6 +75,7 @@ class KitChangeView(TypedDict):
     blockers: list[str]
     detail: str
     result_sha256: str
+    check_evidence: dict[str, str]
     plan_url: str
 
 
@@ -100,6 +105,44 @@ def _canonical(value: object) -> bytes:
 
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _checked_at_now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _result_checked_at(result: object) -> str:
+    """Read a signed Apply-time check timestamp, including older results."""
+    if not isinstance(result, Mapping):
+        return ""
+    common = {
+        "schema",
+        "kind",
+        "session_id",
+        "plan_sha256",
+        "transaction_id",
+        "status",
+        "check",
+        "rollback",
+    }
+    schema = result.get("schema")
+    if schema == 1 and set(result) == common:
+        return ""
+    if schema != RESULT_SCHEMA or set(result) != common | {"checked_at"}:
+        raise KitChangeControllerError(
+            "session-invalid", "stored result fields are not exact"
+        )
+    checked_at = result.get("checked_at")
+    if not isinstance(checked_at, str) or CHECKED_AT_RE.fullmatch(checked_at) is None:
+        raise KitChangeControllerError(
+            "session-invalid", "Apply-time check timestamp is malformed"
+        )
+    return checked_at
 
 
 def _root(path: Path, label: str) -> Path:
@@ -391,6 +434,8 @@ def _parse_session(content: bytes) -> dict[str, Any]:
         or not hmac.compare_digest(result_sha, _sha256(_canonical(value["result"])))
     ):
         raise KitChangeControllerError("session-tampered", "result fingerprint changed")
+    if value["result"] is not None:
+        _result_checked_at(value["result"])
     _validate_baseline_state(value["baseline"])
     return value
 
@@ -636,11 +681,15 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
         "ready": "The exact kit change is ready for review.",
         "blocked": "Resolve the listed blockers, then prepare a new review.",
         "applying": "Applying the exact reviewed kit change.",
-        "checking": "Checking the installed kit without starting Godot.",
+        "checking": "Running the Apply-time check without starting Godot.",
         "recovery_required": "The kit change is safe, but restoring the previous state still needs to finish.",
-        "complete": "The kit change passed its offline checks.",
-        "adoption_required": "The kit works. Existing project gaps still need adoption work.",
-        "restored_failure": "The kit check failed, so the previous project state was restored.",
+        "complete": "The Apply-time check passed. Later project changes are not included.",
+        "adoption_required": (
+            f"The Apply-time check recorded {issue_count} existing project "
+            f"{'problem' if issue_count == 1 else 'problems'}. "
+            "Later project changes are not included."
+        ),
+        "restored_failure": "The Apply-time check failed, so the previous project state was restored.",
         "restored": "The project was restored to its previous state.",
         "failed": "The kit change could not finish safely.",
     }
@@ -688,8 +737,18 @@ def _simple_state(session: Mapping[str, Any], plan_url: str = "") -> KitChangeVi
             )
         ),
         "blockers": blockers,
-        "detail": str(check.get("detail") or details[state]) if check else details[state],
+        "detail": (
+            details[state]
+            if state in {"complete", "adoption_required"}
+            else str(check.get("detail") or details[state])
+            if check
+            else details[state]
+        ),
         "result_sha256": str(session.get("result_sha256") or ""),
+        "check_evidence": {
+            "state": "apply_time" if session.get("result") is not None else "not_run",
+            "checked_at": _result_checked_at(session.get("result")),
+        },
         "plan_url": plan_url,
     }
 
@@ -1077,6 +1136,7 @@ def _finish(
         "status": state,
         "check": dict(check),
         "rollback": _lifecycle(rollback),
+        "checked_at": _checked_at_now(),
     }
     return _transition(
         runtime,

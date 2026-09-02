@@ -2308,7 +2308,10 @@ def _kit_change_status(session_id: str, *, base_url: str = "") -> dict:
         existing = view.get("existing_gaps")
         count = int(existing.get("count") or 0) if isinstance(existing, dict) else 0
         noun = "problem" if count == 1 else "problems"
-        view["detail"] = f"The kit works. {count} existing project {noun} remain."
+        view["detail"] = (
+            f"The Apply-time check recorded {count} existing project {noun}. "
+            "Later project changes are not included."
+        )
     project = view.get("project") if isinstance(view.get("project"), dict) else {}
     project_path = str(project.get("path") or "")
     try:

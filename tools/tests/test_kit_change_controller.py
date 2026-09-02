@@ -360,6 +360,45 @@ class KitChangeControllerTest(unittest.TestCase):
         loaded = controller.load(self.runtime, prepared["session_id"])
         self.assertEqual("complete", loaded["state"])
         self.assertEqual("1" * 32, loaded["transaction_id"])
+        self.assertEqual(2, loaded["result"]["schema"])
+        self.assertRegex(
+            loaded["result"]["checked_at"],
+            r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        )
+        self.assertEqual(
+            {
+                "state": "apply_time",
+                "checked_at": loaded["result"]["checked_at"],
+            },
+            applied["kit_change"]["check_evidence"],
+        )
+
+    def test_old_finished_result_is_readable_with_an_empty_check_time(self) -> None:
+        prepared = self._prepare()
+        controller.apply(
+            self.runtime,
+            prepared["session_id"],
+            prepared["kit_change"]["plan_sha256"],
+            post_apply_check=self._good_check,
+        )
+        path = (
+            self.runtime
+            / controller.SESSIONS_ROOT
+            / f"{prepared['session_id']}.json"
+        )
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        legacy["result"]["schema"] = 1
+        legacy["result"].pop("checked_at")
+        legacy["result_sha256"] = _sha256(_canonical(legacy["result"]))
+        path.write_bytes(_canonical(controller._signed(legacy)))
+
+        result = controller.status(self.runtime, prepared["session_id"])
+
+        self.assertEqual("complete", result["kit_change"]["status"])
+        self.assertEqual(
+            {"state": "apply_time", "checked_at": ""},
+            result["kit_change"]["check_evidence"],
+        )
 
     def test_failed_kit_check_automatically_restores(self) -> None:
         prepared = self._prepare()
@@ -495,6 +534,7 @@ class KitChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(first["session_id"], repeated["session_id"])
         self.assertEqual("complete", repeated["kit_change"]["status"])
+        self.assertEqual("apply_time", repeated["kit_change"]["check_evidence"]["state"])
 
     def test_interrupted_apply_recovers_then_checks(self) -> None:
         prepared = self._prepare()

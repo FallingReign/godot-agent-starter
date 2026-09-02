@@ -32,6 +32,7 @@ RESULT_A = "1" * 64
 
 def _view(session_id: str, plan: str, status: str = "ready") -> dict:
     adoption = status == "adoption_required"
+    checked = status in {"complete", "adoption_required"}
     return {
         "ok": status in {"ready", "complete", "adoption_required", "restored"},
         "session_id": session_id,
@@ -63,6 +64,10 @@ def _view(session_id: str, plan: str, status: str = "ready") -> dict:
                 if adoption else "The exact kit change is ready for review."
             ),
             "result_sha256": RESULT_A if status in {"complete", "adoption_required"} else "",
+            "check_evidence": {
+                "state": "apply_time" if checked else "not_run",
+                "checked_at": "2026-09-02T01:02:03Z" if checked else "",
+            },
             "plan_url": "",
         },
     }
@@ -317,18 +322,21 @@ class KitChangeBoard(unittest.TestCase):
         self.assertEqual("adoption_required", payload["kit_change"]["status"])
         self.assertEqual(7, payload["kit_change"]["existing_gaps"]["count"])
         self.assertEqual(
-            "The kit works. 7 existing project problems remain.",
+            "The Apply-time check recorded 7 existing project problems. "
+            "Later project changes are not included.",
             payload["kit_change"]["detail"],
         )
         self.apply.assert_called_once_with(self.controller_runtime, SESSION_A, PLAN_A)
 
         code, page = self.get_text(f"kit-change.html?session={SESSION_A}")
         self.assertEqual(200, code)
-        self.assertIn("Kit works; project cleanup remains", page)
+        self.assertIn("Applied; problems recorded at Apply", page)
         self.assertIn(">7</dd>", page)
         self.assertIn("Existing problems", page)
         self.assertIn("Restore previous state", page)
-        self.assertIn("Cleanup remains", page)
+        self.assertIn("Problems recorded at Apply", page)
+        self.assertIn("2026-09-02T01:02:03Z", page)
+        self.assertIn("Later project changes are not included.", page)
 
     def test_d1_creates_a_new_review_and_never_applies(self) -> None:
         blocked = _view(SESSION_A, PLAN_A, "ready")

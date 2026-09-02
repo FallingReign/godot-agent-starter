@@ -27,9 +27,9 @@ STATUS_LABELS = {
     "needs_decision": "{count} decision needed",
     "blocked": "Blocked",
     "applying": "Applying",
-    "checking": "Checking",
-    "complete": "Complete",
-    "adoption_required": "Kit works; project cleanup remains",
+    "checking": "Running Apply-time check",
+    "complete": "Applied; Apply-time check passed",
+    "adoption_required": "Applied; problems recorded at Apply",
     "recovery_required": "Recovery needed",
     "restored": "Previous state restored",
     "failed": "Could not finish",
@@ -53,7 +53,7 @@ STEP_LABELS = (
     ("scan", "Scan"),
     ("review", "Review"),
     ("apply", "Apply"),
-    ("check", "Check"),
+    ("check", "Apply-time check"),
 )
 
 COUNT_FIELDS = (
@@ -64,6 +64,9 @@ COUNT_FIELDS = (
 )
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_CHECKED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 _SAFE_KIT_REVIEW_URL = re.compile(
     r"http://127\.0\.0\.1:(?P<port>[0-9]{1,5})/kit-change\.html"
     r"(?:\?session=(?P<session>[0-9a-f]{64}))?"
@@ -100,6 +103,17 @@ def _integer(value: object) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, number)
+
+
+def _check_evidence(value: object) -> tuple[str, str]:
+    evidence = _object(value)
+    state = _text(evidence.get("state"), "not_run")
+    checked_at = _text(evidence.get("checked_at"))
+    if state != "apply_time":
+        return "not_run", ""
+    if checked_at and _CHECKED_AT_RE.fullmatch(checked_at) is None:
+        checked_at = ""
+    return "apply_time", checked_at
 
 
 def _inline_json(value: object) -> str:
@@ -333,7 +347,10 @@ def _client_script(static: Mapping[str, Any]) -> str:
   "use strict";
   var STATIC = __STATIC__;
   var status = String(STATIC.status || "blocked");
-  var active = {applying:"Applying",checking:"Checking"};
+  var active = {
+    applying:"Applying the reviewed kit change.",
+    checking:"Running the Apply-time check."
+  };
   var labels = __LABELS__;
   var steps = {scanning:"scan",ready:"review",needs_decision:"review",blocked:"review",
                applying:"apply",checking:"check",complete:"check",adoption_required:"check",
@@ -347,6 +364,8 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var statusLabel = document.getElementById("kit-change-status-label");
   var statusNote = document.getElementById("kit-change-status-note");
   var nextStep = document.getElementById("kit-change-next-step");
+  var checkedAt = document.getElementById("kit-change-checked-at");
+  var checkScope = document.getElementById("kit-change-check-scope");
   var kitFilesCheck = document.getElementById("kit-change-kit-files-check");
   var newWorkCheck = document.getElementById("kit-change-new-work-check");
   var gapCount = document.getElementById("kit-change-gap-count");
@@ -355,6 +374,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var recoveryAction = String(STATIC.recovery_action || "");
   var planUrl = String(STATIC.plan_url || "");
   var sessionId = String(STATIC.session_id || "");
+  var checkEvidence = STATIC.check_evidence || {state:"not_run",checked_at:""};
 
   function decisionValues(){
     var values = {}, groups = document.querySelectorAll("[data-decision]");
@@ -380,6 +400,11 @@ def _client_script(static: Mapping[str, Any]) -> str:
     return count;
   }
   function safeDigest(value){ return /^[0-9a-f]{64}$/.test(String(value || "")); }
+  function safeCheckedAt(value){
+    value = String(value || "");
+    return /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)
+      ? value : "";
+  }
   function safePlanUrl(value){
     value = String(value || "");
     if(value === "plan.html") return value;
@@ -450,30 +475,46 @@ def _client_script(static: Mapping[str, Any]) -> str:
     document.body.setAttribute("data-kit-change-status",status);
     var unresolved = unresolvedDecisionCount();
     statusLabel.textContent = labelFor(status, unresolved);
-    statusNote.textContent = detail || (active[status] ? active[status] + " the reviewed kit change." : "");
+    statusNote.textContent = detail || active[status] || "";
     if(state){
       var nextResult = String(state.result_sha256 || resultSha || "");
       var nextPlanUrl = String(state.plan_url || planUrl || "");
       resultSha = safeDigest(nextResult) ? nextResult : "";
       recoveryAction = next === "recovery_required" ? (resultSha ? "restore" : "recover") : "";
       planUrl = safePlanUrl(nextPlanUrl);
+      if(state.check_evidence && typeof state.check_evidence === "object"){
+        checkEvidence = {
+          state:String(state.check_evidence.state || "not_run"),
+          checked_at:safeCheckedAt(state.check_evidence.checked_at)
+        };
+      }
       var gaps = state.existing_gaps;
       if(gaps && typeof gaps === "object"){
         var count = Math.max(0,Number(gaps.count) || 0);
-        var checkedGaps = String(gaps.status || "") === "checked";
+        var checkedGaps = String(gaps.status || "") === "checked"
+          && String(checkEvidence.state || "") === "apply_time";
         gapCount.textContent = checkedGaps ? (count ? String(count) : "None") : "Not checked";
         gapNote.hidden = !(checkedGaps && count);
         gapNote.textContent = checkedGaps && count
-          ? "This change records " + String(count) + " existing "
+          ? "The Apply-time check recorded " + String(count) + " existing "
             + (count === 1 ? "problem" : "problems")
-            + ". It does not hide them or mark them as fixed."
+            + ". It did not hide them or mark them as fixed. "
+            + "Later project changes are not included."
           : "";
       }
     }
     var checked = status === "complete" || status === "adoption_required";
-    kitFilesCheck.textContent = checked ? "Checked" : "Not checked";
-    newWorkCheck.textContent = status === "complete" ? "Ready" :
-      (status === "adoption_required" ? "Cleanup remains" : "Not checked");
+    var applyTime = checked && String(checkEvidence.state || "") === "apply_time";
+    var time = safeCheckedAt(checkEvidence.checked_at);
+    checkedAt.textContent = applyTime
+      ? (time || "Time not recorded (older session)") : "Not run";
+    checkScope.textContent = applyTime
+      ? "This check ran when Apply finished. Later project changes are not included."
+      : "The Apply-time check has not finished.";
+    kitFilesCheck.textContent = applyTime ? "Passed at Apply" : "Not checked";
+    newWorkCheck.textContent = status === "complete" && applyTime ? "Passed at Apply" :
+      (status === "adoption_required" && applyTime
+        ? "Problems recorded at Apply" : "Not checked");
     applyStep(status);
     updateActions();
   }
@@ -546,6 +587,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     digest = _text(data.get("plan_sha256")).lower()
     raw_result_sha = _text(data.get("result_sha256")).lower()
     result_sha = raw_result_sha if _DIGEST_RE.fullmatch(raw_result_sha) else ""
+    evidence_state, checked_at = _check_evidence(data.get("check_evidence"))
     counts = _object(data.get("counts"))
     count_values = {name: _integer(counts.get(name)) for name, _label in COUNT_FIELDS}
     decisions = _items(data.get("decisions"))
@@ -572,6 +614,12 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     if status == "recovery_required" and raw_result_sha and not result_sha:
         status = "blocked"
         blockers.append("The exact recovery fingerprint is malformed.")
+    if (
+        "check_evidence" not in data
+        and status in {"complete", "adoption_required"}
+        and result_sha
+    ):
+        evidence_state = "apply_time"
 
     title = "Add kit to this project" if mode == "install" else "Upgrade this kit"
     action = "Add kit" if mode == "install" else "Upgrade kit"
@@ -584,9 +632,9 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
             "needs_decision": "Answer the choices below before continuing.",
             "blocked": "Resolve the blockers below before continuing.",
             "applying": "Applying the reviewed kit change.",
-            "checking": "Checking the result without starting Godot.",
-            "complete": "The reviewed kit change was applied and checked.",
-            "adoption_required": "The kit works. Existing project cleanup remains.",
+            "checking": "Running the Apply-time check without starting Godot.",
+            "complete": "The Apply-time check passed. Later project changes are not included.",
+            "adoption_required": "Project problems were recorded at Apply. Later project changes are not included.",
             "recovery_required": "The previous project state still needs to be restored.",
             "restored": "The project is back to its previous state.",
             "failed": "The kit change did not finish.",
@@ -600,10 +648,13 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     gaps_value = data.get("existing_gaps")
     if isinstance(gaps_value, Mapping):
         gap_count = _integer(gaps_value.get("count"))
-        gaps_checked = _text(gaps_value.get("status"), "not_checked") == "checked"
+        gaps_checked = (
+            _text(gaps_value.get("status"), "not_checked") == "checked"
+            and evidence_state == "apply_time"
+        )
     else:
         gap_count = _integer(gaps_value)
-        gaps_checked = True
+        gaps_checked = evidence_state == "apply_time"
     recovery = _text(data.get("recovery"), "Previous state will be saved")
     review_url = _text(board_url_hint or data.get("review_url"))
     review_link = _safe_review_link(review_url)
@@ -636,8 +687,9 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         noun = "problem" if gap_count == 1 else "problems"
         gap_note = (
             '<p class="gap-note" id="kit-change-gap-note">'
-            f"This change records {gap_count} existing {noun}. "
-            "It does not hide them or mark them as fixed.</p>"
+            f"The Apply-time check recorded {gap_count} existing {noun}. "
+            "It did not hide them or mark them as fixed. "
+            "Later project changes are not included.</p>"
         )
 
     link_copy = review_link or "the loopback link printed by your agent"
@@ -668,6 +720,10 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         ),
         "plan_sha256": digest,
         "result_sha256": result_sha if _DIGEST_RE.fullmatch(result_sha) else "",
+        "check_evidence": {
+            "state": evidence_state,
+            "checked_at": checked_at,
+        },
         "recovery_action": recovery_action,
         "plan_url": plan_url,
     }
@@ -682,6 +738,30 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     restore_visible = status in {"complete", "adoption_required"} or recovery_action == "restore"
     restore_hidden = "" if restore_visible else " hidden"
     restore_label = "Retry restore" if recovery_action == "restore" else "Restore previous state"
+    apply_check_finished = (
+        status in {"complete", "adoption_required"}
+        and evidence_state == "apply_time"
+    )
+    check_time = (
+        checked_at
+        if checked_at
+        else "Time not recorded (older session)"
+        if apply_check_finished
+        else "Not run"
+    )
+    check_scope = (
+        "This check ran when Apply finished. Later project changes are not included."
+        if apply_check_finished
+        else "The Apply-time check has not finished."
+    )
+    kit_files_result = "Passed at Apply" if apply_check_finished else "Not checked"
+    protection_result = (
+        "Passed at Apply"
+        if status == "complete" and apply_check_finished
+        else "Problems recorded at Apply"
+        if status == "adoption_required" and apply_check_finished
+        else "Not checked"
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -741,13 +821,16 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     {_files_html(files)}
   </section>
   <section class="section" aria-labelledby="check-title">
-    <h2 id="check-title">Check result</h2>
+    <h2 id="check-title">Apply-time check</h2>
+    <p id="kit-change-check-scope">{_esc(check_scope)}</p>
     <dl class="check-list">
-      <div><dt>Kit files</dt><dd id="kit-change-kit-files-check">{"Checked" if status in {"complete", "adoption_required"} else "Not checked"}</dd></div>
-      <div><dt>New-work protection</dt><dd id="kit-change-new-work-check">{"Ready" if status == "complete" else "Cleanup remains" if status == "adoption_required" else "Not checked"}</dd></div>
+      <div><dt>When</dt><dd id="kit-change-checked-at">{_esc(check_time)}</dd></div>
+      <div><dt>Kit files</dt><dd id="kit-change-kit-files-check">{_esc(kit_files_result)}</dd></div>
+      <div><dt>New-work protection</dt><dd id="kit-change-new-work-check">{_esc(protection_result)}</dd></div>
       <div><dt>Godot check</dt><dd>Not run; separate approval required</dd></div>
     </dl>
     {gap_note}
+    <p>For the current project, ask your agent to run <code>kit verify --static</code>.</p>
   </section>
   <fieldset id="kit-change-controls" class="interactive-actions section" disabled>
     <legend class="eyebrow">Action</legend>

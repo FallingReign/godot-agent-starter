@@ -1405,6 +1405,7 @@ class KitCliTest(unittest.TestCase):
                 "blockers": [],
                 "detail": "ready",
                 "result_sha256": "",
+                "check_evidence": {"state": "not_run", "checked_at": ""},
                 "plan_url": "",
             },
         }
@@ -1455,6 +1456,47 @@ class KitCliTest(unittest.TestCase):
         prepare.assert_called_once_with(runtime, target, release, "install", game_root=None)
         board.assert_called_once_with(ROOT.resolve(), target, runtime, session_id)
         status.assert_called_once_with(runtime, session_id, plan_url=review_url)
+
+    def test_install_repeated_prepare_reports_its_terminal_status(self) -> None:
+        session_id = "a" * 64
+        with tempfile.TemporaryDirectory(prefix="kit-cli-install-terminal-") as temporary:
+            target = Path(temporary).resolve() / "brownfield"
+            target.mkdir()
+            release = Path(temporary).resolve() / "release.zip"
+            release.write_bytes(b"release")
+            runtime = Path(temporary).resolve() / "runtime"
+            finished = self._kit_change_result(session_id, status="complete")
+            finished["kit_change"].update({
+                "detail": "The Apply-time check passed.",
+                "result_sha256": "f" * 64,
+                "check_evidence": {
+                    "state": "apply_time",
+                    "checked_at": "2026-09-02T01:02:03Z",
+                },
+            })
+            review_url = (
+                "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+            )
+            process = self.completed()
+            with mock.patch.object(
+                kit, "_kit_change_runtime", return_value=runtime
+            ), mock.patch.object(
+                kit.kit_change_controller, "prepare", return_value=finished
+            ), mock.patch.object(
+                kit,
+                "_register_kit_change_board",
+                return_value=(review_url, {"ok": True}, process),
+            ), mock.patch.object(
+                kit.kit_change_controller, "status", return_value=finished
+            ):
+                code, output = self.invoke(
+                    "install", str(target), "--release", str(release), "--json"
+                )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("complete", payload["status"])
+        self.assertEqual("complete", payload["kit_change"]["status"])
 
     def test_source_checkout_requires_an_explicit_built_release(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kit-cli-release-") as temporary:
