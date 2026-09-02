@@ -1092,9 +1092,14 @@ def _authenticated_active_surfaces(
             "installed-kit-untrusted", "the active release manifest is unreadable"
         ) from exc
     files = release_manifest.get("files") if isinstance(release_manifest, dict) else None
-    if not isinstance(files, list):
+    if (
+        _sha256(manifest_content) != active["release_manifest_sha256"]
+        or not isinstance(release_manifest, dict)
+        or _canonical(release_manifest) != manifest_content
+        or not isinstance(files, list)
+    ):
         raise KitChangeError(
-            "installed-kit-untrusted", "the active release manifest has no exact file list"
+            "installed-kit-untrusted", "the active release manifest identity changed"
         )
     members: dict[str, Any] = {
         RELEASE_MANIFEST: release.ArchiveMember(
@@ -1102,7 +1107,9 @@ def _authenticated_active_surfaces(
         )
     }
     for entry in files:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(entry) != {
+            "path", "bytes", "sha256", "mode"
+        }:
             raise KitChangeError(
                 "installed-kit-untrusted", "the active release file list is malformed"
             )
@@ -1113,12 +1120,24 @@ def _authenticated_active_surfaces(
                 "installed-kit-untrusted", "the active release member mode is malformed"
             )
         member_path = installation.core_root.joinpath(*PurePosixPath(relative).parts)
+        content = _stable_bytes(
+            member_path,
+            limit=getattr(release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES),
+        )
+        if (
+            not isinstance(entry["bytes"], int)
+            or isinstance(entry["bytes"], bool)
+            or entry["bytes"] != len(content)
+            or not isinstance(entry["sha256"], str)
+            or _sha256(content) != entry["sha256"]
+        ):
+            raise KitChangeError(
+                "installed-kit-untrusted",
+                f"the active release member {relative} changed after authentication",
+            )
         members[relative] = release.ArchiveMember(
             relative,
-            _stable_bytes(
-                member_path,
-                limit=getattr(release, "MAX_FILE_BYTES", MAX_MANAGED_FILE_BYTES),
-            ),
+            content,
             int(mode, 8),
         )
     if not _core_matches(installation.core_root, members):
@@ -1128,6 +1147,15 @@ def _authenticated_active_surfaces(
         )
     report = {"version": active["kit_version"]}
     _manifest, surfaces, _retired = _install_manifest(report, members)
+    if (
+        _sha256(_member_bytes(members, INSTALL_MANIFEST))
+        != active["install_manifest_sha256"]
+        or _stable_bytes(installation.current_path) != raw_state
+    ):
+        raise KitChangeError(
+            "installed-kit-untrusted",
+            "the active kit identity changed while upgrade was being prepared",
+        )
     return surfaces
 
 

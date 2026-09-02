@@ -673,6 +673,25 @@ class KitChangeTest(unittest.TestCase):
 
         self.assertEqual("installed-kit-untrusted", raised.exception.code)
 
+    def test_core_change_after_launcher_authentication_blocks_upgrade(self) -> None:
+        self._preview_and_apply()
+        original = kit_change.managed_launcher.resolve_installation
+
+        def change_after_authentication(project: Path):
+            installation = original(project)
+            (installation.core_root / "kit.py").write_bytes(b"changed after authentication\n")
+            return installation
+
+        with mock.patch.object(
+            kit_change.managed_launcher,
+            "resolve_installation",
+            side_effect=change_after_authentication,
+        ):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change.preview(self.root, self.archive)
+
+        self.assertEqual("installed-kit-untrusted", raised.exception.code)
+
     def test_exact_transaction_can_be_inspected_after_apply(self) -> None:
         decision = kit_change.preview(self.root, self.archive)
         result = kit_change.apply(
