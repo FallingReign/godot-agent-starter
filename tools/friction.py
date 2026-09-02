@@ -26,7 +26,6 @@ tool is worth building, and that judgement is the human's.
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -37,6 +36,7 @@ TOOLS = Path(__file__).resolve().parent
 CORE_ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
+import process_supervisor  # noqa: E402
 
 CONTEXT = project_context.load_active_context(CORE_ROOT)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
@@ -49,13 +49,14 @@ REVISION_THRESHOLD = 3
 
 
 def git(*args: str) -> Tuple[int, str]:
-    if not shutil.which("git"):
-        return 1, ""
     try:
-        r = subprocess.run(["git", "-C", str(ROOT), *args],
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(ROOT, CORE_ROOT)
+        )
+        r = subprocess.run([executable, "-C", str(ROOT), *args],
                            capture_output=True, text=True, timeout=30)
         return r.returncode, r.stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return 1, ""
 
 
@@ -134,7 +135,8 @@ def main() -> int:
     since = args.since or baseline()
 
     print("== authoring friction ==")
-    if not shutil.which("git"):
+    available, _output = git("--version")
+    if available != 0:
         print("  git not found; nothing to measure")
         return 0
     if since:

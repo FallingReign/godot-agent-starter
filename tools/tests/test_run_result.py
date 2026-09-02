@@ -18,10 +18,14 @@ REPOSITORY = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
 import run_result  # noqa: E402
+import process_supervisor  # noqa: E402
 
 
 def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(root), *args], check=True,
+    executable = process_supervisor.resolve_ordinary_executable(
+        "git", excluded_roots=(root, REPOSITORY)
+    )
+    result = subprocess.run([executable, "-C", str(root), *args], check=True,
                             capture_output=True, text=True)
     return result.stdout.strip()
 
@@ -101,7 +105,11 @@ class CurrentDispatchPolicyTest(unittest.TestCase):
 
 class RunResultTest(unittest.TestCase):
     def setUp(self) -> None:
-        if not run_result.git_head(Path.cwd()) and not __import__("shutil").which("git"):
+        try:
+            process_supervisor.resolve_ordinary_executable(
+                "git", excluded_roots=(REPOSITORY,)
+            )
+        except (FileNotFoundError, ValueError):
             self.skipTest("git is not installed")
         self.root = _scratch()
         _git(self.root, "init")

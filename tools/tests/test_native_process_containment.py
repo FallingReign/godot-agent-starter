@@ -7,8 +7,10 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -411,6 +413,193 @@ class ProcessLivenessTriState(unittest.TestCase):
                 ):
             state = process_supervisor.pid_liveness(4242)
         self.assertEqual(process_supervisor.PID_UNKNOWN, state)
+
+
+class ExecutableResolution(unittest.TestCase):
+    def test_ordinary_interpreter_is_accepted(self) -> None:
+        candidate = (
+            Path(sys.base_prefix) / Path(sys.executable).name
+            if os.name == "nt"
+            else Path(sys.executable).resolve(strict=True)
+        )
+        self.assertEqual(
+            str(candidate),
+            process_supervisor.isolated_python_executable(candidate),
+        )
+
+    def test_current_app_exec_alias_uses_exact_base_prefix_interpreter(self) -> None:
+        alias = Path(r"C:\Users\person\AppData\Local\Microsoft\WindowsApps\python.exe")
+        ordinary = Path(r"C:\Program Files\WindowsApps\Python\python.exe")
+        with mock.patch.object(
+            process_supervisor.sys, "executable", str(alias)
+        ), mock.patch.object(
+            process_supervisor.sys, "base_prefix", str(ordinary.parent)
+        ), mock.patch.object(
+            process_supervisor,
+            "_windows_app_execution_alias",
+            return_value=True,
+        ), mock.patch.object(
+            process_supervisor,
+            "validated_executable",
+            side_effect=[ValueError("alias"), str(ordinary)],
+        ) as validate:
+            selected = process_supervisor.isolated_python_executable(alias)
+        self.assertEqual(str(ordinary), selected)
+        self.assertEqual(
+            [
+                mock.call(alias, label="isolated Python interpreter"),
+                mock.call(ordinary, label="isolated Python interpreter"),
+            ],
+            validate.call_args_list,
+        )
+
+    def test_app_exec_alias_requires_exact_tag_and_shape(self) -> None:
+        alias = mock.Mock()
+        alias.is_absolute.return_value = True
+        info = mock.Mock(
+            st_mode=stat.S_IFREG,
+            st_size=0,
+            st_file_attributes=0x0400,
+            st_reparse_tag=0x8000001B,
+        )
+        alias.lstat.return_value = info
+        with mock.patch.object(
+            process_supervisor, "_is_windows", return_value=True
+        ):
+            self.assertTrue(
+                process_supervisor._windows_app_execution_alias(alias)
+            )
+            info.st_reparse_tag = 0xA000000C
+            self.assertFalse(
+                process_supervisor._windows_app_execution_alias(alias)
+            )
+            info.st_reparse_tag = 0x8000001B
+            info.st_size = 1
+            self.assertFalse(
+                process_supervisor._windows_app_execution_alias(alias)
+            )
+
+    def test_relative_interpreter_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            process_supervisor.isolated_python_executable("python.exe")
+
+    def test_other_redirected_current_interpreter_is_refused(self) -> None:
+        redirected = Path(r"C:\redirected\python.exe")
+        with mock.patch.object(
+            process_supervisor.sys, "executable", str(redirected)
+        ), mock.patch.object(
+            process_supervisor,
+            "validated_executable",
+            side_effect=ValueError("redirected"),
+        ), mock.patch.object(
+            process_supervisor,
+            "_windows_app_execution_alias",
+            return_value=False,
+        ), self.assertRaisesRegex(ValueError, "redirected"):
+            process_supervisor.isolated_python_executable(redirected)
+
+    def test_posix_safe_symlink_resolves_to_exact_target(self) -> None:
+        if os.name == "nt":
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            link = directory / "git"
+            target = Path(sys.executable).resolve(strict=True)
+            link.symlink_to(target)
+            selected = process_supervisor.resolve_ordinary_executable(
+                "git",
+                environment={"PATH": str(directory)},
+                excluded_roots=(ROOT,),
+            )
+        self.assertEqual(str(target), selected)
+
+    def test_posix_exact_current_interpreter_symlink_resolves(self) -> None:
+        if os.name == "nt":
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            alias = Path(temporary) / "python"
+            target = Path(sys.executable).resolve(strict=True)
+            alias.symlink_to(target)
+            with mock.patch.object(
+                process_supervisor.sys, "executable", str(alias)
+            ):
+                selected = process_supervisor.isolated_python_executable(alias)
+        self.assertEqual(str(target), selected)
+
+    def test_posix_arbitrary_interpreter_symlink_is_refused(self) -> None:
+        if os.name == "nt":
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            alias = Path(temporary) / "python"
+            alias.symlink_to(Path(sys.executable).resolve(strict=True))
+            with self.assertRaises(ValueError):
+                process_supervisor.isolated_python_executable(alias)
+
+    def test_posix_symlink_into_project_is_refused(self) -> None:
+        if os.name == "nt":
+            return
+        with _project() as root, tempfile.TemporaryDirectory() as temporary:
+            target = root / "git"
+            target.write_bytes(Path(sys.executable).read_bytes())
+            target.chmod(0o755)
+            link = Path(temporary) / "git"
+            link.symlink_to(target)
+            with self.assertRaises(FileNotFoundError):
+                process_supervisor.resolve_ordinary_executable(
+                    "git",
+                    environment={"PATH": temporary},
+                    excluded_roots=(ROOT,),
+                )
+
+    def test_windows_target_local_git_node_and_cmd_never_execute(self) -> None:
+        if os.name != "nt":
+            return
+        with _project() as target:
+            marker = target / "hijacked.txt"
+            for name in ("git.cmd", "node.cmd", "cmd.cmd"):
+                (target / name).write_text(
+                    f'@echo off\r\n>"{marker}" echo {name}\r\n',
+                    encoding="utf-8",
+                )
+            environment = dict(os.environ)
+            environment["PATH"] = str(target) + os.pathsep + environment["PATH"]
+            git = process_supervisor.resolve_ordinary_executable(
+                "git",
+                environment=environment,
+                excluded_roots=(target, ROOT),
+            )
+            with self.assertRaises(FileNotFoundError):
+                process_supervisor.resolve_ordinary_executable(
+                    "node",
+                    environment={"PATH": str(target)},
+                    excluded_roots=(target, ROOT),
+                )
+            try:
+                node = process_supervisor.resolve_ordinary_executable(
+                    "node",
+                    environment=environment,
+                    excluded_roots=(target, ROOT),
+                )
+            except FileNotFoundError:
+                node = ""
+            cmd = process_supervisor.windows_command_processor()
+            commands = [
+                [git, "--version"],
+                [cmd, "/d", "/c", "exit", "0"],
+            ]
+            if node:
+                commands.append([node, "--version"])
+            for command in commands:
+                completed = subprocess.run(
+                    command,
+                    cwd=target,
+                    env=environment,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, command)
+            self.assertFalse(marker.exists())
 
 
 class BoundedProcessLifecycle(unittest.TestCase):

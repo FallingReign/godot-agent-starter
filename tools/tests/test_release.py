@@ -22,6 +22,7 @@ REPOSITORY = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
 import release  # noqa: E402
+import process_supervisor  # noqa: E402
 
 
 def _scratch() -> Path:
@@ -56,8 +57,11 @@ def _write(root: Path, relative: str, content: str | bytes) -> Path:
 
 
 def _git(root: Path, *arguments: str) -> str:
+    executable = process_supervisor.resolve_ordinary_executable(
+        "git", excluded_roots=(root, REPOSITORY)
+    )
     completed = subprocess.run(
-        ["git", "-C", str(root), *arguments],
+        [executable, "-C", str(root), *arguments],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -274,7 +278,10 @@ def _extract_exact(path: Path, destination: Path) -> None:
 def _make_directory_redirect(link: Path, target: Path) -> None:
     if os.name == "nt":
         completed = subprocess.run(
-            ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            [
+                process_supervisor.windows_command_processor(),
+                "/d", "/c", "mklink", "/J", str(link), str(target),
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -616,7 +623,10 @@ class TestManagedInstallContract(ReleaseTestCase):
                 "kit.cmd",
                 release._managed_windows_launcher(launcher_content),
             )
-            command = ["cmd", "/d", "/c", str(stable)]
+            command = [
+                process_supervisor.windows_command_processor(),
+                "/d", "/c", str(stable),
+            ]
         else:
             stable = _write(
                 project,
@@ -702,7 +712,10 @@ class TestManagedInstallContract(ReleaseTestCase):
         redirected = project / ".agent-kit"
         if os.name == "nt":
             created = subprocess.run(
-                ["cmd", "/d", "/c", "mklink", "/J", str(redirected), str(external)],
+                [
+                    process_supervisor.windows_command_processor(),
+                    "/d", "/c", "mklink", "/J", str(redirected), str(external),
+                ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -742,7 +755,10 @@ class TestManagedInstallContract(ReleaseTestCase):
         environment["KIT_PYTHON"] = sys.executable
         if os.name == "nt":
             stable = _write(copied, "kit.cmd", (REPOSITORY / "kit.cmd").read_bytes())
-            command = ["cmd", "/d", "/c", str(stable)]
+            command = [
+                process_supervisor.windows_command_processor(),
+                "/d", "/c", str(stable),
+            ]
         else:
             stable = _write(copied, "kit", (REPOSITORY / "kit").read_bytes())
             stable.chmod(0o755)
@@ -804,7 +820,10 @@ class TestManagedInstallContract(ReleaseTestCase):
         redirected = project / ".agent-kit"
         if os.name == "nt":
             created = subprocess.run(
-                ["cmd", "/d", "/c", "mklink", "/J", str(redirected), str(target)],
+                [
+                    process_supervisor.windows_command_processor(),
+                    "/d", "/c", "mklink", "/J", str(redirected), str(target),
+                ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -814,7 +833,10 @@ class TestManagedInstallContract(ReleaseTestCase):
             )
             self.assertEqual(0, created.returncode, created.stdout + created.stderr)
             target.rmdir()
-            command = ["cmd", "/d", "/c", str(stable)]
+            command = [
+                process_supervisor.windows_command_processor(),
+                "/d", "/c", str(stable),
+            ]
         else:
             target.rmdir()
             redirected.symlink_to(target, target_is_directory=True)

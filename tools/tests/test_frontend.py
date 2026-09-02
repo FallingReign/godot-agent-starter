@@ -38,6 +38,7 @@ import page_parts  # noqa: E402
 import board_client  # noqa: E402
 import browser_check  # noqa: E402
 import plan_html  # noqa: E402
+import process_supervisor  # noqa: E402
 import retro_html  # noqa: E402
 
 
@@ -2351,8 +2352,11 @@ class Harness(unittest.TestCase):
         return target
 
     def _run(self, page: str) -> dict:
-        node = shutil.which("node")
-        if not node:
+        try:
+            node = process_supervisor.resolve_ordinary_executable(
+                "node", excluded_roots=(ROOT,)
+            )
+        except (FileNotFoundError, ValueError):
             self.skipTest("node not on PATH; DOM harness skipped")
         if page == "retro.html":
             target = self._retro_fixture()

@@ -18,6 +18,7 @@ sys.path.insert(0, str(TOOLS))
 
 import session_digest    # noqa: E402
 import session_evidence  # noqa: E402
+import process_supervisor  # noqa: E402
 
 
 def _scratch() -> Path:
@@ -820,13 +821,22 @@ class TestCommandLineSnapshot(unittest.TestCase):
                 root, "cli-session", str(repo),
                 (_event("user.message", content="CLI correction.") + "\n").encode("utf-8"))
 
-            completed = subprocess.run([
+            command = process_supervisor.isolated_python_script_command(
                 sys.executable,
-                str(TOOLS / "session_digest.py"),
+                TOOLS / "session_digest.py",
+                TOOLS.parent,
                 "--repo", str(repo),
                 "--sessions", str(root),
                 "--snapshot", str(output),
-            ], capture_output=True, text=True, timeout=20, check=False)
+            )
+            completed = subprocess.run(
+                command,
+                env=process_supervisor.isolated_python_environment(),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn('S1:H1 "CLI correction."', completed.stdout)
@@ -837,13 +847,14 @@ class TestCommandLineSnapshot(unittest.TestCase):
                 snapshots[0].stem,
                 hashlib.sha256(snapshots[0].read_bytes()).hexdigest(),
             )
-            repeated = subprocess.run([
-                sys.executable,
-                str(TOOLS / "session_digest.py"),
-                "--repo", str(repo),
-                "--sessions", str(root),
-                "--snapshot", str(output),
-            ], capture_output=True, text=True, timeout=20, check=False)
+            repeated = subprocess.run(
+                command,
+                env=process_supervisor.isolated_python_environment(),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
             self.assertEqual(completed.stdout, repeated.stdout)
             self.assertEqual(len(list(output.glob("*.json"))), 1)

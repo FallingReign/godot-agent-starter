@@ -430,8 +430,12 @@ def _is_generated(relative: str) -> bool:
 
 
 def _run_git(root: Path, *arguments: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    executable = process_supervisor.resolve_ordinary_executable(
+        "git",
+        excluded_roots=(root, CORE_ROOT),
+    )
     return subprocess.run(
-        ["git", "-C", str(root), *arguments],
+        [executable, "-C", str(root), *arguments],
         capture_output=True,
         timeout=timeout,
         check=False,
@@ -523,7 +527,7 @@ def repository_fingerprint(root: Path) -> dict[str, Any]:
             "head": head,
             "untracked": len(untracked),
         }
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {
             "available": False,
             "digest": None,

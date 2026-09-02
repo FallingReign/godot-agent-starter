@@ -548,19 +548,36 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
     allowed_gate_skips = (
         MAINTAINER_GATE_SKIPS if _maintainer_fixture_present(root) else frozenset()
     )
+    try:
+        git_command = [
+            process_supervisor.resolve_ordinary_executable(
+                "git", excluded_roots=(root, core_root)
+            ),
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ]
+    except (FileNotFoundError, ValueError):
+        git_command = [
+            process_supervisor.isolated_python_executable(sys.executable),
+            "-B",
+            "-I",
+            "-S",
+            "-c",
+            (
+                "import sys;"
+                "sys.stderr.write('trusted Git executable is unavailable\\n');"
+                "raise SystemExit(127)"
+            ),
+        ]
 
     with _exclusive_run(verification / "strict.lock"):
         commands = (
             (
                 "source-state",
-                [
-                    "git",
-                    "-C",
-                    str(root),
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                ],
+                git_command,
                 60,
                 _classify_source_state,
             ),

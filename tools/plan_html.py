@@ -36,7 +36,6 @@ import json
 import os
 import posixpath
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -226,13 +225,14 @@ def question_relation(question: Dict[str, Any], proposal: Dict[str, Any]) -> str
 
 
 def git(*args: str) -> Tuple[int, str]:
-    if not shutil.which("git"):
-        return 1, ""
     try:
-        p = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True,
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(ROOT, CORE_ROOT)
+        )
+        p = subprocess.run([executable, "-C", str(ROOT), *args], capture_output=True,
                            text=True, timeout=20)
         return p.returncode, p.stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return 1, ""
 
 
@@ -337,7 +337,7 @@ def touched_since(baseline: str) -> set | None:
     included: new work is usually untracked, and omitting it scopes the view to
     nothing while appearing to be complete.
     """
-    if not baseline or not shutil.which("git"):
+    if not baseline:
         return None
     pathspec = CONTEXT.git_pathspec
     code, tracked = git("diff", "--name-only", baseline, "--", pathspec)
@@ -367,7 +367,7 @@ def files_at_baseline(baseline: str) -> set | None:
     alone is not implementation authority because scope boundaries own an
     exact action as well as a path.
     """
-    if not baseline or not shutil.which("git"):
+    if not baseline:
         return None
     code, listing = git(
         "ls-tree", "-r", "--name-only", baseline, "--", CONTEXT.git_pathspec

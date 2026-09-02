@@ -26,6 +26,7 @@ import plan_html  # noqa: E402
 import project_context  # noqa: E402
 import sanitise  # noqa: E402
 import managed_launcher  # noqa: E402
+import process_supervisor  # noqa: E402
 
 
 def _canonical_json(value: dict) -> bytes:
@@ -38,9 +39,6 @@ def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
     """Create one fully validated managed core from selected source files."""
     marker = {"kind": managed_launcher.MARKER_KIND, "schema": 1}
     (project / managed_launcher.MARKER_NAME).write_bytes(_canonical_json(marker))
-    release_sha = hashlib.sha256(b"managed-layout-consumer-fixture").hexdigest()
-    core = project / ".agent-kit" / "releases" / release_sha
-    core.mkdir(parents=True)
     contents: dict[str, bytes] = {
         "INSTALL-MANIFEST.json": b'{"schema":1}\n',
         "LICENSE": b"MIT\n",
@@ -50,15 +48,12 @@ def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
         contents[relative] = (ROOT / relative).read_bytes()
     files = []
     for relative, content in sorted(contents.items()):
-        target = core.joinpath(*relative.split("/"))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        target.chmod(0o755 if relative.endswith(".py") else 0o644)
+        mode = 0o755 if relative.endswith(".py") else 0o644
         files.append({
             "path": relative,
             "bytes": len(content),
             "sha256": hashlib.sha256(content).hexdigest(),
-            "mode": "0755" if relative.endswith(".py") else "0644",
+            "mode": f"{mode:04o}",
         })
     manifest = {
         "schema": managed_launcher.MANIFEST_SCHEMA,
@@ -79,6 +74,22 @@ def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
         "files": files,
     }
     manifest_content = _canonical_json(manifest)
+    archive_members = {
+        relative: (
+            content,
+            0o755 if relative.endswith(".py") else 0o644,
+        )
+        for relative, content in contents.items()
+    }
+    archive_members[managed_launcher.MANIFEST_NAME] = (manifest_content, 0o644)
+    release_sha = managed_launcher._canonical_archive_sha256(archive_members)
+    core = project / ".agent-kit" / "releases" / release_sha
+    core.mkdir(parents=True)
+    for relative, content in sorted(contents.items()):
+        target = core.joinpath(*relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if relative.endswith(".py") else 0o644)
     (core / managed_launcher.MANIFEST_NAME).write_bytes(manifest_content)
     install_content = contents["INSTALL-MANIFEST.json"]
     active_release = {
@@ -297,18 +308,25 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
         environment = _managed_environment(project, core)
 
         checked = subprocess.run(
-            [sys.executable, str(core / "check.py"), "--only", "integrity"],
+            process_supervisor.isolated_python_script_command(
+                sys.executable, core / "check.py", core, "--only", "integrity"
+            ),
             cwd=project,
-            env=environment,
+            env=process_supervisor.isolated_python_environment(base=environment),
             capture_output=True,
             text=True,
             timeout=60,
             check=False,
         )
         accepted = subprocess.run(
-            [sys.executable, str(core / "check.py"), "--accept-gate-changes"],
+            process_supervisor.isolated_python_script_command(
+                sys.executable,
+                core / "check.py",
+                core,
+                "--accept-gate-changes",
+            ),
             cwd=project,
-            env=environment,
+            env=process_supervisor.isolated_python_environment(base=environment),
             capture_output=True,
             text=True,
             timeout=60,
@@ -354,9 +372,13 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
         ))
 
         result = subprocess.run(
-            [sys.executable, str(core / "arch.py"), "--json"],
+            process_supervisor.isolated_python_script_command(
+                sys.executable, core / "arch.py", core, "--json"
+            ),
             cwd=project,
-            env=_managed_environment(project, core),
+            env=process_supervisor.isolated_python_environment(
+                base=_managed_environment(project, core)
+            ),
             capture_output=True,
             text=True,
             timeout=60,
@@ -394,9 +416,13 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
         ))
 
         result = subprocess.run(
-            [sys.executable, str(core / "bootstrap.py"), "--json"],
+            process_supervisor.isolated_python_script_command(
+                sys.executable, core / "bootstrap.py", core, "--json"
+            ),
             cwd=project,
-            env=_managed_environment(project, core),
+            env=process_supervisor.isolated_python_environment(
+                base=_managed_environment(project, core)
+            ),
             capture_output=True,
             text=True,
             timeout=60,

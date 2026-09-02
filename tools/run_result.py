@@ -43,12 +43,21 @@ class DispatchWorkspaceError(RuntimeError):
     """An isolated worker workspace cannot be created or integrated safely."""
 
 
+def _git_executable(root: Path) -> str:
+    try:
+        return process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(root, CORE_ROOT)
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise DispatchWorkspaceError("trusted Git executable is unavailable") from exc
+
+
 def _git_result(root: Path, *arguments: str, timeout: int = 120,
                 environment: dict[str, str] | None = None
                 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            ["git", "-C", str(root), *arguments],
+            [_git_executable(root), "-C", str(root), *arguments],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -221,7 +230,8 @@ def prepare_workspace(root: Path, run_id: str, baseline_sha: str,
     try:
         cloned = subprocess.run(
             [
-                "git", "-c", "protocol.file.allow=always", "clone", "--no-local",
+                _git_executable(root),
+                "-c", "protocol.file.allow=always", "clone", "--no-local",
                 "--no-hardlinks", "--no-checkout", "--quiet",
                 clone_source, str(workspace),
             ],
@@ -326,10 +336,11 @@ def integrate_workspace(root: Path, workspace: Path, baseline_sha: str,
 def git_head(root: Path) -> str:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True,
+            [_git_executable(root), "rev-parse", "HEAD"],
+            cwd=str(root), capture_output=True,
             text=True, timeout=20,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, DispatchWorkspaceError, subprocess.SubprocessError):
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -337,10 +348,13 @@ def git_head(root: Path) -> str:
 def _changed_files(root: Path, before_sha: str, after_sha: str) -> tuple[list[str], str]:
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", before_sha, after_sha, "--"],
+            [
+                _git_executable(root),
+                "diff", "--name-only", before_sha, after_sha, "--",
+            ],
             cwd=str(root), capture_output=True, text=True, timeout=30,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, DispatchWorkspaceError, subprocess.SubprocessError) as exc:
         return [], str(exc)
     if result.returncode != 0:
         return [], (result.stderr or result.stdout).strip()
@@ -369,10 +383,10 @@ def _config_at_commit(root: Path, commit: str) -> dict:
         raise runtime_paths.RuntimeConfigError("dispatch baseline is not a Git object id")
     try:
         result = subprocess.run(
-            ["git", "show", f"{commit}:kit.config.json"],
+            [_git_executable(root), "show", f"{commit}:kit.config.json"],
             cwd=str(root), capture_output=True, text=True, timeout=20,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, DispatchWorkspaceError, subprocess.SubprocessError) as exc:
         raise runtime_paths.RuntimeConfigError(
             f"cannot read baseline kit.config.json: {exc}"
         ) from exc

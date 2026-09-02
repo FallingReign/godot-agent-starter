@@ -23,8 +23,10 @@ from typing import Any, Callable
 
 try:
     import design
+    import process_supervisor
 except ImportError:  # imported as tools.proposal_authority
     from tools import design  # type: ignore[no-redef]
+    from tools import process_supervisor  # type: ignore[no-redef]
 
 
 class AuthorityError(ValueError):
@@ -160,8 +162,12 @@ def baseline_exists(root: Path, baseline: object) -> bool:
     if not isinstance(baseline, str) or re.fullmatch(r"[0-9a-f]{40,64}", baseline) is None:
         return False
     try:
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git",
+            excluded_roots=(root, Path(__file__).resolve().parent.parent),
+        )
         result = subprocess.run(
-            ["git", "cat-file", "-e", f"{baseline}^{{commit}}"],
+            [executable, "cat-file", "-e", f"{baseline}^{{commit}}"],
             cwd=str(root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -169,7 +175,7 @@ def baseline_exists(root: Path, baseline: object) -> bool:
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
 

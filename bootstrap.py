@@ -75,6 +75,13 @@ QUIET = "--json" in sys.argv
 results = []
 
 
+def _ordinary_tool(name):
+    return process_supervisor.resolve_ordinary_executable(
+        name,
+        excluded_roots=(ROOT, CORE_ROOT),
+    )
+
+
 def _version_in(text):
     match = re.search(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])", text or "")
     return match.group(1) if match else ""
@@ -296,14 +303,16 @@ def check_dependency_lock():
 
 def check_git(initialise=False):
     """Inspect Git; initialise only after the explicit ``--init-git`` opt-in."""
-    if not shutil.which("git"):
+    try:
+        git = _ordinary_tool("git")
+    except (FileNotFoundError, ValueError):
         record("git", MANUAL, "not on PATH",
                "Install Git from https://git-scm.com/downloads then reopen the terminal")
         return False
-    rc, out = run(["git", "--version"])
+    rc, out = run([git, "--version"])
     ver = out.strip()
 
-    rc, inside = run(["git", "rev-parse", "--is-inside-work-tree"])
+    rc, inside = run([git, "rev-parse", "--is-inside-work-tree"])
     repository_exists = rc == 0 and inside.strip().lower() == "true"
 
     if not repository_exists:
@@ -324,14 +333,14 @@ def check_git(initialise=False):
             record("git-repo", MISSING, f"{ver}, no repository here",
                    "Run kit setup repository if this folder should be a repository")
             return False
-        rc, out = run(["git", "init"])
+        rc, out = run([git, "init"])
         if rc != 0:
             record("git-repo", MANUAL, "git init failed", out.strip()[:200])
             return False
         record("git-repo", OK, "initialised without staging or committing files")
         return True
 
-    rc, out = run(["git", "rev-parse", "HEAD"])
+    rc, out = run([git, "rev-parse", "HEAD"])
     if rc != 0:
         record("git-repo", OK, f"{ver}, repository present (no commits yet)")
         return False
@@ -341,11 +350,20 @@ def check_git(initialise=False):
 
 def check_uv():
     """Discover uv without installing it or invoking a network-capable tool run."""
-    if shutil.which("uv") or shutil.which("uvx"):
-        rc, out = run(["uv", "--version"])
-        record("uv", OK, out.strip() or "present")
-        return
-    if shutil.which("gdlint"):
+    for name in ("uv", "uvx"):
+        try:
+            executable = _ordinary_tool(name)
+        except (FileNotFoundError, ValueError):
+            continue
+        rc, out = run([executable, "--version"])
+        if rc == 0:
+            record("uv", OK, out.strip() or f"{name} present")
+            return
+    try:
+        _ordinary_tool("gdlint")
+    except (FileNotFoundError, ValueError):
+        pass
+    else:
         # uv is a convenience, not a requirement. If gdtoolkit already resolves,
         # a missing uv must not keep reporting the setup as incomplete.
         record("uv", OK, "not installed, not needed (gdlint already on PATH)")
@@ -365,6 +383,58 @@ def _gdtoolkit_environment(version):
     bindir = target / ("Scripts" if WIN else "bin")
     suffix = ".exe" if WIN else ""
     return target, bindir / f"gdlint{suffix}", bindir / f"python{suffix}"
+
+
+def _regular_private_path(path, *, directory):
+    candidate = Path(os.path.abspath(path))
+    info = candidate.lstat()
+    redirected = (
+        stat.S_ISLNK(info.st_mode)
+        or bool(
+            int(getattr(info, "st_file_attributes", 0))
+            & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        )
+        or candidate.resolve(strict=True) != candidate
+    )
+    expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if redirected or not expected:
+        raise ValueError(f"private tool path is redirected or invalid: {candidate}")
+    return candidate
+
+
+def _locked_private_gdtoolkit(lock):
+    artifact = lock["tools"]["gdtoolkit"]
+    version = artifact["version"]
+    target, gdlint, python = _gdtoolkit_environment(version)
+    canonical_root = ROOT.resolve(strict=True)
+    target = _regular_private_path(target, directory=True)
+    if target == canonical_root or not target.is_relative_to(canonical_root):
+        raise ValueError("private gdtoolkit path escapes the project")
+    _regular_private_path(gdlint.parent, directory=True)
+    gdlint = Path(
+        process_supervisor.validated_executable(
+            gdlint, label="private gdlint executable"
+        )
+    )
+    python = Path(
+        process_supervisor.validated_executable(
+            python, label="private Python interpreter"
+        )
+    )
+    wheel = _regular_private_path(target / artifact["filename"], directory=False)
+    before = wheel.lstat()
+    content = wheel.read_bytes()
+    after = wheel.lstat()
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or len(content) != int(artifact["bytes"])
+        or hashlib.sha256(content).hexdigest() != artifact["sha256"]
+    ):
+        raise ValueError("private gdtoolkit wheel does not match the dependency lock")
+    return target, gdlint, python
 
 
 def _install_gdtoolkit(lock):
@@ -401,7 +471,10 @@ def _install_gdtoolkit(lock):
         return
     try:
         rc, out = run(
-            [sys.executable, "-B", "-I", "-S", "-m", "venv", str(target)],
+            [
+                process_supervisor.isolated_python_executable(sys.executable),
+                "-B", "-I", "-S", "-m", "venv", "--copies", str(target),
+            ],
             timeout=180,
         )
         if rc != 0:
@@ -429,7 +502,6 @@ def _install_gdtoolkit(lock):
         if rc != 0:
             raise RuntimeError("canonical PyPI install failed: "
                                + " | ".join(out.strip().splitlines()[-5:]))
-        wheel.unlink(missing_ok=True)
         rc, out = run([str(private_gdlint), "--version"], timeout=60)
         if rc != 0 or _version_in(out) != version:
             raise RuntimeError(
@@ -450,16 +522,20 @@ def check_gdtoolkit(lock, install=False):
     requirement = f"gdtoolkit=={version}" if version else "the locked gdtoolkit version"
     if lock and version:
         try:
-            _target, local_gdlint, _local_python = _gdtoolkit_environment(version)
-            if local_gdlint.is_file():
-                rc, out = run([str(local_gdlint), "--version"])
-                if rc == 0 and _version_in(out) == version:
-                    record("gdtoolkit", OK,
-                           f"locked {version} in project-private runtime")
-                    return
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            _locked_private_gdtoolkit(lock)
+        except (OSError, ValueError, KeyError, TypeError):
             pass
-    found = shutil.which("gdlint")
+        else:
+            record(
+                "gdtoolkit",
+                OK,
+                f"locked {version} private files present; not launched during diagnosis",
+            )
+            return
+    try:
+        found = _ordinary_tool("gdlint")
+    except (FileNotFoundError, ValueError):
+        found = ""
     if found:
         rc, out = run([found, "--version"])
         detail = out.strip().splitlines()[-1][:80] if out.strip() else "gdlint on PATH"

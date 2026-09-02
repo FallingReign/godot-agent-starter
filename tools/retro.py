@@ -116,8 +116,18 @@ def _is_link_or_reparse(path: Path) -> bool:
 
 def sh(*args: str, cwd: Path | None = None) -> str:
     try:
+        if not args or args[0] != "git":
+            return ""
+        selected_root = (cwd or ROOT).resolve(strict=True)
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(selected_root, CORE_ROOT)
+        )
         r = subprocess.run(
-            args, cwd=str(cwd or ROOT), capture_output=True, text=True, timeout=30
+            (executable, *args[1:]),
+            cwd=str(selected_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         return r.stdout.strip()
     except Exception:

@@ -12,6 +12,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import re
 import shutil
 import unittest
@@ -213,7 +214,11 @@ class StrictSuccessTests(StrictFixture):
         )
         self.assertNotIn("authenticated", json.dumps(report["authority_receipt"]).lower())
         self.assertEqual(len(runner.commands), 10)
-        self.assertEqual("git", runner.commands[0][0])
+        self.assertTrue(Path(runner.commands[0][0]).is_absolute())
+        self.assertEqual(
+            "git.exe" if os.name == "nt" else "git",
+            Path(runner.commands[0][0]).name,
+        )
         self.assertIn("doctor", runner.commands[1])
         self.assertEqual(runner.commands[2][7], str(self.root / "check.py"))
         self.assertIn("unittest", runner.commands[3])
@@ -430,6 +435,30 @@ class StrictFailureTests(StrictFixture):
 
 
 class StrictBlockedTests(StrictFixture):
+    def test_unavailable_git_becomes_a_blocked_source_stage(self) -> None:
+        commands: list[list[str]] = []
+
+        def runner(command, _cwd, _timeout, _environment):
+            commands.append([str(item) for item in command])
+            return strict_verify.ProcessOutcome(
+                127, "", "trusted Git executable is unavailable\n"
+            )
+
+        with mock.patch.object(
+            strict_verify.process_supervisor,
+            "resolve_ordinary_executable",
+            side_effect=ValueError("redirected"),
+        ):
+            report, code = self.run_with(runner)
+
+        self.assertEqual(strict_verify.EXIT_BLOCKED, code)
+        self.assertEqual(1, len(commands))
+        self.assertEqual(["-B", "-I", "-S", "-c"], commands[0][1:5])
+        self.assertEqual("blocked", report["stages"][0]["status"])
+        self.assertTrue(all(
+            stage["status"] == "not_run" for stage in report["stages"][1:]
+        ))
+
     def test_missing_legal_metadata_is_blocked_not_skipped(self) -> None:
         (self.root / "LICENSE").unlink()
         runner = FakeRunner()

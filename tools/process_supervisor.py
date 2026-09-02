@@ -24,6 +24,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import re
 import select
 import signal
 import stat
@@ -146,6 +147,187 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _reparse(info: object) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+
+def _windows_app_execution_alias(path: Path) -> bool:
+    """Recognise only Microsoft's zero-byte AppExecLink interpreter alias."""
+    if not _is_windows() or not path.is_absolute():
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_size == 0
+        and _reparse(info)
+        and int(getattr(info, "st_reparse_tag", 0)) == 0x8000001B
+    )
+
+
+def _posix_current_interpreter_target(path: Path) -> Path | None:
+    """Resolve only the exact running POSIX interpreter symlink outside cwd."""
+    if _is_windows() or not path.is_absolute():
+        return None
+    try:
+        info = path.lstat()
+        target = path.resolve(strict=True)
+        target_info = target.lstat()
+        cwd = Path.cwd().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if (
+        not stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(target_info.st_mode)
+        or not os.access(target, os.X_OK)
+        or path == cwd
+        or path.is_relative_to(cwd)
+        or target == cwd
+        or target.is_relative_to(cwd)
+    ):
+        return None
+    return target
+
+
+def validated_executable(executable: Path | str, *, label: str) -> str:
+    """Validate one exact ordinary executable path without following redirects."""
+    raw = Path(executable)
+    if not raw.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    candidate = Path(os.path.abspath(raw))
+    try:
+        info = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} is unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or _reparse(info)
+        or not stat.S_ISREG(info.st_mode)
+        or resolved != candidate
+        or (not _is_windows() and not os.access(candidate, os.X_OK))
+    ):
+        raise ValueError(f"{label} is redirected or invalid")
+    return str(candidate)
+
+
+def isolated_python_executable(executable: Path | str) -> str:
+    """Validate the exact interpreter used for an isolated Python child."""
+    try:
+        return validated_executable(executable, label="isolated Python interpreter")
+    except ValueError:
+        alias = Path(executable)
+        if str(executable) != sys.executable:
+            raise
+        if _windows_app_execution_alias(alias):
+            target = Path(sys.base_prefix) / alias.name
+        else:
+            target = _posix_current_interpreter_target(alias)
+            if target is None:
+                raise
+        return validated_executable(target, label="isolated Python interpreter")
+
+
+def resolve_ordinary_executable(
+    name: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+    excluded_roots: Sequence[Path | str] = (),
+) -> str:
+    """Resolve one PATH tool without searching cwd, projects, or relative entries."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}", name):
+        raise ValueError("ordinary executable name is invalid")
+    if any(separator in name for separator in ("/", "\\")):
+        raise ValueError("ordinary executable name must not contain a path")
+    if _is_windows():
+        suffix = Path(name).suffix.casefold()
+        if suffix and suffix != ".exe":
+            raise ValueError("ordinary Windows executable must use .exe")
+        names = (name if suffix else name + ".exe",)
+    else:
+        names = (name,)
+
+    source = os.environ if environment is None else environment
+    path_value = next(
+        (
+            str(value)
+            for key, value in source.items()
+            if str(key).upper() == "PATH"
+        ),
+        "",
+    )
+    try:
+        cwd_raw = Path(os.path.abspath(Path.cwd()))
+        cwd = cwd_raw.resolve(strict=True)
+        excluded_raw = tuple(
+            Path(os.path.abspath(Path(root))) for root in excluded_roots
+        )
+        excluded = tuple(root.resolve(strict=True) for root in excluded_raw)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("ordinary executable exclusion boundary is unavailable") from exc
+    boundaries = (cwd_raw, cwd, *excluded_raw, *excluded)
+
+    def inside_boundary(path: Path) -> bool:
+        return any(
+            path == root or path.is_relative_to(root) for root in boundaries
+        )
+
+    for raw_directory in path_value.split(os.pathsep):
+        if not raw_directory or raw_directory != raw_directory.strip():
+            continue
+        directory = Path(raw_directory)
+        if not directory.is_absolute():
+            continue
+        directory = Path(os.path.abspath(directory))
+        if inside_boundary(directory):
+            continue
+        try:
+            directory_info = directory.lstat()
+            resolved_directory = directory.resolve(strict=True)
+            resolved_directory_info = resolved_directory.lstat()
+            if not stat.S_ISDIR(resolved_directory_info.st_mode):
+                continue
+            if inside_boundary(resolved_directory):
+                continue
+            if _is_windows() and (
+                stat.S_ISLNK(directory_info.st_mode)
+                or _reparse(directory_info)
+                or resolved_directory != directory
+            ):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        for candidate_name in names:
+            candidate = directory / candidate_name
+            if inside_boundary(candidate):
+                continue
+            try:
+                if _is_windows():
+                    selected = Path(
+                        validated_executable(
+                            candidate, label=f"{name} executable"
+                        )
+                    )
+                else:
+                    selected = candidate.resolve(strict=True)
+                    selected_info = selected.lstat()
+                    if (
+                        not stat.S_ISREG(selected_info.st_mode)
+                        or not os.access(selected, os.X_OK)
+                        or candidate.resolve(strict=True) != selected
+                    ):
+                        continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if inside_boundary(selected):
+                continue
+            return str(selected)
+    raise FileNotFoundError(f"trusted {name} executable is unavailable")
+
+
 def windows_system_executable(name: str) -> str:
     """Return one fixed ordinary System32 executable without trusting PATH."""
     if not _is_windows():
@@ -166,8 +348,7 @@ def windows_system_executable(name: str) -> str:
     candidate = Path(buffer.value) / name
     try:
         info = candidate.lstat()
-        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
-        redirected = bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+        redirected = _reparse(info)
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"Windows system executable is unavailable: {name}") from exc
@@ -275,8 +456,9 @@ def isolated_python_script_command(
 ) -> list[str]:
     """Build one captured-byte, isolated command for a selected core script."""
     path, tools, digest = _isolated_anchor(script, core_root)
+    selected = isolated_python_executable(executable)
     return [
-        str(executable),
+        selected,
         "-B",
         "-I",
         "-S",
@@ -302,8 +484,9 @@ def isolated_python_module_command(
     if module != "unittest":
         raise ValueError("isolated Python module is not allowed")
     path, tools, digest = _isolated_anchor(anchor, core_root)
+    selected = isolated_python_executable(executable)
     return [
-        str(executable),
+        selected,
         "-B",
         "-I",
         "-S",

@@ -65,6 +65,7 @@ sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 import retro_ledger  # noqa: E402
+import process_supervisor  # noqa: E402
 import session_digest  # noqa: E402  (needs sys.path set first)
 import session_evidence  # noqa: E402
 
@@ -282,7 +283,18 @@ def implemented_findings() -> list[dict]:
 
 def sh(*args: str) -> str:
     try:
-        r = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=15)
+        if not args or args[0] != "git":
+            return ""
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(ROOT, CORE_ROOT)
+        )
+        r = subprocess.run(
+            (executable, *args[1:]),
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
         return r.stdout.strip()
     except Exception:
         return ""

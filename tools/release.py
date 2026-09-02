@@ -1349,10 +1349,17 @@ def collect_files(root: Path) -> tuple[str, list[str], list[ReleaseFile]]:
 
 
 def _git_state(root: Path) -> tuple[dict, str]:
+    try:
+        executable = process_supervisor.resolve_ordinary_executable(
+            "git", excluded_roots=(root, ROOT)
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise ReleaseError("trusted Git executable is unavailable") from exc
+
     def run(*arguments: str) -> str:
         try:
             completed = subprocess.run(
-                ["git", "-C", str(root), *arguments],
+                [executable, "-C", str(root), *arguments],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

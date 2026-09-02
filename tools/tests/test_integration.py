@@ -45,6 +45,7 @@ sys.path.insert(0, str(HERE))
 
 import board          # noqa: E402
 import mock_board     # noqa: E402
+import process_supervisor  # noqa: E402
 import retro_queue    # noqa: E402
 from test_board_api import SLUG_A, SLUG_B, BoardTestCase  # noqa: E402
 
@@ -156,7 +157,10 @@ class TestMockRealParity(BoardTestCase):
 
 
 def _git(directory: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(directory), *args], check=True,
+    executable = process_supervisor.resolve_ordinary_executable(
+        "git", excluded_roots=(directory, TOOLS.parent)
+    )
+    result = subprocess.run([executable, "-C", str(directory), *args], check=True,
                             capture_output=True, text=True)
     return result.stdout.strip()
 

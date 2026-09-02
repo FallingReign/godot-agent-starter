@@ -20,6 +20,7 @@ sys.path.insert(0, str(TOOLS))
 
 import kit_change_controller as controller  # noqa: E402
 import managed_launcher  # noqa: E402
+import process_supervisor  # noqa: E402
 import release  # noqa: E402
 
 
@@ -32,8 +33,18 @@ def _write(root: Path, relative: str, content: bytes) -> Path:
 
 def _run_git(root: Path, *arguments: str) -> None:
     null_hooks = "NUL" if os.name == "nt" else "/dev/null"
+    executable = process_supervisor.resolve_ordinary_executable(
+        "git", excluded_roots=(root, ROOT)
+    )
     completed = subprocess.run(
-        ["git", "-C", str(root), "-c", f"core.hooksPath={null_hooks}", *arguments],
+        [
+            executable,
+            "-C",
+            str(root),
+            "-c",
+            f"core.hooksPath={null_hooks}",
+            *arguments,
+        ],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -134,7 +145,7 @@ def _guarded_snapshot(root: Path) -> dict[str, dict[str, str]]:
 def _launcher_command(target: Path, *arguments: str) -> list[str]:
     if os.name == "nt":
         return [
-            os.environ.get("COMSPEC", "cmd.exe"),
+            process_supervisor.windows_command_processor(),
             "/d",
             "/c",
             str(target / "kit.cmd"),

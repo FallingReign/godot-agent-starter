@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 import bootstrap  # noqa: E402
 import check as gate  # noqa: E402
 from tools import native_engine  # noqa: E402
+from tools import process_supervisor  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -57,9 +59,15 @@ def _temporary_directory() -> Iterator[str]:
             shutil.rmtree(resolved_directory, ignore_errors=True)
 
 
+def _git_executable(repo: Path) -> str:
+    return process_supervisor.resolve_ordinary_executable(
+        "git", excluded_roots=(repo, ROOT)
+    )
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [_git_executable(repo), "-C", str(repo), *args],
         check=True,
         capture_output=True,
         text=True,
@@ -69,7 +77,11 @@ def _git(repo: Path, *args: str) -> str:
 
 class BootstrapGitSafety(unittest.TestCase):
     def setUp(self) -> None:
-        if not bootstrap.shutil.which("git"):
+        try:
+            process_supervisor.resolve_ordinary_executable(
+                "git", excluded_roots=(ROOT,)
+            )
+        except (FileNotFoundError, ValueError):
             self.skipTest("git is not installed")
 
     def _run_with_unrelated_checks_stubbed(self, repo: Path, *arguments: str) -> int:
@@ -111,6 +123,28 @@ class BootstrapGitSafety(unittest.TestCase):
             for name in stubbed:
                 stack.enter_context(mock.patch.object(bootstrap, name, return_value=None))
             return bootstrap.main()
+
+    def test_target_local_git_command_is_never_started(self) -> None:
+        if os.name != "nt":
+            return
+        with _temporary_directory() as temp:
+            repo = Path(temp)
+            _git(repo, "init", "--quiet")
+            marker = repo / "hijacked.txt"
+            (repo / "git.cmd").write_text(
+                f'@echo off\r\n>"{marker}" echo hijacked\r\n',
+                encoding="utf-8",
+            )
+            environment = {
+                "PATH": str(repo) + os.pathsep + os.environ.get("PATH", "")
+            }
+            bootstrap.results.clear()
+            with mock.patch.object(bootstrap, "ROOT", repo), mock.patch.dict(
+                bootstrap.os.environ, environment, clear=False
+            ):
+                bootstrap.check_git(initialise=False)
+            self.assertFalse(marker.exists())
+            self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
 
     def test_fix_never_stages_or_commits_an_existing_repository(self) -> None:
         with _temporary_directory() as temp:
@@ -184,7 +218,7 @@ class BootstrapGitSafety(unittest.TestCase):
             self.assertEqual(0, result)
             self.assertTrue((repo / ".git").exists())
             self.assertNotEqual(0, subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                [_git_executable(repo), "-C", str(repo), "rev-parse", "HEAD"],
                 capture_output=True,
                 check=False,
             ).returncode)
@@ -367,13 +401,93 @@ class BootstrapMutationBoundary(unittest.TestCase):
 
 
 class PrivateToolResolution(unittest.TestCase):
+    def test_locked_private_files_are_recognised_without_launching_them(self) -> None:
+        with _temporary_directory() as temp:
+            root = Path(temp)
+            target = root / "runtime" / "gdtoolkit-4.5.0"
+            bindir = target / ("Scripts" if os.name == "nt" else "bin")
+            suffix = ".exe" if os.name == "nt" else ""
+            gdlint = bindir / f"gdlint{suffix}"
+            python = bindir / f"python{suffix}"
+            bindir.mkdir(parents=True)
+            for executable in (gdlint, python):
+                executable.write_bytes(b"ordinary executable fixture")
+                executable.chmod(0o755)
+            wheel_content = b"authenticated direct wheel"
+            wheel = target / "gdtoolkit-4.5.0-py3-none-any.whl"
+            wheel.write_bytes(wheel_content)
+            lock = {
+                "tools": {
+                    "gdtoolkit": {
+                        "version": "4.5.0",
+                        "filename": wheel.name,
+                        "bytes": len(wheel_content),
+                        "sha256": hashlib.sha256(wheel_content).hexdigest(),
+                    }
+                }
+            }
+            bootstrap.results.clear()
+            with mock.patch.object(bootstrap, "ROOT", root), mock.patch.object(
+                bootstrap,
+                "_gdtoolkit_environment",
+                return_value=(target, gdlint, python),
+            ), mock.patch.object(bootstrap, "run") as run:
+                bootstrap.check_gdtoolkit(lock, install=False)
+        self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
+        self.assertIn("not launched during diagnosis", bootstrap.results[-1]["detail"])
+        run.assert_not_called()
+
+    def test_changed_private_wheel_is_not_trusted_or_launched(self) -> None:
+        with _temporary_directory() as temp:
+            root = Path(temp)
+            target = root / "runtime" / "gdtoolkit-4.5.0"
+            bindir = target / ("Scripts" if os.name == "nt" else "bin")
+            suffix = ".exe" if os.name == "nt" else ""
+            gdlint = bindir / f"gdlint{suffix}"
+            python = bindir / f"python{suffix}"
+            bindir.mkdir(parents=True)
+            for executable in (gdlint, python):
+                executable.write_bytes(b"ordinary executable fixture")
+                executable.chmod(0o755)
+            wheel = target / "gdtoolkit-4.5.0-py3-none-any.whl"
+            wheel.write_bytes(b"changed")
+            lock = {
+                "tools": {
+                    "gdtoolkit": {
+                        "version": "4.5.0",
+                        "filename": wheel.name,
+                        "bytes": len(b"expected"),
+                        "sha256": hashlib.sha256(b"expected").hexdigest(),
+                    }
+                }
+            }
+            bootstrap.results.clear()
+            with mock.patch.object(bootstrap, "ROOT", root), mock.patch.object(
+                bootstrap,
+                "_gdtoolkit_environment",
+                return_value=(target, gdlint, python),
+            ), mock.patch.object(
+                bootstrap,
+                "_ordinary_tool",
+                side_effect=FileNotFoundError("fixture"),
+            ), mock.patch.object(
+                bootstrap.importlib.metadata,
+                "version",
+                side_effect=bootstrap.importlib.metadata.PackageNotFoundError,
+            ), mock.patch.object(bootstrap, "run") as run:
+                bootstrap.check_gdtoolkit(lock, install=False)
+        self.assertEqual(bootstrap.MISSING, bootstrap.results[-1]["state"])
+        run.assert_not_called()
+
     def test_missing_gdtoolkit_is_an_optional_advisory(self) -> None:
         lock = {"tools": {"gdtoolkit": {"version": "4.5.0"}}}
         bootstrap.results.clear()
         with mock.patch.object(
             bootstrap, "_gdtoolkit_environment", side_effect=ValueError("fixture")
         ), mock.patch.object(
-            bootstrap.shutil, "which", return_value=None
+            bootstrap,
+            "_ordinary_tool",
+            side_effect=FileNotFoundError("fixture"),
         ), mock.patch.object(
             bootstrap.importlib.metadata,
             "version",
@@ -455,7 +569,10 @@ class PrivateToolResolution(unittest.TestCase):
 
         self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
         self.assertEqual(
-                [sys.executable, "-B", "-I", "-S", "-m", "venv"],
+            [
+                process_supervisor.isolated_python_executable(sys.executable),
+                "-B", "-I", "-S", "-m", "venv", "--copies",
+            ],
             run.call_args_list[0].args[0][:-1],
         )
         self.assertEqual(str(target), run.call_args_list[0].args[0][-1])
