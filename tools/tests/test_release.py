@@ -1270,6 +1270,19 @@ class TestRequiredMetadata(ReleaseTestCase):
 
 
 class TestSourcePathSafety(ReleaseTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        manifest = REPOSITORY / release.MANIFEST_PATH
+        cls.installed_release = (
+            manifest.exists()
+            or manifest.is_symlink()
+            or release._is_reparse_point(manifest)
+        )
+        if cls.installed_release:
+            report, _members = release.read_verified_directory(REPOSITORY)
+            if not report["ok"]:
+                raise AssertionError("installed release did not authenticate")
+
     def test_canonical_release_surface_sets_are_complete_and_exact(self) -> None:
         actual_tools = {
             path.relative_to(REPOSITORY).as_posix()
@@ -1289,14 +1302,16 @@ class TestSourcePathSafety(ReleaseTestCase):
         }
 
         self.assertEqual(actual_tools, set(release.TOOL_FILES))
-        source_validation_files = (
-            release.VALIDATION_FILES | release.SOURCE_ONLY_VALIDATION_FILES
+        packaged_tests = {
+            path for path in release.VALIDATION_FILES
+            if Path(path).name.startswith("test_") and path.endswith(".py")
+        }
+        present_source_only = (
+            set()
+            if self.installed_release
+            else set(release.SOURCE_ONLY_VALIDATION_FILES)
         )
-        self.assertTrue(actual_tests.issubset(source_validation_files))
-        self.assertEqual(
-            actual_tests - set(release.VALIDATION_FILES),
-            set(release.SOURCE_ONLY_VALIDATION_FILES),
-        )
+        self.assertEqual(actual_tests, packaged_tests | present_source_only)
         self.assertEqual(actual_skills, set(release.REQUIRED_SKILL_FILES))
         self.assertEqual(actual_agents, set(release.REQUIRED_AGENT_FILES))
 
@@ -1304,12 +1319,15 @@ class TestSourcePathSafety(ReleaseTestCase):
         relative = "tools/tests/test_lifecycle_e2e.py"
 
         self.assertIn(relative, release.SOURCE_ONLY_VALIDATION_FILES)
-        self.assertIn(
-            relative,
-            {
-                path.relative_to(REPOSITORY).as_posix()
-                for path in (REPOSITORY / "tools" / "tests").glob("test_*.py")
-            },
+        present = relative in {
+            path.relative_to(REPOSITORY).as_posix()
+            for path in (REPOSITORY / "tools" / "tests").glob("test_*.py")
+        }
+        self.assertEqual(
+            present,
+            not self.installed_release,
+            "source checkout must discover the lifecycle E2E; installed release "
+            "must exclude it",
         )
         self.assertNotIn(relative, release.VALIDATION_FILES)
         self.assertNotIn(relative, release.REQUIRED_KIT_FILES)
