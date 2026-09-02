@@ -1440,9 +1440,15 @@ class TestLiveness(BoardTestCase):
         process.wait.return_value = 0
         failed = subprocess.CompletedProcess(["taskkill"], 1)
         with mock.patch.object(board.os, "name", "nt"), \
-                mock.patch.object(board.subprocess, "run", return_value=failed):
+                mock.patch.object(
+                    board.subprocess, "run", return_value=failed
+                ) as run:
             terminated = board._terminate_process_tree(process)
         self.assertTrue(terminated)
+        self.assertEqual(
+            board.process_supervisor.windows_system_executable("taskkill.exe"),
+            run.call_args.args[0][0],
+        )
         process.kill.assert_called_once_with()
 
     def test_posix_tree_kill_escalates_from_term_to_kill(self) -> None:

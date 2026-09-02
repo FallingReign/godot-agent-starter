@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 try:
     from tools import managed_launcher, process_supervisor, release
@@ -262,10 +262,10 @@ def _target(root: Path, relative: str, *, leaf: str = "file") -> Path:
     parts = PurePosixPath(portable).parts
     for index, component in enumerate(parts):
         cursor = _case_checked_child(cursor, component, portable)
-        if not cursor.exists() and not cursor.is_symlink():
-            continue
         if cursor.is_symlink() or _is_reparse(cursor):
             raise KitChangeError("redirected-path", f"refusing redirected path: {portable}")
+        if not cursor.exists():
+            continue
         try:
             info = cursor.lstat()
         except OSError as exc:
@@ -1453,23 +1453,39 @@ def _change_entry(
     }
 
 
+def _member_directories(paths: Sequence[str]) -> set[str]:
+    directories: set[str] = set()
+    for relative in paths:
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() != ".":
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return directories
+
+
 def _core_matches(core: Path, members: Mapping[str, Any]) -> bool:
     if core.is_symlink() or _is_reparse(core) or not core.is_dir():
         return False
     expected = sorted(str(name) for name in members)
+    expected_directories = _member_directories(expected)
     actual: list[str] = []
+    actual_directories: list[str] = []
     for current, directories, filenames in os.walk(core, topdown=True, followlinks=False):
         base = Path(current)
         for name in list(directories):
             child = base / name
             if child.is_symlink() or _is_reparse(child):
                 return False
+            actual_directories.append(child.relative_to(core).as_posix())
         for name in filenames:
             path = base / name
             if path.is_symlink() or _is_reparse(path) or not path.is_file():
                 return False
             actual.append(path.relative_to(core).as_posix())
-    if sorted(actual) != expected:
+    if (
+        sorted(actual) != expected
+        or set(actual_directories) != expected_directories
+    ):
         return False
     for name in expected:
         path = core.joinpath(*PurePosixPath(name).parts)
@@ -1857,8 +1873,10 @@ def _ensure_directory(root: Path, relative: str, created: list[str]) -> Path:
     cursor = root
     for component in PurePosixPath(portable).parts:
         next_path = _case_checked_child(cursor, component, portable)
-        if next_path.exists() or next_path.is_symlink():
-            if next_path.is_symlink() or _is_reparse(next_path) or not next_path.is_dir():
+        if next_path.is_symlink() or _is_reparse(next_path):
+            raise KitChangeError("redirected-path", f"unsafe directory: {portable}")
+        if next_path.exists():
+            if not next_path.is_dir():
                 raise KitChangeError("redirected-path", f"unsafe directory: {portable}")
         else:
             try:
@@ -2410,12 +2428,7 @@ def _core_matches_journal(
     if core.is_symlink() or _is_reparse(core) or not core.is_dir():
         return False
     expected = [str(member["path"]) for member in members]
-    expected_directories: set[str] = set()
-    for relative in expected:
-        parent = PurePosixPath(relative).parent
-        while parent.as_posix() != ".":
-            expected_directories.add(parent.as_posix())
-            parent = parent.parent
+    expected_directories = _member_directories(expected)
     actual: list[str] = []
     actual_directories: list[str] = []
     for current, directories, filenames in os.walk(core, topdown=True, followlinks=False):

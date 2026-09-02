@@ -12,9 +12,12 @@ from unittest import mock
 
 
 TOOLS = Path(__file__).resolve().parent.parent
+TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(TESTS))
 
 import kit_change_controller as controller  # noqa: E402
+import test_kit_change as lifecycle_support  # noqa: E402
 
 
 class SimulatedCrash(BaseException):
@@ -1161,6 +1164,162 @@ class KitChangeControllerTest(unittest.TestCase):
         )
         self.assertEqual("complete", recovered["kit_change"]["status"])
         self.assertEqual(2, calls)
+
+
+class RealControllerRecoveryTest(unittest.TestCase):
+    """Prove the controller can finish exact low-level rollback recovery."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="kit-change-recovery-")
+        self.base = Path(self.temporary.name).resolve()
+        self.runtime = self.base / "controller-runtime"
+        self.target = self.base / "project"
+        self.target.mkdir()
+        self.archive = self.base / "release.zip"
+        self.payload = b"verified release fixture\n"
+        self.archive.write_bytes(self.payload)
+        self.agents = self.target / "AGENTS.md"
+        self.agents.write_bytes(b"# Human project rules\n")
+        (self.target / "project.godot").write_bytes(b"[application]\n")
+        report, self.members = lifecycle_support._release_fixture()
+        self.report = dict(report)
+        self.report.update(
+            {
+                "format": "zip",
+                "container_sha256": _sha256(self.payload),
+            }
+        )
+        self.readers = [
+            mock.patch.object(
+                module,
+                "read_verified_archive",
+                side_effect=lambda _path: (dict(self.report), self.members),
+            )
+            for module in (controller.release, controller.kit_change.release)
+        ]
+        for reader in self.readers:
+            reader.start()
+
+    def tearDown(self) -> None:
+        for reader in reversed(self.readers):
+            reader.stop()
+        self.temporary.cleanup()
+
+    def _prepare(self) -> controller.ControllerResult:
+        return controller.prepare(
+            self.runtime,
+            self.target,
+            self.archive,
+            "install",
+            game_root=".",
+        )
+
+    def _snapshot(self) -> list[tuple[str, str, bytes | None]]:
+        result: list[tuple[str, str, bytes | None]] = []
+        for path in sorted(self.target.rglob("*")):
+            relative = path.relative_to(self.target).as_posix()
+            if relative == ".kit" or relative.startswith(".kit/"):
+                continue
+            result.append(
+                (
+                    relative,
+                    "directory" if path.is_dir() else "file",
+                    None if path.is_dir() else path.read_bytes(),
+                )
+            )
+        return result
+
+    @staticmethod
+    def _unexpected_check(_target: Path, _session: object) -> dict[str, object]:
+        raise AssertionError("post-apply checking must not run before recovery")
+
+    def test_apply_rollback_conflict_binds_exact_transaction_and_recovers(self) -> None:
+        before = self._snapshot()
+        prepared = self._prepare()
+        applied_agents = b""
+
+        def interrupt(name: str) -> None:
+            nonlocal applied_agents
+            if name == "after-entry:AGENTS.md":
+                applied_agents = self.agents.read_bytes()
+                self.agents.write_bytes(b"third version owned by another writer\n")
+                raise RuntimeError("interrupt after shared file apply")
+
+        with mock.patch.object(
+            controller.kit_change, "_failpoint", side_effect=interrupt
+        ):
+            paused = controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=self._unexpected_check,
+            )
+
+        self.assertEqual("recovery_required", paused["kit_change"]["status"])
+        self.assertTrue(
+            controller.load(self.runtime, prepared["session_id"])["transaction_id"]
+        )
+        self.assertEqual(
+            b"third version owned by another writer\n", self.agents.read_bytes()
+        )
+
+        self.agents.write_bytes(applied_agents)
+        recovered = controller.recover(
+            self.runtime,
+            prepared["session_id"],
+            post_apply_check=self._unexpected_check,
+        )
+
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.assertEqual(before, self._snapshot())
+        self.assertFalse((self.target / ".agent-kit").exists())
+
+    def test_apply_rollback_permission_error_retries_the_same_transaction(self) -> None:
+        before = self._snapshot()
+        prepared = self._prepare()
+        original_agents = self.agents.read_bytes()
+        original_atomic = controller.kit_change._atomic_bytes
+        interrupted = False
+        restore_failed = False
+
+        def interrupt(name: str) -> None:
+            nonlocal interrupted
+            if name == "after-entry:AGENTS.md" and not interrupted:
+                interrupted = True
+                raise RuntimeError("interrupt after shared file apply")
+
+        def flaky_atomic(path: Path, content: bytes, mode: str | None = None) -> None:
+            nonlocal restore_failed
+            if Path(path) == self.agents and content == original_agents and not restore_failed:
+                restore_failed = True
+                raise PermissionError("shared file is temporarily locked")
+            original_atomic(path, content, mode)
+
+        with (
+            mock.patch.object(
+                controller.kit_change, "_failpoint", side_effect=interrupt
+            ),
+            mock.patch.object(
+                controller.kit_change, "_atomic_bytes", side_effect=flaky_atomic
+            ),
+        ):
+            paused = controller.apply(
+                self.runtime,
+                prepared["session_id"],
+                prepared["kit_change"]["plan_sha256"],
+                post_apply_check=self._unexpected_check,
+            )
+            recovered = controller.recover(
+                self.runtime,
+                prepared["session_id"],
+                post_apply_check=self._unexpected_check,
+            )
+
+        self.assertTrue(restore_failed)
+        self.assertEqual("recovery_required", paused["kit_change"]["status"])
+        self.assertEqual("restored", recovered["kit_change"]["status"])
+        self.assertEqual(before, self._snapshot())
+        self.assertFalse((self.target / ".agent-kit").exists())
 
 
 if __name__ == "__main__":

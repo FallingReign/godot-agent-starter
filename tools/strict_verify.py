@@ -97,6 +97,24 @@ class StrictVerifyError(RuntimeError):
     """The verifier cannot establish its trusted local evidence boundary."""
 
 
+def _isolated_script(core: Path, script: Path, *arguments: str) -> list[str]:
+    try:
+        return process_supervisor.isolated_python_script_command(
+            sys.executable, script, core, *arguments
+        )
+    except (OSError, ValueError) as exc:
+        raise StrictVerifyError(f"isolated child is unavailable: {exc}") from exc
+
+
+def _isolated_unittest(core: Path, *arguments: str) -> list[str]:
+    try:
+        return process_supervisor.isolated_python_module_command(
+            sys.executable, "unittest", core / "kit.py", core, *arguments
+        )
+    except (OSError, ValueError) as exc:
+        raise StrictVerifyError(f"isolated unit tests are unavailable: {exc}") from exc
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
@@ -513,15 +531,15 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
     test_scratch = run_directory / "test-scratch"
     test_scratch.mkdir()
     selected_runner = runner or _default_runner
-    environment = dict(CHILD_ENVIRONMENT if root == ROOT else os.environ)
+    environment = process_supervisor.isolated_python_environment(
+        CHILD_ENVIRONMENT if root == ROOT else {}
+    )
     environment.update(
         {
             "CI": environment.get("CI", "1"),
             "KIT_STRICT_VERIFY": "1",
             "KIT_TEST_TMPDIR": str(test_scratch),
             "NO_COLOR": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUNBUFFERED": "1",
         }
     )
     started_at = _utc_now()
@@ -548,33 +566,33 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             ),
             (
                 "doctor",
-                [sys.executable, str(core_root / "kit.py"), "doctor", "--json"],
+                _isolated_script(core_root, core_root / "kit.py", "doctor", "--json"),
                 60,
                 _classify_doctor,
             ),
             (
                 "gate",
-                [sys.executable, str(core_root / "check.py")],
+                _isolated_script(core_root, core_root / "check.py"),
                 1800,
                 lambda outcome: _classify_gate(outcome, allowed_gate_skips),
             ),
             (
                 "unit-tests",
-                [
-                    sys.executable,
-                    "-m",
-                    "unittest",
+                _isolated_unittest(
+                    core_root,
                     "discover",
                     "-s",
                     str(core_root / "tools" / "tests"),
                     "-v",
-                ],
+                ),
                 1200,
                 _classify_unittest,
             ),
             (
                 "browser-check",
-                [sys.executable, str(core_root / "tools" / "tests" / "browser_check.py")],
+                _isolated_script(
+                    core_root, core_root / "tools" / "tests" / "browser_check.py"
+                ),
                 900,
                 _classify_browser,
             ),
@@ -655,29 +673,49 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 release_commands = (
                     (
                         "release-build-1",
-                        [sys.executable, str(release_tool), "build", str(release_one)],
+                        _isolated_script(
+                            core_root,
+                            release_tool,
+                            "build",
+                            str(release_one),
+                        ),
                     ),
                     (
                         "release-build-2",
-                        [sys.executable, str(release_tool), "build", str(release_two)],
+                        _isolated_script(
+                            core_root,
+                            release_tool,
+                            "build",
+                            str(release_two),
+                        ),
                     ),
                     (
                         "release-verify-1",
-                        [sys.executable, str(release_tool), "verify", str(release_one)],
+                        _isolated_script(
+                            core_root,
+                            release_tool,
+                            "verify",
+                            str(release_one),
+                        ),
                     ),
                     (
                         "release-verify-2",
-                        [sys.executable, str(release_tool), "verify", str(release_two)],
+                        _isolated_script(
+                            core_root,
+                            release_tool,
+                            "verify",
+                            str(release_two),
+                        ),
                     ),
                     (
                         "release-smoke",
-                        [
-                            sys.executable,
-                            str(release_tool),
+                        _isolated_script(
+                            core_root,
+                            release_tool,
                             "smoke",
                             str(release_one),
                             str(release_workspace / "smoke"),
-                        ],
+                        ),
                     ),
                 )
                 for name, command in release_commands:

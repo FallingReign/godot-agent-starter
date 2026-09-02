@@ -46,6 +46,8 @@ sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import engine_discovery  # noqa: E402
 import native_engine  # noqa: E402
+import managed_launcher  # noqa: E402
+import process_supervisor  # noqa: E402
 
 ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
 ROOT = ACTIVE_INSTALLATION.project_root
@@ -59,9 +61,6 @@ KIT_CONFIG = ROOT / "kit.config.json"
 KIT_MARKER = ROOT / ".agent-kit.json"
 
 WIN = platform.system() == "Windows"
-
-if WIN:
-    os.system("")               # enable ANSI on Windows consoles
 
 _TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 GRN = "\033[32m" if _TTY else ""
@@ -402,7 +401,8 @@ def _install_gdtoolkit(lock):
         return
     try:
         rc, out = run(
-            [sys.executable, "-I", "-m", "venv", str(target)], timeout=180
+            [sys.executable, "-B", "-I", "-S", "-m", "venv", str(target)],
+            timeout=180,
         )
         if rc != 0:
             raise RuntimeError("private environment creation failed: "
@@ -1385,8 +1385,18 @@ def normalise_formatting():
         return
     if not QUIET:
         print(f"  {DIM}normalising GDScript formatting with local gdtoolkit...{RST}")
-    code, out = run([sys.executable, str(CORE_ROOT / "check.py"), "--fix-format"],
-                    timeout=240)
+    try:
+        command = process_supervisor.isolated_python_script_command(
+            sys.executable, CORE_ROOT / "check.py", CORE_ROOT, "--fix-format"
+        )
+        environment = process_supervisor.isolated_python_environment(
+            managed_launcher.bound_environment(ACTIVE_INSTALLATION)
+        )
+    except (OSError, ValueError) as exc:
+        if not QUIET:
+            print(f"  {YEL}formatting check could not start: {exc}{RST}")
+        return
+    code, out = run(command, timeout=240, environment=environment)
     if code != 0 and not QUIET:
         print(f"  {YEL}gdformat unavailable or failed; formatting left as shipped{RST}")
         for line in out.strip().splitlines()[-3:]:

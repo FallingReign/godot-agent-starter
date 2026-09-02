@@ -27,6 +27,7 @@ import runtime_paths
 import proposal_authority
 import project_context
 import managed_launcher
+import process_supervisor
 try:
     import native_engine
 except ImportError:  # compatibility with older kit revisions
@@ -2173,13 +2174,32 @@ def regenerate_views(root: Path, *, snapshot: str = "") -> dict[str, Any]:
     """Regenerate plan and retro as one pure operation; never start the board."""
     canonical = root.resolve(strict=True)
     core = _core_for_project(canonical)
-    child_environment = CHILD_ENVIRONMENT if canonical == PROJECT_ROOT else None
-    plan_command = [sys.executable, str(core / "tools" / "plan_html.py")]
+    try:
+        child_environment = process_supervisor.isolated_python_environment(
+            CHILD_ENVIRONMENT if canonical == PROJECT_ROOT else {}
+        )
+        plan_command = process_supervisor.isolated_python_script_command(
+            sys.executable, core / "tools" / "plan_html.py", core
+        )
+        retro_command = process_supervisor.isolated_python_script_command(
+            sys.executable, core / "tools" / "retro_html.py", core
+        )
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "processes": {
+                "isolation": {
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": str(exc),
+                }
+            },
+        }
     if snapshot:
         plan_command.extend(("--slice", snapshot_label(snapshot)))
     jobs = {
         "plan": plan_command,
-        "retro": [sys.executable, str(core / "tools" / "retro_html.py")],
+        "retro": retro_command,
     }
     processes: dict[str, Any] = {}
     ok = True

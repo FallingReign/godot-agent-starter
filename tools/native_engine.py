@@ -1658,7 +1658,13 @@ def _terminate_pid_tree(pid: int) -> None:
     if _is_windows():
         try:
             subprocess.run(
-                ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+                [
+                    process_supervisor.windows_system_executable("taskkill.exe"),
+                    "/PID",
+                    str(pid),
+                    "/T",
+                    "/F",
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1667,7 +1673,7 @@ def _terminate_pid_tree(pid: int) -> None:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             pass
     else:
         try:

@@ -1260,6 +1260,40 @@ def apply(
                     "detail": exc.detail[:MAX_DETAIL_CHARS],
                     "baseline_sha256": "",
                 }
+                if exc.code == "apply-recovery-failed":
+                    raw = session["preview"].get("raw")
+                    material = raw.get("material") if isinstance(raw, Mapping) else None
+                    target_scope = (
+                        str(material.get("target_scope_sha256") or "")
+                        if isinstance(material, Mapping)
+                        else ""
+                    )
+                    try:
+                        inspected = kit_change.inspect_transaction(
+                            Path(str(session["target"]["path"])),
+                            preview_sha256=str(session["preview"]["sha256"]),
+                            target_scope_sha256=target_scope,
+                        )
+                    except kit_change.KitChangeError as recovery:
+                        raise KitChangeControllerError(
+                            "recovery-bind-failed",
+                            "rollback is incomplete and its exact transaction "
+                            f"could not be found: {recovery.detail}",
+                        ) from exc
+                    if inspected.get("status") != "blocked":
+                        raise KitChangeControllerError(
+                            "recovery-bind-failed",
+                            "rollback is incomplete but its transaction is not blocked",
+                        )
+                    return _public(
+                        _transition(
+                            runtime,
+                            session,
+                            "recovery_required",
+                            transaction_id=inspected.get("transaction_id"),
+                            check=check,
+                        )
+                    )
                 state = "restored_failure" if exc.code == "apply-failed" else "failed"
                 return _public(_finish(runtime, session, state, check))
             session = _transition(

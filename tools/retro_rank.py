@@ -68,7 +68,7 @@ import retro_ledger  # noqa: E402
 import session_digest  # noqa: E402  (needs sys.path set first)
 import session_evidence  # noqa: E402
 
-ROOT = project_context.load_active_context(CORE_ROOT).project_root
+ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 RETRO_DIR = ROOT / "docs" / "retro"
 DEFERRED_FILE = RETRO_DIR / "deferred.json"
 _RUNTIME = runtime_paths.resolve(ROOT)

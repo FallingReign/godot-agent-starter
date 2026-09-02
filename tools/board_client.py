@@ -43,7 +43,7 @@ sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 
-ROOT = project_context.load_active_context(CORE_ROOT).project_root
+ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 BOARD_STATE = runtime_paths.resolve(ROOT).board_state
 PROTOCOL_SCHEMA = 2
 PROTOCOL_FILES = (

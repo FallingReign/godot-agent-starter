@@ -53,10 +53,14 @@ import proposal_authority  # noqa: E402  (exact current/historical approval)
 import schema as artifact_schema  # noqa: E402  (shared artefact contract)
 import project_context  # noqa: E402  (shared configured roots)
 import release as kit_release  # noqa: E402  (authoritative fixed kit paths)
+import managed_launcher  # noqa: E402  (exact active child bindings)
+import process_supervisor  # noqa: E402  (captured isolated Python children)
 
 TOOLS = Path(__file__).resolve().parent
 CORE_ROOT = TOOLS.parent
 CONTEXT = project_context.load_active_context(CORE_ROOT)
+_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+CHILD_ENVIRONMENT = managed_launcher.bound_environment(_INSTALLATION)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 GAME_ROOT = CONTEXT.game_root
 SHAPE = ROOT / "project.shape.json"
@@ -454,10 +458,22 @@ def module_graph() -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     if not script.is_file():
         return [], "", {}
     try:
-        p = subprocess.run([sys.executable, str(script), "--json"],
-                           capture_output=True, text=True, timeout=60)
+        p = subprocess.run(
+            process_supervisor.isolated_python_script_command(
+                sys.executable, script, CORE_ROOT, "--json"
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=process_supervisor.isolated_python_environment(CHILD_ENVIRONMENT),
+        )
         data = json.loads(p.stdout) if p.stdout.strip() else {}
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+    except (
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ArchitectureGraphError(
             f"arch.py did not return a readable graph: {exc}"
         ) from exc

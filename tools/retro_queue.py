@@ -46,7 +46,7 @@ sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 
-ROOT = project_context.load_active_context(CORE_ROOT).project_root
+ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
 QUEUE_DIR = _RUNTIME.retro_queue

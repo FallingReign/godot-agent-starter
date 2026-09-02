@@ -28,6 +28,11 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+try:
+    import process_supervisor
+except ImportError:  # package import in tests
+    from tools import process_supervisor  # type: ignore[no-redef]
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = "RELEASE-MANIFEST.json"
 SCHEMA = 2
@@ -2526,15 +2531,22 @@ def smoke_archive(path: Path, workspace: Path) -> dict:
         workspace, workspace_identity, label="release smoke workspace"
     )
 
-    if os.name == "nt":
-        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "kit.cmd", "--help"]
-        launcher = "kit.cmd"
-    else:
-        command = [str(workspace / "kit"), "--help"]
-        launcher = "kit"
-    environment = dict(os.environ)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
+        if os.name == "nt":
+            command = [
+                process_supervisor.windows_command_processor(),
+                "/d",
+                "/c",
+                "kit.cmd",
+                "--help",
+            ]
+            launcher = "kit.cmd"
+        else:
+            command = [str(workspace / "kit"), "--help"]
+            launcher = "kit"
+        environment = process_supervisor.isolated_python_environment({
+            "KIT_PYTHON": str(Path(sys.executable).resolve()),
+        })
         completed = subprocess.run(
             command,
             cwd=str(workspace),
@@ -2546,7 +2558,7 @@ def smoke_archive(path: Path, workspace: Path) -> dict:
             check=False,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ReleaseError(f"extracted public launcher could not run: {exc}") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ sys.path.insert(0, str(TOOLS))
 
 import brownfield  # noqa: E402
 import kit_change_check as check  # noqa: E402
+import release  # noqa: E402
 
 
 def _canonical(value: object) -> bytes:
@@ -40,6 +42,10 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.core.mkdir(parents=True)
         (self.core / "kit.py").write_text("# kit\n", encoding="utf-8")
         (self.core / "check.py").write_text("# check\n", encoding="utf-8")
+        (self.core / "tools").mkdir()
+        (self.core / "tools" / "managed_launcher.py").write_text(
+            "# managed launcher\n", encoding="utf-8"
+        )
         launcher_contents = {
             ".agent-kit/launcher.py": b"# launcher\n",
             "kit": b"#!/bin/sh\n",
@@ -72,6 +78,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.returncodes = {"self-test": 0, "scan": 0, "verify": 0}
         self.malformed_verify = False
         self.commands: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
         self.installation = SimpleNamespace(
             mode="managed",
             project_root=self.target,
@@ -131,17 +138,20 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
             launch_error=None,
         )
 
-    def _runner(self, command: list[str], **_kwargs: object) -> SimpleNamespace:
+    def _runner(self, command: list[str], **kwargs: object) -> SimpleNamespace:
         self.commands.append(list(command))
+        environment = kwargs.get("environment")
+        if isinstance(environment, dict):
+            self.environments.append(dict(environment))
         if "self-test" in command:
             code = self.returncodes["self-test"]
             return self._process_outcome(code, json.dumps({
                 "command": "self-test", "ok": code == 0, "exit_code": code
             }))
-        if "--brownfield-scan" in command:
+        if "__brownfield-scan" in command:
             code = self.returncodes["scan"]
             if code == 0:
-                output = Path(command[command.index("--brownfield-scan") + 1])
+                output = Path(command[command.index("__brownfield-scan") + 1])
                 output.write_bytes(brownfield.canonical_json(
                     brownfield.build_scan_document(self.issues)
                 ))
@@ -206,6 +216,14 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertNotIn("godot", joined)
         self.assertNotIn("git ", joined)
         self.assertNotIn("http", joined)
+        selected_launcher = "managed_launcher.py"
+        self.assertTrue(
+            all(selected_launcher in " ".join(command) for command in self.commands)
+        )
+        for environment in self.environments:
+            self.assertEqual(str(Path(sys.executable).resolve()), environment["KIT_PYTHON"])
+            for unsafe in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+                self.assertNotIn(unsafe, environment)
 
     def test_existing_issues_make_adoption_required_not_kit_failure(self) -> None:
         self.issues = [{
@@ -275,11 +293,11 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
 
         result = check.run(self.target, self.session, runner=self._runner)
 
-        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["kit_ok"])
         self.assertFalse(result["project_ok"])
         self.assertEqual([], self._stored_baseline()["issues"])
         self.assertEqual([new_issue], result["existing_issues"])
-        self.assertIn("were not added to the baseline", str(result["detail"]))
+        self.assertIn("static verification failed", str(result["detail"]))
 
     def test_upgrade_does_not_baseline_an_issue_after_its_file_changed(self) -> None:
         issue = {
@@ -296,10 +314,10 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
 
         result = check.run(self.target, self.session, runner=self._runner)
 
-        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["kit_ok"])
         self.assertFalse(result["project_ok"])
         self.assertEqual([], self._stored_baseline()["issues"])
-        self.assertIn("new or changed", str(result["detail"]))
+        self.assertIn("static verification failed", str(result["detail"]))
 
     def test_upgrade_rechecks_a_file_changed_after_its_first_evaluation(self) -> None:
         issue = {
@@ -320,10 +338,10 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         with mock.patch.object(check, "_failpoint", side_effect=mutate):
             result = check.run(self.target, self.session, runner=self._runner)
 
-        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["kit_ok"])
         self.assertFalse(result["project_ok"])
         self.assertEqual([], self._stored_baseline()["issues"])
-        self.assertIn("were not added to the baseline", str(result["detail"]))
+        self.assertIn("static verification failed", str(result["detail"]))
 
     def test_self_test_failure_stops_before_scan_and_baseline(self) -> None:
         self.returncodes["self-test"] = 1
@@ -343,15 +361,15 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertEqual(2, len(self.commands))
         self.assertIsNone(brownfield.read_baseline_file(self.target))
 
-    def test_completed_scan_plus_static_failure_keeps_working_kit(self) -> None:
+    def test_clean_scan_plus_static_failure_is_a_kit_failure(self) -> None:
         self.returncodes["verify"] = 1
 
         result = check.run(self.target, self.session, runner=self._runner)
 
-        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["kit_ok"])
         self.assertFalse(result["project_ok"])
         self.assertTrue(brownfield.read_baseline_file(self.target))
-        self.assertIn("project checks failed", str(result["detail"]))
+        self.assertIn("static verification failed", str(result["detail"]))
 
     def test_malformed_static_proof_is_kit_failure_with_generated_identity(self) -> None:
         self.malformed_verify = True
@@ -382,6 +400,104 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertTrue(first["kit_ok"])
         self.assertTrue(second["kit_ok"])
         self.assertEqual(first["baseline_sha256"], second["baseline_sha256"])
+
+    def test_real_children_ignore_target_and_pythonpath_startup_files(self) -> None:
+        launcher = self.target / ".agent-kit" / "launcher.py"
+        launcher_bytes = b"""#!/usr/bin/env python3
+import base64
+import json
+import sys
+from pathlib import Path
+
+base64.b64encode(b\"proof\")
+command = sys.argv[1]
+if command == \"__brownfield-scan\":
+    Path(sys.argv[2]).write_bytes(
+        b'{\"complete\":true,\"errors\":[],\"issues\":[],\"kind\":'
+        b'\"agent-kit-brownfield-scan\",\"schema\":1}\\n'
+    )
+    raise SystemExit(0)
+if command in {\"self-test\", \"verify\"}:
+    print(json.dumps({\"command\": command, \"ok\": True, \"exit_code\": 0}))
+    raise SystemExit(0)
+raise SystemExit(4)
+"""
+        launcher.write_bytes(launcher_bytes)
+        (self.core / "tools" / "managed_launcher.py").write_bytes(launcher_bytes)
+        launchers = {
+            ".agent-kit/launcher.py": launcher_bytes,
+            "kit": release._managed_unix_launcher(launcher_bytes),
+            "kit.cmd": release._managed_windows_launcher(launcher_bytes),
+        }
+        for relative, content in launchers.items():
+            path = self.target.joinpath(*relative.split("/"))
+            path.write_bytes(content)
+            if relative == "kit":
+                path.chmod(0o755)
+        for surface in self.current["managed_surfaces"]:
+            surface["applied_sha256"] = _sha256(launchers[surface["path"]])
+        self.current_path.write_bytes(_canonical(self.current))
+
+        poison = self.target.parent / "python-poison"
+        poison.mkdir()
+        sentinels: list[Path] = []
+        for root, label in ((self.target, "target"), (poison, "pythonpath")):
+            for module in ("sitecustomize.py", "base64.py"):
+                sentinel = self.target.parent / f"{label}-{module}.ran"
+                sentinels.append(sentinel)
+                (root / module).write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                    "raise RuntimeError('unsafe Python startup input executed')\n",
+                    encoding="utf-8",
+                )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMSPEC": str(poison / "hostile-comspec.exe"),
+                "PATH": f"{self.target}{os.pathsep}{poison}",
+                "PYTHONPATH": f"{self.target}{os.pathsep}{poison}",
+                "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
+                "PYTHONUSERBASE": str(poison),
+            },
+            clear=False,
+        ):
+            result = check.run(self.target, self.session)
+
+        self.assertTrue(result["kit_ok"])
+        self.assertTrue(result["project_ok"])
+        self.assertTrue(all(not sentinel.exists() for sentinel in sentinels))
+
+    def test_tampered_managed_launcher_is_not_executed(self) -> None:
+        sentinel = self.target.parent / "tampered-launcher.ran"
+        tampered = (
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+        ).encode("utf-8")
+        (self.target / ".agent-kit" / "launcher.py").write_bytes(tampered)
+
+        result = check.run(self.target, self.session)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(sentinel.exists())
+        self.assertIsNone(brownfield.read_baseline_file(self.target))
+
+    def test_tampered_root_command_launcher_is_refused_before_core_runs(self) -> None:
+        sentinel = self.target.parent / "core-launcher.ran"
+        (self.core / "tools" / "managed_launcher.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        (self.target / "kit.cmd").write_bytes(b"@echo off\r\necho tampered\r\n")
+
+        result = check.run(self.target, self.session)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(sentinel.exists())
+        self.assertEqual([], self.commands)
+        self.assertIsNone(brownfield.read_baseline_file(self.target))
 
 
 if __name__ == "__main__":

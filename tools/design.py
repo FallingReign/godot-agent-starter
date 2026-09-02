@@ -28,10 +28,9 @@ CORE_ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 
-CONTEXT = project_context.load_active_context(CORE_ROOT)
-ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
+_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
+ROOT = _INSTALLATION.project_root  # compatibility name for project-owned paths
 DESIGN = ROOT / "docs" / "design"
-GAME_ROOT = CONTEXT.game_root
 
 INDEX_NAME = "INDEX.md"
 SKIP_FILES = {"README.md", INDEX_NAME}
@@ -64,6 +63,21 @@ EXCLUDED_GAME_DIRS = {
     ".agents", ".checklogs", ".git", ".github", ".godot", ".godot_doc",
     ".kit", "addons", "docs", "tests", "tools",
 }
+
+
+def _configured_game_root() -> Path:
+    """Resolve the game only when a design operation actually needs it.
+
+    An extracted release is a valid pre-installation controller even though it
+    deliberately contains no game.  Pure design parsing is also used by that
+    controller, so importing this module must not require game files.
+    """
+    context = project_context.load_active_context(CORE_ROOT)
+    if context.project_root != ROOT:
+        raise project_context.ProjectContextError(
+            "active design project changed after startup"
+        )
+    return context.game_root
 
 
 def design_files() -> list[Path]:
@@ -371,10 +385,11 @@ def replace_active_metadata(
 def scan_tunables() -> dict[str, dict]:
     """Find `## @tune <id>` claims in GDScript."""
     found: dict[str, dict] = {}
-    if not GAME_ROOT.is_dir():
+    game_root = _configured_game_root()
+    if not game_root.is_dir():
         return found
-    for gd in sorted(GAME_ROOT.rglob("*.gd")):
-        if EXCLUDED_GAME_DIRS.intersection(gd.relative_to(GAME_ROOT).parts):
+    for gd in sorted(game_root.rglob("*.gd")):
+        if EXCLUDED_GAME_DIRS.intersection(gd.relative_to(game_root).parts):
             continue
         try:
             lines = gd.read_text(encoding="utf-8", errors="replace").splitlines()

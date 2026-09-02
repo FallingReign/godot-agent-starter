@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import select
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -62,10 +64,259 @@ PID_ALIVE = "alive"
 PID_DEAD = "dead"
 PID_UNKNOWN = "unknown"
 
+MAX_ISOLATED_SCRIPT_BYTES = 16 * 1024 * 1024
+
+_ISOLATED_CORE_BOOTSTRAP = r'''from __future__ import annotations
+import hashlib
+import os
+import runpy
+import stat
+import sys
+from pathlib import Path
+
+MAX_BYTES = 16 * 1024 * 1024
+
+def reparse(info):
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+
+def identity(info):
+    return tuple(getattr(info, field, None) for field in (
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_nlink"
+    ))
+
+mode, raw_path, expected, raw_core, raw_tools = sys.argv[1:6]
+path = Path(os.path.abspath(raw_path))
+core = Path(os.path.abspath(raw_core))
+tools = Path(os.path.abspath(raw_tools))
+if not all(item.is_absolute() for item in (path, core, tools)):
+    raise SystemExit("isolated core paths must be absolute")
+if core.resolve(strict=True) != core or tools != core / "tools" or tools.resolve(strict=True) != tools:
+    raise SystemExit("isolated core folders are redirected")
+try:
+    path.relative_to(core)
+except ValueError:
+    raise SystemExit("isolated child is outside the selected core")
+before = path.lstat()
+marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+if (stat.S_ISLNK(before.st_mode) or reparse(before) or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1 or before.st_size > MAX_BYTES
+        or path.resolve(strict=True) != path):
+    raise SystemExit("isolated child path is unsafe")
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+try:
+    opened = os.fstat(descriptor)
+    chunks = []
+    remaining = MAX_BYTES + 1
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    after_handle = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+content = b"".join(chunks)
+after = path.lstat()
+if (identity(before) != identity(opened) or identity(opened) != identity(after_handle)
+        or identity(after_handle) != identity(after) or reparse(after)
+        or len(content) != before.st_size or hashlib.sha256(content).hexdigest() != expected):
+    raise SystemExit("isolated child changed before execution")
+sys.path.insert(0, str(core))
+sys.path.insert(0, str(tools))
+if mode == "script":
+    sys.argv = [str(path), *sys.argv[6:]]
+    scope = {
+        "__name__": "__main__", "__file__": str(path), "__cached__": None,
+        "__package__": None, "__spec__": None,
+    }
+    exec(compile(content, str(path), "exec"), scope, scope)
+elif mode == "module" and len(sys.argv) >= 7:
+    module = sys.argv[6]
+    sys.argv = [module, *sys.argv[7:]]
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+else:
+    raise SystemExit("isolated child mode is invalid")
+'''
+
 
 def _is_windows() -> bool:
     """Report the host branch without making tests mutate Python's global OS state."""
     return os.name == "nt"
+
+
+def windows_system_executable(name: str) -> str:
+    """Return one fixed ordinary System32 executable without trusting PATH."""
+    if not _is_windows():
+        raise ValueError("Windows system executables are unavailable on this host")
+    if name not in ("cmd.exe", "taskkill.exe"):
+        raise ValueError("Windows system executable is not allowed")
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_system_directory = kernel32.GetSystemDirectoryW
+        get_system_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+        get_system_directory.restype = ctypes.c_uint
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = int(get_system_directory(buffer, len(buffer)))
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise ValueError("Windows system directory is unavailable") from exc
+    if length <= 0 or length >= len(buffer):
+        raise ValueError("Windows system directory is unavailable")
+    candidate = Path(buffer.value) / name
+    try:
+        info = candidate.lstat()
+        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        redirected = bool(int(getattr(info, "st_file_attributes", 0)) & marker)
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Windows system executable is unavailable: {name}") from exc
+    if (
+        not candidate.is_absolute()
+        or stat.S_ISLNK(info.st_mode)
+        or redirected
+        or not stat.S_ISREG(info.st_mode)
+        or resolved != candidate
+    ):
+        raise ValueError(f"Windows system executable is redirected or invalid: {name}")
+    return str(candidate)
+
+
+def windows_command_processor() -> str:
+    """Return the fixed ordinary Windows command processor without trusting input."""
+    return windows_system_executable("cmd.exe")
+
+
+def isolated_python_environment(
+    overrides: Mapping[str, object] | None = None,
+    *,
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a child environment without Python startup controls."""
+    source = os.environ if base is None else base
+    environment = {
+        str(key): str(value)
+        for key, value in source.items()
+        if not str(key).upper().startswith("PYTHON")
+    }
+    if overrides:
+        environment.update(
+            {
+                str(key): str(value)
+                for key, value in overrides.items()
+                if not str(key).upper().startswith("PYTHON")
+            }
+        )
+    return environment
+
+
+def _isolated_anchor(script: Path, core_root: Path) -> tuple[Path, Path, str]:
+    core = Path(os.path.abspath(core_root))
+    path = Path(os.path.abspath(script))
+    tools = core / "tools"
+    if core.resolve(strict=True) != core or tools.resolve(strict=True) != tools:
+        raise ValueError("selected core is redirected")
+    try:
+        path.relative_to(core)
+    except ValueError as exc:
+        raise ValueError("isolated Python child is outside the selected core") from exc
+    before = path.lstat()
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or bool(int(getattr(before, "st_file_attributes", 0)) & marker)
+        or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+        or before.st_size > MAX_ISOLATED_SCRIPT_BYTES
+        or path.resolve(strict=True) != path
+    ):
+        raise ValueError("isolated Python child path is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        content = bytearray()
+        while len(content) <= MAX_ISOLATED_SCRIPT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(65536, MAX_ISOLATED_SCRIPT_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        after_handle = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    def identity(info: os.stat_result) -> tuple[object, ...]:
+        return tuple(
+            getattr(info, field, None)
+            for field in (
+                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_nlink"
+            )
+        )
+    if (
+        identity(before) != identity(opened)
+        or identity(opened) != identity(after_handle)
+        or identity(after_handle) != identity(after)
+        or len(content) != before.st_size
+    ):
+        raise ValueError("isolated Python child changed while it was read")
+    return path, tools, hashlib.sha256(content).hexdigest()
+
+
+def isolated_python_script_command(
+    executable: Path | str,
+    script: Path,
+    core_root: Path,
+    *arguments: object,
+) -> list[str]:
+    """Build one captured-byte, isolated command for a selected core script."""
+    path, tools, digest = _isolated_anchor(script, core_root)
+    return [
+        str(executable),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        _ISOLATED_CORE_BOOTSTRAP,
+        "script",
+        str(path),
+        digest,
+        str(Path(os.path.abspath(core_root))),
+        str(tools),
+        *(str(item) for item in arguments),
+    ]
+
+
+def isolated_python_module_command(
+    executable: Path | str,
+    module: str,
+    anchor: Path,
+    core_root: Path,
+    *arguments: object,
+) -> list[str]:
+    """Build one isolated stdlib-module command anchored to selected core bytes."""
+    if module != "unittest":
+        raise ValueError("isolated Python module is not allowed")
+    path, tools, digest = _isolated_anchor(anchor, core_root)
+    return [
+        str(executable),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        _ISOLATED_CORE_BOOTSTRAP,
+        "module",
+        str(path),
+        digest,
+        str(Path(os.path.abspath(core_root))),
+        str(tools),
+        module,
+        *(str(item) for item in arguments),
+    ]
 
 
 class Cancellation(Protocol):
@@ -565,27 +816,29 @@ def posix_parent_death_command(command: Sequence[str]) -> list[str]:
     values = [str(part) for part in command]
     if not sys.platform.startswith("linux"):
         return values
-    return [
+    return isolated_python_script_command(
         sys.executable,
-        str(Path(__file__).resolve()),
+        Path(__file__).resolve(),
+        Path(__file__).resolve().parent.parent,
         "--exec-with-parent-death",
         str(os.getpid()),
         *values,
-    ]
+    )
 
 
 def _guarded_posix_command(
     command: Sequence[str], release_fd: int, expected_parent: int
 ) -> list[str]:
     """Hold a new process group until its independent lifeline is ready."""
-    return [
+    return isolated_python_script_command(
         sys.executable,
-        str(Path(__file__).resolve()),
+        Path(__file__).resolve(),
+        Path(__file__).resolve().parent.parent,
         "--exec-after-lifeline",
         str(int(release_fd)),
         str(int(expected_parent)),
         *[str(part) for part in command],
-    ]
+    )
 
 
 def _exec_after_lifeline(
@@ -685,14 +938,15 @@ class PosixGroupGuard:
         ready_read, ready_write = os.pipe()
         for descriptor in (control_read, ready_write):
             os.set_inheritable(descriptor, True)
-        command = [
+        command = isolated_python_script_command(
             sys.executable,
-            str(Path(__file__).resolve()),
+            Path(__file__).resolve(),
+            Path(__file__).resolve().parent.parent,
             "--watch-posix-group",
             str(int(pgid)),
             str(control_read),
             str(ready_write),
-        ]
+        )
         watcher: subprocess.Popen[bytes] | None = None
         try:
             watcher = subprocess.Popen(

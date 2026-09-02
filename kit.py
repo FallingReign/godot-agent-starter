@@ -22,13 +22,14 @@ import hmac
 import json
 import os
 import re
+import runpy
 import secrets
 import subprocess
 import sys
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 CORE_ROOT = Path(__file__).resolve().parent
 TOOLS = CORE_ROOT / "tools"
@@ -540,6 +541,42 @@ def _looks_like_provider_action(command: Sequence[str]) -> bool:
     return "retro.py" in raw_names and "--sdk" in command
 
 
+def _isolated_python_command(script: Path, *arguments: object) -> list[str]:
+    try:
+        return process_supervisor.isolated_python_script_command(
+            sys.executable, script, CORE_ROOT, *arguments
+        )
+    except (OSError, ValueError) as exc:
+        raise CliError(
+            f"internal kit command is unsafe: {exc}",
+            code=EXIT_REFUSED,
+            status="command_unsafe",
+        ) from exc
+
+
+def _isolated_unittest_command(*arguments: object) -> list[str]:
+    try:
+        return process_supervisor.isolated_python_module_command(
+            sys.executable,
+            "unittest",
+            CORE_ROOT / "kit.py",
+            CORE_ROOT,
+            *arguments,
+        )
+    except (OSError, ValueError) as exc:
+        raise CliError(
+            f"internal kit tests are unsafe: {exc}",
+            code=EXIT_REFUSED,
+            status="command_unsafe",
+        ) from exc
+
+
+def _isolated_python_environment(
+    overrides: Mapping[str, object] | None = None,
+) -> dict[str, str]:
+    return process_supervisor.isolated_python_environment(overrides)
+
+
 def _run_process(
     command: Sequence[str],
     *,
@@ -548,6 +585,7 @@ def _run_process(
     allow_provider: bool = False,
     allow_child_breakaway: bool = False,
     environment: dict[str, str] | None = None,
+    inherit_environment: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     argv = [str(part) for part in command]
     if _looks_like_provider_action(argv) and not allow_provider:
@@ -560,7 +598,11 @@ def _run_process(
         argv,
         cwd=cwd,
         timeout=timeout,
-        environment=({**os.environ, **environment} if environment else None),
+        environment=(
+            ({**os.environ, **environment} if inherit_environment else dict(environment))
+            if environment is not None
+            else None
+        ),
         capture_output=True,
         allow_child_breakaway=allow_child_breakaway,
     )
@@ -600,6 +642,7 @@ def _run_process_inherited(
     cwd: Path,
     timeout: int,
     environment: dict[str, str] | None = None,
+    inherit_environment: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run a human-facing command with live output and shared cancellation.
 
@@ -621,7 +664,11 @@ def _run_process_inherited(
         argv,
         cwd=cwd,
         timeout=timeout,
-        environment=({**os.environ, **environment} if environment else None),
+        environment=(
+            ({**os.environ, **environment} if inherit_environment else dict(environment))
+            if environment is not None
+            else None
+        ),
         capture_output=False,
         allow_child_breakaway=False,
     )
@@ -694,9 +741,11 @@ def _gdls_read_only_status(project: Path) -> dict[str, Any] | None:
     if not tool.is_file():
         return None
     result = _run_process(
-        [sys.executable, str(tool), "status"],
+        _isolated_python_command(tool, "status"),
         cwd=project,
         timeout=30,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     return _final_json_object(result.stdout or "")
 
@@ -712,7 +761,11 @@ def _doctor(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, An
     """
     bootstrap = _script(project, "bootstrap.py")
     result = _run_process(
-        [sys.executable, str(bootstrap), "--json"], cwd=project, timeout=300
+        _isolated_python_command(bootstrap, "--json"),
+        cwd=project,
+        timeout=300,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     try:
         state = json.loads(result.stdout or "")
@@ -848,20 +901,28 @@ def _setup(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
     }
     if operation == "format":
         result = _run_process(
-            [sys.executable, str(_script(project, "check.py")), "--fix-format"],
+            _isolated_python_command(_script(project, "check.py"), "--fix-format"),
             cwd=project,
             timeout=300,
+            environment=_isolated_python_environment(),
+            inherit_environment=False,
         )
     else:
-        command = [sys.executable, str(bootstrap), *flags[operation]]
+        arguments = list(flags[operation])
         if operation == "import":
             selected_engine = _selected_engine_path(
                 project, operation="setup import"
             )
-            command.extend(["--engine-bin", str(selected_engine)])
+            arguments.extend(["--engine-bin", str(selected_engine)])
         if operation in targets:
-            command.extend(["--operation-target", targets[operation]])
-        result = _run_process(command, cwd=project, timeout=900)
+            arguments.extend(["--operation-target", targets[operation]])
+        result = _run_process(
+            _isolated_python_command(bootstrap, *arguments),
+            cwd=project,
+            timeout=900,
+            environment=_isolated_python_environment(),
+            inherit_environment=False,
+        )
     output = (result.stdout or "") + (result.stderr or "")
     ok = result.returncode == 0
     payload = {
@@ -896,9 +957,11 @@ def _integrity_accept(
         )
     check = _script(project, "check.py")
     result = _run_process(
-        [sys.executable, str(check), "--accept-gate-changes"],
+        _isolated_python_command(check, "--accept-gate-changes"),
         cwd=project,
         timeout=120,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     output = (result.stdout or "") + (result.stderr or "")
     ok = result.returncode == 0
@@ -1237,10 +1300,11 @@ def _verify_once(
         }
         strict = _script(project, "tools", "strict_verify.py")
         result = _run_process(
-            [sys.executable, str(strict), "--json"],
+            _isolated_python_command(strict, "--json"),
             cwd=project,
             timeout=10800,
-            environment=environment,
+            environment=_isolated_python_environment(environment),
+            inherit_environment=False,
         )
         try:
             report = json.loads(result.stdout or "")
@@ -1323,7 +1387,7 @@ def _verify_once(
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     check = _script(project, "check.py")
-    command = [sys.executable, str(check)]
+    command = _isolated_python_command(check)
     for stage in args.stage:
         command.extend(["--only", stage])
     if args.fast:
@@ -1333,11 +1397,19 @@ def _verify_once(
     streamed = not bool(getattr(args, "json_output", False))
     result = (
         _run_process_inherited(
-            command, cwd=project, timeout=1800, environment=environment
+            command,
+            cwd=project,
+            timeout=1800,
+            environment=_isolated_python_environment(environment),
+            inherit_environment=False,
         )
         if streamed
         else _run_process(
-            command, cwd=project, timeout=1800, environment=environment
+            command,
+            cwd=project,
+            timeout=1800,
+            environment=_isolated_python_environment(environment),
+            inherit_environment=False,
         )
     )
     output = (result.stdout or "") + (result.stderr or "")
@@ -1387,14 +1459,11 @@ def _self_test(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Run kit-owned regression tests behind an enforced no-engine boundary."""
-    command = [
-        sys.executable,
-        "-m",
-        "unittest",
+    command = _isolated_unittest_command(
         "discover",
         "-s",
         str(CORE_ROOT / "tools" / "tests"),
-    ]
+    )
     environment = {
         "KIT_ENGINE_DISABLED": "1",
         "KIT_SELF_TEST": "1",
@@ -1411,16 +1480,18 @@ def _self_test(
     result = (
         _run_process_inherited(
             command,
-            cwd=project,
+            cwd=CORE_ROOT,
             timeout=1800,
-            environment=environment,
+            environment=_isolated_python_environment(environment),
+            inherit_environment=False,
         )
         if streamed
         else _run_process(
             command,
-            cwd=project,
+            cwd=CORE_ROOT,
             timeout=1800,
-            environment=environment,
+            environment=_isolated_python_environment(environment),
+            inherit_environment=False,
         )
     )
     ok = result.returncode == 0
@@ -1451,9 +1522,11 @@ def _maintenance_process(
     timeout: int = 300,
 ) -> tuple[int, dict[str, Any], list[str]]:
     result = _run_process(
-        [sys.executable, str(_script(project, script_name)), *arguments],
+        _isolated_python_command(_script(project, script_name), *arguments),
         cwd=project,
         timeout=timeout,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     output = (result.stdout or "") + (result.stderr or "")
     ok = result.returncode == 0
@@ -1496,14 +1569,15 @@ def _schema_describe(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
     result = _run_process(
-        [
-            sys.executable,
-            str(_script(project, "tools", "schema.py")),
+        _isolated_python_command(
+            _script(project, "tools", "schema.py"),
             "--describe",
             args.value,
-        ],
+        ),
         cwd=project,
         timeout=60,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     ok = result.returncode == 0 and bool((result.stdout or "").strip())
     payload = {
@@ -1547,21 +1621,25 @@ def _gdls(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
     operation = args.gdls_command
-    command = [sys.executable, str(_script(project, "tools", "gdls.py"))]
+    arguments: list[str] = []
     if operation == "start":
-        command.extend([
+        arguments.extend([
             "--engine",
             str(_selected_engine_path(project, operation="gdls start")),
         ])
-    command.append(operation)
+    arguments.append(operation)
     if operation in {"diagnose", "symbols", "refs"}:
-        command.append(str(getattr(args, "value", "")))
+        arguments.append(str(getattr(args, "value", "")))
     timeout = 120 if operation == "start" else 60
     result = _run_process(
-        command,
+        _isolated_python_command(
+            _script(project, "tools", "gdls.py"), *arguments
+        ),
         cwd=project,
         timeout=timeout,
         allow_child_breakaway=operation == "start",
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     output = (result.stdout or "") + (result.stderr or "")
     try:
@@ -1658,7 +1736,16 @@ def _serve(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
             payload = dict(regeneration)
             payload.update({"command": f"serve {operation}", "status": "render_failed"})
             return plan_code, payload, plan_human
-    tool = _script(project, "tools", "board.py")
+    runtime = _source_controller_runtime(project)
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CliError(
+            f"review storage is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+    tool, board_cwd, board_environment = _board_target(project, project, runtime)
     switch = {
         "start": "--ensure",
         "status": "--status",
@@ -1666,11 +1753,12 @@ def _serve(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
         "stop": "--stop",
     }[operation]
     result = _run_process(
-        [sys.executable, str(tool), switch, "--json"],
-        cwd=project,
+        _isolated_python_command(tool, switch, "--json"),
+        cwd=board_cwd,
         timeout=60,
         allow_child_breakaway=operation in ("start", "open"),
-        environment={runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
+        environment=_isolated_python_environment(board_environment),
+        inherit_environment=False,
     )
     output = (result.stdout or "") + (result.stderr or "")
     state = _final_json_object(result.stdout or "")
@@ -1702,7 +1790,11 @@ def _serve(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any]
 def _retro_status(project: Path, _args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
     tool = _script(project, "tools", "retro_due.py")
     result = _run_process(
-        [sys.executable, str(tool), "--json"], cwd=project, timeout=30
+        _isolated_python_command(tool, "--json"),
+        cwd=project,
+        timeout=30,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     try:
         state = json.loads(result.stdout or "") if result.returncode == 0 else None
@@ -1797,10 +1889,12 @@ def _retro_run(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, 
             )
         capture_window.extend(("--limit", str(args.limit)))
     result = _run_process(
-        [sys.executable, str(tool), mode, "--force", *capture_window],
+        _isolated_python_command(tool, mode, "--force", *capture_window),
         cwd=project,
         timeout=3600,
         allow_provider=provider.automatic and bool(args.confirm_spend),
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     ok = result.returncode == 0
     successful_status = "completed" if provider.automatic else "evidence_prepared"
@@ -1863,12 +1957,18 @@ def _resolve_retro_report(project: Path, raw_report: str | None) -> Path:
 def _retro_publish(
         project: Path, args: argparse.Namespace) -> tuple[int, dict[str, Any], list[str]]:
     report_path = _resolve_retro_report(project, args.report)
-    command = [sys.executable, str(_script(project, "tools", "retro_rank.py"))]
+    command = _isolated_python_command(
+        _script(project, "tools", "retro_rank.py"), report_path
+    )
     # Resolve the exact report before ranking. The same path is rendered and
     # then bound back to its immutable evidence snapshot during completion.
-    command.append(str(report_path))
-
-    ranked = _run_process(command, cwd=project, timeout=180)
+    ranked = _run_process(
+        command,
+        cwd=project,
+        timeout=180,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
+    )
     rank_output = (ranked.stdout or "") + (ranked.stderr or "")
     if ranked.returncode != 0:
         payload = {
@@ -1900,14 +2000,15 @@ def _retro_publish(
 
     completion_tool = _script(project, "tools", "retro.py")
     completed = _run_process(
-        [
-            sys.executable,
-            str(completion_tool),
+        _isolated_python_command(
+            completion_tool,
             "--complete-published",
             str(report_path),
-        ],
+        ),
         cwd=project,
         timeout=180,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     completion_output = (completed.stdout or "") + (completed.stderr or "")
     ok = completed.returncode == 0
@@ -1944,9 +2045,11 @@ def _release(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, An
             status="release_unavailable",
         )
     result = _run_process(
-        [sys.executable, str(tool), args.release_command, args.archive],
+        _isolated_python_command(tool, args.release_command, args.archive),
         cwd=project,
         timeout=900,
+        environment=_isolated_python_environment(),
+        inherit_environment=False,
     )
     ok = result.returncode == 0
     payload = {
@@ -1965,6 +2068,41 @@ def _release(project: Path, args: argparse.Namespace) -> tuple[int, dict[str, An
     ]
     human.extend("  " + line for line in _output_tail(output, limit=6))
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
+
+
+def _brownfield_scan(
+    project: Path, args: argparse.Namespace
+) -> tuple[int, dict[str, Any], list[str]]:
+    output = Path(str(args.output))
+    if not output.is_absolute():
+        raise CliError(
+            "brownfield scan output must be an absolute path",
+            code=EXIT_REFUSED,
+            status="scan_output_invalid",
+        )
+    namespace = runpy.run_path(
+        str(_script(project, "check.py")),
+        run_name="_agent_kit_brownfield_scan",
+    )
+    scan = namespace.get("run_brownfield_scan")
+    if not callable(scan):
+        raise CliError(
+            "brownfield scan is unavailable in this kit",
+            code=EXIT_REFUSED,
+            status="scan_unavailable",
+        )
+    result = int(scan(str(output)))
+    ok = result == 0
+    payload = {
+        "ok": ok,
+        "command": "brownfield-scan",
+        "status": "completed" if ok else "failed",
+        "project": str(project),
+        "output": str(output),
+    }
+    return (EXIT_OK if ok else EXIT_FAILED), payload, [
+        f"brownfield scan: {'completed' if ok else 'failed'}"
+    ]
 
 
 def _explicit_path(value: str, label: str) -> Path:
@@ -2143,23 +2281,23 @@ def _register_kit_change_board(
 ) -> tuple[str, dict[str, Any], subprocess.CompletedProcess[str]]:
     tool, cwd, environment = _board_target(project, target, runtime)
     result = _run_process(
-        [
-            sys.executable,
-            str(tool),
+        _isolated_python_command(
+            tool,
             "--ensure",
             "--kit-change-session",
             session_id,
             "--json",
-        ],
+        ),
         cwd=cwd,
         timeout=60,
         allow_child_breakaway=True,
-        environment=environment,
+        environment=_isolated_python_environment(environment),
+        inherit_environment=False,
     )
     board = _final_json_object(result.stdout or "")
     if result.returncode != 0 or not isinstance(board, dict) or not board.get("ok"):
         output = (result.stdout or "") + (result.stderr or "")
-        detail = "; ".join(_output_tail(output, limit=4)) or "review server failed"
+        detail = "; ".join(_output_tail(output, limit=20)) or "review server failed"
         raise CliError(detail, status="board_failed")
     review_url = _exact_kit_change_url(board.get("review_url"), session_id)
     return review_url, board, result
@@ -2264,6 +2402,7 @@ _HANDLERS = {
     "retro_run": _retro_run,
     "retro_publish": _retro_publish,
     "release": _release,
+    "brownfield_scan": _brownfield_scan,
     "kit_change_prepare": _kit_change_prepare,
     "kit_change_recover": _kit_change_recover,
 }
@@ -2284,6 +2423,7 @@ _COMMAND_LABELS = {
     "retro_run": "retro run",
     "retro_publish": "retro publish",
     "release": "release",
+    "brownfield_scan": "brownfield scan",
     "kit_change_prepare": "kit change",
     "kit_change_recover": "recover",
 }
@@ -2312,8 +2452,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(payload, [f"kit: {payload['error']}"], json_output=wants_json)
         return EXIT_REFUSED
 
-    parser = build_parser()
-    args = parser.parse_args(raw_argv)
+    if raw_argv[:1] == ["__brownfield-scan"]:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("internal_command")
+        parser.add_argument("output")
+        _add_common_options(parser)
+        args = parser.parse_args(raw_argv)
+        args.action = "brownfield_scan"
+    else:
+        parser = build_parser()
+        args = parser.parse_args(raw_argv)
     json_output = bool(getattr(args, "json_output", False))
     project: Path | None = None
     try:

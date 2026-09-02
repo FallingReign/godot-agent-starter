@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import project_context  # noqa: E402
 import managed_launcher  # noqa: E402
 import runtime_paths  # noqa: E402
+import process_supervisor  # noqa: E402
 
 TOOLS = Path(__file__).resolve().parent
 CORE_ROOT = TOOLS.parent
@@ -702,16 +703,20 @@ def evaluate(path: Path, expected_run_id: str, expected_before_sha: str,
         static_only = trusted_host_result
         canonical_root = root.resolve(strict=True)
         core = _core_for_project(root)
-        gate_command = [sys.executable, str(core / "check.py")]
         public_command = "kit verify"
-        if static_only:
-            gate_command.append("--static")
-            public_command += " --static"
         try:
+            gate_command = process_supervisor.isolated_python_script_command(
+                sys.executable, core / "check.py", core
+            )
+            if static_only:
+                gate_command.append("--static")
+                public_command += " --static"
             gate = subprocess.run(
                 gate_command, cwd=str(root),
                 capture_output=True, text=True, timeout=gate_timeout,
-                env=CHILD_ENVIRONMENT if canonical_root == PROJECT_ROOT else None,
+                env=process_supervisor.isolated_python_environment(
+                    CHILD_ENVIRONMENT if canonical_root == PROJECT_ROOT else {}
+                ),
             )
             output = (gate.stdout or "") + (gate.stderr or "")
             passed = gate.returncode == 0 and "GATE PASSED" in output
@@ -720,7 +725,7 @@ def evaluate(path: Path, expected_run_id: str, expected_before_sha: str,
                             "tail": "\n".join(output.splitlines()[-30:])}
             if not passed:
                 base["errors"].append("fresh dispatcher gate verification failed")
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             base["errors"].append(f"fresh dispatcher gate verification failed: {exc}")
     if not base["errors"]:
         base["status"] = "completed"

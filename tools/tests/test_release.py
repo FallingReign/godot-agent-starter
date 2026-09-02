@@ -1355,10 +1355,27 @@ class TestReleaseSmoke(ReleaseTestCase):
     def test_verified_archive_starts_its_platform_launcher(self) -> None:
         archive = _synthetic_smoke_archive(self.scratch)
         workspace = self.scratch / "smoke-workspace"
+        sentinel = self.scratch / "hostile-command-processor.ran"
+        hostile = self.scratch / "hostile-command-processor.cmd"
+        hostile.write_text(
+            "@echo off\r\n"
+            f">\"{sentinel}\" echo executed\r\n"
+            "exit /b 99\r\n",
+            encoding="utf-8",
+        )
 
-        report = release.smoke_archive(archive, workspace)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMSPEC": str(hostile),
+                "PATH": f"{self.scratch}{os.pathsep}{os.environ.get('PATH', '')}",
+            },
+            clear=False,
+        ):
+            report = release.smoke_archive(archive, workspace)
 
         self.assertTrue(report["ok"])
+        self.assertFalse(sentinel.exists())
         self.assertEqual(
             "kit.cmd" if os.name == "nt" else "kit",
             report["smoke"]["launcher"],

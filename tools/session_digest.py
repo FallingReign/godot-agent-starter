@@ -43,7 +43,7 @@ import project_context
 
 TOOLS = Path(__file__).resolve().parent
 CORE_ROOT = TOOLS.parent
-ROOT = project_context.load_active_context(CORE_ROOT).project_root
+ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 
 # Copilot keeps one directory per session, each with a workspace.yaml carrying
 # the cwd. That file is small and declarative; the session database is an

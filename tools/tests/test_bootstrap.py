@@ -455,7 +455,7 @@ class PrivateToolResolution(unittest.TestCase):
 
         self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
         self.assertEqual(
-            [sys.executable, "-I", "-m", "venv"],
+                [sys.executable, "-B", "-I", "-S", "-m", "venv"],
             run.call_args_list[0].args[0][:-1],
         )
         self.assertEqual(str(target), run.call_args_list[0].args[0][-1])

@@ -36,8 +36,12 @@ import session_digest  # noqa: E402
 import session_evidence  # noqa: E402
 import runtime_paths  # noqa: E402
 import retro_due  # noqa: E402
+import managed_launcher  # noqa: E402
+import process_supervisor  # noqa: E402
 
+_ACTIVE_INSTALLATION = project_context.resolve_active_installation(CORE_ROOT)
 ROOT = project_context.load_active_context(CORE_ROOT).project_root
+CHILD_ENVIRONMENT = managed_launcher.bound_environment(_ACTIVE_INSTALLATION)
 RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
 EVIDENCE_DIR = _RUNTIME.evidence
@@ -1137,28 +1141,49 @@ def finalise_retro(pack: dict, pack_path: Path, completion_key: str) -> int:
         print("retro analyzer produced no validated findings report")
         return 1
     report = reports[-1]
-    ranked = subprocess.run(
-        [sys.executable, str(CORE_ROOT / "tools" / "retro_rank.py"), str(report)],
-        cwd=str(ROOT), capture_output=True, text=True, timeout=120,
-    )
+    try:
+        ranked = subprocess.run(
+            process_supervisor.isolated_python_script_command(
+                sys.executable,
+                CORE_ROOT / "tools" / "retro_rank.py",
+                CORE_ROOT,
+                str(report),
+            ),
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=process_supervisor.isolated_python_environment(CHILD_ENVIRONMENT),
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"ranking failed; notes were not archived: {exc}")
+        return 1
     if ranked.returncode != 0:
         print("ranking failed; notes were not archived")
         print((ranked.stderr or ranked.stdout)[-1500:])
         return 1
-    for label, command in (
-        ("plan", [sys.executable, str(CORE_ROOT / "tools" / "plan_html.py")]),
+    for label, script, arguments in (
+        ("plan", CORE_ROOT / "tools" / "plan_html.py", ()),
         (
             "retrospective",
-            [sys.executable, str(CORE_ROOT / "tools" / "retro_html.py"), "--no-board"],
+            CORE_ROOT / "tools" / "retro_html.py",
+            ("--no-board",),
         ),
     ):
-        rendered = subprocess.run(
-            command,
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+        try:
+            rendered = subprocess.run(
+                process_supervisor.isolated_python_script_command(
+                    sys.executable, script, CORE_ROOT, *arguments
+                ),
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=process_supervisor.isolated_python_environment(CHILD_ENVIRONMENT),
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"{label} publication view failed: {exc}")
+            return 1
         if rendered.returncode != 0:
             print(f"{label} publication view failed")
             print((rendered.stderr or rendered.stdout)[-1500:])

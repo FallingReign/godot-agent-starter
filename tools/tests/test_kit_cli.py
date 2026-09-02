@@ -9,6 +9,7 @@ or server.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import hmac
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -54,12 +56,54 @@ class KitCliTest(unittest.TestCase):
         )
         lock_patch.start()
         self.addCleanup(lock_patch.stop)
+        warning_patch = mock.patch.object(
+            kit.native_engine,
+            "snapshot_native_warning",
+            return_value=kit.native_engine.NativeWarningSnapshot(
+                kit.native_engine.WARNING_CLEAN, None
+            ),
+        )
+        warning_patch.start()
+        self.addCleanup(warning_patch.stop)
 
     @staticmethod
     def completed(
         returncode: int = 0, stdout: str = "", stderr: str = ""
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def assert_isolated_script(
+        self, command: list[str], script: Path, *arguments: str
+    ) -> None:
+        self.assertEqual([sys.executable, "-B", "-I", "-S", "-c"], command[:5])
+        self.assertEqual("script", command[6])
+        self.assertEqual(str(script.resolve()), command[7])
+        self.assertRegex(command[8], r"^[0-9a-f]{64}$")
+        self.assertEqual(str(kit.CORE_ROOT.resolve()), command[9])
+        self.assertEqual(str((kit.CORE_ROOT / "tools").resolve()), command[10])
+        self.assertEqual(list(arguments), command[11:])
+
+    def assert_isolated_environment(self, environment: dict[str, str]) -> None:
+        self.assertFalse(
+            [key for key in environment if key.upper().startswith("PYTHON")]
+        )
+
+    def assert_isolated_run(
+        self,
+        run: mock.Mock,
+        script: Path,
+        *arguments: str,
+        timeout: int,
+        **expected: object,
+    ) -> None:
+        run.assert_called_once()
+        self.assert_isolated_script(run.call_args.args[0], script, *arguments)
+        self.assertEqual(ROOT.resolve(), run.call_args.kwargs["cwd"])
+        self.assertEqual(timeout, run.call_args.kwargs["timeout"])
+        self.assert_isolated_environment(run.call_args.kwargs["environment"])
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
+        for key, value in expected.items():
+            self.assertEqual(value, run.call_args.kwargs[key])
 
     @staticmethod
     def signed_gate_summary(
@@ -259,11 +303,7 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual("OK", payload["check"]["bootstrap_result"]["state"])
         self.assertNotIn("stdout", payload["process"])
         self.assertEqual(0, payload["process"]["exit_code"])
-        run.assert_called_once_with(
-            [sys.executable, str(bootstrap), "--json"],
-            cwd=ROOT.resolve(),
-            timeout=300,
-        )
+        self.assert_isolated_run(run, bootstrap, "--json", timeout=300)
         called = run.call_args.args[0]
         self.assertFalse(kit._looks_like_provider_action(called))
         self.assertNotIn("--fix", called)
@@ -291,9 +331,7 @@ class KitCliTest(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual("needs_setup", payload["status"])
         self.assertEqual(["godot"], payload["blocking"])
-        self.assertEqual(
-            [sys.executable, str(bootstrap), "--json"], run.call_args.args[0]
-        )
+        self.assert_isolated_script(run.call_args.args[0], bootstrap, "--json")
 
     def test_doctor_surfaces_persisted_native_crash_without_another_process(self) -> None:
         probe = self.completed(stdout=json.dumps({
@@ -366,10 +404,14 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("completed", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(bootstrap), "--download-dep", "gut",
-             "--operation-target", "gut"],
-            cwd=ROOT.resolve(), timeout=900,
+        self.assert_isolated_run(
+            run,
+            bootstrap,
+            "--download-dep",
+            "gut",
+            "--operation-target",
+            "gut",
+            timeout=900,
         )
 
     def test_setup_gdtoolkit_uses_the_same_explicit_locked_dependency_path(self) -> None:
@@ -381,10 +423,14 @@ class KitCliTest(unittest.TestCase):
                 "setup", "dependency", "gdtoolkit", "--project", str(ROOT), "--json"
             )
         self.assertEqual(kit.EXIT_OK, code)
-        run.assert_called_once_with(
-            [sys.executable, str(bootstrap), "--download-dep", "gdtoolkit",
-             "--operation-target", "gdtoolkit"],
-            cwd=ROOT.resolve(), timeout=900,
+        self.assert_isolated_run(
+            run,
+            bootstrap,
+            "--download-dep",
+            "gdtoolkit",
+            "--operation-target",
+            "gdtoolkit",
+            timeout=900,
         )
 
     def test_setup_dependency_audit_uses_one_public_bounded_operation(self) -> None:
@@ -397,10 +443,13 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("completed", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(bootstrap), "--audit-dependencies",
-             "--operation-target", "dependency-audit"],
-            cwd=ROOT.resolve(), timeout=900,
+        self.assert_isolated_run(
+            run,
+            bootstrap,
+            "--audit-dependencies",
+            "--operation-target",
+            "dependency-audit",
+            timeout=900,
         )
 
     def test_setup_layout_maps_the_public_root_name_to_the_config_value(self) -> None:
@@ -412,10 +461,14 @@ class KitCliTest(unittest.TestCase):
                 "setup", "layout", "root", "--project", str(ROOT), "--json"
             )
         self.assertEqual(kit.EXIT_OK, code)
-        run.assert_called_once_with(
-            [sys.executable, str(bootstrap), "--game-layout", ".",
-             "--operation-target", "game-layout"],
-            cwd=ROOT.resolve(), timeout=900,
+        self.assert_isolated_run(
+            run,
+            bootstrap,
+            "--game-layout",
+            ".",
+            "--operation-target",
+            "game-layout",
+            timeout=900,
         )
 
     def test_setup_import_passes_the_one_public_engine_selection_to_bootstrap(self) -> None:
@@ -435,17 +488,14 @@ class KitCliTest(unittest.TestCase):
                 "setup", "import", "--project", str(ROOT), "--json"
             )
         self.assertEqual(kit.EXIT_OK, code)
-        run.assert_called_once_with(
-            [
-                sys.executable,
-                str(bootstrap),
-                "--import-project",
-                "--engine-bin",
-                str(engine_path),
-                "--operation-target",
-                "import-cache",
-            ],
-            cwd=ROOT.resolve(),
+        self.assert_isolated_run(
+            run,
+            bootstrap,
+            "--import-project",
+            "--engine-bin",
+            str(engine_path),
+            "--operation-target",
+            "import-cache",
             timeout=900,
         )
 
@@ -477,10 +527,7 @@ class KitCliTest(unittest.TestCase):
                 "setup", "format", "--project", str(ROOT), "--json"
             )
         self.assertEqual(kit.EXIT_OK, code)
-        run.assert_called_once_with(
-            [sys.executable, str(check), "--fix-format"],
-            cwd=ROOT.resolve(), timeout=300,
-        )
+        self.assert_isolated_run(run, check, "--fix-format", timeout=300)
 
     def test_integrity_accept_is_a_typed_human_review_action(self) -> None:
         check = ROOT / "check.py"
@@ -490,10 +537,7 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("accepted", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(check), "--accept-gate-changes"],
-            cwd=ROOT.resolve(), timeout=120,
-        )
+        self.assert_isolated_run(run, check, "--accept-gate-changes", timeout=120)
 
     def test_verify_routes_normal_and_strict_modes_to_their_owners(self) -> None:
         check = ROOT / "check.py"
@@ -517,18 +561,19 @@ class KitCliTest(unittest.TestCase):
             code, _ = self.invoke("verify", "--project", str(ROOT))
         self.assertEqual(kit.EXIT_OK, code)
         run.assert_called_once()
-        self.assertEqual([sys.executable, str(check)], run.call_args.args[0])
+        self.assert_isolated_script(run.call_args.args[0], check)
         self.assertEqual(ROOT.resolve(), run.call_args.kwargs["cwd"])
         self.assertEqual(1800, run.call_args.kwargs["timeout"])
         actual_environment = dict(run.call_args.kwargs["environment"])
-        nonce = actual_environment.pop("KIT_VERIFY_NONCE")
-        auth_key = actual_environment.pop("KIT_VERIFY_AUTH_KEY")
-        repository_sha256 = actual_environment.pop("KIT_VERIFY_REPOSITORY_SHA256")
-        self.assertEqual("1", actual_environment.pop("PYTHONDONTWRITEBYTECODE"))
+        nonce = actual_environment["KIT_VERIFY_NONCE"]
+        auth_key = actual_environment["KIT_VERIFY_AUTH_KEY"]
+        repository_sha256 = actual_environment["KIT_VERIFY_REPOSITORY_SHA256"]
         self.assertRegex(nonce, r"^[0-9a-f]{32}$")
         self.assertRegex(auth_key, r"^[0-9a-f]{64}$")
         self.assertRegex(repository_sha256, r"^[0-9a-f]{64}$")
-        self.assertEqual(environment, actual_environment)
+        self.assertEqual(environment["GODOT_BIN"], actual_environment["GODOT_BIN"])
+        self.assert_isolated_environment(actual_environment)
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
         captured.assert_not_called()
 
         strict = self.completed(
@@ -575,20 +620,19 @@ class KitCliTest(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual("blocked", payload["status"])
         run.assert_called_once()
-        self.assertEqual(
-            [sys.executable, str(strict_tool), "--json"], run.call_args.args[0]
-        )
+        self.assert_isolated_script(run.call_args.args[0], strict_tool, "--json")
         self.assertEqual(ROOT.resolve(), run.call_args.kwargs["cwd"])
         self.assertEqual(10800, run.call_args.kwargs["timeout"])
         actual_environment = dict(run.call_args.kwargs["environment"])
-        nonce = actual_environment.pop("KIT_VERIFY_NONCE")
-        auth_key = actual_environment.pop("KIT_VERIFY_AUTH_KEY")
-        repository_sha256 = actual_environment.pop("KIT_VERIFY_REPOSITORY_SHA256")
-        self.assertEqual("1", actual_environment.pop("PYTHONDONTWRITEBYTECODE"))
+        nonce = actual_environment["KIT_VERIFY_NONCE"]
+        auth_key = actual_environment["KIT_VERIFY_AUTH_KEY"]
+        repository_sha256 = actual_environment["KIT_VERIFY_REPOSITORY_SHA256"]
         self.assertRegex(nonce, r"^[0-9a-f]{32}$")
         self.assertRegex(auth_key, r"^[0-9a-f]{64}$")
         self.assertRegex(repository_sha256, r"^[0-9a-f]{64}$")
-        self.assertEqual(environment, actual_environment)
+        self.assertEqual(environment["GODOT_BIN"], actual_environment["GODOT_BIN"])
+        self.assert_isolated_environment(actual_environment)
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
 
     def test_static_verify_is_explicit_json_safe_and_never_routes_to_strict(self) -> None:
         check = ROOT / "check.py"
@@ -609,19 +653,10 @@ class KitCliTest(unittest.TestCase):
         self.assertTrue(payload["static"])
         self.assertFalse(payload["strict"])
         run.assert_called_once()
-        self.assertEqual(
-            [sys.executable, str(check), "--static"], run.call_args.args[0]
-        )
+        self.assert_isolated_script(run.call_args.args[0], check, "--static")
         actual_environment = run.call_args.kwargs["environment"]
-        self.assertEqual(
-            {
-                "KIT_VERIFY_NONCE",
-                "KIT_VERIFY_AUTH_KEY",
-                "KIT_VERIFY_REPOSITORY_SHA256",
-                "PYTHONDONTWRITEBYTECODE",
-            },
-            set(actual_environment),
-        )
+        self.assert_isolated_environment(actual_environment)
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
         self.assertRegex(
             actual_environment["KIT_VERIFY_NONCE"], r"^[0-9a-f]{32}$"
         )
@@ -814,28 +849,103 @@ class KitCliTest(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual("passed", payload["status"])
         self.assertEqual("disabled", payload["engine"])
-        run.assert_called_once_with(
-            [
-                sys.executable,
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                str(kit.CORE_ROOT / "tools" / "tests"),
-            ],
-            cwd=ROOT.resolve(),
-            timeout=1800,
-            environment={
-                "KIT_ENGINE_DISABLED": "1",
-                "KIT_SELF_TEST": "1",
-                "KIT_VERIFY_NONCE": "",
-                "KIT_VERIFY_AUTH_KEY": "",
-                "KIT_VERIFY_REPOSITORY_SHA256": "",
-                "KIT_NATIVE_RETRY_TOKEN": "",
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual([sys.executable, "-B", "-I", "-S", "-c"], command[:5])
+        self.assertEqual("module", command[6])
+        self.assertEqual(str((kit.CORE_ROOT / "kit.py").resolve()), command[7])
+        self.assertRegex(command[8], r"^[0-9a-f]{64}$")
+        self.assertEqual("unittest", command[11])
+        self.assertEqual(
+            ["discover", "-s", str(kit.CORE_ROOT / "tools" / "tests")],
+            command[12:],
         )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(kit.CORE_ROOT, run.call_args.kwargs["cwd"])
+        self.assertEqual("1", environment["KIT_ENGINE_DISABLED"])
+        self.assertEqual("1", environment["KIT_SELF_TEST"])
+        self.assert_isolated_environment(environment)
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
         inherited.assert_not_called()
+
+    def test_nested_self_test_and_static_children_ignore_python_startup_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-child-isolation-") as temporary:
+            base = Path(temporary).resolve()
+            core = base / "core"
+            tests = core / "tools" / "tests"
+            tests.mkdir(parents=True)
+            target = base / "target"
+            target.mkdir()
+            poison = base / "pythonpath"
+            poison.mkdir()
+            (core / "kit.py").write_text("# authenticated anchor\n", encoding="utf-8")
+            (core / "check.py").write_text(
+                "import base64\n"
+                "import sys\n"
+                f"assert {str(target)!r} not in sys.path\n"
+                "base64.b64encode(b'proof')\n"
+                "print('GATE PASSED')\n",
+                encoding="utf-8",
+            )
+            (tests / "test_probe.py").write_text(
+                "import base64\n"
+                "import sys\n"
+                "import unittest\n\n"
+                "class Probe(unittest.TestCase):\n"
+                "    def test_isolated(self):\n"
+                f"        self.assertNotIn({str(target)!r}, sys.path)\n"
+                "        self.assertTrue(base64.b64encode(b'proof'))\n",
+                encoding="utf-8",
+            )
+            sentinels: list[Path] = []
+            for root, label in ((target, "target"), (poison, "pythonpath")):
+                for name in ("sitecustomize.py", "base64.py"):
+                    sentinel = base / f"{label}-{name}.ran"
+                    sentinels.append(sentinel)
+                    (root / name).write_text(
+                        "from pathlib import Path\n"
+                        f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                        "raise RuntimeError('unsafe Python startup input executed')\n",
+                        encoding="utf-8",
+                    )
+
+            hostile = {
+                "PYTHONPATH": f"{target}{os.pathsep}{poison}",
+                "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
+                "PYTHONUSERBASE": str(poison),
+            }
+            with mock.patch.object(kit, "CORE_ROOT", core), mock.patch.object(
+                kit, "TOOLS", core / "tools"
+            ), mock.patch.dict(os.environ, hostile, clear=False):
+                self_code, self_payload, _human = kit._self_test(
+                    target, argparse.Namespace(json_output=True)
+                )
+                verify_args = argparse.Namespace(
+                    strict=False,
+                    stage=[],
+                    fast=False,
+                    static=True,
+                    json_output=True,
+                    confirm_native_retry="",
+                )
+                with mock.patch.object(
+                    kit, "_prepare_gate_summary"
+                ), mock.patch.object(
+                    kit,
+                    "_read_gate_summary",
+                    return_value={"failed": False, "results": []},
+                ):
+                    verify_code, verify_payload, _verify_human = kit._verify_once(
+                        target,
+                        verify_args,
+                        repository_sha256="a" * 64,
+                    )
+
+            self.assertEqual(kit.EXIT_OK, self_code)
+            self.assertTrue(self_payload["ok"])
+            self.assertEqual(kit.EXIT_OK, verify_code)
+            self.assertTrue(verify_payload["ok"])
+            self.assertTrue(all(not sentinel.exists() for sentinel in sentinels))
 
     def test_core_commands_are_resolved_from_the_selected_core(self) -> None:
         project = ROOT / "not-the-core"
@@ -1040,20 +1150,17 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         run.assert_called_once()
-        self.assertEqual(
-            [sys.executable, str(check), "--only", "shape", "--only", "conformance"],
+        self.assert_isolated_script(
             run.call_args.args[0],
+            check,
+            "--only",
+            "shape",
+            "--only",
+            "conformance",
         )
         actual_environment = run.call_args.kwargs["environment"]
-        self.assertEqual(
-            {
-                "KIT_VERIFY_NONCE",
-                "KIT_VERIFY_AUTH_KEY",
-                "KIT_VERIFY_REPOSITORY_SHA256",
-                "PYTHONDONTWRITEBYTECODE",
-            },
-            set(actual_environment),
-        )
+        self.assert_isolated_environment(actual_environment)
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
         self.assertRegex(
             actual_environment["KIT_VERIFY_NONCE"], r"^[0-9a-f]{32}$"
         )
@@ -1072,10 +1179,7 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("completed", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--write"],
-            cwd=ROOT.resolve(), timeout=300,
-        )
+        self.assert_isolated_run(run, tool, "--write", timeout=300)
 
     def test_sanitize_is_read_only_unless_write_is_explicit(self) -> None:
         tool = ROOT / "sanitise.py"
@@ -1087,10 +1191,7 @@ class KitCliTest(unittest.TestCase):
                     "sanitize", *arguments, "--project", str(ROOT), "--json"
                 )
             self.assertEqual(kit.EXIT_OK, code)
-            run.assert_called_once_with(
-                [sys.executable, str(tool), *delegated],
-                cwd=ROOT.resolve(), timeout=300,
-            )
+            self.assert_isolated_run(run, tool, *delegated, timeout=300)
 
     def test_schema_describe_exposes_fields_through_the_public_cli(self) -> None:
         tool = ROOT / "tools" / "schema.py"
@@ -1102,9 +1203,8 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertIn("slice (required)", json.loads(output)["description"])
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--describe", "proposal"],
-            cwd=ROOT.resolve(), timeout=60,
+        self.assert_isolated_run(
+            run, tool, "--describe", "proposal", timeout=60
         )
 
     def test_godot_docs_and_friction_hide_internal_entry_points(self) -> None:
@@ -1117,16 +1217,16 @@ class KitCliTest(unittest.TestCase):
             selected_version="4.7.2",
         )
         cases = (
-            (("godot-docs", "build"),
-             [sys.executable, str(docs), "--build", "--engine", str(engine_path)], 360),
-            (("godot-docs", "show", "Color.from_string"),
-             [sys.executable, str(docs), "Color.from_string"], 60),
-            (("godot-docs", "search", "from_string"),
-             [sys.executable, str(docs), "--search", "from_string"], 60),
-            (("friction", "--since", "HEAD~2"),
-             [sys.executable, str(friction), "--since", "HEAD~2"], 60),
+            (("godot-docs", "build"), docs,
+             ("--build", "--engine", str(engine_path)), 360),
+            (("godot-docs", "show", "Color.from_string"), docs,
+             ("Color.from_string",), 60),
+            (("godot-docs", "search", "from_string"), docs,
+             ("--search", "from_string"), 60),
+            (("friction", "--since", "HEAD~2"), friction,
+             ("--since", "HEAD~2"), 60),
         )
-        for public, delegated, timeout in cases:
+        for public, tool, delegated, timeout in cases:
             with self.subTest(public=public), mock.patch.object(
                 kit, "_run_process", return_value=self.completed()
             ) as run, mock.patch.object(
@@ -1136,9 +1236,7 @@ class KitCliTest(unittest.TestCase):
                     *public, "--project", str(ROOT), "--json"
                 )
             self.assertEqual(kit.EXIT_OK, code)
-            run.assert_called_once_with(
-                delegated, cwd=ROOT.resolve(), timeout=timeout
-            )
+            self.assert_isolated_run(run, tool, *delegated, timeout=timeout)
 
     def test_gdls_public_commands_hide_internal_entry_point(self) -> None:
         tool = ROOT / "tools" / "gdls.py"
@@ -1149,18 +1247,10 @@ class KitCliTest(unittest.TestCase):
             selected_version="4.7.2",
         )
         cases = (
-            (
-                ("gdls", "start"),
-                [sys.executable, str(tool), "--engine", str(engine_path), "start"],
-                120,
-            ),
-            (("gdls", "status"), [sys.executable, str(tool), "status"], 60),
-            (("gdls", "stop"), [sys.executable, str(tool), "stop"], 60),
-            (
-                ("gdls", "refs", "Mover"),
-                [sys.executable, str(tool), "refs", "Mover"],
-                60,
-            ),
+            (("gdls", "start"), ("--engine", str(engine_path), "start"), 120),
+            (("gdls", "status"), ("status",), 60),
+            (("gdls", "stop"), ("stop",), 60),
+            (("gdls", "refs", "Mover"), ("refs", "Mover"), 60),
         )
         for public, delegated, timeout in cases:
             with self.subTest(public=public), mock.patch.object(
@@ -1177,9 +1267,10 @@ class KitCliTest(unittest.TestCase):
                 )
             self.assertEqual(kit.EXIT_OK, code)
             self.assertEqual("ok", json.loads(output)["status"])
-            run.assert_called_once_with(
-                delegated,
-                cwd=ROOT.resolve(),
+            self.assert_isolated_run(
+                run,
+                tool,
+                *delegated,
                 timeout=timeout,
                 allow_child_breakaway=public[1] == "start",
             )
@@ -1246,13 +1337,19 @@ class KitCliTest(unittest.TestCase):
             "http://127.0.0.1:54321/plan.html", json.loads(output)["review_url"]
         )
         plan.assert_called_once()
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--ensure", "--json"],
-            cwd=ROOT.resolve(),
-            timeout=60,
-            allow_child_breakaway=True,
-            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
+        run.assert_called_once()
+        self.assert_isolated_script(run.call_args.args[0], tool, "--ensure", "--json")
+        self.assertEqual(ROOT.resolve(), run.call_args.kwargs["cwd"])
+        self.assertEqual(60, run.call_args.kwargs["timeout"])
+        self.assertTrue(run.call_args.kwargs["allow_child_breakaway"])
+        self.assertEqual(
+            "",
+            run.call_args.kwargs["environment"][
+                kit.runtime_paths.CONTROLLER_RUNTIME_ENV
+            ],
         )
+        self.assert_isolated_environment(run.call_args.kwargs["environment"])
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
 
     def test_serve_human_output_prints_the_complete_review_url(self) -> None:
         tool = ROOT / "tools" / "board.py"
@@ -1269,13 +1366,16 @@ class KitCliTest(unittest.TestCase):
             code, output = self.invoke("serve", "--project", str(ROOT))
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual(f"serve: running\n  {review_url}\n", output)
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--ensure", "--json"],
-            cwd=ROOT.resolve(),
-            timeout=60,
-            allow_child_breakaway=True,
-            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
+        run.assert_called_once()
+        self.assert_isolated_script(run.call_args.args[0], tool, "--ensure", "--json")
+        self.assertEqual(
+            "",
+            run.call_args.kwargs["environment"][
+                kit.runtime_paths.CONTROLLER_RUNTIME_ENV
+            ],
         )
+        self.assert_isolated_environment(run.call_args.kwargs["environment"])
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
 
     @staticmethod
     def _kit_change_result(session_id: str, *, status: str = "ready") -> dict:
@@ -1375,6 +1475,16 @@ class KitCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="kit-cli-extracted-") as temporary:
             base = Path(temporary).resolve()
             source, _commit = release_test_support._fixture_repository(base)
+            for relative in sorted(kit.release_tool.REQUIRED_KIT_FILES):
+                original = ROOT.joinpath(*relative.split("/"))
+                self.assertTrue(original.is_file(), relative)
+                destination = source.joinpath(*relative.split("/"))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            release_test_support._git(source, "add", "-A")
+            release_test_support._git(
+                source, "commit", "-m", "Use the current complete kit"
+            )
             archive = base / "built" / "kit.zip"
             report = kit.release_tool.build_release(source, archive)
             extracted = base / "extracted"
@@ -1387,6 +1497,19 @@ class KitCliTest(unittest.TestCase):
                 encoding="utf-8",
             )
             user_state = base / "user-state"
+            poison = base / "python-poison"
+            poison.mkdir()
+            sentinels: list[Path] = []
+            for root, label in ((target, "target"), (poison, "pythonpath")):
+                for name in ("sitecustomize.py", "base64.py"):
+                    sentinel = base / f"{label}-{name}.ran"
+                    sentinels.append(sentinel)
+                    (root / name).write_text(
+                        "from pathlib import Path\n"
+                        f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                        "raise RuntimeError('unsafe Python startup input executed')\n",
+                        encoding="utf-8",
+                    )
 
             def tree(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
                 return tuple(
@@ -1400,30 +1523,59 @@ class KitCliTest(unittest.TestCase):
 
             before_release = tree(extracted)
             before_target = tree(target)
-
-            def board(
-                _project: Path,
-                _target: Path,
-                _runtime: Path,
-                session_id: str,
-            ) -> tuple[str, dict, subprocess.CompletedProcess[str]]:
-                url = f"http://127.0.0.1:43123/kit-change.html?session={session_id}"
-                return url, {"ok": True, "review_url": url}, self.completed()
-
-            with mock.patch.object(
-                kit, "CORE_ROOT", extracted
+            stopped = False
+            hostile = {
+                "PYTHONPATH": f"{target}{os.pathsep}{poison}",
+                "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
+                "PYTHONUSERBASE": str(poison),
+            }
+            with mock.patch.object(kit, "CORE_ROOT", extracted), mock.patch.object(
+                kit, "TOOLS", extracted / "tools"
             ), mock.patch.object(
                 kit, "_user_controller_root", return_value=user_state
-            ), mock.patch.object(
-                kit, "_register_kit_change_board", side_effect=board
-            ):
-                code, output = self.invoke(
-                    "install",
-                    str(target),
-                    "--project",
-                    str(extracted),
-                    "--json",
-                )
+            ), mock.patch.dict(os.environ, hostile, clear=False):
+                try:
+                    code, output = self.invoke(
+                        "install",
+                        str(target),
+                        "--project",
+                        str(extracted),
+                        "--json",
+                    )
+                    payload = json.loads(output)
+                    runtime = user_state / str(report["archive_sha256"]) / "runtime"
+                    board_log = runtime / "board" / "board.log"
+                    detail = output
+                    if board_log.is_file():
+                        detail += "\n" + board_log.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    self.assertEqual(kit.EXIT_OK, code, detail)
+                    with urllib.request.urlopen(
+                        payload["review_url"], timeout=5
+                    ) as response:
+                        self.assertEqual(200, response.status)
+                        self.assertIn(b"kit change", response.read().lower())
+                    stop_code, stop_output = self.invoke(
+                        "serve",
+                        "stop",
+                        "--project",
+                        str(extracted),
+                        "--json",
+                    )
+                    stopped = stop_code == kit.EXIT_OK
+                    self.assertEqual(
+                        "stopping", json.loads(stop_output)["status"], stop_output
+                    )
+                finally:
+                    if not stopped:
+                        self.invoke(
+                            "serve",
+                            "stop",
+                            "--project",
+                            str(extracted),
+                            "--json",
+                        )
 
             payload = json.loads(output)
             runtime = user_state / str(report["archive_sha256"]) / "runtime"
@@ -1434,6 +1586,7 @@ class KitCliTest(unittest.TestCase):
             self.assertTrue(runtime.is_dir())
             self.assertEqual(before_release, tree(extracted))
             self.assertEqual(before_target, tree(target))
+            self.assertTrue(all(not sentinel.exists() for sentinel in sentinels))
 
     def test_upgrade_routes_the_explicit_target_and_game_root(self) -> None:
         session_id = "9" * 64
@@ -1491,20 +1644,17 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual(url, actual)
         self.assertTrue(board["ok"])
         self.assertIs(result, process)
-        run.assert_called_once_with(
-            [
-                sys.executable,
-                str(tool),
-                "--ensure",
-                "--kit-change-session",
-                session_id,
-                "--json",
-            ],
-            cwd=ROOT.resolve(),
-            timeout=60,
-            allow_child_breakaway=True,
-            environment=None,
+        run.assert_called_once()
+        self.assert_isolated_script(
+            run.call_args.args[0],
+            tool,
+            "--ensure",
+            "--kit-change-session",
+            session_id,
+            "--json",
         )
+        self.assert_isolated_environment(run.call_args.kwargs["environment"])
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
 
     def test_upgrade_review_always_uses_incoming_board_not_old_target_core(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kit-old-target-") as temporary:
@@ -1578,13 +1728,17 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("stopped", json.loads(output)["status"])
         plan.assert_not_called()
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--status", "--json"],
-            cwd=ROOT.resolve(),
-            timeout=60,
-            allow_child_breakaway=False,
-            environment={kit.runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
+        run.assert_called_once()
+        self.assert_isolated_script(run.call_args.args[0], tool, "--status", "--json")
+        self.assertFalse(run.call_args.kwargs["allow_child_breakaway"])
+        self.assertEqual(
+            "",
+            run.call_args.kwargs["environment"][
+                kit.runtime_paths.CONTROLLER_RUNTIME_ENV
+            ],
         )
+        self.assert_isolated_environment(run.call_args.kwargs["environment"])
+        self.assertFalse(run.call_args.kwargs["inherit_environment"])
 
     def test_retro_status_is_deterministic_and_routes_to_due_tool(self) -> None:
         tool = ROOT / "tools" / "retro_due.py"
@@ -1601,11 +1755,7 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("not_due", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--json"],
-            cwd=ROOT.resolve(),
-            timeout=30,
-        )
+        self.assert_isolated_run(run, tool, "--json", timeout=30)
 
     def test_retro_status_human_output_exposes_urgency_codes_and_progress(self) -> None:
         result = self.completed(stdout=json.dumps({
@@ -1643,9 +1793,13 @@ class KitCliTest(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual("evidence_prepared", payload["status"])
         self.assertEqual("manual", payload["provider"]["kind"])
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--print", "--force"],
-            cwd=ROOT.resolve(), timeout=3600, allow_provider=False,
+        self.assert_isolated_run(
+            run,
+            tool,
+            "--print",
+            "--force",
+            timeout=3600,
+            allow_provider=False,
         )
 
     def test_retro_run_forwards_only_an_explicit_session_window(self) -> None:
@@ -1665,10 +1819,17 @@ class KitCliTest(unittest.TestCase):
             "limit": 7,
             "explicit": True,
         })
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--print", "--force",
-             "--since", "2026-01-01T00:00:00Z", "--limit", "7"],
-            cwd=ROOT.resolve(), timeout=3600, allow_provider=False,
+        self.assert_isolated_run(
+            run,
+            tool,
+            "--print",
+            "--force",
+            "--since",
+            "2026-01-01T00:00:00Z",
+            "--limit",
+            "7",
+            timeout=3600,
+            allow_provider=False,
         )
 
     def test_retro_run_rejects_nonpositive_session_limit_before_capture(self) -> None:
@@ -1706,9 +1867,11 @@ class KitCliTest(unittest.TestCase):
             )
         self.assertEqual(kit.EXIT_OK, code)
         self.assertEqual("completed", json.loads(output)["status"])
-        run.assert_called_once_with(
-            [sys.executable, str(tool), "--sdk", "--force"],
-            cwd=ROOT.resolve(),
+        self.assert_isolated_run(
+            run,
+            tool,
+            "--sdk",
+            "--force",
             timeout=3600,
             allow_provider=True,
         )
@@ -1757,26 +1920,18 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual("published", payload["status"])
         self.assertEqual(str(report), payload["report"])
         resolve.assert_called_once_with(ROOT.resolve(), None)
-        self.assertEqual(
-            [
-                mock.call(
-                    [sys.executable, str(rank_tool), str(report)],
-                    cwd=ROOT.resolve(),
-                    timeout=180,
-                ),
-                mock.call(
-                    [
-                        sys.executable,
-                        str(completion_tool),
-                        "--complete-published",
-                        str(report),
-                    ],
-                    cwd=ROOT.resolve(),
-                    timeout=180,
-                ),
-            ],
-            run.call_args_list,
+        self.assertEqual(2, len(run.call_args_list))
+        expected_calls = (
+            (rank_tool, (str(report),)),
+            (completion_tool, ("--complete-published", str(report))),
         )
+        for call, (tool, arguments) in zip(
+            run.call_args_list, expected_calls, strict=True
+        ):
+            self.assert_isolated_script(call.args[0], tool, *arguments)
+            self.assertEqual(180, call.kwargs["timeout"])
+            self.assert_isolated_environment(call.kwargs["environment"])
+            self.assertFalse(call.kwargs["inherit_environment"])
         plan.assert_called_once()
 
     def test_retro_publish_does_not_close_when_rendering_fails(self) -> None:
@@ -1868,9 +2023,11 @@ class KitCliTest(unittest.TestCase):
             payload = json.loads(output)
             self.assertEqual("completed", payload["status"])
             self.assertEqual(operation, payload["operation"])
-            run.assert_called_once_with(
-                [sys.executable, str(tool), operation, "dist/kit.zip"],
-                cwd=ROOT.resolve(),
+            self.assert_isolated_run(
+                run,
+                tool,
+                operation,
+                "dist/kit.zip",
                 timeout=900,
             )
 

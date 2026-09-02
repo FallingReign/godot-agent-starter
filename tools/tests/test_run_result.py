@@ -119,9 +119,19 @@ class RunResultTest(unittest.TestCase):
             },
         }), encoding="utf-8")
         (self.root / "check.py").write_text("print('GATE PASSED')\n", encoding="utf-8")
+        (self.root / "tools").mkdir()
+        (self.root / "tools" / ".keep").write_text("fixture\n", encoding="utf-8")
         (self.root / "base.txt").write_text("base\n", encoding="utf-8")
         (self.root / ".gitignore").write_text(".kit/\n", encoding="utf-8")
-        _git(self.root, "add", ".gitignore", "check.py", "base.txt", "kit.config.json")
+        _git(
+            self.root,
+            "add",
+            ".gitignore",
+            "check.py",
+            "base.txt",
+            "kit.config.json",
+            "tools/.keep",
+        )
         _git(self.root, "commit", "-m", "baseline")
         self.before = _git(self.root, "rev-parse", "HEAD")
         self.path = self.root / "result.json"

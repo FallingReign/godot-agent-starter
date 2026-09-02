@@ -26,7 +26,7 @@ sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
 import runtime_paths  # noqa: E402
 
-ROOT = project_context.load_active_context(CORE_ROOT).project_root
+ROOT = project_context.resolve_active_installation(CORE_ROOT).project_root
 NOTES = ROOT / "docs" / "retro" / "notes"
 ARCHIVE = ROOT / "docs" / "retro" / "archive"
 DEFAULT_THRESHOLD = 10

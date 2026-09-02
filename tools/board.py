@@ -106,15 +106,27 @@ import retro_rank      # noqa: E402  (sibling module; no top-level import of `bo
 import retro_queue     # noqa: E402  (dispatch prompt artifacts; same non-cycle argument)
 import retro_ledger    # noqa: E402  (fail-closed tracked decision persistence)
 import retro_due       # noqa: E402  (deterministic note counter; it never calls a model and must not learn how)
-import retro_html      # noqa: E402  (same -- see its main() for the lazy `import board`)
 import session_digest  # noqa: E402
 import session_evidence  # noqa: E402  (stable repository scope identity)
 import board_client    # noqa: E402  (CSS/JS constants only, zero project imports of its own)
 import run_result      # noqa: E402  (structured worker outcome verification)
 import kit_change_controller  # noqa: E402  (bounded install/upgrade session API)
 import kit_change_html  # noqa: E402  (pure install/upgrade review renderer)
+import process_supervisor  # noqa: E402  (isolated authenticated-core children)
 
-CONTEXT = project_context.load_active_context(CORE_ROOT)
+
+class _LazyRetroHtml:
+    """Keep the renderer API without requiring game files for kit-only reviews."""
+
+    def __getattr__(self, name: str):
+        module = __import__("retro_html")
+        globals()["retro_html"] = module
+        return getattr(module, name)
+
+
+retro_html = _LazyRetroHtml()
+
+CONTEXT = project_context.resolve_active_installation(CORE_ROOT)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 RETRO_DIR = ROOT / "docs" / "retro"
 # A lifecycle review is one private unit: board state and controller sessions
@@ -314,9 +326,13 @@ def _process_group_options() -> dict:
     return {"start_new_session": True}
 
 
+def _isolated_python_environment() -> dict[str, str]:
+    return process_supervisor.isolated_python_environment()
+
+
 def _worker_environment(workspace: Path) -> dict[str, str]:
     """Build a bounded provider environment with no inherited Git context."""
-    environment = dict(os.environ)
+    environment = _isolated_python_environment()
     environment.pop("COPILOT_ALLOW_ALL", None)
     for variable in (
         "GIT_DIR",
@@ -352,11 +368,17 @@ def _terminate_process_tree(proc: subprocess.Popen) -> bool:
         result: subprocess.CompletedProcess | None = None
         try:
             result = subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                [
+                    process_supervisor.windows_system_executable("taskkill.exe"),
+                    "/PID",
+                    str(proc.pid),
+                    "/T",
+                    "/F",
+                ],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, timeout=15, check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             result = None
         if (result is None or result.returncode != 0) and proc.poll() is None:
             try:
@@ -556,7 +578,7 @@ def _stop_stale_recorded_instance(state: dict) -> bool:
     ):
         return False
     url = f"http://127.0.0.1:{port}/"
-    token = _served_capability(url)
+    token = _served_capability(url, state)
     if not token:
         return False
     body = b"{}"
@@ -641,15 +663,18 @@ def ensure_running() -> str | None:
         else:
             popen_kwargs["start_new_session"] = True
         with open(BOARD_LOG, "ab") as log_file:
-            board_environment = dict(os.environ)
+            board_environment = _isolated_python_environment()
             proc = subprocess.Popen(
-                [
-                    sys.executable, str(Path(__file__).resolve()), "--serve",
+                process_supervisor.isolated_python_script_command(
+                    sys.executable,
+                    Path(__file__).resolve(),
+                    CORE_ROOT,
+                    "--serve",
                     "--port", str(port), "--instance-id", instance_id,
                     "--repository-scope-id", repository_scope_id,
                     "--controller-runtime-id", _controller_runtime_id(),
                     "--started", started,
-                ],
+                ),
                 cwd=str(ROOT), stdout=log_file, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, env=board_environment, **popen_kwargs,
             )
@@ -670,7 +695,7 @@ def ensure_running() -> str | None:
         state.setdefault("runs", [])
         save_state(state)
         return f"http://127.0.0.1:{port}/"
-    except OSError:
+    except (OSError, ValueError):
         return None
     finally:
         if got_lock:
@@ -695,23 +720,33 @@ def lifecycle_status() -> dict:
     }
 
 
-def _served_capability(url: str) -> str:
-    try:
-        with urllib.request.urlopen(url + "plan.html", timeout=5) as response:
-            text = response.read().decode("utf-8")
-    except (OSError, UnicodeError, urllib.error.URLError):
-        return ""
-    match = re.search(r'<meta name="kit-board-token" content="([^"]+)">', text)
-    return html.unescape(match.group(1)) if match else ""
+def _served_capability(url: str, state: dict | None = None) -> str:
+    pages = ["plan.html"]
+    session_id = (state or {}).get("kit_change_session")
+    if isinstance(session_id, str) and KIT_CHANGE_SESSION_RE.fullmatch(session_id):
+        pages.append(f"kit-change.html?session={session_id}")
+    for page in pages:
+        try:
+            with urllib.request.urlopen(url + page, timeout=5) as response:
+                text = response.read().decode("utf-8")
+        except (OSError, UnicodeError, urllib.error.URLError):
+            continue
+        match = re.search(
+            r'<meta name="kit-board-token" content="([^"]+)">', text
+        )
+        if match:
+            return html.unescape(match.group(1))
+    return ""
 
 
 def stop_running() -> tuple[int, dict]:
+    state = load_state()
     current = lifecycle_status()
     if current["status"] != "running":
         current["status"] = "already-stopped"
         return 0, current
     url = str(current.get("url") or "")
-    token = _served_capability(url)
+    token = _served_capability(url, state)
     if not token:
         return 1, {"ok": False, "status": "stop-refused", "url": url,
                    "review_url": url + "plan.html",
@@ -743,8 +778,8 @@ def stop_running() -> tuple[int, dict]:
 
 # --------------------------------------------------------------- decisions
 #
-# Same two files retro_html.py already established. Duplicated here (not
-# imported from retro_html, even though it is already imported above for the
+# Same two files retro_html.py already established. Duplicated here (rather
+# than importing that renderer into the board process) because the renderer
 # lazy-cycle reason in its own header) only for accepted.json, because these
 # are six-line wrappers around one json file each and keeping them next to
 # the API handler that calls them is clearer than a cross-module hop for
@@ -1608,8 +1643,17 @@ class RunManager:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         run_id = self._new_run_id("retro")
         log_path = RUNS_DIR / f"{run_id}.log"
-        cmd = [sys.executable, str(CORE_ROOT / "tools" / "retro.py"), "--sdk", "--force"]
-        env = dict(os.environ)
+        try:
+            cmd = process_supervisor.isolated_python_script_command(
+                sys.executable,
+                CORE_ROOT / "tools" / "retro.py",
+                CORE_ROOT,
+                "--sdk",
+                "--force",
+            )
+        except (OSError, ValueError) as exc:
+            return {"error": f"retrospective runner is unsafe: {exc}"}
+        env = _isolated_python_environment()
         env.pop("COPILOT_ALLOW_ALL", None)
         env["COPILOT_AUTO_UPDATE"] = "false"
         if model:

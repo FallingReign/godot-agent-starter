@@ -57,19 +57,39 @@ def _sha256(content: bytes) -> str:
 def _clean_environment(
     installation: managed_launcher.Installation,
 ) -> dict[str, str]:
-    base = dict(os.environ)
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("PYTHON")
+    }
     base.pop(managed_launcher.PROJECT_ROOT_ENV, None)
     base.pop(managed_launcher.CORE_ROOT_ENV, None)
     environment = managed_launcher.bound_environment(installation, base)
     environment.update({
         "KIT_ENGINE_DISABLED": "1",
         "KIT_NATIVE_RETRY_TOKEN": "",
+        "KIT_PYTHON": str(Path(sys.executable).resolve()),
         "KIT_VERIFY_AUTH_KEY": "",
         "KIT_VERIFY_NONCE": "",
         "KIT_VERIFY_REPOSITORY_SHA256": "",
         "PYTHONDONTWRITEBYTECODE": "1",
     })
     return environment
+
+
+def _launcher_command(
+    installation: managed_launcher.Installation,
+    *arguments: str,
+) -> list[str]:
+    launcher = kit_change._target(  # noqa: SLF001 - authenticated active core
+        installation.core_root, "tools/managed_launcher.py"
+    )
+    return process_supervisor.isolated_python_script_command(
+        Path(sys.executable).resolve(),
+        launcher,
+        installation.core_root,
+        *arguments,
+    )
 
 
 def _echo(outcome: Any) -> None:
@@ -465,14 +485,13 @@ def run(
         environment = _clean_environment(installation)
 
         self_test = _run_process(
-            [
-                sys.executable,
-                str(installation.core_root / "kit.py"),
+            _launcher_command(
+                installation,
                 "self-test",
                 "--project",
                 str(installation.project_root),
                 "--json",
-            ],
+            ),
             cwd=installation.project_root,
             environment=environment,
             timeout=1800,
@@ -484,12 +503,14 @@ def run(
 
         scan_path = _scan_path(context, str(session.get("session_id") or ""))
         scan = _run_process(
-            [
-                sys.executable,
-                str(installation.core_root / "check.py"),
-                "--brownfield-scan",
+            _launcher_command(
+                installation,
+                "__brownfield-scan",
                 str(scan_path),
-            ],
+                "--project",
+                str(installation.project_root),
+                "--json",
+            ),
             cwd=installation.project_root,
             environment=environment,
             timeout=900,
@@ -524,15 +545,14 @@ def run(
         _failpoint("after-baseline-write")
 
         static = _run_process(
-            [
-                sys.executable,
-                str(installation.core_root / "kit.py"),
+            _launcher_command(
+                installation,
                 "verify",
                 "--static",
                 "--project",
                 str(installation.project_root),
                 "--json",
-            ],
+            ),
             cwd=installation.project_root,
             environment=environment,
             timeout=1800,
@@ -542,8 +562,15 @@ def run(
         static_ok = getattr(static, "returncode", None) == 0 and bool(
             static_receipt["ok"]
         )
+        if not static_ok:
+            failed = _failure(
+                "Installed static verification failed after applying the exact baseline.",
+                generated_sha,
+            )
+            failed["existing_issues"] = scan_issues
+            return failed
         issues = scan_issues
-        project_ok = static_ok and not issues
+        project_ok = not issues
         if project_ok:
             detail = (
                 f"Offline kit and project checks passed; {resolved_count} old gap(s) resolved."

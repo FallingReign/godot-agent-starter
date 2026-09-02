@@ -99,18 +99,21 @@ class FakeRunner:
             raise AssertionError("strict environment marker was not supplied")
         if Path(argv[0]).name.lower() in ("git", "git.exe"):
             return self.source
-        script_name = Path(argv[1]).name
+        self.assert_isolated(argv)
+        mode = argv[6]
+        script_name = Path(argv[7]).name
+        child_arguments = argv[11:]
+        if mode == "module" and child_arguments[0] == "unittest":
+            return self.unit
         if script_name == "kit.py":
             return self.doctor
         if script_name == "check.py":
             return self.gate
-        if "unittest" in argv:
-            return self.unit
         if script_name == "browser_check.py":
             return self.browser
         if script_name == "release.py":
-            operation = argv[2]
-            archive = Path(argv[3])
+            operation = child_arguments[0]
+            archive = Path(child_arguments[1])
             if operation == "build":
                 content = self.archive_one if self.release_builds == 0 else self.archive_two
                 self.release_builds += 1
@@ -122,6 +125,13 @@ class FakeRunner:
                 0, json.dumps({"ok": True, "archive_sha256": digest})
             )
         raise AssertionError(f"unexpected command: {argv}")
+
+    @staticmethod
+    def assert_isolated(argv: list[str]) -> None:
+        if argv[1:5] != ["-B", "-I", "-S", "-c"]:
+            raise AssertionError(f"Python child is not isolated: {argv}")
+        if len(argv) < 11 or argv[6] not in ("script", "module"):
+            raise AssertionError(f"isolated child receipt is malformed: {argv}")
 
 
 class StrictFixture(unittest.TestCase):
@@ -205,9 +215,9 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(len(runner.commands), 10)
         self.assertEqual("git", runner.commands[0][0])
         self.assertIn("doctor", runner.commands[1])
-        self.assertEqual(runner.commands[2][1], str(self.root / "check.py"))
+        self.assertEqual(runner.commands[2][7], str(self.root / "check.py"))
         self.assertIn("unittest", runner.commands[3])
-        self.assertTrue(runner.commands[4][1].endswith("browser_check.py"))
+        self.assertTrue(runner.commands[4][7].endswith("browser_check.py"))
 
         report_path = self.root / report["report_path"]
         retained = json.loads(report_path.read_text(encoding="utf-8"))
@@ -647,17 +657,20 @@ class StrictCiContractTests(unittest.TestCase):
 
         self.assertLess(
             windows.index("if defined KIT_PYTHON"),
-            windows.index("where py"),
+            windows.index('if exist "%SystemRoot%\\py.exe"'),
         )
-        self.assertIn('"%KIT_PYTHON%" "%KIT_ENTRY%" %*', windows)
+        self.assertIn(
+            '"%KIT_PYTHON%" -B -I -S -c "%KIT_BOOTSTRAP_CODE%"', windows
+        )
         self.assertIn("KIT_PYTHON must name one absolute interpreter file", windows)
-        self.assertIn("KIT_PYTHON does not name an existing interpreter file", windows)
-        self.assertIn("KIT_PYTHON must name a file, not a directory", windows)
+        self.assertIn("KIT_PYTHON must name one absolute interpreter file", windows)
         self.assertLess(
             posix.index('if [ -n "${KIT_PYTHON:-}" ]'),
-            posix.index("command -v python3"),
+            posix.index("for KIT_SYSTEM_PYTHON in"),
         )
-        self.assertIn('exec "$KIT_PYTHON" "$KIT_ENTRY" "$@"', posix)
+        self.assertIn(
+            'exec "$KIT_PYTHON" -B -I -S -c "$KIT_BOOTSTRAP_CODE"', posix
+        )
         self.assertIn("KIT_PYTHON must name one absolute interpreter file", posix)
         self.assertIn("KIT_PYTHON does not name an executable interpreter file", posix)
 

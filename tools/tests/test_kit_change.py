@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS))
 
 import kit_change  # noqa: E402
+import process_supervisor  # noqa: E402
 
 
 BEGIN = "<!-- BEGIN GODOT AGENT KIT -->"
@@ -250,6 +252,25 @@ class KitChangeTest(unittest.TestCase):
         return kit_change.apply(
             self.root, self.archive, str(decision["approval"]["sha256"])
         )
+
+    def _materialize_core(
+        self,
+        fixture: tuple[dict[str, object], dict[str, SimpleNamespace]],
+    ) -> Path:
+        core = (
+            self.root
+            / ".agent-kit"
+            / "releases"
+            / str(fixture[0]["archive_sha256"])
+        )
+        for relative, member in fixture[1].items():
+            path = _write(
+                self.root,
+                f"{core.relative_to(self.root).as_posix()}/{relative}",
+                member.content,
+            )
+            path.chmod(member.mode)
+        return core
 
     def test_preview_is_read_only_and_stable(self) -> None:
         original = b"# Human project rules\nKeep this paragraph.\n"
@@ -681,6 +702,50 @@ class KitChangeTest(unittest.TestCase):
             {blocker["code"] for blocker in decision["material"]["blockers"]},
         )
 
+    def test_dangling_junction_blocks_preview(self) -> None:
+        if os.name != "nt":
+            return
+        destination = self.root / "junction-destination"
+        junction = self.root / "AGENTS.md"
+        destination.mkdir()
+        completed = subprocess.run(
+            [
+                process_supervisor.windows_command_processor(),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(destination),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.skipTest(completed.stderr or completed.stdout)
+        destination.rmdir()
+        try:
+            self.assertFalse(junction.exists())
+            self.assertTrue(kit_change._is_reparse(junction))
+
+            decision = kit_change.preview(self.root, self.archive)
+
+            self.assertFalse(decision["approval"]["approvable"])
+            self.assertIn(
+                "redirected-path",
+                {
+                    blocker["code"]
+                    for blocker in decision["material"]["blockers"]
+                },
+            )
+        finally:
+            if kit_change._is_reparse(junction):
+                junction.rmdir()
+
     def test_hardlinked_managed_target_blocks_preview(self) -> None:
         agents = _write(self.root, "AGENTS.md", b"# Human project rules\n")
         alias = self.root / "agents-hardlink-source.md"
@@ -719,6 +784,46 @@ class KitChangeTest(unittest.TestCase):
             kit_change.preview(self.root, self.archive)
 
         self.assertEqual("installed-kit-untrusted", raised.exception.code)
+
+    def test_incoming_core_with_extra_empty_directory_cannot_be_reused(self) -> None:
+        self._preview_and_apply()
+        incoming = _release_fixture(
+            version="0.4.0",
+            source_commit="c" * 40,
+            launcher=b"@echo off\necho managed kit 0.4\n",
+        )
+        core = self._materialize_core(incoming)
+        (core / "extra-empty").mkdir()
+        self._switch_release(incoming)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertIn(
+            "managed-core-modified",
+            {blocker["code"] for blocker in decision["material"]["blockers"]},
+        )
+
+    def test_incoming_core_with_case_colliding_directory_cannot_be_reused(self) -> None:
+        if os.path.normcase("install") == os.path.normcase("INSTALL"):
+            return
+        self._preview_and_apply()
+        incoming = _release_fixture(
+            version="0.4.0",
+            source_commit="c" * 40,
+            launcher=b"@echo off\necho managed kit 0.4\n",
+        )
+        core = self._materialize_core(incoming)
+        (core / "INSTALL").mkdir()
+        self._switch_release(incoming)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertIn(
+            "managed-core-modified",
+            {blocker["code"] for blocker in decision["material"]["blockers"]},
+        )
 
     def test_forged_ownership_hash_cannot_authorize_overwriting_human_work(self) -> None:
         self._preview_and_apply()
