@@ -223,13 +223,18 @@ class KitChangeBoard(unittest.TestCase):
         self.assertNotIn("release", json.dumps(stored))
         self.status.assert_called()
 
-    def test_explicit_controller_runtime_does_not_move_board_state(self) -> None:
+    def test_explicit_controller_runtime_moves_all_private_board_state(self) -> None:
         external = self.scratch / "external-controller-runtime"
         external.mkdir()
+        project_state = board.STATE_FILE
+        project_state_before = project_state.read_bytes()
         self.controller_runtime = external
-        board._CONTROLLER_RUNTIME = board.runtime_paths.RuntimePaths(
+        selected = board.runtime_paths.RuntimePaths(
             self.scratch, external
         )
+        board._RUNTIME = selected
+        board._CONTROLLER_RUNTIME = selected
+        board.STATE_FILE = selected.board_state
 
         self.activate()
 
@@ -238,9 +243,11 @@ class KitChangeBoard(unittest.TestCase):
             SESSION_A,
             plan_url="",
         )
-        self.assertEqual(self.runtime / "board" / "state.json", board.STATE_FILE)
+        self.assertEqual(external / "board" / "state.json", board.STATE_FILE)
         self.assertTrue(board.STATE_FILE.is_file())
-        self.assertEqual(self.runtime, board._RUNTIME.runtime)
+        self.assertEqual(external, board._RUNTIME.runtime)
+        self.assertEqual(external, board._CONTROLLER_RUNTIME.runtime)
+        self.assertEqual(project_state_before, project_state.read_bytes())
 
     def test_ensure_registration_prints_the_exact_review_url(self) -> None:
         output = io.StringIO()

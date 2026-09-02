@@ -97,6 +97,26 @@ class RuntimePathsTests(unittest.TestCase):
                     (root / ".kit" / "runtime").resolve(), ordinary.runtime
                 )
                 self.assertEqual(external.resolve(), controller.runtime)
+                self.assertEqual(
+                    external.resolve() / "board" / "state.json",
+                    controller.board_state,
+                )
+                self.assertEqual(
+                    external.resolve() / "board" / "board.lock",
+                    controller.board_lock,
+                )
+                self.assertEqual(
+                    external.resolve() / "board" / "board.log",
+                    controller.board_log,
+                )
+                self.assertEqual(
+                    external.resolve() / "board" / "runs",
+                    controller.board_runs,
+                )
+                self.assertEqual(
+                    external.resolve() / "evidence" / "sessions",
+                    controller.session_evidence,
+                )
                 self.assertEqual(core_before, runtime_paths.CORE_ROOT)
                 self.assertFalse((external / "board").exists())
             finally:

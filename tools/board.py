@@ -117,8 +117,11 @@ import kit_change_html  # noqa: E402  (pure install/upgrade review renderer)
 CONTEXT = project_context.load_active_context(CORE_ROOT)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 RETRO_DIR = ROOT / "docs" / "retro"
-_RUNTIME = runtime_paths.resolve(ROOT)
-_CONTROLLER_RUNTIME = runtime_paths.resolve_controller(ROOT)
+# A lifecycle review is one private unit: board state and controller sessions
+# must use the same validated runtime. With no explicit lifecycle binding this
+# resolves to the configured project-local runtime.
+_RUNTIME = runtime_paths.resolve_controller(ROOT)
+_CONTROLLER_RUNTIME = _RUNTIME
 RUNS_DIR = _RUNTIME.board_runs
 STATE_FILE = _RUNTIME.board_state
 LOCK_FILE = _RUNTIME.board_lock
