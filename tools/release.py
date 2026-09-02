@@ -185,6 +185,7 @@ DOC_FILES = frozenset({
     "docs/DESIGN.md",
     "docs/GATE.md",
     "docs/GDSCRIPT.md",
+    "docs/LIFECYCLE.md",
     "docs/RULES.md",
     "docs/SCENES.md",
     "docs/WORKFLOW.md",
@@ -418,6 +419,17 @@ MANAGED_AGENT_BLOCK_BODY = """# Managed Godot Agent Kit
 
 This project uses a versioned kit under `.agent-kit/`.
 
+Use these exact roots throughout the active rules:
+
+- `PROJECT_ROOT`: the folder containing this file and `.agent-kit/current.json`.
+- `CORE_ROOT`: `PROJECT_ROOT` joined to the `active_release.core_path` recorded
+  in `.agent-kit/current.json`.
+- `GAME_ROOT`: `PROJECT_ROOT` joined to `game_root` in `kit.config.json`.
+
+Read kit rules, kit docs, kit tools, and kit skills from `CORE_ROOT`. Read game
+design, proposals, retrospectives, project decisions, and other project state
+from `PROJECT_ROOT`. Read and change game code only under `GAME_ROOT`.
+
 Before planning, running commands, editing files, or delegating work:
 
 1. Run `kit doctor --json`.
@@ -440,6 +452,9 @@ The provider-neutral project contract is `../AGENTS.md`. Read it in full before
 planning, running commands, editing files, or delegating work. If this client
 cannot load that file, stop and tell the human; do not substitute chat history,
 model defaults, or silence.
+
+The project contract defines `PROJECT_ROOT`, `CORE_ROOT`, and `GAME_ROOT`.
+Preserve those exact meanings when reading the active kit rules.
 """
 
 DEFAULT_KIT_CONFIG = {

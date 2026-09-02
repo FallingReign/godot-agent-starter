@@ -569,6 +569,30 @@ class TestDeterministicBuild(ReleaseTestCase):
 
 
 class TestManagedInstallContract(ReleaseTestCase):
+    def test_provider_bridges_keep_project_core_and_game_roots_distinct(self) -> None:
+        archive = _synthetic_smoke_archive(self.scratch)
+        contents = _member_contents(archive)
+        agents = contents["install/agents.block.md"].decode("utf-8")
+        copilot = contents["install/copilot.block.md"].decode("utf-8")
+
+        for root_name in ("PROJECT_ROOT", "CORE_ROOT", "GAME_ROOT"):
+            self.assertIn(f"`{root_name}`", agents)
+            self.assertIn(f"`{root_name}`", copilot)
+        self.assertIn("active_release.core_path", agents)
+        self.assertIn("game_root` in `kit.config.json", agents)
+        self.assertIn("@../AGENTS.md", copilot)
+        for relative in (
+            "AGENTS.md",
+            "docs/DESIGN.md",
+            "docs/GATE.md",
+            "docs/GDSCRIPT.md",
+            "docs/LIFECYCLE.md",
+            "docs/RULES.md",
+            "docs/SCENES.md",
+            "docs/WORKFLOW.md",
+        ):
+            self.assertIn(relative, contents)
+
     def test_historic_0_2_archive_remains_verifiable_without_install_support(self) -> None:
         archive = _historic_0_2_archive(self.scratch)
 

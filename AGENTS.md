@@ -37,12 +37,26 @@ dependency is not proof.
 
 ## Layout
 
-The kit root is the nearest ancestor containing `.agent-kit.json`.
-`kit.config.json` declares `game_root` (`src` or `.`), the private
+Use three roots and keep their meanings fixed:
+
+- `PROJECT_ROOT` owns the game project, design, proposal, retrospective state,
+  project decisions and private runtime.
+- `CORE_ROOT` owns the active kit rules, kit documentation, tools and skills.
+- `GAME_ROOT` owns the files Godot loads and the agent may change as game work.
+
+In a managed install, the project-level managed block defines all three roots;
+do not replace `PROJECT_ROOT` with the marker inside the active release. In a
+flat source checkout, `PROJECT_ROOT` and `CORE_ROOT` are the nearest ancestor
+containing `.agent-kit.json`. `GAME_ROOT` is `PROJECT_ROOT` joined to the exact
+`game_root` in `kit.config.json`. That file also declares the private
 `runtime_root`, providers and dispatch ownership. Resolve those values; do not
-infer the project boundary from a game file or the current working directory.
-Paths in `arch.rules.json` and `proposal.json` are relative to the configured
-game root.
+infer any root from a game file or the current working directory. Paths in
+`arch.rules.json` and `proposal.json` are relative to `GAME_ROOT`.
+
+Read `docs/RULES.md`, `docs/GATE.md`, `docs/WORKFLOW.md`, `docs/DESIGN.md`,
+`docs/GDSCRIPT.md`, `docs/SCENES.md`, `docs/LIFECYCLE.md`, tools and skills from
+`CORE_ROOT`. Read `docs/design/`, `project.shape.json`, `proposal.json`, project
+decision state, and retrospective evidence from `PROJECT_ROOT`.
 
 `.kit/runtime/` is private, machine-local and release-excluded. It may contain
 session evidence, prompts and logs. Never cite it as durable product intent,
