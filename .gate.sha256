@@ -1,6 +1,6 @@
 # Integrity manifest for the verification gate.
 # Regenerate deliberately: kit integrity accept
-b6847d7596057ec37ef6080b254600d93c214695c26e1ed6d02f4d5d0a28aded  check.py
+6f11c3fc6b92e3317ae61844a9c1ea6391a7cef35e5d718c33f48cf70b87f52f  check.py
 6c69285d78c60dd6868d50674acbc3b65113a4ab922a596fc643ac59d23de79b  arch.py
 36714336f9beaaf44b130f4543f81beaf0fab55f65bdad547cfdd1111aa77115  sanitise.py
 1a7c79b2d2541ba4a30c02caf90fb8e757d36155f5a70014c24ea505207722ff  gate.rules.json

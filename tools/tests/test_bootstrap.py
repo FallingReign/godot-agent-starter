@@ -513,6 +513,7 @@ class PrivateToolResolution(unittest.TestCase):
                     / f"gdlint{suffix}")
             tool.parent.mkdir(parents=True)
             tool.write_bytes(b"fixture")
+            tool.chmod(0o755)
             probe = subprocess.CompletedProcess(
                 [str(tool), "--version"], 0, stdout="gdlint 4.5.0\n", stderr=""
             )

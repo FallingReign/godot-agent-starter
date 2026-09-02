@@ -241,7 +241,10 @@ class DesignConformanceTests(unittest.TestCase):
         ), mock.patch.object(
             design_contract, "DESIGN", self.scratch / "docs" / "design"
         ), mock.patch.object(
-            gate.shutil, "which", return_value="git" if self.git_available else None
+            gate,
+            "_ordinary_executable",
+            return_value="git" if self.git_available else None,
+            side_effect=None if self.git_available else FileNotFoundError("fixture"),
         ), mock.patch.object(
             gate, "run", side_effect=fake_git
         ), mock.patch.object(

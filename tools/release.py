@@ -258,6 +258,7 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_engine_boundary.py",
     "tools/tests/test_frontend.py",
     "tools/tests/test_friction.py",
+    "tools/tests/test_gate_child_isolation.py",
     "tools/tests/test_gate_receipt.py",
     "tools/tests/test_gd_signature.py",
     "tools/tests/test_integration.py",

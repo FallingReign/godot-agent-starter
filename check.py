@@ -44,6 +44,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # repository's configuration, design and generated views. PROJECT_DIR is the
 # Godot project: everything the engine loads.
 CORE_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(CORE_ROOT))
 sys.path.insert(0, str(CORE_ROOT / "tools"))
 import managed_launcher  # noqa: E402
 import project_context  # noqa: E402
@@ -503,7 +504,12 @@ def _cap(text: str) -> str:
 
 
 def run(
-    cmd: Sequence[str], timeout: int, log: Path, *, native: bool = False
+    cmd: Sequence[str],
+    timeout: int,
+    log: Path,
+    *,
+    native: bool = False,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Tuple[int, str]:
     """Run a command, capture combined output to `log`, never raise.
 
@@ -550,6 +556,7 @@ def run(
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
                 check=False,
+                env=(dict(env) if env is not None else None),
             )
             out = proc.stdout.decode("utf-8", errors="replace")
             code = proc.returncode
@@ -572,6 +579,108 @@ def run(
         with log.open("w", encoding="utf-8", errors="replace", newline="") as fh:
             fh.write(clean)
     return code, out
+
+
+_DEFAULT_RUNNER = run
+
+
+def _run_internal_python(
+    script: Path,
+    arguments: Sequence[object],
+    timeout: int,
+    log: Path,
+) -> Tuple[int, str]:
+    """Run one kit-owned Python script without trusting project Python state."""
+    try:
+        from tools import process_supervisor
+
+        command = process_supervisor.isolated_python_script_command(
+            sys.executable,
+            script,
+            CORE_ROOT,
+            *arguments,
+        )
+        environment = process_supervisor.isolated_python_environment()
+    except (OSError, ValueError) as exc:
+        output = f"internal kit script is unsafe: {type(exc).__name__}\n"
+        if not BROWNFIELD_CAPTURE:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(output, encoding="utf-8", newline="")
+        return 127, output
+    if run is not _DEFAULT_RUNNER:
+        # Focused stage tests replace the process boundary with a three-argument
+        # deterministic runner. No child exists in that case.
+        return run(command, timeout, log)
+    return run(command, timeout, log, env=environment)
+
+
+def _ordinary_executable(name: str) -> str:
+    """Resolve one external tool without searching the project or selected core."""
+    from tools import process_supervisor
+
+    return process_supervisor.resolve_ordinary_executable(
+        name,
+        excluded_roots=(PROJECT_ROOT, CORE_ROOT),
+    )
+
+
+def _run_git(command: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
+    """Run authenticated Git without inherited Git control variables."""
+    if run is not _DEFAULT_RUNNER:
+        return run(command, timeout, log)
+    safe_command = [
+        str(command[0]),
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.trustExitCode=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        *[str(argument) for argument in command[1:]],
+    ]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return run(safe_command, timeout, log, env=environment)
+
+
+def _external_tool_environment() -> Dict[str, str]:
+    """Build a child environment that cannot import project Python customisations."""
+    from tools import process_supervisor
+
+    environment = process_supervisor.isolated_python_environment()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    if os.name == "nt":
+        environment["COMSPEC"] = process_supervisor.windows_command_processor()
+        environment["NoDefaultCurrentDirectoryInExePath"] = "1"
+    return environment
+
+
+def _run_external_tool(
+    command: Sequence[str], timeout: int, log: Path
+) -> Tuple[int, str]:
+    """Run one exact external tool with the project import boundary removed."""
+    if run is not _DEFAULT_RUNNER:
+        return run(command, timeout, log)
+    return run(command, timeout, log, env=_external_tool_environment())
+
+
+def _lifecycle_tool_boundary() -> bool:
+    """Report the managed Apply-time boundary that forbids project-local tools."""
+    return os.environ.get("KIT_LIFECYCLE_CHECK") == "1"
 
 
 def group_errors(out: str) -> List[dict]:
@@ -705,7 +814,7 @@ def authored_game_files() -> List[Path]:
 
 def _private_gdtool(name: str) -> Optional[Path]:
     """Resolve the exact project-private tool installed by public setup."""
-    if not GDTOOLKIT_VERSION:
+    if not GDTOOLKIT_VERSION or _lifecycle_tool_boundary():
         return None
     try:
         config = json.loads(KIT_CONFIG_FILE.read_text(encoding="utf-8"))
@@ -715,7 +824,14 @@ def _private_gdtool(name: str) -> Optional[Path]:
         bindir = (ROOT / runtime / "tooling" / f"gdtoolkit-{GDTOOLKIT_VERSION}"
                   / ("Scripts" if os.name == "nt" else "bin"))
         candidate = bindir / (name + (".exe" if os.name == "nt" else ""))
-        return candidate if candidate.is_file() else None
+        from tools import process_supervisor
+
+        return Path(
+            process_supervisor.validated_executable(
+                candidate,
+                label=f"private {name} executable",
+            )
+        )
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
@@ -725,21 +841,22 @@ def gdtool(name: str) -> Optional[List[str]]:
 
     Order of preference:
       1. the exact project-private environment installed by public setup
-      2. an exact-version binary on PATH
+      2. an exact-version external binary outside the project and selected core
       3. an offline uv tool run of the exact version in dependencies.lock.json
       4. `python -m`, only when that Python has the exact locked package
          pip's Scripts directory is missing from PATH, which is common on Windows
 
     Verification never downloads implicitly. Every uv fallback is forced into
     offline mode; acquisition belongs to a separate, explicitly approved setup
-    operation.
+    operation. The managed Apply-time check never executes an external style
+    tool; current formatting and lint remain a separate project check.
     """
     private = _private_gdtool(name)
     if private is not None:
         try:
             probe = subprocess.run(
                 [str(private), "--version"], capture_output=True, text=True,
-                timeout=30, check=False,
+                timeout=30, check=False, env=_external_tool_environment(),
             )
             match = re.search(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])",
                               (probe.stdout or "") + (probe.stderr or ""))
@@ -749,12 +866,15 @@ def gdtool(name: str) -> Optional[List[str]]:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    found = shutil.which(name)
+    try:
+        found = _ordinary_executable(name)
+    except (FileNotFoundError, ValueError):
+        found = ""
     if found:
         try:
             probe = subprocess.run(
                 [found, "--version"], capture_output=True, text=True,
-                timeout=30, check=False,
+                timeout=30, check=False, env=_external_tool_environment(),
             )
             match = re.search(
                 r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])",
@@ -767,17 +887,26 @@ def gdtool(name: str) -> Optional[List[str]]:
             pass
 
     if GDTOOLKIT_VERSION:
-        runner = shutil.which("uvx")
+        try:
+            runner = _ordinary_executable("uvx")
+        except (FileNotFoundError, ValueError):
+            runner = ""
         base = [runner] if runner else None
-        if base is None and shutil.which("uv"):
-            base = [shutil.which("uv"), "tool", "run"]
+        if base is None:
+            try:
+                uv = _ordinary_executable("uv")
+            except (FileNotFoundError, ValueError):
+                uv = ""
+            if uv:
+                base = [uv, "tool", "run"]
         if base:
             base.append("--offline")
             cmd = base + ["--from", f"gdtoolkit=={GDTOOLKIT_VERSION}", name]
             try:
                 probe = subprocess.run(
                     cmd + ["--version"], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, timeout=300, check=False)
+                    stderr=subprocess.DEVNULL, timeout=300, check=False,
+                    env=_external_tool_environment())
                 if probe.returncode == 0:
                     return cmd
             except (subprocess.TimeoutExpired, OSError):
@@ -790,12 +919,21 @@ def gdtool(name: str) -> Optional[List[str]]:
     if installed != GDTOOLKIT_VERSION:
         return None
     module = {"gdformat": "gdtoolkit.formatter", "gdlint": "gdtoolkit.linter"}[name]
+    try:
+        from tools import process_supervisor
+
+        python = process_supervisor.isolated_python_executable(sys.executable)
+    except (OSError, ValueError):
+        return None
     probe = subprocess.run(
-        [sys.executable, "-m", module, "--help"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        [python, "-B", "-I", "-m", module, "--help"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=_external_tool_environment(),
     )
     if probe.returncode == 0:
-        return [sys.executable, "-m", module]
+        return [python, "-B", "-I", "-m", module]
     return None
 
 
@@ -1030,7 +1168,7 @@ def stage_sanitise() -> None:
             _capture_error("sanitise", "sanitise.py is unavailable")
         RESULTS.skip("sanitise")
         return
-    code, out = run([sys.executable, str(script)], 60, LOG_DIR / "sanitise.log")
+    code, out = _run_internal_python(script, (), 60, LOG_DIR / "sanitise.log")
     indent(out, 40)
     if code == 0:
         _finish_file_stage("sanitise", [], failed=False)
@@ -1038,8 +1176,9 @@ def stage_sanitise() -> None:
         print("  apply the automatic fixes with: kit sanitize --write")
         print("  structural errors are NOT auto-fixable and need a real correction")
         skill("godot-scene-files", "what is safe to author and what is engine-owned")
-        json_code, json_out = run(
-            [sys.executable, str(script), "--json"],
+        json_code, json_out = _run_internal_python(
+            script,
+            ("--json",),
             60,
             LOG_DIR / "sanitise-scan.log",
         )
@@ -1266,7 +1405,7 @@ def stage_schema() -> None:
         print("  tools/schema.py missing")
         RESULTS.skip("schema")
         return
-    code, out = run([sys.executable, str(tool)], 30, LOG_DIR / "schema.log")
+    code, out = _run_internal_python(tool, (), 30, LOG_DIR / "schema.log")
     body = (out or "").strip()
     for line in body.splitlines()[:24]:
         line = line.rstrip()
@@ -1545,17 +1684,28 @@ def stage_format() -> None:
     head("format (gdformat --check)")
     tool = gdtool("gdformat")
     if tool is None:
-        print("  gdformat unavailable. Install the locked gdtoolkit version shown by: kit doctor")
+        if _lifecycle_tool_boundary():
+            print("  gdformat not run; no trusted external formatter is available")
+        else:
+            print("  gdformat unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         if BROWNFIELD_CAPTURE:
-            _capture_error("format", "gdformat is unavailable")
+            detail = (
+                "no trusted external gdformat is available"
+                if _lifecycle_tool_boundary()
+                else "gdformat is unavailable"
+            )
+            _capture_error("format", detail)
         RESULTS.skip("format")
         return
     files = [str(p) for p in gd_files()]
     if not files:
         RESULTS.passed("format")
         return
-    code, out = run(tool + ["--line-length=120", "--check"] + files, 120,
-                    LOG_DIR / "format.log")
+    code, out = _run_external_tool(
+        tool + ["--line-length=120", "--check"] + files,
+        120,
+        LOG_DIR / "format.log",
+    )
     indent(out, 20)
     issues, errors = _format_issues(out)
     if code != 0:
@@ -1583,8 +1733,11 @@ def fix_format() -> int:
         print("  no .gd files found")
         return 0
     print(f"  {len(files)} file(s) in scope (addons/ excluded)")
-    code, out = run(tool + ["--line-length=120"] + files, 180,
-                    LOG_DIR / "fix-format.log")
+    code, out = _run_external_tool(
+        tool + ["--line-length=120"] + files,
+        180,
+        LOG_DIR / "fix-format.log",
+    )
     indent(out, 30)
     if code == 0:
         print(f"  {GRN}formatted{RST}. Review with: git diff")
@@ -1670,15 +1823,23 @@ def stage_lint() -> None:
     head("lint (gdlint)")
     tool = gdtool("gdlint")
     if tool is None:
-        print("  gdlint unavailable. Install the locked gdtoolkit version shown by: kit doctor")
+        if _lifecycle_tool_boundary():
+            print("  gdlint not run; no trusted external linter is available")
+        else:
+            print("  gdlint unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         if BROWNFIELD_CAPTURE:
-            _capture_error("lint", "gdlint is unavailable")
+            detail = (
+                "no trusted external gdlint is available"
+                if _lifecycle_tool_boundary()
+                else "gdlint is unavailable"
+            )
+            _capture_error("lint", detail)
         RESULTS.skip("lint")
         return
     # gdlint honours .gdlintrc excluded_directories; gdformat does not, so both
     # are given the same explicitly filtered list for consistency.
     targets = [str(p) for p in gd_files()] or [str(PROJECT_DIR)]
-    code, out = run(tool + targets, 120, LOG_DIR / "lint.log")
+    code, out = _run_external_tool(tool + targets, 120, LOG_DIR / "lint.log")
     indent(out, 30)
     issues, errors = _lint_issues(out)
     if code == 0:
@@ -1949,8 +2110,12 @@ def stage_arch() -> None:
         print("  arch.py not present, architecture stage disabled")
         RESULTS.skip("arch")
         return
-    code, out = run([sys.executable, str(script), "--check"], 60,
-                    LOG_DIR / "arch.log")
+    code, out = _run_internal_python(
+        script,
+        ("--check",),
+        60,
+        LOG_DIR / "arch.log",
+    )
     indent(out, 30)
     if "undeclared module" in out:
         print("  skill: .agents/skills/godot-human-involvement/SKILL.md")
@@ -2029,7 +2194,7 @@ def write_plan() -> None:
     script = CORE_ROOT / "tools" / "plan_html.py"
     if not script.is_file():
         return
-    code, _ = run([sys.executable, str(script)], 30, LOG_DIR / "plan.log")
+    code, _ = _run_internal_python(script, (), 30, LOG_DIR / "plan.log")
     if code == 0:
         print(f"  {DIM}plan.html regenerated{RST}")
 
@@ -2067,7 +2232,12 @@ def stage_design() -> None:
         print("  tools/design.py not found")
         RESULTS.skip("design")
         return
-    code, out = run([sys.executable, str(tool), "--json"], 60, LOG_DIR / "design.log")
+    code, out = _run_internal_python(
+        tool,
+        ("--json",),
+        60,
+        LOG_DIR / "design.log",
+    )
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
@@ -2096,7 +2266,7 @@ def stage_design() -> None:
         return
 
     # Write mode: the --json call above is read-only, so run once more to emit.
-    run([sys.executable, str(tool)], 60, LOG_DIR / "design_write.log")
+    _run_internal_python(tool, (), 60, LOG_DIR / "design_write.log")
 
     declared = {t for sec in sections for t in (sec.get("declared_tunables") or [])}
     print(f"  {len(sections)} section(s), {len(declared)} tunable(s) declared")
@@ -2204,13 +2374,15 @@ def _unbound_authored_changes() -> Tuple[Optional[List[str]], str]:
         path.relative_to(PROJECT_DIR).as_posix()
         for path in authored_game_files()
     }
-    if not shutil.which("git"):
+    try:
+        git = _ordinary_executable("git")
+    except (FileNotFoundError, ValueError):
         if not current and not (ROOT / ".git").exists():
             return [], ""
         return None, "Git is unavailable; authored changes cannot be compared to a baseline"
 
-    verify_code, verified_head = run(
-        ["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD^{commit}"],
+    verify_code, verified_head = _run_git(
+        [git, "-C", str(ROOT), "rev-parse", "--verify", "HEAD^{commit}"],
         30,
         LOG_DIR / "conformance.log",
     )
@@ -2220,12 +2392,13 @@ def _unbound_authored_changes() -> Tuple[Optional[List[str]], str]:
             return [], ""
         return None, "the current Git baseline is unavailable"
 
-    tracked_code, tracked = run(
+    tracked_code, tracked = _run_git(
         [
-            "git",
+            git,
             "-C",
             str(ROOT),
             "diff",
+            "--no-ext-diff",
             "--name-only",
             verified_head,
             "--",
@@ -2236,9 +2409,9 @@ def _unbound_authored_changes() -> Tuple[Optional[List[str]], str]:
     )
     if tracked_code != 0:
         return None, "Git could not derive tracked authored changes"
-    untracked_code, untracked = run(
+    untracked_code, untracked = _run_git(
         [
-            "git",
+            git,
             "-C",
             str(ROOT),
             "ls-files",
@@ -2814,12 +2987,14 @@ def stage_conformance() -> None:
         print(f"  {RED}baseline_sha is not an exact lowercase commit id{RST}")
         RESULTS.fail("conformance (invalid baseline)")
         return
-    if not shutil.which("git"):
+    try:
+        git = _ordinary_executable("git")
+    except (FileNotFoundError, ValueError):
         print(f"  {RED}Git is unavailable; changed-file scope cannot be proven{RST}")
         RESULTS.fail("conformance (git unavailable)")
         return
-    verify_code, verified_baseline = run(
-        ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{baseline}^{{commit}}"],
+    verify_code, verified_baseline = _run_git(
+        [git, "-C", str(ROOT), "rev-parse", "--verify", f"{baseline}^{{commit}}"],
         30,
         LOG_DIR / "conformance.log",
     )
@@ -2830,9 +3005,18 @@ def stage_conformance() -> None:
         RESULTS.fail("conformance (baseline unavailable)")
         return
     pathspec = GAME_LAYOUT
-    code, out = run(
-        ["git", "-C", str(ROOT), "diff", "--name-only", verified_baseline,
-         "--", pathspec],
+    code, out = _run_git(
+        [
+            git,
+            "-C",
+            str(ROOT),
+            "diff",
+            "--no-ext-diff",
+            "--name-only",
+            verified_baseline,
+            "--",
+            pathspec,
+        ],
         30,
         LOG_DIR / "conformance.log",
     )
@@ -2840,8 +3024,8 @@ def stage_conformance() -> None:
         print(f"  {RED}Git could not derive tracked changes from the baseline{RST}")
         RESULTS.fail("conformance (tracked scope unavailable)")
         return
-    untracked_code, untracked = run(
-        ["git", "-C", str(ROOT), "ls-files", "--others", "--exclude-standard",
+    untracked_code, untracked = _run_git(
+        [git, "-C", str(ROOT), "ls-files", "--others", "--exclude-standard",
          "--", pathspec],
         30,
         LOG_DIR / "conformance.log",
@@ -2866,8 +3050,8 @@ def stage_conformance() -> None:
     # wrong action means the agent has not looked at what is already there --
     # which is exactly when extend-before-create gets skipped.
     action_wrong: List[str] = []
-    code, listing = run(
-        ["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only",
+    code, listing = _run_git(
+        [git, "-C", str(ROOT), "ls-tree", "-r", "--name-only",
          verified_baseline, "--", GAME_LAYOUT],
         30,
         LOG_DIR / "conformance.log",
@@ -3041,8 +3225,9 @@ def stage_conformance() -> None:
         elif changed_now and act == "delete" and exists_now:
             action_wrong.append(f"{rel}/: still exists but is marked 'delete'")
 
-    graph_code, graph_output = run(
-        [sys.executable, str(CORE_ROOT / "arch.py"), "--json"],
+    graph_code, graph_output = _run_internal_python(
+        CORE_ROOT / "arch.py",
+        ("--json",),
         60,
         LOG_DIR / "conformance-architecture.log",
     )
@@ -3145,9 +3330,9 @@ def stage_conformance() -> None:
                 repository_path = (
                     relative if GAME_LAYOUT == "." else f"{GAME_LAYOUT}/{relative}"
                 )
-                show_code, baseline_source = run(
+                show_code, baseline_source = _run_git(
                     [
-                        "git",
+                        git,
                         "-C",
                         str(ROOT),
                         "show",
