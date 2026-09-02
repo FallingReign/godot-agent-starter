@@ -54,9 +54,8 @@ class ProviderTests(unittest.TestCase):
                 "worker", {"worker": {"kind": "manual", "timeout_minutes": 0}}
             )
 
-    @mock.patch("tools.providers._copilot_launcher", return_value=["copilot"])
     def test_copilot_worker_fails_closed_without_host_read_boundary(
-        self, _launcher: mock.Mock
+        self,
     ) -> None:
         spec = self.select(
             "worker",
@@ -96,15 +95,44 @@ class ProviderTests(unittest.TestCase):
                 "role": "analyzer", "kind": "copilot-cli", "automatic": True,
             })
 
-    def test_analyzer_preflight_is_read_only_and_specific(self) -> None:
-        spec = providers.ProviderSpec("analyzer", "copilot-sdk")
-        with mock.patch("tools.providers._node_major", return_value=20), mock.patch(
-            "tools.providers.copilot_sdk_path", return_value=None
+    def test_blocked_automatic_preflight_never_probes_or_starts_host_tools(self) -> None:
+        cases = (
+            (
+                providers.ProviderSpec("analyzer", "copilot-sdk"),
+                providers.COPILOT_READ_BOUNDARY_BLOCKER,
+            ),
+            (
+                providers.ProviderSpec(
+                    "worker", "copilot-cli", persona="kit-builder"
+                ),
+                providers.COPILOT_READ_BOUNDARY_BLOCKER,
+            ),
+            (
+                providers.ProviderSpec("analyzer", "codex-cli"),
+                providers.CODEX_READ_BOUNDARY_BLOCKER,
+            ),
+            (
+                providers.ProviderSpec("worker", "codex-cli"),
+                providers.CODEX_READ_BOUNDARY_BLOCKER,
+            ),
+        )
+        unexpected_probe = AssertionError("blocked preflight probed a host tool")
+        with mock.patch.object(
+            providers.shutil, "which", side_effect=unexpected_probe
+        ), mock.patch.object(
+            providers.subprocess, "run", side_effect=unexpected_probe
+        ), mock.patch.object(
+            providers.subprocess, "Popen", side_effect=unexpected_probe
+        ), mock.patch.object(
+            providers, "_copilot_package_root", side_effect=unexpected_probe
+        ), mock.patch.object(
+            providers, "_codex_package_root", side_effect=unexpected_probe
+        ), mock.patch.object(
+            providers, "copilot_sdk_path", side_effect=unexpected_probe
         ):
-            problems = providers.preflight(spec)
-        self.assertEqual(len(problems), 3)
-        self.assertIn("needs >= 24", problems[0])
-        self.assertEqual(problems[-1], providers.COPILOT_READ_BOUNDARY_BLOCKER)
+            for spec, blocker in cases:
+                with self.subTest(role=spec.role, kind=spec.kind):
+                    self.assertEqual(providers.preflight(spec), [blocker])
 
     def test_resume_hint_rejects_shell_metacharacters(self) -> None:
         spec = providers.ProviderSpec("worker", "copilot-cli", persona="kit-builder")
@@ -112,9 +140,8 @@ class ProviderTests(unittest.TestCase):
                          "copilot --agent kit-builder --resume=good-session_123")
         self.assertEqual(providers.resume_command(spec, "x&whoami"), "")
 
-    @mock.patch("tools.providers._codex_launcher", return_value=["node", "codex.js"])
     def test_codex_analyzer_is_recognized_but_execution_is_explicitly_unavailable(
-            self, _launcher: mock.Mock) -> None:
+            self) -> None:
         spec = self.select("analyzer", {"analyzer": {"kind": "openai-codex"}})
         self.assertEqual(spec.kind, "codex-cli")
         self.assertEqual(providers.preflight(spec), [providers.CODEX_READ_BOUNDARY_BLOCKER])

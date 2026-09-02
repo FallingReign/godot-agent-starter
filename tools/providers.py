@@ -339,29 +339,14 @@ def preflight(spec: ProviderSpec) -> list[str]:
             f"{spec.role} provider is manual; configure an explicit adapter in "
             f"{runtime_paths.CONFIG_NAME} before using automatic {spec.role} actions"
         ]
-    if spec.kind == "copilot-cli":
-        problems = [] if _copilot_launcher() else [
-            "Copilot CLI has no safe shell-free launcher on PATH"
-        ]
-        problems.append(COPILOT_READ_BOUNDARY_BLOCKER)
-        return problems
-    if spec.kind == "copilot-sdk":
-        problems: list[str] = []
-        major = _node_major()
-        if major is None:
-            problems.append(f"Node.js >= {NODE_MIN} is not available on PATH")
-        elif major < NODE_MIN:
-            problems.append(f"Node.js {major} is installed; Copilot SDK needs >= {NODE_MIN}")
-        if copilot_sdk_path() is None:
-            problems.append("The @github/copilot/sdk entry point is not available from the installed CLI")
-        problems.append(COPILOT_READ_BOUNDARY_BLOCKER)
-        return problems
+    # Repository-scoped reads are the first decisive prerequisite. Keep this
+    # blocked preflight process-free: a brownfield project must not be able to
+    # make a status view resolve or execute a project-local provider, Node
+    # binary or shell shim before the host boundary exists.
+    if spec.kind in ("copilot-cli", "copilot-sdk"):
+        return [COPILOT_READ_BOUNDARY_BLOCKER]
     if spec.kind == "codex-cli":
-        problems = [] if _codex_launcher() else [
-            "Official @openai/codex has no authenticated shell-free launcher on PATH"
-        ]
-        problems.append(CODEX_READ_BOUNDARY_BLOCKER)
-        return problems
+        return [CODEX_READ_BOUNDARY_BLOCKER]
     return [f"unsupported provider kind: {spec.kind}"]
 
 
