@@ -76,12 +76,15 @@ class KitChangeBoard(unittest.TestCase):
         self.saved = {
             "state": board.STATE_FILE,
             "runtime": board._RUNTIME,
+            "controller_runtime": board._CONTROLLER_RUNTIME,
             "finding_states": board.finding_states,
             "retro_due": board.retro_due.state,
             "plan_view": board.cockpit.plan_view,
         }
         board.STATE_FILE = self.runtime / "board" / "state.json"
         board._RUNTIME = board.runtime_paths.RuntimePaths(self.scratch, self.runtime)
+        board._CONTROLLER_RUNTIME = board._RUNTIME
+        self.controller_runtime = self.runtime
         board.finding_states = lambda silence=None: []
         board.retro_due.state = lambda: {"due": False}
         board.cockpit.plan_view = lambda _root: {"status": "unavailable", "verification": {}}
@@ -93,7 +96,7 @@ class KitChangeBoard(unittest.TestCase):
         }
 
         def status(runtime: Path, session_id: str, *, plan_url: str = "") -> dict:
-            self.assertEqual(self.runtime, runtime)
+            self.assertEqual(self.controller_runtime, runtime)
             if session_id not in self.states:
                 raise board.kit_change_controller.KitChangeControllerError(
                     "file-unreadable", "private path is deliberately not public"
@@ -103,7 +106,7 @@ class KitChangeBoard(unittest.TestCase):
             return value
 
         def apply(runtime: Path, session_id: str, digest: str) -> dict:
-            self.assertEqual(self.runtime, runtime)
+            self.assertEqual(self.controller_runtime, runtime)
             if digest != self.states[session_id]["kit_change"]["plan_sha256"]:
                 raise board.kit_change_controller.KitChangeControllerError(
                     "approval-mismatch", "stale"
@@ -112,7 +115,7 @@ class KitChangeBoard(unittest.TestCase):
             return self.states[session_id]
 
         def restore(runtime: Path, session_id: str, digest: str) -> dict:
-            self.assertEqual(self.runtime, runtime)
+            self.assertEqual(self.controller_runtime, runtime)
             if digest != RESULT_A:
                 raise board.kit_change_controller.KitChangeControllerError(
                     "result-mismatch", "stale"
@@ -122,13 +125,13 @@ class KitChangeBoard(unittest.TestCase):
             return self.states[session_id]
 
         def recover(runtime: Path, session_id: str) -> dict:
-            self.assertEqual(self.runtime, runtime)
+            self.assertEqual(self.controller_runtime, runtime)
             plan = self.states[session_id]["kit_change"]["plan_sha256"]
             self.states[session_id] = _view(session_id, plan, "restored")
             return self.states[session_id]
 
         def reprepare(runtime: Path, session_id: str, choices: dict) -> dict:
-            self.assertEqual(self.runtime, runtime)
+            self.assertEqual(self.controller_runtime, runtime)
             self.assertEqual(SESSION_A, session_id)
             self.assertEqual({"D1": "game"}, choices)
             return self.states[SESSION_NEW]
@@ -166,6 +169,7 @@ class KitChangeBoard(unittest.TestCase):
         mock.patch.stopall()
         board.STATE_FILE = self.saved["state"]
         board._RUNTIME = self.saved["runtime"]
+        board._CONTROLLER_RUNTIME = self.saved["controller_runtime"]
         board.finding_states = self.saved["finding_states"]
         board.retro_due.state = self.saved["retro_due"]
         board.cockpit.plan_view = self.saved["plan_view"]
@@ -218,6 +222,25 @@ class KitChangeBoard(unittest.TestCase):
         self.assertNotIn("target", json.dumps(stored))
         self.assertNotIn("release", json.dumps(stored))
         self.status.assert_called()
+
+    def test_explicit_controller_runtime_does_not_move_board_state(self) -> None:
+        external = self.scratch / "external-controller-runtime"
+        external.mkdir()
+        self.controller_runtime = external
+        board._CONTROLLER_RUNTIME = board.runtime_paths.RuntimePaths(
+            self.scratch, external
+        )
+
+        self.activate()
+
+        self.status.assert_called_with(
+            external,
+            SESSION_A,
+            plan_url="",
+        )
+        self.assertEqual(self.runtime / "board" / "state.json", board.STATE_FILE)
+        self.assertTrue(board.STATE_FILE.is_file())
+        self.assertEqual(self.runtime, board._RUNTIME.runtime)
 
     def test_ensure_registration_prints_the_exact_review_url(self) -> None:
         output = io.StringIO()
@@ -290,7 +313,7 @@ class KitChangeBoard(unittest.TestCase):
             "The kit works. 7 existing project problems remain.",
             payload["kit_change"]["detail"],
         )
-        self.apply.assert_called_once_with(self.runtime, SESSION_A, PLAN_A)
+        self.apply.assert_called_once_with(self.controller_runtime, SESSION_A, PLAN_A)
 
         code, page = self.get_text(f"kit-change.html?session={SESSION_A}")
         self.assertEqual(200, code)
@@ -329,7 +352,9 @@ class KitChangeBoard(unittest.TestCase):
         self.assertEqual(
             self.base + f"kit-change.html?session={SESSION_NEW}", payload["review_url"]
         )
-        self.reprepare.assert_called_once_with(self.runtime, SESSION_A, {"D1": "game"})
+        self.reprepare.assert_called_once_with(
+            self.controller_runtime, SESSION_A, {"D1": "game"}
+        )
         self.apply.assert_not_called()
         self.assertEqual(SESSION_NEW, board.load_state()["kit_change_session"])
 
@@ -369,7 +394,7 @@ class KitChangeBoard(unittest.TestCase):
 
         self.assertEqual(200, code)
         self.assertEqual("restored", recovered["kit_change"]["status"])
-        self.recover.assert_called_once_with(self.runtime, SESSION_A)
+        self.recover.assert_called_once_with(self.controller_runtime, SESSION_A)
         self.restore.assert_not_called()
 
     def test_retry_manual_restore_keeps_the_exact_result_digest(self) -> None:
@@ -393,7 +418,9 @@ class KitChangeBoard(unittest.TestCase):
         })
         self.assertEqual(200, code)
         self.assertEqual("restored", restored["kit_change"]["status"])
-        self.restore.assert_called_once_with(self.runtime, SESSION_A, RESULT_A)
+        self.restore.assert_called_once_with(
+            self.controller_runtime, SESSION_A, RESULT_A
+        )
 
     def test_retry_recovery_requires_exact_body_capability_and_origin(self) -> None:
         self.states[SESSION_A] = _view(SESSION_A, PLAN_A, "recovery_required")

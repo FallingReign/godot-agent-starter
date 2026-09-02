@@ -9,8 +9,10 @@ callers opt in to creating directories.
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ CONFIG_NAME = "kit.config.json"
 CONFIG_SCHEMA = 1
 DEFAULT_RUNTIME = ".kit/runtime"
 PRIVATE_ROOT = ".kit"
+CONTROLLER_RUNTIME_ENV = "AGENT_KIT_CONTROLLER_RUNTIME"
 
 
 class RuntimeConfigError(ValueError):
@@ -98,6 +101,41 @@ def _relative_private_root(root: Path, configured: object) -> Path:
             "runtime_root must be a descendant of the project-local .kit directory"
         )
     return resolved
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return _inside(first, second) or _inside(second, first)
+
+
+def _absolute_private_root(root: Path, configured: object) -> Path:
+    if not isinstance(configured, str) or not configured.strip():
+        raise RuntimeConfigError(
+            f"{CONTROLLER_RUNTIME_ENV} must be a canonical absolute directory"
+        )
+    candidate = Path(configured)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise RuntimeConfigError(
+            f"{CONTROLLER_RUNTIME_ENV} must be a canonical absolute directory"
+        )
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeConfigError(
+            f"{CONTROLLER_RUNTIME_ENV} directory is unavailable: {exc}"
+        ) from exc
+    if os.path.normcase(os.path.abspath(str(candidate))) != os.path.normcase(str(canonical)):
+        raise RuntimeConfigError(
+            f"{CONTROLLER_RUNTIME_ENV} must name its canonical directory"
+        )
+    anchor = Path(candidate.anchor)
+    _require_unredirected_directories(anchor, Path(*candidate.parts[1:]))
+    project = root.resolve(strict=True)
+    core = CORE_ROOT.resolve(strict=True)
+    if _paths_overlap(canonical, project) or _paths_overlap(canonical, core):
+        raise RuntimeConfigError(
+            f"{CONTROLLER_RUNTIME_ENV} must be outside the project and release directories"
+        )
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -209,3 +247,17 @@ def resolve(root: Path = DEFAULT_ROOT, *, create: bool = False) -> RuntimePaths:
     config = load_config(canonical)
     paths = RuntimePaths(canonical, _relative_private_root(canonical, config.get("runtime_root")))
     return paths.ensure() if create else paths
+
+
+def resolve_controller(
+    root: Path = DEFAULT_ROOT,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> RuntimePaths:
+    """Resolve the lifecycle controller runtime without moving project state."""
+    project_paths = resolve(root)
+    source = os.environ if environment is None else environment
+    if CONTROLLER_RUNTIME_ENV not in source or source[CONTROLLER_RUNTIME_ENV] == "":
+        return project_paths
+    runtime = _absolute_private_root(project_paths.root, source[CONTROLLER_RUNTIME_ENV])
+    return RuntimePaths(project_paths.root, runtime)

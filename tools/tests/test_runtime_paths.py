@@ -74,6 +74,98 @@ class RuntimePathsTests(unittest.TestCase):
             self.assertTrue(paths.dispatch_workspaces.is_dir())
             self.assertFalse((root / "docs").exists())
 
+    def test_controller_override_changes_only_the_controller_runtime(self) -> None:
+        with _scratch() as root:
+            _configure(root)
+            external = Path(tempfile.gettempdir()).resolve() / f"controller-{uuid.uuid4().hex}"
+            external.mkdir()
+            core_before = runtime_paths.CORE_ROOT
+            try:
+                environment = {
+                    runtime_paths.CONTROLLER_RUNTIME_ENV: str(external.resolve())
+                }
+
+                with mock.patch.dict(os.environ, environment, clear=False):
+                    ordinary = runtime_paths.resolve(root)
+                controller = runtime_paths.resolve_controller(
+                    root, environment=environment
+                )
+
+                self.assertEqual(root.resolve(), ordinary.root)
+                self.assertEqual(root.resolve(), controller.root)
+                self.assertEqual(
+                    (root / ".kit" / "runtime").resolve(), ordinary.runtime
+                )
+                self.assertEqual(external.resolve(), controller.runtime)
+                self.assertEqual(core_before, runtime_paths.CORE_ROOT)
+                self.assertFalse((external / "board").exists())
+            finally:
+                shutil.rmtree(external, ignore_errors=True)
+
+    def test_controller_override_is_opt_in_and_empty_disables_inherited_input(self) -> None:
+        with _scratch() as root:
+            _configure(root, ".kit/private")
+            expected = (root / ".kit" / "private").resolve()
+            self.assertEqual(
+                expected,
+                runtime_paths.resolve_controller(root, environment={}).runtime,
+            )
+            self.assertEqual(
+                expected,
+                runtime_paths.resolve_controller(
+                    root,
+                    environment={runtime_paths.CONTROLLER_RUNTIME_ENV: ""},
+                ).runtime,
+            )
+
+    def test_controller_override_rejects_unsafe_or_overlapping_paths(self) -> None:
+        with _scratch() as root:
+            _configure(root)
+            external = Path(tempfile.gettempdir()).resolve() / f"controller-{uuid.uuid4().hex}"
+            external.mkdir()
+            file_path = (
+                Path(tempfile.gettempdir()).resolve()
+                / f"controller-file-{uuid.uuid4().hex}"
+            )
+            file_path.write_text("not a directory", encoding="utf-8")
+            missing = (
+                Path(tempfile.gettempdir()).resolve()
+                / f"controller-missing-{uuid.uuid4().hex}"
+            )
+            values = (
+                "relative/runtime",
+                str(missing),
+                str(root.resolve()),
+                str((root / ".kit").resolve()),
+                str(runtime_paths.CORE_ROOT.resolve()),
+                str(file_path.resolve()),
+                str(external / ".." / external.name),
+                " ",
+            )
+            try:
+                for value in values:
+                    with self.subTest(value=value):
+                        with self.assertRaises(runtime_paths.RuntimeConfigError):
+                            runtime_paths.resolve_controller(
+                                root,
+                                environment={
+                                    runtime_paths.CONTROLLER_RUNTIME_ENV: value
+                                },
+                            )
+                with mock.patch.object(runtime_paths, "_is_reparse", return_value=True):
+                    with self.assertRaisesRegex(
+                        runtime_paths.RuntimeConfigError, "unredirected directory"
+                    ):
+                        runtime_paths.resolve_controller(
+                            root,
+                            environment={
+                                runtime_paths.CONTROLLER_RUNTIME_ENV: str(external)
+                            },
+                        )
+            finally:
+                shutil.rmtree(external, ignore_errors=True)
+                file_path.unlink(missing_ok=True)
+
     def test_rejects_absolute_traversal_and_project_root(self) -> None:
         with _scratch() as root:
             for bad in (

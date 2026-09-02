@@ -36,6 +36,7 @@ describes the user workflow without duplicating this endpoint inventory:
     POST /api/retro/run           start the retrospective model (spends quota)
     GET  /api/runs/<run_id>       status, exit code, silence, log tail
     POST /api/kit-change/apply    apply one exact registered kit review
+    POST /api/kit-change/recover  retry one exact automatic recovery
     POST /api/kit-change/restore  restore one exact checked kit result
 
 Those routes are the whole API surface. `/api/dispatch/prepare`, `/api/dispatch/run`
@@ -117,6 +118,7 @@ CONTEXT = project_context.load_active_context(CORE_ROOT)
 ROOT = CONTEXT.project_root  # compatibility name for project-owned paths
 RETRO_DIR = ROOT / "docs" / "retro"
 _RUNTIME = runtime_paths.resolve(ROOT)
+_CONTROLLER_RUNTIME = runtime_paths.resolve_controller(ROOT)
 RUNS_DIR = _RUNTIME.board_runs
 STATE_FILE = _RUNTIME.board_state
 LOCK_FILE = _RUNTIME.board_lock
@@ -415,6 +417,11 @@ def _repository_scope_id() -> str:
     return session_evidence.repository_scope(ROOT)["scope_id"]
 
 
+def _controller_runtime_id() -> str:
+    canonical = os.path.normcase(str(_CONTROLLER_RUNTIME.runtime.resolve(strict=True)))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _probe(
     port: int,
     expected: dict,
@@ -468,6 +475,10 @@ def _probe(
         or (
             expected.get("schema") == SCHEMA
             and expected.get("version") == BOARD_VERSION
+            and secrets.compare_digest(
+                str(payload.get("controller_runtime_id") or ""),
+                _controller_runtime_id(),
+            )
         )
     )
 
@@ -494,7 +505,8 @@ def board_health(state: dict | None = None) -> dict:
         detail = f"pid {pid} is gone and port {port} does not answer"
     elif pid_ok and identity_ok and not port_ok:
         detail = (
-            f"recorded cockpit pid {pid} answers on port {port} but its build is stale"
+            f"recorded cockpit pid {pid} answers on port {port} but its build "
+            "is stale or its controller binding changed"
         )
     elif not pid_ok:
         detail = f"port {port} answers but recorded pid {pid} is gone"
@@ -626,15 +638,17 @@ def ensure_running() -> str | None:
         else:
             popen_kwargs["start_new_session"] = True
         with open(BOARD_LOG, "ab") as log_file:
+            board_environment = dict(os.environ)
             proc = subprocess.Popen(
                 [
                     sys.executable, str(Path(__file__).resolve()), "--serve",
                     "--port", str(port), "--instance-id", instance_id,
                     "--repository-scope-id", repository_scope_id,
+                    "--controller-runtime-id", _controller_runtime_id(),
                     "--started", started,
                 ],
                 cwd=str(ROOT), stdout=log_file, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, **popen_kwargs,
+                stdin=subprocess.DEVNULL, env=board_environment, **popen_kwargs,
             )
         expected["pid"] = proc.pid
         ready = False
@@ -2223,7 +2237,7 @@ def _kit_change_status(session_id: str, *, base_url: str = "") -> dict:
             "session-id-invalid", "session id must be a full SHA-256"
         )
     result = kit_change_controller.status(
-        _RUNTIME.runtime,
+        _CONTROLLER_RUNTIME.runtime,
         session_id,
         plan_url="",
     )
@@ -2347,7 +2361,7 @@ def api_kit_change_apply(body: dict, server=None) -> tuple[int, dict]:
             if not has_d1:
                 return _error(409, "This review has no game-folder decision.", "decision_not_available")
             prepared = kit_change_controller.reprepare(
-                _RUNTIME.runtime, str(value["session_id"]), choices
+                _CONTROLLER_RUNTIME.runtime, str(value["session_id"]), choices
             )
             next_id = str(prepared["session_id"])
             refreshed = register_kit_change_session(next_id, base_url=base_url)
@@ -2359,7 +2373,9 @@ def api_kit_change_apply(body: dict, server=None) -> tuple[int, dict]:
                 **refreshed,
             }
         applied = kit_change_controller.apply(
-            _RUNTIME.runtime, str(value["session_id"]), str(value["plan_sha256"])
+            _CONTROLLER_RUNTIME.runtime,
+            str(value["session_id"]),
+            str(value["plan_sha256"]),
         )
         refreshed = _kit_change_status(str(applied["session_id"]), base_url=base_url)
         return 200, {"ok": True, **refreshed}
@@ -2379,7 +2395,9 @@ def api_kit_change_restore(body: dict, server=None) -> tuple[int, dict]:
     base_url = _board_url(server)
     try:
         restored = kit_change_controller.restore(
-            _RUNTIME.runtime, str(value["session_id"]), str(value["result_sha256"])
+            _CONTROLLER_RUNTIME.runtime,
+            str(value["session_id"]),
+            str(value["result_sha256"]),
         )
         refreshed = _kit_change_status(str(restored["session_id"]), base_url=base_url)
         return 200, {"ok": True, **refreshed}
@@ -2405,7 +2423,9 @@ def api_kit_change_recover(body: dict, server=None) -> tuple[int, dict]:
                 "Retry restore with the exact result fingerprint shown by this review.",
                 "restore_retry_required",
             )
-        recovered = kit_change_controller.recover(_RUNTIME.runtime, session_id)
+        recovered = kit_change_controller.recover(
+            _CONTROLLER_RUNTIME.runtime, session_id
+        )
         refreshed = _kit_change_status(str(recovered["session_id"]), base_url=base_url)
         return 200, {"ok": True, **refreshed}
     except kit_change_controller.KitChangeControllerError as exc:
@@ -2441,6 +2461,10 @@ def api_health(server=None) -> tuple[int, dict]:
         "repository_scope_id": (
             getattr(server, "repository_scope_id", None) if server is not None
             else state.get("repository_scope_id")
+        ),
+        "controller_runtime_id": (
+            getattr(server, "controller_runtime_id", None) if server is not None
+            else _controller_runtime_id()
         ),
         "schema": SCHEMA,
         "version": BOARD_VERSION,
@@ -3034,6 +3058,7 @@ class BoardHTTPServer(http.server.ThreadingHTTPServer):
                  capability_token: str | None = None, *,
                  instance_id: str | None = None,
                  repository_scope_id: str | None = None,
+                 controller_runtime_id: str | None = None,
                  started: str | None = None) -> None:
         super().__init__(server_address, handler_class)
         port = int(self.server_address[1])
@@ -3042,9 +3067,17 @@ class BoardHTTPServer(http.server.ThreadingHTTPServer):
                 and not secrets.compare_digest(repository_scope_id, actual_scope)):
             self.server_close()
             raise ValueError("board repository scope does not match this checkout")
+        actual_controller = _controller_runtime_id()
+        if (
+            controller_runtime_id is not None
+            and not secrets.compare_digest(controller_runtime_id, actual_controller)
+        ):
+            self.server_close()
+            raise ValueError("board controller runtime does not match this process")
         self.capability_token = capability_token or secrets.token_urlsafe(32)
         self.instance_id = instance_id or secrets.token_urlsafe(18)
         self.repository_scope_id = actual_scope
+        self.controller_runtime_id = actual_controller
         self.started = started or _now_iso()
         self.allowed_hosts = {f"127.0.0.1:{port}"}
         self.allowed_origins = {f"http://127.0.0.1:{port}"}
@@ -3474,6 +3507,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def serve(port: int, *, instance_id: str | None = None,
           repository_scope_id: str | None = None,
+          controller_runtime_id: str | None = None,
           started: str | None = None) -> int:
     # Self-heal on start: a decision file from the pre-comment pipeline must
     # not render as a queued item nobody is working on (see migrate_accepted).
@@ -3485,6 +3519,7 @@ def serve(port: int, *, instance_id: str | None = None,
         ("127.0.0.1", port), Handler,
         instance_id=instance_id,
         repository_scope_id=repository_scope_id,
+        controller_runtime_id=controller_runtime_id,
         started=started,
     )
     mutate_state(lambda state: state.update({
@@ -3544,6 +3579,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--instance-id", default="", help=argparse.SUPPRESS)
     ap.add_argument("--repository-scope-id", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--controller-runtime-id", default="", help=argparse.SUPPRESS)
     ap.add_argument("--started", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
@@ -3566,6 +3602,7 @@ def main() -> int:
             args.port or _free_port(),
             instance_id=args.instance_id or None,
             repository_scope_id=args.repository_scope_id or None,
+            controller_runtime_id=args.controller_runtime_id or None,
             started=args.started or None,
         )
     if args.status:

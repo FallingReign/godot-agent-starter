@@ -232,6 +232,7 @@ class BoardTestCase(unittest.TestCase):
             "board_accepted": board.ACCEPTED_FILE,
             "board_root": board.ROOT,
             "board_runtime": board._RUNTIME,
+            "board_controller_runtime": board._CONTROLLER_RUNTIME,
             "regen": board._regenerate,
             "rm": board._run_manager,
             "provider_selection": board.providers.selection,
@@ -257,6 +258,7 @@ class BoardTestCase(unittest.TestCase):
         board.ACCEPTED_FILE = self.retro / "accepted.json"
         board.ROOT = self.dir
         board._RUNTIME = board.runtime_paths.RuntimePaths(self.dir, self.runtime)
+        board._CONTROLLER_RUNTIME = board._RUNTIME
         (self.dir / "plan.html").write_text(
             "<!doctype html><html><head></head><body><script>ok</script></body></html>",
             encoding="utf-8",
@@ -296,6 +298,7 @@ class BoardTestCase(unittest.TestCase):
         board.ACCEPTED_FILE = self._saved["board_accepted"]
         board.ROOT = self._saved["board_root"]
         board._RUNTIME = self._saved["board_runtime"]
+        board._CONTROLLER_RUNTIME = self._saved["board_controller_runtime"]
         board._regenerate = self._saved["regen"]
         board._run_manager = self._saved["rm"]
         board.providers.selection = self._saved["provider_selection"]
@@ -1344,6 +1347,62 @@ class TestLiveness(BoardTestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_probe_rejects_a_different_controller_runtime_binding(self) -> None:
+        httpd = board.BoardHTTPServer(
+            ("127.0.0.1", 0), board.Handler,
+            instance_id="controller-binding",
+            repository_scope_id=board._repository_scope_id(),
+        )
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        expected = self.probe_identity(port, instance_id="controller-binding")
+        other = self.runtime / "other-controller"
+        other.mkdir()
+        original = board._CONTROLLER_RUNTIME
+        try:
+            board._CONTROLLER_RUNTIME = board.runtime_paths.RuntimePaths(
+                self.dir, other
+            )
+            self.assertFalse(board._probe(port, expected))
+            self.assertTrue(
+                board._probe(port, expected, require_current=False)
+            )
+        finally:
+            board._CONTROLLER_RUNTIME = original
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_restart_preserves_the_exact_controller_runtime_environment(self) -> None:
+        process = mock.Mock(pid=54321)
+        process.poll.return_value = None
+        inherited = str(self.runtime.resolve())
+        with mock.patch.object(board, "board_health", return_value={
+            "alive": False, "detail": "no board", "url": None,
+        }), mock.patch.object(board, "_free_port", return_value=48991), \
+                mock.patch.object(board, "_probe", return_value=False), \
+                mock.patch.object(board.time, "sleep", return_value=None), \
+                mock.patch.object(
+                    board.subprocess, "Popen", return_value=process
+                ) as spawn, mock.patch.object(
+                    board, "_terminate_process_tree", return_value=True
+                ), mock.patch.dict(
+                    board.os.environ,
+                    {board.runtime_paths.CONTROLLER_RUNTIME_ENV: inherited},
+                    clear=False,
+                ):
+            board.ensure_running()
+
+        environment = spawn.call_args.kwargs["env"]
+        self.assertEqual(
+            inherited,
+            environment[board.runtime_paths.CONTROLLER_RUNTIME_ENV],
+        )
+        arguments = spawn.call_args.args[0]
+        runtime_index = arguments.index("--controller-runtime-id")
+        self.assertEqual(
+            board._controller_runtime_id(), arguments[runtime_index + 1]
+        )
+
     def test_failed_start_is_not_persisted_or_reported_as_live(self) -> None:
         process = mock.Mock(pid=54321)
         process.poll.return_value = None
@@ -1513,6 +1572,9 @@ class TestOverHTTP(BoardTestCase):
         self.assertEqual(payload["instance_id"], self.httpd.instance_id)
         self.assertEqual(
             payload["repository_scope_id"], board._repository_scope_id()
+        )
+        self.assertEqual(
+            payload["controller_runtime_id"], board._controller_runtime_id()
         )
 
     def test_served_html_receives_an_ephemeral_capability_and_security_headers(self) -> None:
