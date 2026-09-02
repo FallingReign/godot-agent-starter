@@ -8,7 +8,7 @@ copying a repository over that project.
 1. Build or obtain one verified kit release.
 2. Run `kit install TARGET` or `kit upgrade TARGET` from that release.
 3. Open the exact local review link printed by the command.
-4. Review the affected files, then choose **Apply**.
+4. Review the affected files, then choose **Add kit** or **Upgrade kit**.
 5. Keep the result, or choose **Restore** to put the prior project bytes back.
 
 The review does not change game files, design, project instructions, Git, or the
@@ -62,7 +62,7 @@ Upgrade authenticates the old active core and its ownership record before it
 trusts any file as kit-owned. A human-edited file or managed section is never
 silently reclaimed by changing the install record.
 
-## What Apply may change
+## What the Apply stage may change
 
 - Versioned kit code is written under `.agent-kit/releases/`.
 - The stable `kit` and `kit.cmd` launchers select the active verified core.
@@ -103,7 +103,7 @@ only records that have first been explicitly made non-restorable.
 
 | State | Meaning | Next action |
 | --- | --- | --- |
-| Ready | The exact change can be applied | Review and choose Apply |
+| Ready | The exact change can be applied | Review and choose Add kit or Upgrade kit |
 | Needs a decision | One folder choice is unresolved | Answer D1 and review the new plan |
 | Complete | The Apply-time check passed when Apply finished | Ask your agent to run `kit verify --static` for the current project |
 | Adoption required | Project problems were recorded at Apply | Keep the kit and address the recorded problems separately |
@@ -126,10 +126,13 @@ Run recovery from the same incoming kit that created the review:
 kit recover FULL_SESSION_ID
 ```
 
-The session ID is printed by `install` or `upgrade`. Recovery reads the durable
-journal and continues or restores the exact known state; it does not guess which
-write completed. A third version of any protected file stops automatic Restore
-and leaves the conflict visible.
+The labelled session ID is printed by `install` or `upgrade`. Recovery reads the
+durable journal and continues or restores the exact known state; it does not guess
+which write completed. It does not run a new project check. When the resulting state
+is finished or still needs recovery, it starts or reuses the local review page and
+prints a fresh exact link. If recovery still cannot finish, the command prints the
+specific problem. A third version of any protected file stops automatic Restore and
+leaves the conflict visible.
 
 ## Legacy 0.2.0 projects
 

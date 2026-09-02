@@ -1457,6 +1457,41 @@ class KitCliTest(unittest.TestCase):
         board.assert_called_once_with(ROOT.resolve(), target, runtime, session_id)
         status.assert_called_once_with(runtime, session_id, plan_url=review_url)
 
+    def test_install_human_output_labels_the_session_and_review(self) -> None:
+        session_id = "8" * 64
+        target = ROOT.resolve() / "fresh-project"
+        release = ROOT.resolve() / "release.zip"
+        runtime = ROOT.resolve() / ".runtime"
+        prepared = self._kit_change_result(session_id)
+        ready = self._kit_change_result(session_id)
+        review_url = (
+            "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        )
+        ready["kit_change"]["plan_url"] = review_url
+        process = self.completed()
+        with mock.patch.object(
+            kit, "_kit_change_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "prepare", return_value=prepared
+        ), mock.patch.object(
+            kit,
+            "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, process),
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", return_value=ready
+        ):
+            code, output = self.invoke(
+                "install", str(target), "--release", str(release)
+            )
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual(
+            "install: ready\n"
+            f"  Session ID: {session_id}\n"
+            f"  Review: {review_url}\n",
+            output,
+        )
+
     def test_install_repeated_prepare_reports_its_terminal_status(self) -> None:
         session_id = "a" * 64
         with tempfile.TemporaryDirectory(prefix="kit-cli-install-terminal-") as temporary:
@@ -1745,17 +1780,74 @@ class KitCliTest(unittest.TestCase):
     def test_recover_uses_current_private_runtime_and_real_controller_default(self) -> None:
         session_id = "c" * 64
         runtime = ROOT / ".kit" / "runtime"
+        target = (ROOT / "recover-target").resolve()
         recovered = self._kit_change_result(session_id, status="complete")
+        recovered["kit_change"]["project"]["path"] = str(target)
+        review_url = (
+            "http://127.0.0.1:45555/kit-change.html?session=" + session_id
+        )
+        refreshed = self._kit_change_result(session_id, status="complete")
+        refreshed["kit_change"]["project"]["path"] = str(target)
+        refreshed["kit_change"]["plan_url"] = review_url
+        process = self.completed()
         with mock.patch.object(
             kit, "_source_controller_runtime", return_value=runtime
         ), mock.patch.object(
             kit.kit_change_controller, "recover", return_value=recovered
-        ) as recover:
+        ) as recover, mock.patch.object(
+            kit,
+            "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, process),
+        ) as board, mock.patch.object(
+            kit.kit_change_controller, "status", return_value=refreshed
+        ) as status:
             code, output = self.invoke("recover", session_id, "--json")
 
         self.assertEqual(kit.EXIT_OK, code)
-        self.assertEqual("complete", json.loads(output)["status"])
+        payload = json.loads(output)
+        self.assertEqual("complete", payload["status"])
+        self.assertEqual(review_url, payload["review_url"])
         recover.assert_called_once_with(runtime, session_id)
+        board.assert_called_once_with(ROOT.resolve(), target, runtime, session_id)
+        status.assert_called_once_with(runtime, session_id, plan_url=review_url)
+
+    def test_recover_human_output_explains_failure_and_reopens_review(self) -> None:
+        session_id = "7" * 64
+        runtime = ROOT / ".kit" / "runtime"
+        target = (ROOT / "recover-target").resolve()
+        detail = "Restore is still required because AGENTS.md changed after Apply."
+        recovered = self._kit_change_result(session_id, status="recovery_required")
+        recovered["kit_change"]["project"]["path"] = str(target)
+        recovered["kit_change"]["detail"] = detail
+        review_url = (
+            "http://127.0.0.1:46666/kit-change.html?session=" + session_id
+        )
+        refreshed = self._kit_change_result(session_id, status="recovery_required")
+        refreshed["kit_change"]["project"]["path"] = str(target)
+        refreshed["kit_change"]["detail"] = detail
+        refreshed["kit_change"]["plan_url"] = review_url
+        process = self.completed()
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "recover", return_value=recovered
+        ), mock.patch.object(
+            kit,
+            "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, process),
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", return_value=refreshed
+        ):
+            code, output = self.invoke("recover", session_id)
+
+        self.assertEqual(kit.EXIT_FAILED, code)
+        self.assertEqual(
+            "recover: recovery required\n"
+            f"  Session ID: {session_id}\n"
+            f"  Problem: {detail}\n"
+            f"  Review: {review_url}\n",
+            output,
+        )
 
     def test_serve_status_does_not_regenerate_or_open(self) -> None:
         tool = ROOT / "tools" / "board.py"

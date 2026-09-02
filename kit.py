@@ -2353,7 +2353,11 @@ def _kit_change_prepare(
         "board": board,
         "process": _process_summary(process),
     }
-    human = [f"{mode}: {status.replace('_', ' ')}", f"  {review_url}"]
+    human = [
+        f"{mode}: {status.replace('_', ' ')}",
+        f"  Session ID: {session_id}",
+        f"  Review: {review_url}",
+    ]
     return EXIT_OK, payload, human
 
 
@@ -2370,6 +2374,28 @@ def _kit_change_recover(
             status=exc.code.replace("-", "_"),
         ) from exc
     state = recovered["kit_change"]
+    review_url = ""
+    board: dict[str, Any] | None = None
+    process: subprocess.CompletedProcess[str] | None = None
+    reviewable_states = (
+        kit_change_controller.FINAL_STATES | kit_change_controller.RECOVERY_STATES
+    )
+    if state["status"] in reviewable_states:
+        # Controller status re-authenticates stored terminal/recovery state. It
+        # refreshes project input only for an open ready/blocked review.
+        target = _explicit_path(str(state["project"]["path"]), "target project")
+        review_url, board, process = _register_kit_change_board(
+            project,
+            target,
+            runtime,
+            recovered["session_id"],
+        )
+        recovered = kit_change_controller.status(
+            runtime,
+            recovered["session_id"],
+            plan_url=review_url,
+        )
+        state = recovered["kit_change"]
     ok = state["status"] in {
         "ready", "blocked", "complete", "adoption_required", "restored"
     }
@@ -2378,11 +2404,19 @@ def _kit_change_recover(
         "command": "recover",
         "status": state["status"],
         "session_id": recovered["session_id"],
+        "review_url": review_url,
         "kit_change": state,
+        "board": board,
+        "process": _process_summary(process) if process is not None else None,
     }
-    human = [f"recover: {state['status'].replace('_', ' ')}"]
-    if state.get("plan_url"):
-        human.append(f"  {state['plan_url']}")
+    human = [
+        f"recover: {state['status'].replace('_', ' ')}",
+        f"  Session ID: {recovered['session_id']}",
+    ]
+    if not ok and state.get("detail"):
+        human.append(f"  Problem: {state['detail']}")
+    if review_url:
+        human.append(f"  Review: {review_url}")
     return (EXIT_OK if ok else EXIT_FAILED), payload, human
 
 
