@@ -531,10 +531,32 @@ def _run_release_controller(
         child_output = completed.stdout.split(_CONTROLLER_RESULT_PREFIX, 1)[0].strip()
         stdout_tail = child_output[-4000:]
         stderr_tail = completed.stderr.strip()[-4000:]
+        private_log_tail = ""
+        kit_change = payload.get("kit_change") if isinstance(payload, dict) else None
+        detail = kit_change.get("detail", "") if isinstance(kit_change, dict) else ""
+        marker = "private log: "
+        if isinstance(detail, str) and marker in detail:
+            relative_text = detail.split(marker, 1)[1].split(" (", 1)[0]
+            relative = Path(relative_text)
+            target_text = request.get("target")
+            if (
+                isinstance(target_text, str)
+                and relative.parts[:4] == (".kit", "runtime", "self-test", "failures")
+                and not relative.is_absolute()
+                and ".." not in relative.parts
+            ):
+                private_log = Path(target_text) / relative
+                try:
+                    private_log_tail = private_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[-4000:]
+                except OSError as exc:
+                    private_log_tail = f"unavailable: {exc}"
         raise AssertionError(
             f"release controller {request.get('action')} returned a failing receipt: "
             f"{payload}; child stdout tail: {stdout_tail}; "
-            f"child stderr tail: {stderr_tail}"
+            f"child stderr tail: {stderr_tail}; "
+            f"private failure log tail: {private_log_tail}"
         )
     return payload
 
