@@ -33,6 +33,11 @@ try:
 except ImportError:  # package import in tests
     from tools import process_supervisor  # type: ignore[no-redef]
 
+try:
+    import managed_launcher
+except ImportError:  # package import in tests
+    from tools import managed_launcher  # type: ignore[no-redef]
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = "RELEASE-MANIFEST.json"
 SCHEMA = 2
@@ -2681,6 +2686,11 @@ def smoke_archive(path: Path, workspace: Path) -> dict:
             launcher = "kit"
         environment = process_supervisor.isolated_python_environment({
             "KIT_PYTHON": str(Path(sys.executable).resolve()),
+            # Strict verification is launched from the source kit with an
+            # authenticated project/core binding. The extracted release is an
+            # independent project and must never inherit that outer binding.
+            managed_launcher.PROJECT_ROOT_ENV: "",
+            managed_launcher.CORE_ROOT_ENV: "",
         })
         completed = subprocess.run(
             command,

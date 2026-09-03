@@ -279,6 +279,21 @@ class ArchitectureSignatureConsumer(unittest.TestCase):
         self.assertEqual(1, scanner.call_count)
         self.assertIn('m0["scripts"]', rendered)
 
+    def test_architecture_document_writes_canonical_lf_after_windows_input(self) -> None:
+        document = (
+            "# Architecture\r\r\n\r\r\n"
+            f"{arch.BEGIN}\r\nold\r\n{arch.END}\r\n"
+        )
+        rendered = arch.splice(document, "```mermaid\r\ngraph TD\r\n```")
+        output = self.scratch / "ARCHITECTURE.md"
+
+        arch._write_architecture_document(output, rendered)
+
+        content = output.read_bytes()
+        self.assertNotIn(b"\r", content)
+        self.assertEqual(1, content.count(arch.BEGIN.encode("utf-8")))
+        self.assertIn(b"```mermaid\ngraph TD\n```", content)
+
     def test_architecture_graph_rejects_amplification_limits(self) -> None:
         self._write(
             "a/one.gd",

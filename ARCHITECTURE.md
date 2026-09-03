@@ -21,13 +21,13 @@ kit architecture update
 
 ```mermaid
 graph TD
-    scripts_logic["scripts/logic<br/><i>pure rules, no engine deps</i>"]
-    tests["tests<br/><i>harnesses</i>"]
-    tests_fixtures["tests/fixtures<br/><i>kit verification scenes used only by the canonical source repository</i>"]
-    tests_unit["tests/unit<br/><i>logic tests</i>"]
-    tools["tools<br/><i>headless validators run by the gate, not shipped in the game</i>"]
+    m0["scripts/logic<br/><i>pure rules, no engine deps</i>"]
+    m1["tests<br/><i>harnesses</i>"]
+    m2["tests/fixtures<br/><i>kit verification scenes used only by the canonical source repository</i>"]
+    m3["tests/unit<br/><i>logic tests</i>"]
+    m4["tools<br/><i>headless validators run by the gate, not shipped in the game</i>"]
 
-    tests_unit --> scripts_logic
+    m3 --> m0
 ```
 
 <!-- END GENERATED GRAPH -->

@@ -244,6 +244,20 @@ def _read_optional_architecture_file(path: Path, label: str) -> Optional[str]:
         raise _blocked(f"project file is not valid UTF-8: {label}") from exc
 
 
+def _canonical_newlines(text: str) -> str:
+    """Return one LF for every input line ending, including doubled CRLF."""
+    return re.sub(r"\r+\n?", "\n", text)
+
+
+def _write_architecture_document(path: Path, text: str) -> None:
+    """Write the generated document with the repository's canonical LF bytes."""
+    path.write_text(
+        _canonical_newlines(text),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
 def scan_project(project_dir: Optional[Path] = None) -> ArchitectureScan:
     """Capture one bounded, link-free snapshot of the game root.
 
@@ -668,6 +682,8 @@ def check_rules(edges: Dict[str, Set[str]], autoload_users: Dict[str, Set[str]],
 
 
 def splice(doc: str, block: str) -> str:
+    doc = _canonical_newlines(doc)
+    block = _canonical_newlines(block)
     generated = f"{BEGIN}\n\n{block}\n\n{END}"
     if BEGIN in doc and END in doc:
         head = doc.split(BEGIN)[0]
@@ -774,7 +790,7 @@ def main() -> int:
         doc = _read_optional_architecture_file(ARCH_DOC, ARCH_DOC.name)
         if doc is None:
             doc = "# Architecture\n"
-        ARCH_DOC.write_text(splice(doc, block), encoding="utf-8")
+        _write_architecture_document(ARCH_DOC, splice(doc, block))
         print(f"wrote {ARCH_DOC.name} ({len(edges)} modules)")
         for line in violations:
             print(f"  VIOLATION {line}")

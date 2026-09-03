@@ -1695,6 +1695,12 @@ class TestReleaseSmoke(ReleaseTestCase):
             {
                 "COMSPEC": str(hostile),
                 "PATH": f"{self.scratch}{os.pathsep}{os.environ.get('PATH', '')}",
+                release.managed_launcher.PROJECT_ROOT_ENV: str(
+                    self.scratch / "wrong-project"
+                ),
+                release.managed_launcher.CORE_ROOT_ENV: str(
+                    self.scratch / "wrong-core"
+                ),
             },
             clear=False,
         ):
