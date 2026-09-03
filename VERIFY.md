@@ -219,8 +219,10 @@ metadata. It must not contain:
 `ARCHITECTURE.md` must equal the canonical empty release template even when the
 source checkout's generated graph contains project-only modules and edges.
 Verification must reject a manifest that reauthorizes different architecture
-bytes. The destination project generates its own graph with `kit architecture
-update`.
+bytes. If the destination has no architecture document, Preview must render its
+real graph from the authenticated template and rules, bind those exact bytes in
+the review digest, and Apply must write those bytes. Existing destination
+documents must remain unchanged.
 
 Verification must reject malformed or tampered archives without extracting:
 
@@ -257,6 +259,11 @@ the unresolved consequence without relaunching Godot.
 Strict success requires every stage supported and passed, retained evidence under
 the configured private runtime, release-archive smoke validation, and no unsupported
 skip converted into a false green.
+
+A source checkout proves release determinism by building twice from clean Git
+provenance. A managed install has no source Git history, so it proves the same
+active release by materializing its already verified core twice. Both paths then
+verify both archives, smoke-test one, and require byte-identical output.
 
 The canonical kit-source checkout has one narrower contract: an exact marker at
 `src/.kit-maintainer-fixture` identifies its release-excluded engine fixture. Only
@@ -334,6 +341,14 @@ The kit is release-ready only when all answers are yes:
 - [ ] Approved legal metadata and version identity exist.
 - [ ] Two release builds are byte-identical and independently verify.
 - [ ] The archive contains the complete kit and none of the excluded project/private state.
+- [ ] An install into a real existing Godot project keeps the kit active without changing game, design or Git files: **Complete** when every check is ready, or **Adoption required** with every unavailable or unchanged check named.
+- [ ] A managed A-to-B upgrade activates the exact B release and preserves project-owned files.
+- [ ] An exact verified 0.2.0 install migrates into the managed layout without treating modified legacy files as kit-owned.
+- [ ] Existing file-scoped project problems produce **Adoption required**; unchanged problems stay visible, while new problems and unresolved problems in changed files fail.
+- [ ] **Restore** recreates the exact prior bytes and restores prior file absence.
+- [ ] An empty folder or a selected folder without a regular exact-case `project.godot` is refused before project-facing writes.
+- [ ] A missing architecture document is generated from the destination graph and bound into the exact review; an existing document is preserved.
+- [ ] Missing test-runner or trusted style-tool checks are reported as adoption work, never invented or hidden, and strict verification rejects their skips.
 - [ ] A bounded full verification succeeds without repeated native launches.
 - [ ] `kit verify --strict` passes.
 - [ ] Windows, macOS and Linux CI jobs pass.

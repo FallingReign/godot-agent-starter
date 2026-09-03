@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -61,6 +62,7 @@ MAX_BACKUP_ENTRIES = 1024
 MAX_HISTORY = 32
 MAX_PROJECT_SCAN_ENTRIES = 20_000
 MAX_PROJECT_SCAN_DEPTH = 12
+MAX_CODEX_INSTRUCTIONS_BYTES = 32 * 1024
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -70,6 +72,10 @@ MODE_RE = re.compile(r"0[0-7]{3}\Z")
 CONFIG_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}\Z")
 
 CREATE_ONLY_PATHS = frozenset({".gdlintrc", "ARCHITECTURE.md", "arch.rules.json"})
+CODEX_INSTRUCTIONS_PATH = "AGENTS.md"
+CODEX_OVERRIDE_PATH = "AGENTS.override.md"
+ARCHITECTURE_PATH = "ARCHITECTURE.md"
+ARCHITECTURE_RULES_PATH = "arch.rules.json"
 SCHEMA_JSON_PATH = "kit.config.json"
 PROJECT_SETTING_PATHS = frozenset({"export_presets.cfg", "project.godot"})
 RETIRED_PROTECTED_PATHS = frozenset({
@@ -185,6 +191,18 @@ class ChangePlan:
     current: dict[str, Any]
     target_state: bytes
     noop: bool
+
+
+@dataclass
+class _PreparedTransaction:
+    """Exact filesystem identities created before the journal is durable."""
+
+    transaction_id: str
+    directory_identity: tuple[object, ...]
+    blobs_identity: tuple[object, ...]
+    blob_identities: dict[str, tuple[object, ...]]
+    backup_content: bytes
+    backup_identity: tuple[object, ...] | None = None
 
 
 def _now() -> str:
@@ -320,6 +338,68 @@ def _game_project_blockers(
             "create and close a blank Godot 4.7.2 GDScript project there, then retry"
         ),
     }]
+
+
+def _instruction_override_blockers(root: Path) -> list[dict[str, Any]]:
+    """Block a root override because Codex would ignore the managed instructions."""
+    try:
+        override = _target(root, CODEX_OVERRIDE_PATH)
+    except KitChangeError as exc:
+        return [{
+            "code": "instruction-override-conflict",
+            "path": CODEX_OVERRIDE_PATH,
+            "detail": (
+                "the root AGENTS.override.md path is unsafe; remove or rename it "
+                f"before installing the kit ({exc.detail})"
+            ),
+        }]
+    if override.exists() or override.is_symlink():
+        return [{
+            "code": "instruction-override-conflict",
+            "path": CODEX_OVERRIDE_PATH,
+            "detail": (
+                "root AGENTS.override.md would make Codex ignore the kit instructions; "
+                "remove or rename it before installing the kit"
+            ),
+        }]
+    return []
+
+
+def _csharp_project_blockers(root: Path, game_root: str) -> list[dict[str, Any]]:
+    """Detect the clear C# project markers this GDScript-only kit cannot verify."""
+    selected = root if game_root == "." else _target(root, game_root, leaf="directory")
+    directories = [root] if selected == root else [root, selected]
+    inspected = 0
+    for directory in directories:
+        try:
+            children: list[Path] = []
+            for child in directory.iterdir():
+                inspected += 1
+                if inspected > MAX_PROJECT_SCAN_ENTRIES:
+                    return [{
+                        "code": "game-root-scan-bounded",
+                        "path": game_root,
+                        "detail": "C# project detection reached its safety limit",
+                    }]
+                children.append(child)
+        except OSError as exc:
+            return [{
+                "code": "game-root-scan-failed",
+                "path": game_root,
+                "detail": f"cannot inspect the selected game root for C# markers: {exc}",
+            }]
+        for child in sorted(children, key=lambda item: item.name.casefold()):
+            if child.name.casefold().endswith(".csproj"):
+                relative = child.relative_to(root).as_posix()
+                return [{
+                    "code": "unsupported-csharp-project",
+                    "path": relative,
+                    "detail": (
+                        f"{relative} identifies a Godot C# project, but this kit only "
+                        "verifies GDScript projects"
+                    ),
+                }]
+    return []
 
 
 def _discover_game_root(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -622,6 +702,73 @@ def _strict_json(content: bytes, *, code: str, label: str) -> Any:
         return json.loads(content.decode("utf-8"), object_pairs_hook=object_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise KitChangeError(code, f"{label} is not unambiguous UTF-8 JSON: {exc}") from exc
+
+
+def _architecture_document_bytes(
+    root: Path,
+    game_root: str,
+    template: bytes,
+    surfaces: Sequence[Surface],
+    members: Mapping[str, Any],
+) -> bytes:
+    """Render the target's current module graph into a new project document."""
+    rules_surface = next(
+        (surface for surface in surfaces if surface.path == ARCHITECTURE_RULES_PATH),
+        None,
+    )
+    if rules_surface is None or rules_surface.strategy != "create-only":
+        raise KitChangeError(
+            "install-manifest-invalid",
+            "architecture rules are unavailable for target graph generation",
+        )
+    rules_path = _target(root, rules_surface.path)
+    rules_snapshot = _snapshot(rules_path)
+    if rules_snapshot["kind"] == "absent":
+        rules_content = _member_bytes(members, rules_surface.source)
+    else:
+        rules_content = _stable_bytes(rules_path)
+    rules = _strict_json(
+        rules_content,
+        code="architecture-rules-invalid",
+        label=ARCHITECTURE_RULES_PATH,
+    )
+    if not isinstance(rules, dict):
+        raise KitChangeError(
+            "architecture-rules-invalid",
+            f"{ARCHITECTURE_RULES_PATH} must contain one object",
+        )
+    try:
+        template_text = template.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise KitChangeError(
+            "install-manifest-invalid",
+            "architecture document template is not UTF-8",
+        ) from exc
+
+    script = Path(__file__).resolve().parent.parent / "arch.py"
+    spec = importlib.util.spec_from_file_location("_agent_kit_arch_renderer", script)
+    if spec is None or spec.loader is None:
+        raise KitChangeError(
+            "architecture-generator-unavailable",
+            "the active release cannot load its architecture generator",
+        )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        renderer = getattr(module, "render_document")
+        selected_game_root = _target(root, game_root, leaf="directory")
+        rendered = renderer(selected_game_root, rules, template_text)
+    except Exception as exc:
+        raise KitChangeError(
+            "architecture-generation-failed",
+            f"the target architecture graph could not be generated: {exc}",
+        ) from exc
+    if not isinstance(rendered, str):
+        raise KitChangeError(
+            "architecture-generation-failed",
+            "the target architecture generator returned invalid content",
+        )
+    return rendered.encode("utf-8")
 
 
 def _nullable_sha(value: object, label: str) -> str | None:
@@ -1467,6 +1614,11 @@ def _schema_json_bytes(
 
 
 def _mode_snapshot(content: bytes, mode: str) -> dict[str, Any]:
+    if len(content) > MAX_MANAGED_FILE_BYTES:
+        raise KitChangeError(
+            "managed-file-too-large",
+            f"managed result exceeds {MAX_MANAGED_FILE_BYTES} bytes",
+        )
     if os.name == "nt":
         mode = "0644"
     return {"kind": "file", "bytes": len(content), "sha256": _sha256(content), "mode": mode}
@@ -1573,7 +1725,17 @@ def _build_plan(
     identity = _release_identity(report, members, archive_sha256)
     current = _current_context(canonical_root, surfaces, retired)
     game_root_selection, game_root_blockers = _select_game_root(canonical_root, game_root)
-    blockers: list[dict[str, Any]] = list(game_root_blockers)
+    blockers: list[dict[str, Any]] = [
+        *game_root_blockers,
+        *_instruction_override_blockers(canonical_root),
+    ]
+    if game_root_selection["value"] is not None:
+        blockers.extend(
+            _csharp_project_blockers(
+                canonical_root,
+                str(game_root_selection["value"]),
+            )
+        )
 
     current_version = current.get("kit_version")
     if isinstance(current_version, str):
@@ -1652,7 +1814,18 @@ def _build_plan(
             elif surface.strategy == "create-only":
                 base_sha = _sha256(source)
                 if before["kind"] == "absent":
-                    after_bytes = source
+                    after_bytes = (
+                        _architecture_document_bytes(
+                            canonical_root,
+                            str(game_root_selection["value"]),
+                            source,
+                            surfaces,
+                            members,
+                        )
+                        if surface.path == ARCHITECTURE_PATH
+                        and game_root_selection["value"] is not None
+                        else source
+                    )
                     after = _mode_snapshot(after_bytes, surface.mode)
                 else:
                     after_bytes = _stable_bytes(path)
@@ -1721,6 +1894,24 @@ def _build_plan(
                 modes[surface.path] = after["mode"]
         except KitChangeError as exc:
             blockers.append({"code": exc.code, "path": surface.path, "detail": exc.detail})
+
+    try:
+        resulting_agents = replacements.get(CODEX_INSTRUCTIONS_PATH)
+        if resulting_agents is None:
+            agents_path = _target(canonical_root, CODEX_INSTRUCTIONS_PATH)
+            resulting_agents = _stable_bytes(agents_path) if agents_path.exists() else b""
+        if len(resulting_agents) > MAX_CODEX_INSTRUCTIONS_BYTES:
+            blockers.append({
+                "code": "instruction-file-too-large",
+                "path": CODEX_INSTRUCTIONS_PATH,
+                "detail": (
+                    f"the resulting root AGENTS.md is {len(resulting_agents)} bytes; "
+                    f"Codex loads at most {MAX_CODEX_INSTRUCTIONS_BYTES} bytes"
+                ),
+            })
+    except KitChangeError:
+        # The surface-specific blocker already explains an unsafe AGENTS.md.
+        pass
 
     if current["mode"] == "legacy":
         for index, item in enumerate(retired, start=1):
@@ -2000,12 +2191,18 @@ def _runtime_paths(root: Path, *, create: bool) -> tuple[Path, Path, Path]:
 @contextmanager
 def _change_guard(root: Path) -> Iterator[None]:
     _upgrade, _transactions, lock = _runtime_paths(root, create=True)
+    entered = False
     try:
         with process_supervisor.exclusive_file_lock(lock, label="kit change"):
+            entered = True
             yield
     except process_supervisor.ExclusiveLockUnavailable as exc:
+        if entered:
+            raise
         raise KitChangeError("change-busy", str(exc)) from exc
     except OSError as exc:
+        if entered:
+            raise
         raise KitChangeError("change-lock-failed", f"cannot establish kit change lock: {exc}") from exc
 
 
@@ -2044,6 +2241,248 @@ def _transaction_directory(root: Path, transaction_id: str, *, create: bool) -> 
     return _target(root, relative, leaf="directory")
 
 
+def _owned_directory_identity(path: Path) -> tuple[object, ...]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            f"cannot inspect transaction directory: {exc}",
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or _is_reparse(path) or not stat.S_ISDIR(info.st_mode):
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            "transaction directory identity is unsafe",
+        )
+    return tuple(
+        getattr(info, field, None)
+        for field in ("st_dev", "st_ino", "st_mode")
+    )
+
+
+def _owned_file_identity(info: os.stat_result) -> tuple[object, ...]:
+    return tuple(
+        getattr(info, field, None)
+        for field in ("st_dev", "st_ino", "st_mode", "st_nlink")
+    )
+
+
+def _checked_owned_file_identity(path: Path) -> tuple[object, ...]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            f"cannot inspect transaction file: {exc}",
+        ) from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or _is_reparse(path)
+        or not stat.S_ISREG(info.st_mode)
+        or int(getattr(info, "st_nlink", 1)) != 1
+    ):
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            "transaction file identity is unsafe",
+        )
+    return _owned_file_identity(info)
+
+
+def _discard_prepared_transaction(
+    root: Path,
+    prepared: _PreparedTransaction,
+) -> None:
+    """Remove only the exact pre-journal files created by this process."""
+    tx_dir = _transaction_directory(root, prepared.transaction_id, create=False)
+    if not os.path.lexists(tx_dir):
+        return
+    blobs_dir = _target(
+        root,
+        f"{TRANSACTIONS_ROOT}/{prepared.transaction_id}/blobs",
+        leaf="directory",
+    )
+    if (
+        _owned_directory_identity(tx_dir) != prepared.directory_identity
+        or _owned_directory_identity(blobs_dir) != prepared.blobs_identity
+    ):
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            "transaction directory changed before cleanup",
+        )
+
+    try:
+        tx_children = {child.name: child for child in tx_dir.iterdir()}
+        blob_children = {child.name: child for child in blobs_dir.iterdir()}
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            f"cannot inspect incomplete transaction: {exc}",
+        ) from exc
+    allowed_tx = {"blobs"}
+    backup = tx_children.get("backup.json")
+    backup_identity = prepared.backup_identity
+    if backup is not None:
+        if backup_identity is None:
+            if _stable_bytes(backup) != prepared.backup_content:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "incomplete transaction backup changed before cleanup",
+                )
+            backup_identity = _checked_owned_file_identity(backup)
+        allowed_tx.add("backup.json")
+    if set(tx_children) != allowed_tx or set(blob_children) != set(
+        prepared.blob_identities
+    ):
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            "incomplete transaction contains unexpected files",
+        )
+    for name, child in blob_children.items():
+        if _checked_owned_file_identity(child) != prepared.blob_identities[name]:
+            raise KitChangeError(
+                "transaction-cleanup-unsafe",
+                "incomplete transaction blob changed before cleanup",
+            )
+    if backup is not None and _checked_owned_file_identity(backup) != backup_identity:
+        raise KitChangeError(
+            "transaction-cleanup-unsafe",
+            "incomplete transaction backup changed before cleanup",
+        )
+
+    try:
+        for name in sorted(blob_children):
+            child = blob_children[name]
+            if _checked_owned_file_identity(child) != prepared.blob_identities[name]:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "incomplete transaction blob changed during cleanup",
+                )
+            child.unlink()
+        if backup is not None:
+            if _checked_owned_file_identity(backup) != backup_identity:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "incomplete transaction backup changed during cleanup",
+                )
+            backup.unlink()
+        if _owned_directory_identity(blobs_dir) != prepared.blobs_identity:
+            raise KitChangeError(
+                "transaction-cleanup-unsafe",
+                "transaction blob directory changed during cleanup",
+            )
+        blobs_dir.rmdir()
+        if _owned_directory_identity(tx_dir) != prepared.directory_identity:
+            raise KitChangeError(
+                "transaction-cleanup-unsafe",
+                "transaction directory changed during cleanup",
+            )
+        tx_dir.rmdir()
+        _sync_directory(tx_dir.parent)
+    except KitChangeError:
+        raise
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-cleanup-failed",
+            f"cannot remove incomplete transaction: {exc}",
+        ) from exc
+
+
+def _recover_journal_less_transaction(root: Path, transaction_id: str) -> None:
+    """Remove one bounded, link-free private backup that never reached a journal."""
+    tx_dir = _transaction_directory(root, transaction_id, create=False)
+    tx_identity = _owned_directory_identity(tx_dir)
+    try:
+        children = {child.name: child for child in tx_dir.iterdir()}
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-incomplete",
+            f"cannot inspect journal-less transaction {transaction_id}: {exc}",
+        ) from exc
+    if not set(children).issubset({"blobs", "backup.json"}):
+        raise KitChangeError(
+            "transaction-incomplete",
+            f"journal-less transaction {transaction_id} contains unexpected files",
+        )
+
+    blobs_dir = children.get("blobs")
+    blobs_identity: tuple[object, ...] | None = None
+    blob_identities: dict[str, tuple[object, ...]] = {}
+    blob_paths: dict[str, Path] = {}
+    total = 0
+    if blobs_dir is not None:
+        blobs_identity = _owned_directory_identity(blobs_dir)
+        try:
+            blob_paths = {child.name: child for child in blobs_dir.iterdir()}
+        except OSError as exc:
+            raise KitChangeError(
+                "transaction-incomplete",
+                f"cannot inspect journal-less transaction blobs: {exc}",
+            ) from exc
+        if len(blob_paths) > MAX_BACKUP_ENTRIES:
+            raise KitChangeError(
+                "transaction-incomplete",
+                "journal-less transaction has too many blobs",
+            )
+        for name, blob in blob_paths.items():
+            if SHA256_RE.fullmatch(name) is None:
+                raise KitChangeError(
+                    "transaction-incomplete",
+                    "journal-less transaction blob name is malformed",
+                )
+            blob_identities[name] = _checked_owned_file_identity(blob)
+            content = _stable_bytes(blob)
+            total += len(content)
+            if total > MAX_BACKUP_BYTES or _sha256(content) != name:
+                raise KitChangeError(
+                    "transaction-incomplete",
+                    "journal-less transaction blob is invalid",
+                )
+
+    backup = children.get("backup.json")
+    backup_identity: tuple[object, ...] | None = None
+    if backup is not None:
+        backup_identity = _checked_owned_file_identity(backup)
+        _stable_bytes(backup)
+
+    try:
+        for name in sorted(blob_paths):
+            blob = blob_paths[name]
+            if _checked_owned_file_identity(blob) != blob_identities[name]:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "journal-less transaction blob changed during recovery",
+                )
+            blob.unlink()
+        if backup is not None:
+            if _checked_owned_file_identity(backup) != backup_identity:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "journal-less transaction backup changed during recovery",
+                )
+            backup.unlink()
+        if blobs_dir is not None:
+            if _owned_directory_identity(blobs_dir) != blobs_identity:
+                raise KitChangeError(
+                    "transaction-cleanup-unsafe",
+                    "journal-less blob directory changed during recovery",
+                )
+            blobs_dir.rmdir()
+        if _owned_directory_identity(tx_dir) != tx_identity:
+            raise KitChangeError(
+                "transaction-cleanup-unsafe",
+                "journal-less transaction changed during recovery",
+            )
+        tx_dir.rmdir()
+        _sync_directory(tx_dir.parent)
+    except KitChangeError:
+        raise
+    except OSError as exc:
+        raise KitChangeError(
+            "transaction-cleanup-failed",
+            f"cannot recover journal-less transaction: {exc}",
+        ) from exc
+
+
 def _journal_write(path: Path, journal: dict[str, Any]) -> None:
     _durable_json(path, journal)
 
@@ -2060,12 +2499,16 @@ def _created_target_directories(root: Path, paths: list[str]) -> list[str]:
     return sorted(found, key=lambda value: (len(PurePosixPath(value).parts), value))
 
 
-def _prepare_backup(plan: ChangePlan, transaction_id: str) -> tuple[dict[str, Any], str]:
-    tx_dir = _transaction_directory(plan.root, transaction_id, create=True)
-    _ensure_directory(plan.root, f"{TRANSACTIONS_ROOT}/{transaction_id}/blobs", [])
+def _prepare_backup(
+    plan: ChangePlan,
+    transaction_id: str,
+) -> tuple[dict[str, Any], str, _PreparedTransaction]:
+    if len(plan.replacements) > MAX_BACKUP_ENTRIES:
+        raise KitChangeError("backup-too-large", "kit change has too many backup entries")
     entries: list[dict[str, Any]] = []
+    contents: dict[str, bytes] = {}
     total = 0
-    for relative, replacement in plan.replacements.items():
+    for relative in plan.replacements:
         path = _target(plan.root, relative)
         before = next(
             change["before"]
@@ -2077,22 +2520,18 @@ def _prepare_backup(plan: ChangePlan, transaction_id: str) -> tuple[dict[str, An
         blob: str | None = None
         if before["kind"] == "file":
             content = _stable_bytes(path)
+            if (
+                len(content) != before["bytes"]
+                or _sha256(content) != before["sha256"]
+            ):
+                raise KitChangeError("target-changed", f"{relative} changed after Preview")
             total += len(content)
             if total > MAX_BACKUP_BYTES:
                 raise KitChangeError("backup-too-large", "kit change backup exceeds its safety limit")
             digest = _sha256(content)
             blob = f"blobs/{digest}"
-            blob_path = tx_dir / "blobs" / digest
-            if not blob_path.exists():
-                with blob_path.open("xb") as handle:
-                    handle.write(content)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            if _sha256(_stable_bytes(blob_path)) != digest:
-                raise KitChangeError("backup-failed", f"backup blob did not verify: {relative}")
+            contents.setdefault(digest, content)
         entries.append({"path": relative, "before": before, "blob": blob})
-    if len(entries) > MAX_BACKUP_ENTRIES:
-        raise KitChangeError("backup-too-large", "kit change has too many backup entries")
     created = _created_target_directories(
         plan.root,
         [*plan.replacements, plan.preview["material"]["core"]["path"] + "/member"],
@@ -2106,10 +2545,55 @@ def _prepare_backup(plan: ChangePlan, transaction_id: str) -> tuple[dict[str, An
         "created_directories": created,
         "total_bytes": total,
     }
-    path = _backup_path(plan.root, transaction_id)
-    _durable_json(path, value)
-    content = _stable_bytes(path)
-    return value, _sha256(content)
+    backup_content = _canonical(value)
+
+    tx_dir = _transaction_directory(plan.root, transaction_id, create=True)
+    blobs_dir = _ensure_directory(
+        plan.root,
+        f"{TRANSACTIONS_ROOT}/{transaction_id}/blobs",
+        [],
+    )
+    prepared = _PreparedTransaction(
+        transaction_id=transaction_id,
+        directory_identity=_owned_directory_identity(tx_dir),
+        blobs_identity=_owned_directory_identity(blobs_dir),
+        blob_identities={},
+        backup_content=backup_content,
+    )
+    try:
+        for digest, content in contents.items():
+            blob_path = blobs_dir / digest
+            with blob_path.open("xb") as handle:
+                prepared.blob_identities[digest] = _owned_file_identity(
+                    os.fstat(handle.fileno())
+                )
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if (
+                _checked_owned_file_identity(blob_path)
+                != prepared.blob_identities[digest]
+                or _sha256(_stable_bytes(blob_path)) != digest
+            ):
+                raise KitChangeError(
+                    "backup-failed", f"backup blob did not verify: {digest}"
+                )
+        path = _backup_path(plan.root, transaction_id)
+        _durable_json(path, value)
+        prepared.backup_identity = _checked_owned_file_identity(path)
+        content = _stable_bytes(path)
+        if content != backup_content:
+            raise KitChangeError("backup-failed", "backup manifest did not verify")
+        return value, _sha256(content), prepared
+    except BaseException as exc:
+        try:
+            _discard_prepared_transaction(plan.root, prepared)
+        except KitChangeError as cleanup:
+            raise KitChangeError(
+                "transaction-cleanup-failed",
+                f"backup preparation failed and cleanup was refused: {cleanup.detail}",
+            ) from exc
+        raise
 
 
 def _journal_for(
@@ -2248,8 +2732,10 @@ def _journal_files(root: Path) -> list[Path]:
         if TRANSACTION_RE.fullmatch(child.name) is None:
             continue
         journal = child / "journal.json"
-        if journal.is_file():
-            found.append(journal)
+        if not journal.is_file():
+            _recover_journal_less_transaction(root, child.name)
+            continue
+        found.append(journal)
     return sorted(found)
 
 
@@ -2296,13 +2782,19 @@ def _load_journal(path: Path) -> dict[str, Any]:
         "path", "archive_sha256", "state", "members"
     }:
         raise KitChangeError("journal-invalid", "transaction core state is malformed")
-    _safe_relative(core["path"])
-    if not SHA256_RE.fullmatch(str(core["archive_sha256"] or "")) or core["state"] not in {
+    core_path = _safe_relative(core["path"])
+    core_sha256 = str(core["archive_sha256"] or "")
+    if not SHA256_RE.fullmatch(core_sha256) or core["state"] not in {
         "create_pending",
         "created",
         "reused",
     }:
         raise KitChangeError("journal-invalid", "transaction core identity is malformed")
+    if core_path != f"{RELEASES_ROOT}/{core_sha256}":
+        raise KitChangeError(
+            "journal-invalid",
+            "transaction core path does not match its release identity",
+        )
     members = core["members"]
     if not isinstance(members, list) or not members or len(members) > MAX_BACKUP_ENTRIES:
         raise KitChangeError("journal-invalid", "transaction core members are malformed")
@@ -2332,6 +2824,7 @@ def _load_journal(path: Path) -> dict[str, Any]:
         )
     sequences: list[int] = []
     paths: list[str] = []
+    activation_indexes: list[int] = []
     for raw in value["entries"]:
         if not isinstance(raw, dict) or set(raw) != {
             "sequence",
@@ -2344,23 +2837,51 @@ def _load_journal(path: Path) -> dict[str, Any]:
         }:
             raise KitChangeError("journal-invalid", "transaction entry is malformed")
         relative = _safe_relative(raw["path"])
-        if raw["phase"] not in {"project", "activation"} or raw["action"] not in {
-            "create",
-            "modify",
-            "delete",
-        }:
+        expected_phase = "activation" if relative == CURRENT_STATE else "project"
+        if raw["phase"] != expected_phase:
             raise KitChangeError("journal-invalid", "transaction entry action is malformed")
-        _validate_snapshot(raw["before"])
-        _validate_snapshot(raw["after"])
-        blob = raw["backup_blob"]
-        if blob is not None:
-            safe_blob = _safe_relative(blob, label="backup blob")
-            if not safe_blob.startswith("blobs/") or not SHA256_RE.fullmatch(safe_blob[6:]):
-                raise KitChangeError("journal-invalid", "backup blob path is malformed")
-        sequences.append(raw["sequence"])
+        before = _validate_snapshot(raw["before"])
+        after = _validate_snapshot(raw["after"])
+        if before == after:
+            raise KitChangeError("journal-invalid", "transaction entry records no change")
+        if before["kind"] == "absent" and after["kind"] == "file":
+            expected_action = "create"
+        elif before["kind"] == "file" and after["kind"] == "file":
+            expected_action = "modify"
+        elif before["kind"] == "file" and after["kind"] == "absent":
+            expected_action = "delete"
+        else:
+            raise KitChangeError(
+                "journal-invalid", "transaction entry snapshots are inconsistent"
+            )
+        if raw["action"] != expected_action:
+            raise KitChangeError("journal-invalid", "transaction entry action is malformed")
+        expected_blob = (
+            f"blobs/{before['sha256']}" if before["kind"] == "file" else None
+        )
+        if raw["backup_blob"] != expected_blob:
+            raise KitChangeError(
+                "journal-invalid", "transaction backup relationship is malformed"
+            )
+        sequence = raw["sequence"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise KitChangeError("journal-invalid", "transaction sequence is malformed")
+        sequences.append(sequence)
         paths.append(relative)
+        if expected_phase == "activation":
+            if after["kind"] != "file":
+                raise KitChangeError(
+                    "journal-invalid", "activation must select one current release"
+                )
+            activation_indexes.append(len(paths) - 1)
     if sequences != list(range(1, len(sequences) + 1)) or len(paths) != len(set(paths)):
         raise KitChangeError("journal-invalid", "transaction entries are not unique and ordered")
+    if len(activation_indexes) > 1 or (
+        activation_indexes and activation_indexes[0] != len(paths) - 1
+    ):
+        raise KitChangeError(
+            "journal-invalid", "transaction activation must be unique and last"
+        )
     return value
 
 
@@ -2394,18 +2915,22 @@ def _load_backup(root: Path, journal: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(value["total_bytes"], int)
     ):
         raise KitChangeError("backup-invalid", "backup manifest is malformed")
-    expected_entries = {entry["path"]: entry for entry in journal["entries"]}
-    backup_paths: set[str] = set()
-    for raw in value["entries"]:
+    expected_entries = list(journal["entries"])
+    if len(value["entries"]) != len(expected_entries):
+        raise KitChangeError("backup-invalid", "backup entry set is incomplete")
+    backup_paths: list[str] = []
+    calculated_total = 0
+    for raw, expected_entry in zip(value["entries"], expected_entries):
         if not isinstance(raw, dict) or set(raw) != {"path", "before", "blob"}:
             raise KitChangeError("backup-invalid", "backup entry is malformed")
         relative = _safe_relative(raw["path"])
         before = _validate_snapshot(raw["before"])
-        if relative not in expected_entries or before != expected_entries[relative]["before"]:
+        if relative != expected_entry["path"] or before != expected_entry["before"]:
             raise KitChangeError("backup-invalid", "backup entry does not match the journal")
         blob = raw["blob"]
         if before["kind"] == "file":
-            if not isinstance(blob, str) or not blob.startswith("blobs/"):
+            expected_blob = f"blobs/{before['sha256']}"
+            if blob != expected_blob:
                 raise KitChangeError("backup-invalid", "backup blob is missing")
             safe_blob = _safe_relative(blob, label="backup blob")
             digest = safe_blob[6:]
@@ -2414,13 +2939,45 @@ def _load_backup(root: Path, journal: dict[str, Any]) -> dict[str, Any]:
             blob_path = path.parent.joinpath(*PurePosixPath(safe_blob).parts)
             if _sha256(_stable_bytes(blob_path)) != digest or digest != before["sha256"]:
                 raise KitChangeError("backup-invalid", f"backup blob is damaged: {relative}")
+            calculated_total += int(before["bytes"])
         elif blob is not None:
             raise KitChangeError("backup-invalid", "absent file has an unexpected backup blob")
-        backup_paths.add(relative)
-    if backup_paths != set(expected_entries):
+        backup_paths.append(relative)
+    if backup_paths != [entry["path"] for entry in expected_entries]:
         raise KitChangeError("backup-invalid", "backup manifest entry set is incomplete")
-    for directory in value["created_directories"]:
+    if (
+        isinstance(value["total_bytes"], bool)
+        or value["total_bytes"] != calculated_total
+        or not 0 <= calculated_total <= MAX_BACKUP_BYTES
+    ):
+        raise KitChangeError("backup-invalid", "backup byte total is inconsistent")
+    created_directories = [
         _safe_relative(directory, label="created directory")
+        for directory in value["created_directories"]
+    ]
+    expected_order = sorted(
+        set(created_directories),
+        key=lambda candidate: (len(PurePosixPath(candidate).parts), candidate),
+    )
+    if created_directories != expected_order:
+        raise KitChangeError(
+            "backup-invalid", "created directory list is not unique and ordered"
+        )
+    possible_directories: set[str] = set()
+    managed_targets = [
+        *(entry["path"] for entry in expected_entries),
+        f"{journal['core']['path']}/member",
+    ]
+    for target in managed_targets:
+        parts = PurePosixPath(target).parts[:-1]
+        for index in range(1, len(parts) + 1):
+            possible_directories.add(PurePosixPath(*parts[:index]).as_posix())
+    unexpected_directories = set(created_directories) - possible_directories
+    if unexpected_directories:
+        raise KitChangeError(
+            "backup-invalid",
+            "created directory list contains a path outside managed targets",
+        )
     return value
 
 
@@ -2680,11 +3237,29 @@ def apply(
             }
 
         transaction_id = uuid.uuid4().hex
-        backup, backup_sha = _prepare_backup(plan, transaction_id)
+        backup, backup_sha, prepared = _prepare_backup(plan, transaction_id)
         del backup
-        journal = _journal_for(plan, transaction_id, backup_sha)
-        journal_path = _journal_path(canonical_root, transaction_id)
-        _journal_write(journal_path, journal)
+        try:
+            journal = _journal_for(plan, transaction_id, backup_sha)
+            journal_path = _journal_path(canonical_root, transaction_id)
+            _journal_write(journal_path, journal)
+        except BaseException as exc:
+            journal_path = _journal_path(canonical_root, transaction_id)
+            journal_is_durable = False
+            if os.path.lexists(journal_path):
+                try:
+                    journal_is_durable = _stable_bytes(journal_path) == _canonical(journal)
+                except (KitChangeError, UnboundLocalError):
+                    journal_is_durable = False
+            if not journal_is_durable:
+                try:
+                    _discard_prepared_transaction(canonical_root, prepared)
+                except KitChangeError as cleanup:
+                    raise KitChangeError(
+                        "transaction-cleanup-failed",
+                        f"journal creation failed and cleanup was refused: {cleanup.detail}",
+                    ) from exc
+            raise
         try:
             _failpoint("after-prepared")
             _stage_core(plan, transaction_id)

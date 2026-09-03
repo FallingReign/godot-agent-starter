@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Mapping
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,9 +23,14 @@ from tools import design as design_contract  # noqa: E402
 from tools import proposal_authority  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
+
+
 class DesignConformanceTests(unittest.TestCase):
     def setUp(self) -> None:
-        parent = ROOT / ".checklogs" / "tests"
+        parent = _scratch_parent()
         parent.mkdir(parents=True, exist_ok=True)
         self.scratch = parent / f"design-conformance-{uuid.uuid4().hex}"
         self.scratch.mkdir()
@@ -73,7 +79,7 @@ class DesignConformanceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         resolved = self.scratch.resolve()
-        expected = (ROOT / ".checklogs" / "tests").resolve()
+        expected = _scratch_parent().resolve()
         if resolved.parent != expected or not resolved.name.startswith(
             "design-conformance-"
         ):
@@ -206,9 +212,31 @@ class DesignConformanceTests(unittest.TestCase):
         else:
             proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
         results = gate.Results()
-        def fake_git(command: list[str], _timeout: int, _log: Path) -> tuple[int, str]:
+        def fake_git(
+            command: list[str],
+            _timeout: int,
+            _log: Path,
+            *,
+            env: Mapping[str, str] | None = None,
+        ) -> tuple[int, str]:
             if any(str(part).endswith("arch.py") for part in command):
                 return 0, json.dumps({"modules": self.module_edges})
+            self.assertIsNotNone(env)
+            assert env is not None
+            expected_git_environment = {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            self.assertEqual(
+                expected_git_environment,
+                {
+                    name: value
+                    for name, value in env.items()
+                    if name.upper().startswith("GIT_")
+                },
+            )
             operation = next(
                 (name for name in ("rev-parse", "diff", "ls-files", "ls-tree", "show")
                  if name in command),

@@ -70,9 +70,15 @@ bounded native retry.
 | `kit install TARGET [--release PATH]` | Review adding the kit to an existing project | No project-facing change before Apply |
 | `kit upgrade TARGET [--release PATH]` | Review replacing only managed kit parts | Authenticates existing ownership before Apply |
 | `kit recover SESSION_ID` | Continue or restore an interrupted kit change | Uses the exact durable session and journal |
+| `kit change list` | List retained install and upgrade reviews | Shows full session IDs; no project change |
+| `kit change status SESSION_ID` | Reopen one exact review | Starts or reuses its local review server |
+| `kit change apply SESSION_ID --plan-sha256 SHA256` | Apply one exact approved review | Requires the full review fingerprint |
+| `kit change restore SESSION_ID --result-sha256 SHA256` | Restore one applied change | Requires the full Apply result fingerprint |
 
-All commands accept `--project PATH` and `--json`. A kit root is the nearest
-ancestor containing `.agent-kit.json`; layout and private runtime paths come from
+All commands accept `--json`. To select a different kit root, put the global
+option before the command: `kit --project PATH COMMAND`. For `install` and
+`upgrade`, `TARGET` is always the game project. A kit root is the nearest ancestor
+containing `.agent-kit.json`; layout and private runtime paths come from
 `kit.config.json`, never from the current directory by inference.
 
 ## Install and upgrade
@@ -91,6 +97,14 @@ The target must already be a real Godot 4.7.2 GDScript project with a regular
 folder is refused because the kit never invents or edits `project.godot`. For a
 new game, create and close a blank Godot project first, then install the kit.
 
+Preview also stops before writing when the project has a root
+`AGENTS.override.md`, when the resulting root `AGENTS.md` would exceed 32 KiB,
+or when a `.csproj` shows that the game uses C#. The override would hide the kit
+rules from Codex, an oversized instructions file may be read only in part, and
+C# projects are not supported by this release. Remove or rename the override,
+shorten the instructions, or use a supported GDScript project, then Preview
+again.
+
 The kit running the change must be the exact incoming extracted release, or a
 clean source checkout that produces that exact release. A mismatch is refused
 before any project or review-session file is written. Run the command from the
@@ -101,11 +115,32 @@ will be created, changed, preserved, or removed. **Apply** writes a journal and
 backup first, changes the active release last, and runs offline kit and project
 checks. **Restore** puts exact prior project bytes back. Existing project gaps
 remain visible as **Adoption required**; they are not called fixed and do not
-authorize a project rewrite.
+authorize a project rewrite. The existing-problem baseline covers file-scoped
+formatting, lint, scene hygiene, banned old Godot patterns, typed boundaries,
+the architecture graph and its boundaries, test files the runner would miss,
+and missing asset `.import` sidecars. An unchanged recorded problem stays
+visible. A new problem, or a recorded problem that remains in a changed file,
+fails the check.
+
+The command starts or reuses a review server on `127.0.0.1`. It stays running
+when the browser closes. Stop it from the same incoming kit with
+`kit serve stop`. If browser buttons are unavailable, Codex or Copilot can use
+`kit change status`, `kit change apply`, or `kit change restore`; no internal
+Python command is part of the public workflow.
+
+If the project has no `.gutconfig.json`, installation does not invent its test
+layout. If no trusted external `gdformat` or `gdlint` is available during Apply,
+installation does not download or execute a project-owned tool. These checks are
+named as **Adoption required**, and strict verification remains incomplete until
+they are ready.
 
 If work stops between durable steps, run `kit recover FULL_SESSION_ID` from the
 same incoming kit. See [Install and upgrade the kit](docs/LIFECYCLE.md) for the
 complete short runbook and preservation boundaries.
+
+After Apply, start a fresh Codex or Copilot chat before game work. In Codex,
+check the active instruction sources. In Copilot, run `/instructions` and check
+References. The chat that performed the upgrade may still hold the old kit rules.
 
 ## Explicit setup
 
@@ -335,10 +370,12 @@ after verification into new private scratch and starts the public launcher.
 The archive contains the kit, not this repository's game or private history.
 `src/`, `docs/design/`, `project.shape.json`, `proposal.json`, generated pages,
 current retrospective decisions/evidence and `.kit/runtime/` are excluded.
-The required `ARCHITECTURE.md` member is replaced with a canonical empty graph,
+The required `ARCHITECTURE.md` member is replaced with a canonical empty template,
 and `arch.rules.json` is replaced with a fixed genre-neutral starting policy.
-Running `kit architecture update` in the destination derives the graph from that
-project, so source-project module names, descriptions and edges never ship.
+When the destination has no architecture document, the install review renders
+that template from the destination's real module graph and binds the exact result
+into Apply. Existing architecture documents remain project-owned. Source-project
+module names, descriptions and edges never ship.
 Building an archive never publishes it.
 
 CI repeats control-plane, strict engine and release evidence on Windows, macOS

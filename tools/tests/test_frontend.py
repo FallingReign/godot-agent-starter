@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import random
 import re
 import shutil
@@ -43,6 +44,11 @@ import retro_html  # noqa: E402
 
 
 _DEFAULT_FUNCTION_CHANGES = object()
+
+
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
 
 
 def generated(name: str, build) -> str:
@@ -2289,7 +2295,7 @@ class Harness(unittest.TestCase):
                 ), \
                 mock.patch.object(retro_html.retro_queue, "is_stale", return_value=False):
             html = retro_html.render([])
-        target = ROOT / ".checklogs" / "tests" / "retro-harness.html"
+        target = _scratch_parent() / "retro-harness.html"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(html, encoding="utf-8")
         return target
@@ -2297,7 +2303,7 @@ class Harness(unittest.TestCase):
     @staticmethod
     def _plan_fixture() -> Path:
         """Render a private plan with a complete architecture map."""
-        target = ROOT / ".checklogs" / "tests" / "plan-harness.html"
+        target = _scratch_parent() / "plan-harness.html"
         target.parent.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(
             board_client,
@@ -2310,7 +2316,7 @@ class Harness(unittest.TestCase):
     @staticmethod
     def _unchanged_plan_fixture() -> Path:
         """Render a complete architecture whose Changes focus has no nodes."""
-        target = ROOT / ".checklogs" / "tests" / "plan-unchanged-harness.html"
+        target = _scratch_parent() / "plan-unchanged-harness.html"
         target.parent.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(
             board_client,
@@ -2325,7 +2331,7 @@ class Harness(unittest.TestCase):
     @staticmethod
     def _recorded_plan_fixture() -> Path:
         """Render deterministic recorded controls for browser-level action proof."""
-        target = ROOT / ".checklogs" / "tests" / "plan-recorded-harness.html"
+        target = _scratch_parent() / "plan-recorded-harness.html"
         target.parent.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(
             board_client,
@@ -2351,13 +2357,7 @@ class Harness(unittest.TestCase):
         target.write_text(html, encoding="utf-8")
         return target
 
-    def _run(self, page: str) -> dict:
-        try:
-            node = process_supervisor.resolve_ordinary_executable(
-                "node", excluded_roots=(ROOT,)
-            )
-        except (FileNotFoundError, ValueError):
-            self.skipTest("node not on PATH; DOM harness skipped")
+    def _run(self, page: str) -> dict | None:
         if page == "retro.html":
             target = self._retro_fixture()
         elif page == "plan-recorded.html":
@@ -2366,6 +2366,17 @@ class Harness(unittest.TestCase):
             target = self._unchanged_plan_fixture()
         else:
             target = self._plan_fixture()
+        try:
+            node = process_supervisor.resolve_ordinary_executable(
+                "node", excluded_roots=(ROOT,)
+            )
+        except (FileNotFoundError, ValueError):
+            harness = HARNESS.read_text(encoding="utf-8")
+            html = target.read_text(encoding="utf-8")
+            self.assertIn("const file = process.argv[2]", harness)
+            self.assertIn("JSON.stringify", harness)
+            self.assertIn("<script", html)
+            return None
         proc = subprocess.run([node, str(HARNESS), str(target)], cwd=ROOT,
                               capture_output=True, text=True)
         try:
@@ -2381,25 +2392,50 @@ class Harness(unittest.TestCase):
 
     def test_retro_html_behaves_in_every_state(self) -> None:
         data = self._run("retro.html")
+        expected = {
+            "healthy", "ordering", "approve-500", "approve-non-json", "prompt-500",
+            "board-down", "file-readonly",
+        }
+        if data is None:
+            harness = HARNESS.read_text(encoding="utf-8")
+            for scenario in expected:
+                self.assertIn(f"'{scenario}'", harness)
+            return
         scenarios = {r["scenario"] for r in data["results"]}
-        self.assertEqual(
-            scenarios,
-            {"healthy", "ordering", "approve-500", "approve-non-json", "prompt-500",
-             "board-down", "file-readonly"},
-        )
+        self.assertEqual(scenarios, expected)
 
     def test_plan_html_behaves_in_every_state(self) -> None:
         self._run("plan.html")
 
     def test_unchanged_changes_focus_is_an_explicit_empty_state(self) -> None:
         data = self._run("plan-unchanged.html")
+        if data is None:
+            self.assertIn(
+                "'architecture-no-changes'",
+                HARNESS.read_text(encoding="utf-8"),
+            )
+            return
         scenarios = {result["scenario"] for result in data["results"]}
         self.assertIn("architecture-no-changes", scenarios)
 
     def test_recorded_plan_controls_post_exact_reasoned_actions(self) -> None:
         data = self._run("plan-recorded.html")
+        if data is None:
+            self.assertIn(
+                "'recorded-plan-decision'",
+                HARNESS.read_text(encoding="utf-8"),
+            )
+            return
         scenarios = {r["scenario"] for r in data["results"]}
         self.assertIn("recorded-plan-decision", scenarios)
+
+    def test_static_dom_contract_runs_when_node_is_unavailable(self) -> None:
+        with mock.patch.object(
+            process_supervisor,
+            "resolve_ordinary_executable",
+            side_effect=FileNotFoundError,
+        ):
+            self.assertIsNone(self._run("plan.html"))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import unittest
 import uuid
@@ -32,7 +33,7 @@ RELEASE_SHA256 = "a" * 64
 class _Scratch:
     def __enter__(self) -> Path:
         configured = os.environ.get("KIT_TEST_TMPDIR")
-        candidates = ([Path(configured)] if configured else []) + [
+        candidates = [Path(configured)] if configured else [
             ROOT / ".checklogs" / "tests",
             Path(tempfile.gettempdir()),
             Path("/tmp"),
@@ -64,6 +65,14 @@ def _write(root: Path, relative: str, content: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def _changed_scan_stat(info: os.stat_result, **changes: object) -> SimpleNamespace:
+    fields = set(gate._SCAN_PATH_IDENTITY_FIELDS)
+    fields.add("st_file_attributes")
+    values = {field: getattr(info, field, None) for field in fields}
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def _issue(
@@ -131,6 +140,9 @@ def _empty_scan(root: Path):
             "stage_sanitise",
             "stage_grep",
             "stage_types",
+            "stage_arch",
+            "stage_tests",
+            "stage_assets",
         ):
             stack.enter_context(mock.patch.object(gate, name, side_effect=lambda: None))
         stack.enter_context(mock.patch.object(gate, "LOG_DIR", root / "logs"))
@@ -138,7 +150,7 @@ def _empty_scan(root: Path):
 
 
 class BrownfieldGateTests(unittest.TestCase):
-    def test_unchanged_old_issue_passes_and_is_shown(self) -> None:
+    def test_unchanged_old_issue_passes_even_when_tool_exits_zero(self) -> None:
         with _Scratch() as root:
             _write(root, "scripts/player.gd", b"old problem\n")
             issue = _issue()
@@ -146,7 +158,7 @@ class BrownfieldGateTests(unittest.TestCase):
             output = io.StringIO()
 
             with _managed_gate(root) as results, contextlib.redirect_stdout(output):
-                gate._finish_file_stage("lint", [issue], failed=True)
+                gate._finish_file_stage("lint", [issue], failed=False)
 
             self.assertFalse(results.failed)
             self.assertEqual(["PASS  lint"], results.lines)
@@ -207,11 +219,20 @@ class BrownfieldGateTests(unittest.TestCase):
             self.assertTrue(results.failed)
             self.assertEqual(["FAIL  schema"], results.lines)
             self.assertEqual(
-                {"format", "lint", "sanitise", "grep", "types"},
+                {
+                    "format",
+                    "lint",
+                    "sanitise",
+                    "grep",
+                    "types",
+                    "arch",
+                    "tests",
+                    "assets",
+                },
                 set(gate.BASELINEABLE_STAGES),
             )
 
-    def test_flat_source_keeps_normal_failure_behavior(self) -> None:
+    def test_flat_source_issue_fails_even_when_tool_exits_zero(self) -> None:
         with _Scratch() as root:
             _write(root, "scripts/player.gd", b"old problem\n")
             issue = _issue()
@@ -226,7 +247,7 @@ class BrownfieldGateTests(unittest.TestCase):
                 output
             ):
                 gate._reset_brownfield_state()
-                gate._finish_file_stage("lint", [issue], failed=True)
+                gate._finish_file_stage("lint", [issue], failed=False)
 
             self.assertTrue(results.failed)
             self.assertNotIn("EXISTING", output.getvalue())
@@ -285,6 +306,9 @@ class BrownfieldGateTests(unittest.TestCase):
                 mock.patch.object(gate, "stage_sanitise", side_effect=clean("sanitise")),
                 mock.patch.object(gate, "stage_grep", side_effect=clean("grep")),
                 mock.patch.object(gate, "stage_types", side_effect=clean("types")),
+                mock.patch.object(gate, "stage_arch", side_effect=clean("arch")),
+                mock.patch.object(gate, "stage_tests", side_effect=clean("tests")),
+                mock.patch.object(gate, "stage_assets", side_effect=clean("assets")),
                 mock.patch.object(gate, "LOG_DIR", root),
             )
             with _managed_gate(root), contextlib.ExitStack() as stack:
@@ -323,6 +347,12 @@ class BrownfieldGateTests(unittest.TestCase):
                 gate, "stage_grep", side_effect=lambda: None
             ), mock.patch.object(
                 gate, "stage_types", side_effect=lambda: None
+            ), mock.patch.object(
+                gate, "stage_arch", side_effect=lambda: None
+            ), mock.patch.object(
+                gate, "stage_tests", side_effect=lambda: None
+            ), mock.patch.object(
+                gate, "stage_assets", side_effect=lambda: None
             ), mock.patch.object(gate, "LOG_DIR", root):
                 self.assertEqual(2, gate.run_brownfield_scan(str(output)))
 
@@ -505,6 +535,562 @@ class BrownfieldGateTests(unittest.TestCase):
             )
             gate.BROWNFIELD_CAPTURE_ISSUES.clear()
             gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+    def test_architecture_capture_keeps_graph_and_source_file_boundaries(self) -> None:
+        document = {
+            "mermaid": "graph TD\n    scripts --> custom",
+            "violations": [
+                "scripts -> custom is not permitted "
+                "(arch.rules.json allows: nothing)"
+            ],
+            "violation_issues": [{
+                "code": "dependency-not-permitted",
+                "path": "scripts/player.gd",
+                "line": 0,
+                "message": (
+                    "scripts -> custom is not permitted "
+                    "(arch.rules.json allows: nothing)"
+                ),
+            }],
+        }
+
+        with mock.patch.object(gate, "GAME_LAYOUT", "src"):
+            issues, errors = gate._arch_issues(
+                document,
+                "ARCHITECTURE.md diagram is stale; run: kit architecture update",
+            )
+
+        self.assertEqual([], errors)
+        self.assertEqual(
+            [
+                ("stale-architecture-graph", "ARCHITECTURE.md"),
+                ("dependency-not-permitted", "src/scripts/player.gd"),
+            ],
+            [(item["code"], item["path"]) for item in issues],
+        )
+
+    def test_architecture_capture_fails_closed_for_an_unscoped_violation(self) -> None:
+        document = {
+            "mermaid": "graph TD",
+            "violations": ["scripts -> custom is not permitted"],
+            "violation_issues": [],
+        }
+
+        issues, errors = gate._arch_issues(document, "boundary violation")
+
+        self.assertEqual([], issues)
+        self.assertIn("not bound to a source file", errors[0])
+
+    def test_tests_and_assets_capture_the_affected_project_files(self) -> None:
+        with _Scratch() as root:
+            _write(
+                root,
+                ".gutconfig.json",
+                b'{"dirs":["res://tests/unit"],"prefix":"test_",'
+                b'"suffix":".gd","include_subdirs":true}\n',
+            )
+            orphan = _write(root, "tests/missed_spec.gd", b"extends Node\n")
+            asset = _write(root, "art/icon.png", b"existing asset\n")
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+            with mock.patch.object(gate, "PROJECT_DIR", root), mock.patch.object(
+                gate, "GAME_LAYOUT", "."
+            ), mock.patch.object(
+                gate, "gd_files", return_value=[orphan]
+            ), mock.patch.object(
+                gate, "_layer_dirs", return_value=((), ())
+            ), mock.patch.object(
+                gate, "BROWNFIELD_CAPTURE", True
+            ), contextlib.redirect_stdout(io.StringIO()):
+                gate.stage_tests()
+                gate.stage_assets()
+
+            captured = gate.BROWNFIELD_CAPTURE_ISSUES
+            self.assertIn(
+                ("tests", "uncollected-test", "tests/missed_spec.gd"),
+                [
+                    (item["stage"], item["code"], item["path"])
+                    for item in captured
+                ],
+            )
+            self.assertIn(
+                ("assets", "missing-import-sidecar", "art/icon.png"),
+                [
+                    (item["stage"], item["code"], item["path"])
+                    for item in captured
+                ],
+            )
+            self.assertEqual(b"existing asset\n", asset.read_bytes())
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+    def test_missing_test_configuration_is_not_invented_as_an_existing_issue(self) -> None:
+        with _Scratch() as root:
+            _write(root, "project.godot", b"[application]\n")
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+            with _managed_gate(root), mock.patch.object(
+                gate, "BROWNFIELD_CAPTURE", True
+            ), contextlib.redirect_stdout(io.StringIO()):
+                gate.stage_tests()
+
+            self.assertEqual([], gate.BROWNFIELD_CAPTURE_ISSUES)
+            self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+    def test_invalid_test_configuration_is_bound_to_the_existing_file(self) -> None:
+        with _Scratch() as root:
+            _write(root, ".gutconfig.json", b"{invalid\n")
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+            with _managed_gate(root), mock.patch.object(
+                gate, "BROWNFIELD_CAPTURE", True
+            ), contextlib.redirect_stdout(io.StringIO()):
+                gate.stage_tests()
+
+            self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+            self.assertEqual(
+                [("invalid-runner-config", ".gutconfig.json")],
+                [
+                    (item["code"], item["path"])
+                    for item in gate.BROWNFIELD_CAPTURE_ISSUES
+                ],
+            )
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+    def test_invalid_test_configuration_fields_are_bound_to_the_existing_file(self) -> None:
+        invalid_documents = (
+            {"dirs": 1},
+            {"dirs": [1]},
+            {"dirs": [""]},
+            {"dirs": ["res://"]},
+            {"dirs": ["/outside"]},
+            {"dirs": ["C:/outside"]},
+            {"dirs": ["../outside"]},
+            {"dirs": ["."]},
+            {"dirs": ["tests//unit"]},
+            {"dirs": ["tests/"]},
+            {"dirs": [r"tests\unit"]},
+            {"prefix": []},
+            {"prefix": ""},
+            {"prefix": "nested/test_"},
+            {"suffix": False},
+            {"suffix": ""},
+            {"suffix": r"nested\_spec.gd"},
+            {"include_subdirs": "yes"},
+        )
+        for document in invalid_documents:
+            with self.subTest(document=document), _Scratch() as root:
+                _write(
+                    root,
+                    ".gutconfig.json",
+                    json.dumps(document).encode("utf-8"),
+                )
+                gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+                gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+                with _managed_gate(root), mock.patch.object(
+                    gate, "BROWNFIELD_CAPTURE", True
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    gate.stage_tests()
+
+                self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+                self.assertEqual(
+                    [("invalid-runner-config", ".gutconfig.json")],
+                    [
+                        (item["code"], item["path"])
+                        for item in gate.BROWNFIELD_CAPTURE_ISSUES
+                    ],
+                )
+                gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+                gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+    def test_test_configuration_accepts_res_and_project_relative_directories(self) -> None:
+        for directory in ("res://tests/unit", "tests/unit"):
+            with self.subTest(directory=directory), _Scratch() as root:
+                _write(
+                    root,
+                    ".gutconfig.json",
+                    json.dumps({
+                        "dirs": [directory],
+                        "prefix": "test_",
+                        "suffix": ".gd",
+                        "include_subdirs": True,
+                    }).encode("utf-8"),
+                )
+                test_file = _write(root, "tests/unit/test_example.gd", b"extends Node\n")
+                gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+                gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+
+                with _managed_gate(root), mock.patch.object(
+                    gate, "BROWNFIELD_CAPTURE", True
+                ), mock.patch.object(
+                    gate, "gd_files", return_value=[test_file]
+                ), mock.patch.object(
+                    gate, "_layer_dirs", return_value=((), ())
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    gate.stage_tests()
+
+                self.assertEqual([], gate.BROWNFIELD_CAPTURE_ISSUES)
+                self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+
+    def test_managed_project_without_test_configuration_reports_an_honest_skip(self) -> None:
+        with _Scratch() as root:
+            _write(root, "project.godot", b"[application]\n")
+
+            with _managed_gate(root) as results, contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                gate.stage_tests()
+
+            self.assertFalse(results.failed)
+            self.assertEqual(["SKIP  tests (runner not configured)"], results.lines)
+
+    def test_project_inventory_is_reused_without_a_second_walk_or_read(self) -> None:
+        with _Scratch() as root:
+            source = _write(root, "scripts/player.gd", b"extends Node\n")
+            scene = _write(root, "scenes/main.tscn", b"[gd_scene format=3]\n")
+            asset = _write(root, "art/icon.png", b"image bytes")
+            sidecar = _write(root, "art/icon.png.import", b"[remap]\n")
+            _write(root, ".gutconfig.json", b'{"dirs":["tests"]}\n')
+
+            inventory = gate.scan_brownfield_project(root)
+            with mock.patch.object(
+                gate, "_BROWNFIELD_PROJECT_INVENTORY", inventory
+            ), mock.patch.object(
+                Path, "rglob", side_effect=AssertionError("second walk")
+            ), mock.patch.object(
+                Path, "read_text", side_effect=AssertionError("second read")
+            ):
+                self.assertEqual([source], gate.gd_files())
+                self.assertEqual(
+                    "extends Node\n",
+                    gate._read_project_text(source, errors="replace"),
+                )
+                self.assertEqual(
+                    [scene], gate._project_files_with_suffixes((".tscn",))
+                )
+                self.assertEqual(
+                    [asset], gate._project_files_with_suffixes(gate.ASSET_EXTS)
+                )
+                self.assertTrue(gate._project_file_exists(sidecar))
+
+    def test_project_inventory_rejects_linked_stage_inputs_before_reading(self) -> None:
+        for relative in ("scripts/external.gd", "scenes/external.tscn", "art/external.png"):
+            with self.subTest(relative=relative), _Scratch() as root:
+                linked = _write(root, relative, b"outside content\n")
+                linked_key = os.path.normcase(os.path.abspath(linked))
+                real_lstat = Path.lstat
+
+                def simulated_hardlink(path: Path) -> object:
+                    info = real_lstat(path)
+                    if os.path.normcase(os.path.abspath(path)) == linked_key:
+                        return _changed_scan_stat(info, st_nlink=2)
+                    return info
+
+                with mock.patch.object(
+                    Path, "lstat", simulated_hardlink
+                ), mock.patch.object(
+                    gate.os,
+                    "open",
+                    side_effect=AssertionError("linked input was read"),
+                ):
+                    with self.assertRaisesRegex(
+                        gate.BrownfieldScanError,
+                        r"hard-linked file is not allowed",
+                    ):
+                        gate.scan_brownfield_project(root)
+
+    def test_project_inventory_never_opens_a_symbolic_link_target(self) -> None:
+        with _Scratch() as root:
+            linked = _write(root, "external.gd", b"outside content\n")
+            linked_key = os.path.normcase(os.path.abspath(linked))
+            real_lstat = Path.lstat
+
+            def simulated_symlink(path: Path) -> object:
+                info = real_lstat(path)
+                if os.path.normcase(os.path.abspath(path)) == linked_key:
+                    return _changed_scan_stat(
+                        info,
+                        st_mode=stat.S_IFLNK | stat.S_IMODE(info.st_mode),
+                    )
+                return info
+
+            with mock.patch.object(
+                Path, "lstat", simulated_symlink
+            ), mock.patch.object(
+                gate.os,
+                "open",
+                side_effect=AssertionError("symbolic link target was opened"),
+            ):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"symbolic link is not allowed: external\.gd",
+                ):
+                    gate.scan_brownfield_project(root)
+
+    def test_brownfield_scan_does_not_run_or_pass_tools_after_link_blocker(self) -> None:
+        with _Scratch() as root:
+            linked = _write(root, "scripts/external.gd", b"extends Node\n")
+            linked_key = os.path.normcase(os.path.abspath(linked))
+            real_lstat = Path.lstat
+
+            def simulated_hardlink(path: Path) -> object:
+                info = real_lstat(path)
+                if os.path.normcase(os.path.abspath(path)) == linked_key:
+                    return _changed_scan_stat(info, st_nlink=2)
+                return info
+
+            stage_mocks = []
+            with _managed_gate(root), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(Path, "lstat", simulated_hardlink))
+                tool = stack.enter_context(mock.patch.object(gate, "_run_external_tool"))
+                for name in (
+                    "stage_format", "stage_lint", "stage_sanitise", "stage_grep",
+                    "stage_types", "stage_arch", "stage_tests", "stage_assets",
+                ):
+                    stage_mocks.append(
+                        stack.enter_context(mock.patch.object(gate, name))
+                    )
+                output = root / "scan.json"
+                self.assertEqual(2, gate.run_brownfield_scan(str(output)))
+
+            tool.assert_not_called()
+            for stage in stage_mocks:
+                stage.assert_not_called()
+            document = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(document["complete"])
+            self.assertIn("hard-linked file", document["errors"][0])
+
+    def test_project_inventory_member_limit_bounds_the_walk(self) -> None:
+        with _Scratch() as root:
+            _write(root, "one.txt", b"1")
+            _write(root, "two.txt", b"2")
+            with mock.patch.object(gate, "MAX_BROWNFIELD_SCAN_MEMBERS", 1):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"more than 1 scan members",
+                ):
+                    gate.scan_brownfield_project(root)
+
+    def test_project_inventory_depth_and_total_bytes_are_bounded(self) -> None:
+        with _Scratch() as root:
+            _write(root, "nested/source.gd", b"1234")
+            with mock.patch.object(gate, "MAX_BROWNFIELD_SCAN_DEPTH", 1):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"nesting exceeds 1 levels",
+                ):
+                    gate.scan_brownfield_project(root)
+
+        with _Scratch() as root:
+            _write(root, "one.gd", b"1234")
+            _write(root, "two.gd", b"5678")
+            with mock.patch.object(gate, "MAX_BROWNFIELD_TOTAL_BYTES", 7):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"text files exceed 7 total bytes",
+                ):
+                    gate.scan_brownfield_project(root)
+
+    def test_project_inventory_rejects_a_reparse_directory_without_entering_it(self) -> None:
+        with _Scratch() as root:
+            linked = root / "external"
+            linked.mkdir()
+            _write(linked, "outside.gd", b"extends Node\n")
+            linked_key = os.path.normcase(os.path.abspath(linked))
+            real_lstat = Path.lstat
+            real_scandir = gate.os.scandir
+            marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+            entered: list[str] = []
+
+            def simulated_reparse(path: Path) -> object:
+                info = real_lstat(path)
+                if os.path.normcase(os.path.abspath(path)) == linked_key:
+                    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+                    return _changed_scan_stat(
+                        info, st_file_attributes=attributes | marker
+                    )
+                return info
+
+            def tracked_scandir(path: Path) -> object:
+                entered.append(os.path.normcase(os.path.abspath(path)))
+                return real_scandir(path)
+
+            with mock.patch.object(
+                Path, "lstat", simulated_reparse
+            ), mock.patch.object(gate.os, "scandir", side_effect=tracked_scandir):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"linked directory is not allowed: external",
+                ):
+                    gate.scan_brownfield_project(root)
+
+            self.assertNotIn(linked_key, entered)
+
+    def test_project_inventory_rejects_an_unrelated_reparse_file_consistently(self) -> None:
+        with _Scratch() as root:
+            linked = _write(root, "notes.bin", b"not a stage input")
+            linked_key = os.path.normcase(os.path.abspath(linked))
+            real_lstat = Path.lstat
+            marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+
+            def simulated_reparse(path: Path) -> object:
+                info = real_lstat(path)
+                if os.path.normcase(os.path.abspath(path)) == linked_key:
+                    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+                    return _changed_scan_stat(
+                        info, st_file_attributes=attributes | marker
+                    )
+                return info
+
+            with mock.patch.object(Path, "lstat", simulated_reparse):
+                with self.assertRaisesRegex(
+                    gate.BrownfieldScanError,
+                    r"linked file is not allowed: notes\.bin",
+                ):
+                    gate.scan_brownfield_project(root)
+
+    def test_lifecycle_style_tools_use_shipped_policy_and_captured_sources(self) -> None:
+        observed: dict[str, object] = {}
+
+        def isolated_run(
+            command: object,
+            _timeout: int,
+            _log: Path,
+            *,
+            cwd: Path,
+        ) -> tuple[int, str]:
+            observed["cwd"] = str(cwd)
+            observed["format"] = (cwd / "gdformatrc").read_text(encoding="utf-8")
+            observed["lint"] = (cwd / "gdlintrc").read_text(encoding="utf-8")
+            values = list(command)  # type: ignore[arg-type]
+            mirror = Path(values[-1])
+            observed["input"] = mirror.read_text(encoding="utf-8")
+            observed["argument"] = str(mirror)
+            return 0, f"{mirror}: ok\n"
+
+        with _Scratch() as root:
+            source = _write(root, "scripts/safe.gd", b"extends Node\n")
+            inventory = gate.scan_brownfield_project(root)
+            source.write_text("changed after inventory\n", encoding="utf-8")
+            with mock.patch.object(
+                gate, "_lifecycle_tool_boundary", return_value=True
+            ), mock.patch.object(
+                gate, "_BROWNFIELD_PROJECT_INVENTORY", inventory
+            ), mock.patch.object(
+                gate, "_run_external_tool", side_effect=isolated_run
+            ):
+                code, output = gate._run_style_tool(
+                    ["gdlint", str(source)], 30, Path("unused")
+                )
+
+            self.assertEqual(0, code)
+            self.assertIn(str(source), output)
+            self.assertNotIn(str(observed["argument"]), output)
+            self.assertNotEqual(str(source), observed["argument"])
+
+        shipped_lint_policy = "\n".join(
+            line
+            for line in (ROOT / ".gdlintrc").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ) + "\n"
+        self.assertEqual("{}\n", observed["format"])
+        self.assertEqual(shipped_lint_policy, observed["lint"])
+        self.assertEqual("extends Node\n", observed["input"])
+        self.assertNotEqual(str(gate.PROJECT_DIR), observed["cwd"])
+
+    def test_lifecycle_style_batches_bound_the_file_argv(self) -> None:
+        files = [f"C:/project/file_{index}.gd" for index in range(5)]
+        with mock.patch.object(
+            gate, "_lifecycle_tool_boundary", return_value=True
+        ), mock.patch.object(
+            gate, "MAX_STYLE_TOOL_BATCH_FILES", 2
+        ), mock.patch.object(
+            gate, "_run_style_tool", return_value=(0, "ok")
+        ) as run:
+            code, _output = gate._run_style_batches(
+                ["gdlint"], files, 30, Path("lint.log")
+            )
+
+        self.assertEqual(0, code)
+        self.assertEqual(3, run.call_count)
+        self.assertEqual([3, 3, 2], [len(call.args[0]) for call in run.call_args_list])
+
+    def test_nested_game_root_uses_the_same_captured_layer_rules(self) -> None:
+        with _Scratch() as root:
+            game_root = root / "game"
+            game_root.mkdir()
+            _write(
+                root,
+                "arch.rules.json",
+                b'{"type_boundary":{"interior":["code/"],'
+                b'"boundary":["io/"]}}\n',
+            )
+            with mock.patch.object(gate, "ROOT", root), mock.patch.object(
+                gate, "PROJECT_DIR", game_root
+            ):
+                expected = gate._layer_dirs()
+                inventory = gate.scan_brownfield_project()
+                with mock.patch.object(
+                    gate, "_BROWNFIELD_PROJECT_INVENTORY", inventory
+                ), mock.patch.object(
+                    Path, "read_text", side_effect=AssertionError("live config read")
+                ):
+                    captured = gate._layer_dirs()
+
+            self.assertEqual((("code/",), ("io/",)), expected)
+            self.assertEqual(expected, captured)
+
+    def test_invalid_utf8_test_config_becomes_a_file_scoped_issue(self) -> None:
+        with _Scratch() as root:
+            _write(root, ".gutconfig.json", b"\xff")
+            inventory = gate.scan_brownfield_project(root)
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+            gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+            with mock.patch.object(gate, "PROJECT_DIR", root), mock.patch.object(
+                gate, "GAME_LAYOUT", "."
+            ), mock.patch.object(
+                gate, "_BROWNFIELD_PROJECT_INVENTORY", inventory
+            ), mock.patch.object(
+                gate, "BROWNFIELD_CAPTURE", True
+            ), contextlib.redirect_stdout(io.StringIO()):
+                gate.stage_tests()
+
+            self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+            self.assertEqual(
+                ["invalid-runner-config"],
+                [item["code"] for item in gate.BROWNFIELD_CAPTURE_ISSUES],
+            )
+            gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+
+    def test_brownfield_sanitise_uses_one_json_snapshot(self) -> None:
+        payload = json.dumps({
+            "scanned": 1,
+            "changed": [],
+            "notes": [],
+            "structural_errors": [],
+            "errors": [],
+            "applied": False,
+            "ok": True,
+        })
+        gate.BROWNFIELD_CAPTURE_ISSUES.clear()
+        gate.BROWNFIELD_CAPTURE_ERRORS.clear()
+        with mock.patch.object(
+            gate, "BROWNFIELD_CAPTURE", True
+        ), mock.patch.object(
+            gate, "_run_internal_python", return_value=(0, payload)
+        ) as run, contextlib.redirect_stdout(io.StringIO()):
+            gate.stage_sanitise()
+
+        run.assert_called_once()
+        self.assertEqual(("--json",), run.call_args.args[1])
+        self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
 
 
 if __name__ == "__main__":

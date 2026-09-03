@@ -24,7 +24,7 @@ import engine_discovery  # noqa: E402
 @contextlib.contextmanager
 def _scratch() -> Iterator[Path]:
     configured = os.environ.get("KIT_TEST_TMPDIR")
-    candidates = ([Path(configured)] if configured else []) + [
+    candidates = [Path(configured)] if configured else [
         TOOLS.parent / ".checklogs" / "tests",
         Path(tempfile.gettempdir()),
         Path("/tmp"),

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import io
 import json
+import os
 import shutil
 import unittest
 import uuid
@@ -18,14 +19,19 @@ import check
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs"
+
+
 class GateReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.scratch = ROOT / ".checklogs" / f"gate-receipt-{uuid.uuid4().hex}"
+        self.scratch = _scratch_parent() / f"gate-receipt-{uuid.uuid4().hex}"
         self.scratch.mkdir(parents=True)
 
     def tearDown(self) -> None:
         resolved = self.scratch.resolve()
-        expected = (ROOT / ".checklogs").resolve()
+        expected = _scratch_parent().resolve()
         if resolved.parent != expected or not resolved.name.startswith("gate-receipt-"):
             raise AssertionError(f"refusing to remove unexpected path: {resolved}")
         shutil.rmtree(resolved)

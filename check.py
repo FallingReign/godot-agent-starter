@@ -37,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # CORE_ROOT contains immutable gate code and rules. PROJECT_ROOT contains the
@@ -191,6 +191,89 @@ ASSET_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".bmp", ".tga", ".exr",
 # Directories never scanned or type-checked.
 EXCLUDED_DIRS = {".godot", "addons", "build", "export", ".git", ".checklogs"}
 
+# The managed Apply-time scan must finish before it can trust project paths.
+# Only files consumed by its stages contribute to byte limits; every directory
+# entry contributes to the member/depth limits.
+BROWNFIELD_SCAN_SUFFIXES = frozenset({
+    ".gd", ".gdshader", ".tscn", ".tres", ".uid", ".import", *ASSET_EXTS,
+})
+BROWNFIELD_SCAN_NAMES = frozenset({
+    ".gutconfig.json", ".gdlintrc", ".editorconfig", "pyproject.toml",
+    "setup.cfg", "project.godot", "arch.rules.json", "gate.rules.json",
+})
+BROWNFIELD_TEXT_SUFFIXES = frozenset({".gd", ".gdshader", ".tscn", ".tres", ".uid"})
+BROWNFIELD_TEXT_NAMES = BROWNFIELD_SCAN_NAMES
+MAX_BROWNFIELD_SCAN_DEPTH = 12
+MAX_BROWNFIELD_SCAN_MEMBERS = 20_000
+MAX_BROWNFIELD_FILE_BYTES = 4 * 1024 * 1024
+MAX_BROWNFIELD_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_STYLE_TOOL_BATCH_FILES = 128
+
+_SCAN_PATH_IDENTITY_FIELDS = (
+    "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_nlink",
+)
+_SCAN_HANDLE_IDENTITY_FIELDS = (
+    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink",
+)
+
+
+class BrownfieldScanError(RuntimeError):
+    """The selected game root cannot be safely and completely inventoried."""
+
+
+class BrownfieldScannedFile:
+    __slots__ = ("content", "path", "relative")
+
+    def __init__(
+        self,
+        path: Path,
+        relative: Path,
+        content: Optional[bytes],
+    ) -> None:
+        self.path = path
+        self.relative = relative
+        self.content = content
+
+
+class BrownfieldProjectInventory:
+    """One checked snapshot shared by every in-process brownfield stage."""
+
+    __slots__ = ("files", "root", "_by_path")
+
+    def __init__(
+        self,
+        root: Path,
+        files: Sequence[BrownfieldScannedFile],
+    ) -> None:
+        self.root = root
+        self.files = tuple(files)
+        self._by_path = {
+            os.path.normcase(os.path.abspath(item.path)): item
+            for item in self.files
+        }
+
+    def files_with_suffixes(self, suffixes: Iterable[str]) -> List[Path]:
+        accepted = {suffix.casefold() for suffix in suffixes}
+        return [
+            item.path
+            for item in self.files
+            if item.path.suffix.casefold() in accepted
+        ]
+
+    def contains(self, path: Path) -> bool:
+        return os.path.normcase(os.path.abspath(path)) in self._by_path
+
+    def scanned_file(self, path: Path) -> Optional[BrownfieldScannedFile]:
+        return self._by_path.get(os.path.normcase(os.path.abspath(path)))
+
+    def read_text(self, path: Path, *, errors: str = "strict") -> str:
+        item = self._by_path.get(os.path.normcase(os.path.abspath(path)))
+        if item is None:
+            raise FileNotFoundError(path)
+        if item.content is None:
+            raise OSError(f"project file was not captured as text: {path}")
+        return item.content.decode("utf-8", errors=errors)
+
 # Error markers. Deliberately broad: a false alarm costs a re-read, a missed
 # error costs a wrong "done" claim from the agent.
 ERROR_RE = re.compile(
@@ -290,10 +373,20 @@ class Results:
 
 RESULTS = Results()
 
-BASELINEABLE_STAGES = frozenset({"format", "lint", "sanitise", "grep", "types"})
+BASELINEABLE_STAGES = frozenset({
+    "format",
+    "lint",
+    "sanitise",
+    "grep",
+    "types",
+    "arch",
+    "tests",
+    "assets",
+})
 BROWNFIELD_CAPTURE = False
 BROWNFIELD_CAPTURE_ISSUES: List[dict] = []
 BROWNFIELD_CAPTURE_ERRORS: List[str] = []
+_BROWNFIELD_PROJECT_INVENTORY: Optional[BrownfieldProjectInventory] = None
 _BROWNFIELD_UNSET = object()
 _BROWNFIELD_STATE: object = _BROWNFIELD_UNSET
 _BROWNFIELD_NOTICE_SHOWN = False
@@ -325,11 +418,27 @@ def _issue(
     line: int,
     message: str,
 ) -> dict:
+    return _project_issue(
+        stage,
+        code,
+        _game_repository_relative(game_relative),
+        line,
+        message,
+    )
+
+
+def _project_issue(
+    stage: str,
+    code: str,
+    project_relative: str,
+    line: int,
+    message: str,
+) -> dict:
     normalized_message = " ".join(ANSI_RE.sub("", message).split())
     return {
         "stage": stage,
         "code": code,
-        "path": _game_repository_relative(game_relative),
+        "path": project_relative,
         "line": line,
         "message_sha256": hashlib.sha256(
             normalized_message.encode("utf-8")
@@ -437,17 +546,18 @@ def _finish_file_stage(
     scan_errors: Iterable[str] = (),
 ) -> None:
     errors = [str(error) for error in scan_errors if str(error).strip()]
+    detected_failure = failed or bool(issues)
     if BROWNFIELD_CAPTURE:
         BROWNFIELD_CAPTURE_ISSUES.extend(dict(issue) for issue in issues)
         for error in errors:
             _capture_error(stage, error)
-        if failed and not issues and not errors:
+        if detected_failure and not issues and not errors:
             _capture_error(stage, "stage failed without a file-scoped issue")
         return
     # Flat/source mode keeps the historical stage semantics. Managed mode also
     # fails closed when a collector could not prove its file-scoped result.
     blocking_errors = errors if CONTEXT.install_mode == "managed" else []
-    if not failed and not blocking_errors:
+    if not detected_failure and not blocking_errors:
         RESULTS.passed(stage)
     elif not blocking_errors and _brownfield_allows(stage, issues):
         RESULTS.passed(stage)
@@ -510,6 +620,7 @@ def run(
     *,
     native: bool = False,
     env: Optional[Mapping[str, str]] = None,
+    cwd: Optional[Path] = None,
 ) -> Tuple[int, str]:
     """Run a command, capture combined output to `log`, never raise.
 
@@ -527,7 +638,7 @@ def run(
                 str(cmd[0]),
                 [str(value) for value in cmd[1:]],
                 root=ROOT,
-                cwd=PROJECT_DIR,
+                cwd=cwd or PROJECT_DIR,
                 timeout=timeout,
             )
             native_engine.persist_native_failure(
@@ -550,7 +661,7 @@ def run(
         else:
             proc = subprocess.run(
                 list(cmd),
-                cwd=str(PROJECT_DIR),
+                cwd=str(cwd or PROJECT_DIR),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -584,6 +695,47 @@ def run(
 _DEFAULT_RUNNER = run
 
 
+def _run_supervised_child(
+    command: Sequence[str],
+    timeout: int,
+    log: Path,
+    *,
+    environment: Mapping[str, str],
+    cwd: Path,
+) -> Tuple[int, str]:
+    """Run one bounded non-engine child with verified tree containment."""
+    from tools import process_supervisor
+
+    result = process_supervisor.run_supervised(
+        [str(value) for value in command],
+        cwd=cwd,
+        timeout=timeout,
+        environment=environment,
+        output_cap_bytes=LOG_CAP_BYTES,
+    )
+    output = result.stdout or ""
+    if result.stderr:
+        output += ("\n" if output and not output.endswith("\n") else "") + result.stderr
+    if result.launch_error:
+        output += f"executable could not start: {Path(str(command[0])).name}\n"
+    if result.timed_out:
+        output += f"\nTIMEOUT after {timeout}s\n"
+    if not result.termination_verified:
+        output += "\nprocess tree termination could not be verified\n"
+    code = (
+        124
+        if result.timed_out
+        else int(result.returncode)
+        if result.returncode is not None and result.termination_verified
+        else 127
+    )
+    clean = _cap(ANSI_RE.sub("", output))
+    if not BROWNFIELD_CAPTURE:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(clean, encoding="utf-8", errors="replace", newline="")
+    return code, output
+
+
 def _run_internal_python(
     script: Path,
     arguments: Sequence[object],
@@ -611,7 +763,13 @@ def _run_internal_python(
         # Focused stage tests replace the process boundary with a three-argument
         # deterministic runner. No child exists in that case.
         return run(command, timeout, log)
-    return run(command, timeout, log, env=environment)
+    return _run_supervised_child(
+        command,
+        timeout,
+        log,
+        environment=environment,
+        cwd=PROJECT_DIR,
+    )
 
 
 def _ordinary_executable(name: str) -> str:
@@ -626,8 +784,6 @@ def _ordinary_executable(name: str) -> str:
 
 def _run_git(command: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]:
     """Run authenticated Git without inherited Git control variables."""
-    if run is not _DEFAULT_RUNNER:
-        return run(command, timeout, log)
     safe_command = [
         str(command[0]),
         "--no-pager",
@@ -654,7 +810,17 @@ def _run_git(command: Sequence[str], timeout: int, log: Path) -> Tuple[int, str]
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
-    return run(safe_command, timeout, log, env=environment)
+    if run is not _DEFAULT_RUNNER:
+        # Focused stage tests replace the process boundary with a deterministic
+        # runner. Preserve the complete Git isolation contract in that path.
+        return run(safe_command, timeout, log, env=environment)
+    return _run_supervised_child(
+        safe_command,
+        timeout,
+        log,
+        environment=environment,
+        cwd=PROJECT_DIR,
+    )
 
 
 def _external_tool_environment() -> Dict[str, str]:
@@ -670,12 +836,122 @@ def _external_tool_environment() -> Dict[str, str]:
 
 
 def _run_external_tool(
-    command: Sequence[str], timeout: int, log: Path
+    command: Sequence[str],
+    timeout: int,
+    log: Path,
+    *,
+    cwd: Optional[Path] = None,
 ) -> Tuple[int, str]:
     """Run one exact external tool with the project import boundary removed."""
     if run is not _DEFAULT_RUNNER:
         return run(command, timeout, log)
-    return run(command, timeout, log, env=_external_tool_environment())
+    return _run_supervised_child(
+        command,
+        timeout,
+        log,
+        environment=_external_tool_environment(),
+        cwd=cwd or PROJECT_DIR,
+    )
+
+
+def _run_style_tool(
+    command: Sequence[str], timeout: int, log: Path
+) -> Tuple[int, str]:
+    """Keep Apply-time gdtoolkit away from project and parent YAML config."""
+    if not (BROWNFIELD_CAPTURE or _lifecycle_tool_boundary()):
+        return _run_external_tool(command, timeout, log)
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-kit-style-") as raw:
+            trusted_cwd = Path(raw)
+            # gdtoolkit 4.5.0 searches cwd and every parent, then uses the
+            # unsafe general-purpose YAML loader. An empty local mapping stops
+            # that search and makes the locked built-in defaults authoritative.
+            (trusted_cwd / "gdformatrc").write_text(
+                "{}\n", encoding="utf-8", newline="\n"
+            )
+            (trusted_cwd / "gdlintrc").write_text(
+                "max-line-length: 120\n"
+                "max-file-lines: 400\n"
+                "function-arguments-number: 6\n"
+                "max-public-methods: 20\n"
+                "excluded_directories:\n"
+                "  - .git\n"
+                "  - .godot\n"
+                "  - addons\n"
+                "  - build\n"
+                "  - export\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            safe_command = [str(value) for value in command]
+            replacements: List[Tuple[str, str]] = []
+            inventory = _BROWNFIELD_PROJECT_INVENTORY
+            if inventory is not None:
+                mirror_root = trusted_cwd / "project"
+                for index, value in enumerate(safe_command):
+                    candidate = Path(value)
+                    if candidate.suffix.casefold() != ".gd":
+                        continue
+                    source = inventory.scanned_file(candidate)
+                    if source is None or source.content is None:
+                        return 127, f"style-tool input is outside the checked inventory: {value}\n"
+                    mirror = mirror_root.joinpath(*source.relative.parts)
+                    mirror.parent.mkdir(parents=True, exist_ok=True)
+                    mirror.write_bytes(source.content)
+                    safe_command[index] = str(mirror)
+                    replacements.extend((
+                        (str(mirror), str(source.path)),
+                        (mirror.as_posix(), source.path.as_posix()),
+                    ))
+
+            code, output = _run_external_tool(
+                safe_command,
+                timeout,
+                log,
+                cwd=trusted_cwd,
+            )
+            for temporary, original in sorted(
+                replacements, key=lambda item: len(item[0]), reverse=True
+            ):
+                output = output.replace(temporary, original)
+            return code, output
+    except OSError as exc:
+        return 127, f"trusted style-tool workspace could not be created: {exc}\n"
+
+
+def _run_style_batches(
+    prefix: Sequence[str],
+    files: Sequence[str],
+    timeout: int,
+    log: Path,
+) -> Tuple[int, str]:
+    """Bound lifecycle argv while retaining the normal one-process behavior."""
+    if not (BROWNFIELD_CAPTURE or _lifecycle_tool_boundary()):
+        return _run_style_tool([*prefix, *files], timeout, log)
+    combined_output = ""
+    result_code = 0
+    deadline = time.monotonic() + timeout
+    for start in range(0, len(files), MAX_STYLE_TOOL_BATCH_FILES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            combined_output = _cap(
+                combined_output + f"\nTIMEOUT after {timeout}s\n"
+            )
+            result_code = 124
+            break
+        code, output = _run_style_tool(
+            [*prefix, *files[start:start + MAX_STYLE_TOOL_BATCH_FILES]],
+            max(1, int(remaining)),
+            log,
+        )
+        combined_output = _cap(
+            combined_output + ("\n" if combined_output else "") + output
+        )
+        if code != 0:
+            if code in (124, 127) or result_code == 0:
+                result_code = code
+    return result_code, combined_output
 
 
 def _lifecycle_tool_boundary() -> bool:
@@ -774,7 +1050,289 @@ def find_godot() -> Optional[str]:
     return None
 
 
+def _scan_identity(info: os.stat_result, fields: Tuple[str, ...]) -> Tuple[object, ...]:
+    return tuple(getattr(info, field, None) for field in fields)
+
+
+def _scan_is_reparse(info: os.stat_result) -> bool:
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return bool(int(getattr(info, "st_file_attributes", 0) or 0) & marker)
+
+
+def _brownfield_scan_label(relative: Path) -> str:
+    rendered = relative.as_posix()
+    return rendered if rendered and rendered != "." else "<game root>"
+
+
+def _brownfield_blocked(detail: str) -> BrownfieldScanError:
+    return BrownfieldScanError(f"brownfield project scan blocked: {detail}")
+
+
+def _validate_brownfield_directory(info: os.stat_result, relative: Path) -> None:
+    label = _brownfield_scan_label(relative)
+    if stat.S_ISLNK(info.st_mode) or _scan_is_reparse(info):
+        raise _brownfield_blocked(f"linked directory is not allowed: {label}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise _brownfield_blocked(f"expected a directory: {label}")
+
+
+def _validate_brownfield_file(info: os.stat_result, relative: Path) -> None:
+    label = _brownfield_scan_label(relative)
+    if stat.S_ISLNK(info.st_mode) or _scan_is_reparse(info):
+        raise _brownfield_blocked(f"linked file is not allowed: {label}")
+    if not stat.S_ISREG(info.st_mode):
+        raise _brownfield_blocked(f"non-regular file is not allowed: {label}")
+    if int(getattr(info, "st_nlink", 1)) != 1:
+        raise _brownfield_blocked(f"hard-linked file is not allowed: {label}")
+
+
+def _read_brownfield_file(
+    path: Path,
+    relative: Path,
+    expected: os.stat_result,
+) -> bytes:
+    """Read one bounded file and prove its path and handle stayed stable."""
+    label = _brownfield_scan_label(relative)
+    try:
+        path_before = path.lstat()
+        _validate_brownfield_file(path_before, relative)
+        if _scan_identity(expected, _SCAN_PATH_IDENTITY_FIELDS) != _scan_identity(
+            path_before, _SCAN_PATH_IDENTITY_FIELDS
+        ):
+            raise _brownfield_blocked(f"project file changed during the scan: {label}")
+        if path_before.st_size > MAX_BROWNFIELD_FILE_BYTES:
+            raise _brownfield_blocked(
+                f"project file exceeds {MAX_BROWNFIELD_FILE_BYTES} bytes: {label}"
+            )
+
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, flags)
+        try:
+            handle_before = os.fstat(descriptor)
+            chunks: List[bytes] = []
+            remaining = MAX_BROWNFIELD_FILE_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(65_536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+            handle_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        path_after = path.lstat()
+    except BrownfieldScanError:
+        raise
+    except OSError as exc:
+        raise _brownfield_blocked(
+            f"project file could not be read: {label}: {exc}"
+        ) from exc
+
+    if len(content) > MAX_BROWNFIELD_FILE_BYTES:
+        raise _brownfield_blocked(
+            f"project file exceeds {MAX_BROWNFIELD_FILE_BYTES} bytes: {label}"
+        )
+    _validate_brownfield_file(path_after, relative)
+    if (
+        _scan_identity(path_before, _SCAN_PATH_IDENTITY_FIELDS)
+        != _scan_identity(path_after, _SCAN_PATH_IDENTITY_FIELDS)
+        or _scan_identity(path_before, _SCAN_HANDLE_IDENTITY_FIELDS)
+        != _scan_identity(handle_before, _SCAN_HANDLE_IDENTITY_FIELDS)
+        or _scan_identity(handle_before, _SCAN_HANDLE_IDENTITY_FIELDS)
+        != _scan_identity(handle_after, _SCAN_HANDLE_IDENTITY_FIELDS)
+        or len(content) != handle_before.st_size
+    ):
+        raise _brownfield_blocked(f"project file changed while it was read: {label}")
+    return content
+
+
+def scan_brownfield_project(
+    project_dir: Optional[Path] = None,
+) -> BrownfieldProjectInventory:
+    """Build the one bounded, link-free inventory used by Apply-time stages."""
+    selected = PROJECT_DIR if project_dir is None else Path(project_dir)
+    root = Path(os.path.abspath(selected))
+    try:
+        root_info = root.lstat()
+        _validate_brownfield_directory(root_info, Path())
+    except BrownfieldScanError:
+        raise
+    except OSError as exc:
+        raise _brownfield_blocked(
+            f"game root could not be inspected: {root}: {exc}"
+        ) from exc
+
+    files: List[BrownfieldScannedFile] = []
+    member_count = 0
+    total_bytes = 0
+    excluded = {name.casefold() for name in EXCLUDED_DIRS}
+    seen_directories: set[Tuple[int, int]] = set()
+    root_identity = (int(root_info.st_dev), int(root_info.st_ino))
+    if root_identity[1]:
+        seen_directories.add(root_identity)
+    pending: List[Tuple[Path, Path, os.stat_result]] = [(root, Path(), root_info)]
+
+    while pending:
+        directory, relative_dir, expected_dir = pending.pop()
+        label = _brownfield_scan_label(relative_dir)
+        try:
+            before_dir = directory.lstat()
+            _validate_brownfield_directory(before_dir, relative_dir)
+            if _scan_identity(expected_dir, _SCAN_PATH_IDENTITY_FIELDS) != _scan_identity(
+                before_dir, _SCAN_PATH_IDENTITY_FIELDS
+            ):
+                raise _brownfield_blocked(f"directory changed during the scan: {label}")
+
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    member_count += 1
+                    if member_count > MAX_BROWNFIELD_SCAN_MEMBERS:
+                        raise _brownfield_blocked(
+                            "project contains more than "
+                            f"{MAX_BROWNFIELD_SCAN_MEMBERS} scan members"
+                        )
+                    relative = relative_dir / entry.name
+                    rendered = _brownfield_scan_label(relative)
+                    if entry.name.casefold() in excluded:
+                        continue
+                    if len(relative.parts) > MAX_BROWNFIELD_SCAN_DEPTH:
+                        raise _brownfield_blocked(
+                            "project nesting exceeds "
+                            f"{MAX_BROWNFIELD_SCAN_DEPTH} levels: {rendered}"
+                        )
+
+                    relative_name = relative.as_posix().casefold()
+                    suffix = Path(entry.name).suffix.casefold()
+                    included = (
+                        suffix in BROWNFIELD_SCAN_SUFFIXES
+                        or relative_name in BROWNFIELD_SCAN_NAMES
+                    )
+                    needs_content = (
+                        suffix in BROWNFIELD_TEXT_SUFFIXES
+                        or relative_name in BROWNFIELD_TEXT_NAMES
+                    )
+                    path = directory / entry.name
+                    info = path.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        raise _brownfield_blocked(
+                            f"symbolic link is not allowed: {rendered}"
+                        )
+                    if _scan_is_reparse(info):
+                        if stat.S_ISDIR(info.st_mode):
+                            raise _brownfield_blocked(
+                                f"linked directory is not allowed: {rendered}"
+                            )
+                        raise _brownfield_blocked(
+                            f"linked file is not allowed: {rendered}"
+                        )
+
+                    if stat.S_ISDIR(info.st_mode):
+                        _validate_brownfield_directory(info, relative)
+                        identity = (int(info.st_dev), int(info.st_ino))
+                        if identity[1] and identity in seen_directories:
+                            raise _brownfield_blocked(
+                                f"directory alias or hard link is not allowed: {rendered}"
+                            )
+                        if identity[1]:
+                            seen_directories.add(identity)
+                        pending.append((path, relative, info))
+                        continue
+                    if not included:
+                        continue
+
+                    _validate_brownfield_file(info, relative)
+                    content: Optional[bytes] = None
+                    if needs_content:
+                        if total_bytes + info.st_size > MAX_BROWNFIELD_TOTAL_BYTES:
+                            raise _brownfield_blocked(
+                                "project text files exceed "
+                                f"{MAX_BROWNFIELD_TOTAL_BYTES} total bytes"
+                            )
+                        content = _read_brownfield_file(path, relative, info)
+                        total_bytes += len(content)
+                        if total_bytes > MAX_BROWNFIELD_TOTAL_BYTES:
+                            raise _brownfield_blocked(
+                                "project text files exceed "
+                                f"{MAX_BROWNFIELD_TOTAL_BYTES} total bytes"
+                            )
+                    files.append(BrownfieldScannedFile(path, relative, content))
+
+            after_dir = directory.lstat()
+            _validate_brownfield_directory(after_dir, relative_dir)
+            if _scan_identity(before_dir, _SCAN_PATH_IDENTITY_FIELDS) != _scan_identity(
+                after_dir, _SCAN_PATH_IDENTITY_FIELDS
+            ):
+                raise _brownfield_blocked(f"directory changed during the scan: {label}")
+        except BrownfieldScanError:
+            raise
+        except OSError as exc:
+            raise _brownfield_blocked(
+                f"directory could not be scanned: {label}: {exc}"
+            ) from exc
+
+    # Type-boundary rules live at the repository root when the game root is a
+    # nested folder. Capture that exact project input without another walk.
+    if project_dir is None:
+        layer_rules = Path(os.path.abspath(ROOT / "arch.rules.json"))
+        try:
+            layer_rules.relative_to(root)
+        except ValueError:
+            try:
+                info = layer_rules.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise _brownfield_blocked(
+                    f"project config could not be inspected: arch.rules.json: {exc}"
+                ) from exc
+            else:
+                relative = Path("project-config") / "arch.rules.json"
+                _validate_brownfield_file(info, relative)
+                if total_bytes + info.st_size > MAX_BROWNFIELD_TOTAL_BYTES:
+                    raise _brownfield_blocked(
+                        "project text files exceed "
+                        f"{MAX_BROWNFIELD_TOTAL_BYTES} total bytes"
+                    )
+                content = _read_brownfield_file(layer_rules, relative, info)
+                total_bytes += len(content)
+                files.append(BrownfieldScannedFile(layer_rules, relative, content))
+
+    files.sort(key=lambda item: item.relative.as_posix())
+    return BrownfieldProjectInventory(root, files)
+
+
+def _project_files_with_suffixes(suffixes: Iterable[str]) -> List[Path]:
+    if _BROWNFIELD_PROJECT_INVENTORY is not None:
+        return _BROWNFIELD_PROJECT_INVENTORY.files_with_suffixes(suffixes)
+    accepted = {suffix.casefold() for suffix in suffixes}
+    out: List[Path] = []
+    for path in sorted(PROJECT_DIR.rglob("*")):
+        if path.suffix.casefold() not in accepted or not path.is_file():
+            continue
+        rel = path.relative_to(PROJECT_DIR)
+        if EXCLUDED_DIRS.intersection(rel.parts):
+            continue
+        out.append(path)
+    return out
+
+
+def _read_project_text(path: Path, *, errors: str = "strict") -> str:
+    if _BROWNFIELD_PROJECT_INVENTORY is not None:
+        return _BROWNFIELD_PROJECT_INVENTORY.read_text(path, errors=errors)
+    return path.read_text(encoding="utf-8", errors=errors)
+
+
+def _project_file_exists(path: Path) -> bool:
+    if _BROWNFIELD_PROJECT_INVENTORY is not None:
+        return _BROWNFIELD_PROJECT_INVENTORY.contains(path)
+    return path.is_file()
+
+
 def gd_files() -> List[Path]:
+    if _BROWNFIELD_PROJECT_INVENTORY is not None:
+        return _BROWNFIELD_PROJECT_INVENTORY.files_with_suffixes((".gd",))
     out: List[Path] = []
     for path in sorted(PROJECT_DIR.rglob("*.gd")):
         rel = path.relative_to(PROJECT_DIR)
@@ -848,8 +1406,9 @@ def gdtool(name: str) -> Optional[List[str]]:
 
     Verification never downloads implicitly. Every uv fallback is forced into
     offline mode; acquisition belongs to a separate, explicitly approved setup
-    operation. The managed Apply-time check never executes an external style
-    tool; current formatting and lint remain a separate project check.
+    operation. The managed Apply-time check never executes a project-private
+    style tool, but it may use a validated external tool at the exact locked
+    version. Otherwise formatting and lint remain named adoption work.
     """
     private = _private_gdtool(name)
     if private is not None:
@@ -1120,6 +1679,12 @@ def _sanitise_code(message: str, *, structural: bool) -> str:
 def _sanitise_issues(document: Mapping[str, object]) -> Tuple[List[dict], List[str]]:
     issues: List[dict] = []
     errors: List[str] = []
+    raw_errors = document.get("errors", [])
+    if not isinstance(raw_errors, list) or not all(
+        isinstance(item, str) and item.strip() for item in raw_errors
+    ):
+        return [], ["sanitise JSON errors are malformed"]
+    errors.extend(raw_errors)
     notes = document.get("notes")
     structural = document.get("structural_errors")
     changed = document.get("changed")
@@ -1167,6 +1732,34 @@ def stage_sanitise() -> None:
         if BROWNFIELD_CAPTURE:
             _capture_error("sanitise", "sanitise.py is unavailable")
         RESULTS.skip("sanitise")
+        return
+    if BROWNFIELD_CAPTURE or _lifecycle_tool_boundary():
+        code, out = _run_internal_python(
+            script,
+            ("--json",),
+            60,
+            LOG_DIR / "sanitise-scan.log",
+        )
+        indent(out, 40)
+        try:
+            document = json.loads(out)
+        except json.JSONDecodeError as exc:
+            issues: List[dict] = []
+            errors = [f"sanitise JSON is unreadable: {exc}"]
+        else:
+            if not isinstance(document, Mapping):
+                issues = []
+                errors = ["sanitise JSON must be an object"]
+            else:
+                issues, errors = _sanitise_issues(document)
+        if code not in (0, 1):
+            errors.append(f"sanitise scan exited {code}")
+        _finish_file_stage(
+            "sanitise",
+            issues,
+            failed=code != 0,
+            scan_errors=errors,
+        )
         return
     code, out = _run_internal_python(script, (), 60, LOG_DIR / "sanitise.log")
     indent(out, 40)
@@ -1217,15 +1810,148 @@ def stage_tests() -> None:
     head("test discovery (files the runner would ignore)")
     cfg_path = PROJECT_DIR / ".gutconfig.json"
     try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        cfg_text = _read_project_text(cfg_path)
+    except FileNotFoundError as exc:
         print(f"  cannot read .gutconfig.json: {exc}")
-        RESULTS.fail("tests")
+        if BROWNFIELD_CAPTURE:
+            print("  test discovery is not configured yet; no existing issue was inferred")
+            _finish_file_stage("tests", [], failed=False)
+        elif CONTEXT.install_mode == "managed":
+            print("  configure the project test runner before strict verification")
+            RESULTS.skip("tests (runner not configured)")
+        else:
+            _finish_file_stage(
+                "tests",
+                [],
+                failed=True,
+                scan_errors=[f"cannot read .gutconfig.json: {exc}"],
+            )
         return
-    dirs = [str(d).replace("res://", "") for d in cfg.get("dirs", [])]
-    prefix = str(cfg.get("prefix", "test_"))
-    suffix = str(cfg.get("suffix", ".gd"))
-    subdirs = bool(cfg.get("include_subdirs", True))
+    except OSError as exc:
+        print(f"  cannot read .gutconfig.json: {exc}")
+        _finish_file_stage(
+            "tests",
+            [],
+            failed=True,
+            scan_errors=[f"cannot read .gutconfig.json: {exc}"],
+        )
+        return
+    except UnicodeError as exc:
+        print(f"  cannot read .gutconfig.json: {exc}")
+        _finish_file_stage(
+            "tests",
+            [_issue(
+                "tests",
+                "invalid-runner-config",
+                ".gutconfig.json",
+                0,
+                "test runner configuration is not valid UTF-8",
+            )],
+            failed=True,
+        )
+        return
+    try:
+        cfg = json.loads(cfg_text)
+    except ValueError as exc:
+        print(f"  cannot read .gutconfig.json: {exc}")
+        _finish_file_stage(
+            "tests",
+            [_issue(
+                "tests",
+                "invalid-runner-config",
+                ".gutconfig.json",
+                0,
+                "test runner configuration is not valid JSON",
+            )],
+            failed=True,
+        )
+        return
+    if not isinstance(cfg, dict):
+        print("  .gutconfig.json must contain one object")
+        _finish_file_stage(
+            "tests",
+            [_issue(
+                "tests",
+                "invalid-runner-config",
+                ".gutconfig.json",
+                0,
+                "test runner configuration must contain one object",
+            )],
+            failed=True,
+        )
+        return
+
+    raw_dirs = cfg.get("dirs", [])
+    raw_prefix = cfg.get("prefix", "test_")
+    raw_suffix = cfg.get("suffix", ".gd")
+    raw_subdirs = cfg.get("include_subdirs", True)
+    config_problem = ""
+    dirs: List[str] = []
+    if not isinstance(raw_dirs, list):
+        config_problem = "dirs must be a list of paths"
+    elif len(raw_dirs) > 256:
+        config_problem = "dirs contains too many paths"
+    else:
+        for raw_dir in raw_dirs:
+            if not isinstance(raw_dir, str) or not raw_dir.strip():
+                config_problem = "dirs must contain only non-empty path strings"
+                break
+            relative = (
+                raw_dir[len("res://") :]
+                if raw_dir.startswith("res://")
+                else raw_dir
+            )
+            candidate = PurePosixPath(relative)
+            if (
+                len(raw_dir) > 240
+                or not relative
+                or relative == "."
+                or "\\" in relative
+                or "\x00" in relative
+                or candidate.is_absolute()
+                or candidate.as_posix() != relative
+                or any(part in ("", ".", "..") for part in candidate.parts)
+                or (candidate.parts and ":" in candidate.parts[0])
+            ):
+                config_problem = (
+                    "dirs paths must be canonical project-relative or res:// paths"
+                )
+                break
+            dirs.append(relative)
+    for label, value in (("prefix", raw_prefix), ("suffix", raw_suffix)):
+        if config_problem:
+            break
+        if not isinstance(value, str):
+            config_problem = f"{label} must be a string"
+        elif (
+            not value
+            or len(value) > 120
+            or any(separator in value for separator in ("/", "\\", "\x00", "\r", "\n"))
+        ):
+            config_problem = f"{label} must be one non-empty filename fragment"
+    if not config_problem and not isinstance(raw_subdirs, bool):
+        config_problem = "include_subdirs must be true or false"
+    if config_problem:
+        print(f"  .gutconfig.json {config_problem}")
+        _finish_file_stage(
+            "tests",
+            [_issue(
+                "tests",
+                "invalid-runner-config",
+                ".gutconfig.json",
+                0,
+                "test runner configuration has invalid field values",
+            )],
+            failed=True,
+        )
+        return
+
+    # Exact accepted contract: dirs are canonical paths inside res://, supplied
+    # either with that prefix or relative to it. Prefix/suffix are filename
+    # fragments only. This keeps discovery inside the selected game root.
+    prefix = raw_prefix
+    suffix = raw_suffix
+    subdirs = raw_subdirs
 
     def collected(rel: str) -> bool:
         for d in dirs:
@@ -1243,11 +1969,9 @@ def stage_tests() -> None:
     # Scripts attached to a scene are run by that scene (e.g. the smoke
     # harness), not by GUT. Not collecting them is correct, not a false green.
     scene_scripts: set[str] = set()
-    for tscn in PROJECT_DIR.rglob("*.tscn"):
-        if EXCLUDED_DIRS.intersection(tscn.relative_to(PROJECT_DIR).parts):
-            continue
+    for tscn in _project_files_with_suffixes((".tscn",)):
         try:
-            body = tscn.read_text(encoding="utf-8", errors="replace")
+            body = _read_project_text(tscn, errors="replace")
         except OSError:
             continue
         for m in re.finditer(r'path="res://([^"]+\.gd)"', body):
@@ -1303,33 +2027,46 @@ def stage_tests() -> None:
   to tests/harness/. Scripts attached to a scene are exempt automatically.""")
         skill("godot-headless-verification",
               "what a headless run proves and what it does not")
-        RESULTS.fail("tests")
+        issues = [
+            _issue(
+                "tests",
+                "uncollected-test",
+                relative,
+                0,
+                "test-shaped file is not collected by the configured runner",
+            )
+            for relative in orphans
+        ]
+        _finish_file_stage("tests", issues, failed=True)
     else:
-        RESULTS.passed("tests")
+        _finish_file_stage("tests", [], failed=False)
 
 
 def stage_assets() -> None:
     head("assets (sidecar completeness)")
     problems: List[str] = []
+    issues: List[dict] = []
     assets = 0
-    for path in sorted(PROJECT_DIR.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in _project_files_with_suffixes(ASSET_EXTS):
         rel = path.relative_to(PROJECT_DIR)
-        if EXCLUDED_DIRS.intersection(rel.parts):
-            continue
-        if path.suffix.lower() in ASSET_EXTS:
-            assets += 1
-            if not path.with_name(path.name + ".import").is_file():
-                problems.append(f"{rel.as_posix()}: no .import sidecar"
-                                f" -- run: kit verify --stage import")
+        assets += 1
+        if not _project_file_exists(path.with_name(path.name + ".import")):
+            problems.append(f"{rel.as_posix()}: no .import sidecar"
+                            f" -- run: kit verify --stage import")
+            issues.append(_issue(
+                "assets",
+                "missing-import-sidecar",
+                rel.as_posix(),
+                0,
+                "asset has no .import sidecar",
+            ))
     # .uid sidecars for scripts are advisory: whether headless import generates
     # them is engine-version dependent, and a missing one degrades to
     # path-based resolution rather than breaking anything.
     missing_uid = [
         p.relative_to(PROJECT_DIR).as_posix()
         for p in gd_files()
-        if not p.with_name(p.name + ".uid").is_file()
+        if not _project_file_exists(p.with_name(p.name + ".uid"))
     ]
     print(f"  {assets} asset file(s), {len(gd_files())} script(s)")
     if missing_uid:
@@ -1340,9 +2077,9 @@ def stage_assets() -> None:
         print("  Godot assigns these when the editor next saves the script.")
     if problems:
         indent("\n".join(problems), 20)
-        RESULTS.fail("assets")
+        _finish_file_stage("assets", issues, failed=True)
     else:
-        RESULTS.passed("assets")
+        _finish_file_stage("assets", [], failed=False)
 
 
 def stage_resources(godot: str) -> None:
@@ -1689,20 +2426,16 @@ def stage_format() -> None:
         else:
             print("  gdformat unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         if BROWNFIELD_CAPTURE:
-            detail = (
-                "no trusted external gdformat is available"
-                if _lifecycle_tool_boundary()
-                else "gdformat is unavailable"
-            )
-            _capture_error("format", detail)
+            print("  formatter availability is adoption work, not an existing file issue")
         RESULTS.skip("format")
         return
     files = [str(p) for p in gd_files()]
     if not files:
         RESULTS.passed("format")
         return
-    code, out = _run_external_tool(
-        tool + ["--line-length=120", "--check"] + files,
+    code, out = _run_style_batches(
+        tool + ["--line-length=120", "--check"],
+        files,
         120,
         LOG_DIR / "format.log",
     )
@@ -1811,8 +2544,11 @@ def _lint_issues(out: str) -> Tuple[List[dict], List[str]]:
         ):
             errors.append(raw)
         index += 1
-    count_match = re.search(r"Failure: (\d+) problems? found", out)
-    if count_match and int(count_match.group(1)) != len(issues):
+    reported_count = sum(
+        int(match.group(1))
+        for match in re.finditer(r"Failure: (\d+) problems? found", out)
+    )
+    if reported_count and reported_count != len(issues):
         errors.append(
             "gdlint problem count did not match its file-scoped diagnostics"
         )
@@ -1828,18 +2564,16 @@ def stage_lint() -> None:
         else:
             print("  gdlint unavailable. Install the locked gdtoolkit version shown by: kit doctor")
         if BROWNFIELD_CAPTURE:
-            detail = (
-                "no trusted external gdlint is available"
-                if _lifecycle_tool_boundary()
-                else "gdlint is unavailable"
-            )
-            _capture_error("lint", detail)
+            print("  linter availability is adoption work, not an existing file issue")
         RESULTS.skip("lint")
         return
     # gdlint honours .gdlintrc excluded_directories; gdformat does not, so both
     # are given the same explicitly filtered list for consistency.
-    targets = [str(p) for p in gd_files()] or [str(PROJECT_DIR)]
-    code, out = _run_external_tool(tool + targets, 120, LOG_DIR / "lint.log")
+    targets = [str(p) for p in gd_files()]
+    if not targets:
+        _finish_file_stage("lint", [], failed=False)
+        return
+    code, out = _run_style_batches(tool, targets, 120, LOG_DIR / "lint.log")
     indent(out, 30)
     issues, errors = _lint_issues(out)
     if code == 0:
@@ -1937,7 +2671,7 @@ def stage_grep() -> None:
     for path in gd_files():
         rel = path.relative_to(PROJECT_DIR).as_posix()
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = _read_project_text(path, errors="replace").splitlines()
         except OSError as exc:
             print(f"  could not read {rel}: {exc}")
             scan_errors.append(f"could not read {rel}: {exc}")
@@ -1990,7 +2724,7 @@ def _layer_dirs():
     """(interior, boundary) tuples, from arch.rules.json if declared."""
     path = ROOT / "arch.rules.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(_read_project_text(path))
         tb = data.get("type_boundary") or {}
         inter = tuple(str(d) for d in tb.get("interior", []))
         bound = tuple(str(d) for d in tb.get("boundary", []))
@@ -2033,8 +2767,7 @@ def stage_types() -> None:
             continue
         checked += 1
         try:
-            lines = path.read_text(encoding="utf-8",
-                                   errors="replace").splitlines()
+            lines = _read_project_text(path, errors="replace").splitlines()
         except OSError as exc:
             print(f"  could not read {rel}: {exc}")
             scan_errors.append(f"could not read {rel}: {exc}")
@@ -2103,11 +2836,94 @@ def stage_types() -> None:
     )
 
 
+def _arch_issues(
+    document: Mapping[str, object],
+    check_output: str,
+) -> Tuple[List[dict], List[str]]:
+    """Convert architecture diagnostics into exact project-file issues."""
+    issues: List[dict] = []
+    errors: List[str] = []
+    raw_errors = document.get("errors")
+    if raw_errors is not None:
+        if isinstance(raw_errors, list) and all(
+            isinstance(item, str) and item.strip() for item in raw_errors
+        ):
+            errors.extend(str(item) for item in raw_errors)
+        else:
+            errors.append("architecture JSON errors are malformed")
+        return issues, errors
+
+    mermaid = document.get("mermaid")
+    if "ARCHITECTURE.md diagram is stale" in check_output:
+        if isinstance(mermaid, str) and mermaid.strip():
+            issues.append(_project_issue(
+                "arch",
+                "stale-architecture-graph",
+                "ARCHITECTURE.md",
+                0,
+                f"generated architecture graph differs: {mermaid}",
+            ))
+        else:
+            errors.append("architecture JSON has no generated graph")
+    if "ARCHITECTURE.md is missing" in check_output:
+        errors.append("ARCHITECTURE.md is missing and cannot be file-bound")
+
+    raw_violations = document.get("violations")
+    raw_scoped = document.get("violation_issues")
+    if not isinstance(raw_violations, list) or not all(
+        isinstance(item, str) and item.strip() for item in raw_violations
+    ):
+        errors.append("architecture JSON violations are malformed")
+        raw_violations = []
+    if not isinstance(raw_scoped, list):
+        errors.append("architecture JSON file-scoped violations are malformed")
+        raw_scoped = []
+
+    scoped_messages: set[str] = set()
+    for item in raw_scoped:
+        if not isinstance(item, Mapping) or set(item) != {
+            "code",
+            "path",
+            "line",
+            "message",
+        }:
+            errors.append("architecture JSON has a malformed file-scoped violation")
+            continue
+        code = item.get("code")
+        path = item.get("path")
+        line = item.get("line")
+        message = item.get("message")
+        if (
+            not isinstance(code, str)
+            or not code
+            or not isinstance(path, str)
+            or not path
+            or isinstance(line, bool)
+            or not isinstance(line, int)
+            or line < 0
+            or not isinstance(message, str)
+            or not message.strip()
+        ):
+            errors.append("architecture JSON has a malformed file-scoped violation")
+            continue
+        scoped_messages.add(message)
+        issues.append(_issue("arch", code, path, line, message))
+
+    for violation in raw_violations:
+        if violation not in scoped_messages:
+            errors.append(
+                f"architecture violation is not bound to a source file: {violation}"
+            )
+    return issues, errors
+
+
 def stage_arch() -> None:
     head("architecture (generated graph + boundary rules)")
     script = CORE_ROOT / "arch.py"
     if not script.is_file():
         print("  arch.py not present, architecture stage disabled")
+        if BROWNFIELD_CAPTURE:
+            _capture_error("arch", "arch.py is unavailable")
         RESULTS.skip("arch")
         return
     code, out = _run_internal_python(
@@ -2120,11 +2936,39 @@ def stage_arch() -> None:
     if "undeclared module" in out:
         print("  skill: .agents/skills/godot-human-involvement/SKILL.md")
     if code == 0:
-        RESULTS.passed("arch")
+        _finish_file_stage("arch", [], failed=False)
+        return
+
+    print("  regenerate the diagram with: kit architecture update")
+    print("  or fix the boundary violation; see arch.rules.json")
+    json_code, json_out = _run_internal_python(
+        script,
+        ("--json",),
+        60,
+        LOG_DIR / "arch-scan.log",
+    )
+    try:
+        document = json.loads(json_out)
+    except json.JSONDecodeError as exc:
+        document = {}
+        issues: List[dict] = []
+        errors = [f"architecture JSON is unreadable: {exc}"]
     else:
-        print("  regenerate the diagram with: python arch.py --write")
-        print("  or fix the boundary violation; see arch.rules.json")
-        RESULTS.fail("arch")
+        if not isinstance(document, Mapping):
+            issues = []
+            errors = ["architecture JSON must be an object"]
+        else:
+            issues, errors = _arch_issues(document, out)
+    if json_code not in (0, 1):
+        errors.append(f"architecture scan exited {json_code}")
+    if not issues and not errors:
+        errors.append("architecture stage failed without a file-scoped issue")
+    _finish_file_stage(
+        "arch",
+        issues,
+        failed=True,
+        scan_errors=errors,
+    )
 
 
 def involvement() -> str:
@@ -2191,6 +3035,8 @@ def write_plan() -> None:
     refresh is a view that is silently stale, and a stale plan is worse than
     no plan because it reads as current.
     """
+    if _lifecycle_tool_boundary():
+        return
     script = CORE_ROOT / "tools" / "plan_html.py"
     if not script.is_file():
         return
@@ -2232,9 +3078,10 @@ def stage_design() -> None:
         print("  tools/design.py not found")
         RESULTS.skip("design")
         return
+    lifecycle_read_only = _lifecycle_tool_boundary()
     code, out = _run_internal_python(
         tool,
-        ("--json",),
+        ("--json", "--check") if lifecycle_read_only else ("--json",),
         60,
         LOG_DIR / "design.log",
     )
@@ -2265,8 +3112,11 @@ def stage_design() -> None:
         RESULTS.skip("design")
         return
 
-    # Write mode: the --json call above is read-only, so run once more to emit.
-    _run_internal_python(tool, (), 60, LOG_DIR / "design_write.log")
+    # Apply-time verification must not add or rewrite project design files after
+    # the human approved the exact lifecycle plan. Its JSON pass includes
+    # --check, which provides the same evidence without emitting projections.
+    if not lifecycle_read_only:
+        _run_internal_python(tool, (), 60, LOG_DIR / "design_write.log")
 
     declared = {t for sec in sections for t in (sec.get("declared_tunables") or [])}
     print(f"  {len(sections)} section(s), {len(declared)} tunable(s) declared")
@@ -3873,7 +4723,7 @@ def run_brownfield_scan(output: str) -> int:
     baseline. The caller must review a complete result before separately
     building ``.agent-kit/brownfield.json``.
     """
-    global BROWNFIELD_CAPTURE
+    global BROWNFIELD_CAPTURE, _BROWNFIELD_PROJECT_INVENTORY
     destination = Path(output)
     if not destination.is_absolute():
         print("brownfield scan output must be an absolute path")
@@ -3896,15 +4746,26 @@ def run_brownfield_scan(output: str) -> int:
     BROWNFIELD_CAPTURE_ISSUES.clear()
     BROWNFIELD_CAPTURE_ERRORS.clear()
     _reset_brownfield_state()
-    BROWNFIELD_CAPTURE = True
+    _BROWNFIELD_PROJECT_INVENTORY = None
     try:
-        stage_format()
-        stage_lint()
-        stage_sanitise()
-        stage_grep()
-        stage_types()
-    finally:
-        BROWNFIELD_CAPTURE = False
+        _BROWNFIELD_PROJECT_INVENTORY = scan_brownfield_project()
+    except BrownfieldScanError as exc:
+        print(str(exc))
+        _capture_error("inventory", str(exc))
+    else:
+        BROWNFIELD_CAPTURE = True
+        try:
+            stage_format()
+            stage_lint()
+            stage_sanitise()
+            stage_grep()
+            stage_types()
+            stage_arch()
+            stage_tests()
+            stage_assets()
+        finally:
+            BROWNFIELD_CAPTURE = False
+            _BROWNFIELD_PROJECT_INVENTORY = None
 
     from tools import brownfield
 
@@ -3933,6 +4794,7 @@ def run_brownfield_scan(output: str) -> int:
 
 def finish() -> int:
     """Print the one authoritative summary after a bounded verification run."""
+    global _BROWNFIELD_PROJECT_INVENTORY
     summary = {
         "schema": 2,
         "run_id": VERIFY_RUN_ID or None,
@@ -3979,14 +4841,16 @@ def finish() -> int:
     print(f"{DIM}logs: {LOG_DIR}{RST}")
     if RESULTS.failed or not diagnostics_persisted:
         print(f"{RED}GATE FAILED{RST}")
+        _BROWNFIELD_PROJECT_INVENTORY = None
         return 1
     print(f"{GRN}GATE PASSED{RST}")
     retro_nudge()
+    _BROWNFIELD_PROJECT_INVENTORY = None
     return 0
 
 
 def main() -> int:
-    global CONFORMANCE_COMPLETION_REQUIRED
+    global CONFORMANCE_COMPLETION_REQUIRED, _BROWNFIELD_PROJECT_INVENTORY
     parser = argparse.ArgumentParser(
         description="Verification gate for a portable Godot project.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4078,6 +4942,17 @@ def main() -> int:
             for stage in active:
                 if stage != "integrity":
                     RESULTS.skip(f"{stage} (skipped: integrity review required)")
+            return finish()
+
+    if _lifecycle_tool_boundary():
+        try:
+            _BROWNFIELD_PROJECT_INVENTORY = scan_brownfield_project()
+        except BrownfieldScanError as exc:
+            print(str(exc))
+            RESULTS.fail("project-inventory")
+            for stage in active:
+                if stage != "integrity":
+                    RESULTS.skip(f"{stage} (skipped: unsafe project inventory)")
             return finish()
 
     # Every process-light stage completes before the native-engine boundary.

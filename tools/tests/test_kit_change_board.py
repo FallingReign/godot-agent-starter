@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import threading
@@ -28,6 +29,11 @@ PLAN_A = "d" * 64
 PLAN_B = "e" * 64
 PLAN_NEW = "f" * 64
 RESULT_A = "1" * 64
+
+
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else TOOLS.parent / ".checklogs"
 
 
 def _view(session_id: str, plan: str, status: str = "ready") -> dict:
@@ -75,7 +81,7 @@ def _view(session_id: str, plan: str, status: str = "ready") -> dict:
 
 class KitChangeBoard(unittest.TestCase):
     def setUp(self) -> None:
-        self.scratch = TOOLS.parent / ".checklogs" / f"kit-change-board-{uuid.uuid4().hex}"
+        self.scratch = _scratch_parent() / f"kit-change-board-{uuid.uuid4().hex}"
         self.runtime = self.scratch / ".kit" / "runtime"
         self.runtime.mkdir(parents=True)
         self.saved = {

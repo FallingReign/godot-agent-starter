@@ -23,6 +23,11 @@ import session_digest    # noqa: E402
 import session_evidence  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else TOOLS.parent / ".checklogs"
+
+
 def _digest(session_id: str, label: str, count: int = 9) -> dict:
     return {
         "id": session_id,
@@ -87,8 +92,7 @@ fix_lines: 3
 
 class QueueTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = (TOOLS.parent / ".checklogs"
-                     / f"retro-queue-test-{uuid.uuid4().hex}")
+        self.root = _scratch_parent() / f"retro-queue-test-{uuid.uuid4().hex}"
         self.root.mkdir(parents=True)
         self.retro = self.root / "docs" / "retro"
         self.retro.mkdir(parents=True)

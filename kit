@@ -6,7 +6,7 @@ export KIT_BOOTSTRAP_B64='ZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwppbXBvcn
 KIT_BOOTSTRAP_CODE="import base64,os;exec(compile(base64.b64decode(os.environ.pop('KIT_BOOTSTRAP_B64'),validate=True),'<kit-bootstrap>','exec'))"
 KIT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KIT_ENTRY="$KIT_ROOT/tools/managed_launcher.py"
-KIT_ENTRY_SHA256="440a9cfe537e062db0b254acc603b60d29c25f3d0314747081940ac6e32e9916"
+KIT_ENTRY_SHA256="f2b2430a94fa2ea09c97f80bb1a39b9e512f25f709007829778c4ddf29335644"
 
 if [ -e "$KIT_ROOT/.agent-kit" ] || [ -L "$KIT_ROOT/.agent-kit" ]; then
     echo "kit: a managed kit change is incomplete; use its recovery action." >&2

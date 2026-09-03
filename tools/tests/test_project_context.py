@@ -25,7 +25,7 @@ import project_context as context  # noqa: E402
 @contextlib.contextmanager
 def _scratch() -> Iterator[Path]:
     configured = os.environ.get("KIT_TEST_TMPDIR")
-    candidates = ([Path(configured)] if configured else []) + [
+    candidates = [Path(configured)] if configured else [
         TOOLS.parent / ".checklogs" / "tests", Path(tempfile.gettempdir()), Path("/tmp")
     ]
     root = None
@@ -68,7 +68,22 @@ def _canonical_json(value: dict) -> bytes:
 
 def _write_managed_install(root: Path) -> tuple[Path, str]:
     source_commit = "a" * 40
-    install_manifest_content = b'{"schema":1}\n'
+    install_manifest_content = _canonical_json(
+        {
+            "schema": context.managed_launcher.INSTALL_MANIFEST_SCHEMA,
+            "kind": context.managed_launcher.INSTALL_MANIFEST_KIND,
+            "kit_version": "0.3.0",
+            "install_schema": 1,
+            "layout_schema": 1,
+            "config_schema": 1,
+            "supported_legacy_versions": ["0.2.0"],
+            "supported_install_schemas": [1],
+            "core_layout": "versioned-by-archive-sha256",
+            "owned_files": [],
+            "managed_blocks": [],
+            "legacy_retired_files": [],
+        }
+    )
     contents = {
         "INSTALL-MANIFEST.json": install_manifest_content,
         "LICENSE": b"MIT\n",
@@ -262,20 +277,30 @@ class ProjectRootDiscovery(unittest.TestCase):
     def test_configured_context_rejects_a_hardlinked_config(self) -> None:
         with _scratch() as project:
             _write_marker(project)
-            source = project / "config-source.json"
-            source.write_text(
+            config = project / context.CONFIG_NAME
+            config.write_text(
                 '{"schema":1,"game_root":".",'
                 '"runtime_root":".kit/runtime"}\n',
                 encoding="utf-8",
             )
-            config = project / context.CONFIG_NAME
-            try:
-                os.link(source, config)
-            except OSError as exc:
-                self.skipTest(f"hardlinks unavailable on this host: {exc}")
+            path_type = type(config)
+            original_lstat = path_type.lstat
 
-            with self.assertRaisesRegex(context.ProjectContextError, "regular file"):
-                context.load_configured_context(project)
+            def report_hardlink(path: Path):
+                info = original_lstat(path)
+                if path == config:
+                    linked = mock.Mock(wraps=info)
+                    linked.st_mode = info.st_mode
+                    linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                    linked.st_nlink = 2
+                    return linked
+                return info
+
+            with mock.patch.object(
+                path_type, "lstat", autospec=True, side_effect=report_hardlink
+            ):
+                with self.assertRaisesRegex(context.ProjectContextError, "regular file"):
+                    context.load_configured_context(project)
 
     def test_configured_context_rejects_a_change_during_read(self) -> None:
         with _scratch() as project:

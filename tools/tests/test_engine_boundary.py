@@ -19,6 +19,11 @@ import check as gate  # noqa: E402
 from tools import native_engine  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs"
+
+
 class EngineInvocationBoundary(unittest.TestCase):
     def setUp(self) -> None:
         for items in gate.RUN_DIAGNOSTICS.values():
@@ -26,7 +31,7 @@ class EngineInvocationBoundary(unittest.TestCase):
 
     def invoke(self, *arguments: str) -> tuple[int, str]:
         output = io.StringIO()
-        scratch = ROOT / ".checklogs"
+        scratch = _scratch_parent()
         scratch.mkdir(exist_ok=True)
         with mock.patch.object(gate, "RESULTS", gate.Results()), \
                 mock.patch.object(gate, "LOG_DIR", scratch), \
@@ -111,7 +116,7 @@ class EngineInvocationBoundary(unittest.TestCase):
         self.assertIn("typecheck (skipped: previous native-engine check failed)", output)
 
     def test_engine_timeout_from_shared_boundary_is_recorded_by_the_gate(self) -> None:
-        scratch = ROOT / ".checklogs"
+        scratch = _scratch_parent()
         scratch.mkdir(exist_ok=True)
         log = scratch / "owned-engine-timeout-test.log"
         result = native_engine.NativeResult(
@@ -142,7 +147,7 @@ class EngineInvocationBoundary(unittest.TestCase):
             log.unlink(missing_ok=True)
 
     def test_native_access_violation_is_visible_and_classified(self) -> None:
-        scratch = ROOT / ".checklogs"
+        scratch = _scratch_parent()
         scratch.mkdir(exist_ok=True)
         log = scratch / "owned-engine-crash-test.log"
         result = native_engine.NativeResult(

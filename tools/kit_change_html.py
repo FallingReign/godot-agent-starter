@@ -286,6 +286,32 @@ def _files_html(files: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def _problems_html(
+    issues: Sequence[Mapping[str, Any]], *, checked: bool
+) -> str:
+    rows: list[str] = []
+    for issue in issues:
+        stage = _text(issue.get("stage"), "check")
+        code = _text(issue.get("code"), "problem")
+        path = _text(issue.get("path"), "Unknown file")
+        line = _integer(issue.get("line"))
+        location = f"{path}:{line}" if line else path
+        rows.append(
+            '<li class="problem-row">'
+            f'<code class="problem-location">{_esc(location)}</code>'
+            f'<span class="problem-check">{_esc(stage)} — {_esc(code)}</span>'
+            "</li>"
+        )
+    hidden = "" if checked and rows else " hidden"
+    summary = f"Show problems to address ({len(rows)})"
+    return (
+        f'<details class="problem-details" id="kit-change-problems"{hidden}>'
+        f'<summary id="kit-change-problems-summary">{_esc(summary)}</summary>'
+        f'<ul class="problem-list" id="kit-change-problem-list">{"".join(rows)}</ul>'
+        "</details>"
+    )
+
+
 def _styles() -> str:
     return """
 :root{color-scheme:dark;--bg:#111318;--card:#181c24;--line:#303744;
@@ -318,11 +344,15 @@ margin:0;gap:0}.facts div,.check-list div{display:contents}.facts dt,.facts dd,.
 .recommended{display:inline-block;margin-left:8px;color:var(--ok);font-size:.72rem;
 font-weight:800;text-transform:uppercase}.counts{list-style:none;padding:0;margin:0}.counts li{display:flex;
 justify-content:space-between;gap:18px;padding:8px 0;border-bottom:1px solid var(--line)}
-.count{font-weight:800}.file-details{margin-top:14px}.file-details summary{cursor:pointer;font-weight:750}
+.count{font-weight:800}.file-details,.problem-details{margin-top:14px}
+.file-details summary,.problem-details summary{cursor:pointer;font-weight:750}
 .file-list{list-style:none;padding:8px 0 0;margin:0}.file-row{display:grid;grid-template-columns:90px minmax(0,1fr);
 gap:6px 12px;padding:9px 0;border-bottom:1px solid var(--line)}.file-action{color:var(--accent);font-weight:750}
 .file-row code{overflow-wrap:anywhere}.file-reason{grid-column:2}.fingerprint code{display:block;
 overflow-wrap:anywhere;margin-top:7px;color:var(--dim)}.gap-note{border-left:4px solid var(--warn);padding-left:12px}
+.problem-list{list-style:none;padding:8px 0 0;margin:0}.problem-row{display:flex;flex-direction:column;
+gap:3px;padding:9px 0;border-bottom:1px solid var(--line)}.problem-location{overflow-wrap:anywhere}
+.problem-check{color:var(--dim);font-size:.9rem}.provider-handoff{border-left:5px solid var(--ok)}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.primary,.secondary,.retry{
 appearance:none;border:1px solid var(--accent);background:var(--accent);color:#111318;border-radius:7px;
 font:inherit;font-weight:800;padding:10px 16px;cursor:pointer}.secondary,.retry{background:transparent;color:var(--text);
@@ -370,6 +400,10 @@ def _client_script(static: Mapping[str, Any]) -> str:
   var newWorkCheck = document.getElementById("kit-change-new-work-check");
   var gapCount = document.getElementById("kit-change-gap-count");
   var gapNote = document.getElementById("kit-change-gap-note");
+  var problemDetails = document.getElementById("kit-change-problems");
+  var problemSummary = document.getElementById("kit-change-problems-summary");
+  var problemList = document.getElementById("kit-change-problem-list");
+  var providerHandoff = document.getElementById("kit-change-provider-handoff");
   var resultSha = String(STATIC.result_sha256 || "");
   var recoveryAction = String(STATIC.recovery_action || "");
   var planUrl = String(STATIC.plan_url || "");
@@ -419,6 +453,29 @@ def _client_script(static: Mapping[str, Any]) -> str:
     if(!match) return "";
     var port = Number(match[1]);
     return port >= 1 && port <= 65535 && String(port) === match[1] ? value : "";
+  }
+  function renderProblems(gaps,checked){
+    while(problemList.firstChild) problemList.removeChild(problemList.firstChild);
+    var issues = gaps && Array.isArray(gaps.issues) ? gaps.issues.slice(0,4096) : [];
+    for(var i=0;i<issues.length;i++){
+      var issue = issues[i] && typeof issues[i] === "object" ? issues[i] : {};
+      var path = String(issue.path || "Unknown file");
+      var line = Math.max(0,Number(issue.line) || 0);
+      var location = document.createElement("code");
+      location.className = "problem-location";
+      location.textContent = path + (line ? ":" + String(line) : "");
+      var check = document.createElement("span");
+      check.className = "problem-check";
+      check.textContent = String(issue.stage || "check") + " — "
+        + String(issue.code || "problem");
+      var row = document.createElement("li");
+      row.className = "problem-row";
+      row.appendChild(location);
+      row.appendChild(check);
+      problemList.appendChild(row);
+    }
+    problemSummary.textContent = "Show problems to address (" + String(issues.length) + ")";
+    problemDetails.hidden = !(checked && issues.length);
   }
   function labelFor(value, count){
     if(value === "needs_decision"){
@@ -501,6 +558,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
             + ". It did not hide them or mark them as fixed. "
             + "Later project changes are not included."
           : "";
+        renderProblems(gaps,checkedGaps);
       }
     }
     var checked = status === "complete" || status === "adoption_required";
@@ -515,6 +573,7 @@ def _client_script(static: Mapping[str, Any]) -> str:
     newWorkCheck.textContent = status === "complete" && applyTime ? "Passed at Apply" :
       (status === "adoption_required" && applyTime
         ? "Problems recorded at Apply" : "Not checked");
+    providerHandoff.hidden = !(status === "complete" || status === "adoption_required");
     applyStep(status);
     updateActions();
   }
@@ -622,7 +681,13 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         evidence_state = "apply_time"
 
     title = "Add kit to this project" if mode == "install" else "Upgrade this kit"
-    action = "Add kit" if mode == "install" else "Upgrade kit"
+    action = (
+        "Review this folder"
+        if status == "needs_decision"
+        else "Add kit"
+        if mode == "install"
+        else "Upgrade kit"
+    )
     status_label = _status_label(status, missing_decisions)
     detail = _text(data.get("detail"))
     if not detail:
@@ -648,12 +713,14 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     gaps_value = data.get("existing_gaps")
     if isinstance(gaps_value, Mapping):
         gap_count = _integer(gaps_value.get("count"))
+        gap_issues = _items(gaps_value.get("issues"))
         gaps_checked = (
             _text(gaps_value.get("status"), "not_checked") == "checked"
             and evidence_state == "apply_time"
         )
     else:
         gap_count = _integer(gaps_value)
+        gap_issues = []
         gaps_checked = evidence_state == "apply_time"
     recovery = _text(data.get("recovery"), "Previous state will be saved")
     review_url = _text(board_url_hint or data.get("review_url"))
@@ -691,6 +758,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
             "It did not hide them or mark them as fixed. "
             "Later project changes are not included.</p>"
         )
+    problems_html = _problems_html(gap_issues, checked=gaps_checked)
 
     link_copy = review_link or "the loopback link printed by your agent"
     if recovery_action:
@@ -762,6 +830,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
         if status == "adoption_required" and apply_check_finished
         else "Not checked"
     )
+    handoff_hidden = "" if status in {"complete", "adoption_required"} else " hidden"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -777,6 +846,7 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
     <p class="eyebrow">Kit change</p>
     <h1>{_esc(title)}</h1>
     <p class="subtitle">Review what changes, what stays safe, and how recovery works.</p>
+    <p class="subtitle">This review server runs only on this computer. Stop it with <code>kit serve stop</code>.</p>
   </header>
   {_step_html(status)}
   {board_client.shell_html()}
@@ -830,7 +900,16 @@ def render(preview: Mapping[str, Any], board_url_hint: str = "") -> str:
       <div><dt>Godot check</dt><dd>Not run; separate approval required</dd></div>
     </dl>
     {gap_note}
+    {problems_html}
     <p>For the current project, ask your agent to run <code>kit verify --static</code>.</p>
+  </section>
+  <section class="section provider-handoff" id="kit-change-provider-handoff"{handoff_hidden}>
+    <h2>Before game work</h2>
+    <p>Start a fresh Codex or Copilot chat. The current chat may still use the old kit rules.</p>
+    <ul>
+      <li>Codex: check the active instruction sources.</li>
+      <li>Copilot: run <code>/instructions</code> and check References.</li>
+    </ul>
   </section>
   <fieldset id="kit-change-controls" class="interactive-actions section" disabled>
     <legend class="eyebrow">Action</legend>

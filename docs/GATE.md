@@ -56,6 +56,25 @@ Stages are grouped as follows:
 | `gut` | Project unit tests through the selected third-party GUT adapter |
 | `smoke` | The project boots headlessly |
 
+## Existing-problem baseline
+
+During managed Apply, the kit can record existing problems that are tied to
+exact files. It covers formatting, lint, scene hygiene, banned old Godot
+patterns, typed boundaries, architecture graph freshness and boundaries, test
+files the runner would miss, and missing asset `.import` sidecars.
+
+The baseline does not hide a problem. An unchanged recorded problem stays
+visible as **Adoption required**. A new problem, or a recorded problem that
+remains in a changed file, fails verification.
+
+No `.gutconfig.json` means the project has not chosen a test layout; it is not
+an existing file problem and is not added to the baseline. The same applies when
+Apply has no trusted external `gdformat` or `gdlint`: it does not download or run
+a project-owned executable. These unavailable checks are named as **Adoption
+required**. Strict verification rejects their skips until they are ready. A
+present but invalid test config is tied to that exact file and handled by the
+normal baseline rules.
+
 ## Low-level diagnostic flags
 
 ```

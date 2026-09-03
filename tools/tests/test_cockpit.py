@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import unittest
 import uuid
@@ -20,6 +21,11 @@ sys.path.insert(0, str(TOOLS))
 import cockpit  # noqa: E402
 import design  # noqa: E402
 import retro_due  # noqa: E402
+
+
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else TOOLS.parent / ".checklogs"
 
 
 def _remove_readonly(function, path: str, _error) -> None:
@@ -98,9 +104,11 @@ def _passing_gate_payload(**values) -> dict:
 
 class TestCockpitDecision(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = TOOLS.parent / ".checklogs" / f"cockpit-test-{uuid.uuid4().hex}"
+        self.root = _scratch_parent() / f"cockpit-test-{uuid.uuid4().hex}"
         self.design_root = self.root / "docs" / "design"
         self.design_root.mkdir(parents=True)
+        shutil.copyfile(TOOLS.parent / ".agent-kit.json", self.root / ".agent-kit.json")
+        (self.root / "src").mkdir()
         (self.root / "kit.config.json").write_text(
             json.dumps(
                 {
@@ -139,6 +147,52 @@ class TestCockpitDecision(unittest.TestCase):
             cockpit.proposal_authority, "baseline_exists", return_value=True
         )
         self._baseline_patcher.start()
+
+    def test_git_fingerprint_child_is_read_only_and_ignores_host_git_config(self) -> None:
+        completed = subprocess.CompletedProcess(["trusted-git"], 0, b"", b"")
+        hostile = {
+            "GIT_DIR": str(self.root / "outside-git"),
+            "GIT_CONFIG_PARAMETERS": "'core.fsmonitor=attacker-command'",
+        }
+        with mock.patch.dict(cockpit.os.environ, hostile), mock.patch.object(
+            cockpit.process_supervisor,
+            "resolve_ordinary_executable",
+            return_value="trusted-git",
+        ), mock.patch.object(
+            cockpit.subprocess,
+            "run",
+            return_value=completed,
+        ) as runner:
+            result = cockpit._run_git(self.root, "status", "--short")
+
+        self.assertIs(completed, result)
+        command = runner.call_args.args[0]
+        environment = runner.call_args.kwargs["env"]
+        self.assertEqual("trusted-git", command[0])
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn(f"core.hooksPath={os.devnull}", command)
+        self.assertIn("diff.external=", command)
+        self.assertIn("diff.trustExitCode=false", command)
+        self.assertIn(f"core.attributesFile={os.devnull}", command)
+        self.assertEqual(["status", "--short"], command[-2:])
+        allowed_git_keys = {
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+        }
+        self.assertFalse(
+            any(
+                key.upper().startswith("GIT_")
+                for key in environment
+                if key not in allowed_git_keys
+            )
+        )
+        self.assertEqual(os.devnull, environment["GIT_CONFIG_GLOBAL"])
+        self.assertEqual("1", environment["GIT_CONFIG_NOSYSTEM"])
+        self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+        self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+        self.assertEqual(subprocess.DEVNULL, runner.call_args.kwargs["stdin"])
 
     def tearDown(self) -> None:
         self._baseline_patcher.stop()

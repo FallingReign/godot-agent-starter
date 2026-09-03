@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -29,8 +30,25 @@ import release
 
 MAX_DETAIL_CHARS = 2048
 MAX_SCAN_BYTES = brownfield.MAX_DOCUMENT_BYTES
+MAX_RECEIPT_OUTPUT_CHARS = 2 * 1024 * 1024
 CHECK_ROOT = "kit-change-checks"
 REQUIRED_LAUNCHERS = (".agent-kit/launcher.py", "kit", "kit.cmd")
+STATIC_STAGES = (
+    "integrity",
+    "skills",
+    "schema",
+    "shape",
+    "design",
+    "conformance",
+    "format",
+    "lint",
+    "sanitise",
+    "grep",
+    "types",
+    "arch",
+    "tests",
+    "assets",
+)
 _CHECK_FIELDS = {
     "kit_ok",
     "project_ok",
@@ -266,7 +284,6 @@ def _run_process(
         capture_output=True,
         allow_child_breakaway=False,
     )
-    _echo(outcome)
     if not bool(getattr(outcome, "termination_verified", False)):
         raise KitChangeCheckError("offline check containment was not verified")
     if bool(getattr(outcome, "timed_out", False)):
@@ -293,6 +310,283 @@ def _receipt(outcome: Any, command: str) -> dict[str, Any]:
     if value.get("exit_code") != exit_code or not isinstance(value.get("ok"), bool):
         raise KitChangeCheckError(f"{command} receipt does not match its process")
     return value
+
+
+def _receipt_project(receipt: Mapping[str, Any], expected: Path, label: str) -> None:
+    raw = receipt.get("project")
+    if not isinstance(raw, str) or not raw or len(raw) > 32_768:
+        raise KitChangeCheckError(f"{label} receipt has no valid project")
+    candidate = Path(raw)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise KitChangeCheckError(f"{label} receipt project is not canonical")
+    try:
+        resolved = candidate.resolve(strict=True)
+        expected_resolved = expected.resolve(strict=True)
+    except OSError as exc:
+        raise KitChangeCheckError(f"{label} receipt project is unavailable") from exc
+    if (
+        os.path.normcase(os.path.abspath(raw)) != os.path.normcase(str(resolved))
+        or os.path.normcase(str(resolved)) != os.path.normcase(str(expected_resolved))
+    ):
+        raise KitChangeCheckError(f"{label} receipt selected the wrong project")
+
+
+def _nested_process_exit(receipt: Mapping[str, Any], label: str) -> int:
+    process = receipt.get("process")
+    if not isinstance(process, Mapping) or len(process) > 3:
+        raise KitChangeCheckError(f"{label} receipt has malformed process evidence")
+    exit_code = process.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        raise KitChangeCheckError(f"{label} receipt has malformed process evidence")
+    for field in ("stdout", "stderr"):
+        if field in process and (
+            not isinstance(process[field], str)
+            or len(process[field]) > MAX_RECEIPT_OUTPUT_CHARS
+        ):
+            raise KitChangeCheckError(f"{label} receipt has oversized process evidence")
+    return exit_code
+
+
+def _validate_self_test_receipt(
+    receipt: Mapping[str, Any], installation: managed_launcher.Installation, outer_exit: int
+) -> None:
+    _receipt_project(receipt, installation.project_root, "self-test")
+    if receipt.get("ok") is False and "error" in receipt:
+        if set(receipt) != {
+            "ok", "command", "status", "error", "project", "exit_code"
+        }:
+            raise KitChangeCheckError("self-test error receipt fields are malformed")
+        status = receipt.get("status")
+        error = receipt.get("error")
+        if (
+            not isinstance(outer_exit, int)
+            or isinstance(outer_exit, bool)
+            or outer_exit == 0
+            or receipt.get("exit_code") != outer_exit
+            or not isinstance(status, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,79}", status) is None
+            or not isinstance(error, str)
+            or not 1 <= len(error) <= 2_000
+            or any(ord(character) < 32 or ord(character) == 127 for character in error)
+        ):
+            raise KitChangeCheckError("self-test error receipt is malformed")
+        return
+    nested_exit = _nested_process_exit(receipt, "self-test")
+    if receipt.get("engine") != "disabled":
+        raise KitChangeCheckError("self-test receipt did not disable the native engine")
+    tests = receipt.get("tests")
+    if not isinstance(tests, Mapping) or set(tests) != {
+        "ran", "failures", "errors", "skipped"
+    }:
+        raise KitChangeCheckError("self-test receipt has no valid test summary")
+    test_counts: dict[str, int] = {}
+    for field in ("ran", "failures", "errors", "skipped"):
+        value = tests.get(field)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 1_000_000
+        ):
+            raise KitChangeCheckError("self-test receipt has no valid test summary")
+        test_counts[field] = value
+    if receipt.get("ok") is True:
+        if (
+            outer_exit != 0
+            or receipt.get("exit_code") != 0
+            or nested_exit != 0
+            or receipt.get("status") != "passed"
+            or test_counts["ran"] < 1
+            or test_counts["failures"] != 0
+            or test_counts["errors"] != 0
+            or test_counts["skipped"] != 0
+            or "failure" in receipt
+        ):
+            raise KitChangeCheckError("self-test success receipt is internally inconsistent")
+    elif receipt.get("status") != "failed":
+        raise KitChangeCheckError("self-test failure receipt is internally inconsistent")
+
+
+def _bounded_gate_summary(receipt: Mapping[str, Any]) -> None:
+    nonce = receipt.get("verification_nonce")
+    summary = receipt.get("gate_summary")
+    validated_skips = _verification_skips(receipt)
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise KitChangeCheckError("static verification receipt has no valid run identity")
+    if not isinstance(summary, Mapping):
+        raise KitChangeCheckError("static verification receipt has no gate summary")
+    repository_sha = summary.get("repository_sha256")
+    if (
+        summary.get("schema") != 2
+        or summary.get("run_id") != nonce
+        or summary.get("failed") is not False
+        or not isinstance(repository_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", repository_sha) is None
+        or not isinstance(summary.get("auth_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(summary.get("auth_sha256"))) is None
+    ):
+        raise KitChangeCheckError("static verification gate summary is malformed")
+    results = summary.get("results")
+    diagnostics = summary.get("diagnostics")
+    if (
+        not isinstance(results, list)
+        or len(results) > 200
+        or any(not isinstance(item, str) or len(item) > 500 for item in results)
+        or not isinstance(diagnostics, Mapping)
+        or set(diagnostics) != {
+            "native_crashes",
+            "engine_refusals",
+            "engine_start_failures",
+            "timeouts",
+        }
+    ):
+        raise KitChangeCheckError("static verification gate evidence is malformed")
+    if len(results) != len(STATIC_STAGES):
+        raise KitChangeCheckError("static verification did not report every static stage")
+    seen: set[str] = set()
+    reported_skips: list[str] = []
+    for line in results:
+        match = re.fullmatch(r"(PASS|FAIL|SKIP)\s{2}(.+)", line)
+        if match is None:
+            raise KitChangeCheckError("static verification stage evidence is malformed")
+        state, detail = match.groups()
+        stage = detail.split(maxsplit=1)[0]
+        if stage not in STATIC_STAGES or stage in seen or state == "FAIL":
+            raise KitChangeCheckError("static verification stage evidence is malformed")
+        seen.add(stage)
+        if state == "SKIP":
+            reported_skips.append(detail)
+    if seen != set(STATIC_STAGES):
+        raise KitChangeCheckError("static verification did not report every static stage")
+    if reported_skips != validated_skips:
+        raise KitChangeCheckError("static verification skipped-check evidence disagrees")
+    for entries in diagnostics.values():
+        if (
+            not isinstance(entries, list)
+            or len(entries) > 20
+            or any(not isinstance(entry, Mapping) for entry in entries)
+        ):
+            raise KitChangeCheckError("static verification gate evidence is malformed")
+    for field in ("repository_start", "repository_end"):
+        state = receipt.get(field)
+        if (
+            not isinstance(state, Mapping)
+            or state.get("available") is not True
+            or state.get("digest") != repository_sha
+        ):
+            raise KitChangeCheckError("static verification repository evidence is malformed")
+    if receipt.get("repository_stable") is not True:
+        raise KitChangeCheckError("static verification did not prove a stable repository")
+
+
+def _validate_static_success(
+    receipt: Mapping[str, Any], installation: managed_launcher.Installation, outer_exit: int
+) -> None:
+    _receipt_project(receipt, installation.project_root, "static verification")
+    nested_exit = _nested_process_exit(receipt, "static verification")
+    if (
+        outer_exit != 0
+        or receipt.get("exit_code") != 0
+        or nested_exit != 0
+        or receipt.get("ok") is not True
+        or receipt.get("status") != "passed"
+        or receipt.get("strict") is not False
+        or receipt.get("static") is not True
+        or receipt.get("stages") != []
+        or receipt.get("fast") is not False
+        or receipt.get("engine") is not None
+    ):
+        raise KitChangeCheckError("static verification receipt has the wrong scope")
+    _bounded_gate_summary(receipt)
+
+
+def _verification_skips(receipt: Mapping[str, Any]) -> list[str]:
+    if "skips" not in receipt:
+        raise KitChangeCheckError("verify receipt has no skipped-check list")
+    raw = receipt["skips"]
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise KitChangeCheckError("verify returned malformed skipped checks")
+    skips: list[str] = []
+    for item in raw:
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item) > 160
+            or "\n" in item
+            or "\r" in item
+        ):
+            raise KitChangeCheckError("verify returned malformed skipped checks")
+        skips.append(" ".join(item.split()))
+    return skips
+
+
+def _skip_detail(skips: Sequence[str]) -> str:
+    visible = list(skips[:8])
+    detail = ", ".join(visible)
+    if len(skips) > len(visible):
+        detail += f", and {len(skips) - len(visible)} more"
+    return detail
+
+
+def _self_test_failure_detail(receipt: Mapping[str, Any]) -> str:
+    """Render only bounded structured failure evidence, never raw test output."""
+    if receipt.get("ok") is False and "error" in receipt:
+        status = str(receipt["status"]).replace("_", " ")
+        return f"Installed kit self-test could not run ({status}): {receipt['error']}"
+    failure = receipt.get("failure")
+    if not isinstance(failure, Mapping) or set(failure) != {
+        "ran", "failures", "errors", "skipped", "test_ids", "skip_ids", "log"
+    }:
+        return "Installed kit self-test failed; no valid failure report was returned."
+    counts: dict[str, int] = {}
+    for field in ("ran", "failures", "errors", "skipped"):
+        value = failure.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
+            return "Installed kit self-test failed; its failure report was malformed."
+        counts[field] = value
+    groups: dict[str, list[str]] = {}
+    for field in ("test_ids", "skip_ids"):
+        raw = failure.get(field)
+        if (
+            not isinstance(raw, list)
+            or len(raw) > 20
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", item) is None
+                for item in raw
+            )
+        ):
+            return "Installed kit self-test failed; its failure report was malformed."
+        groups[field] = list(raw)
+    parts = [
+        f"{counts['ran']} ran",
+        f"{counts['failures']} failed",
+        f"{counts['errors']} errors",
+        f"{counts['skipped']} skipped",
+    ]
+    if groups["test_ids"]:
+        parts.append("tests: " + ", ".join(groups["test_ids"][:8]))
+    if groups["skip_ids"]:
+        parts.append("skipped tests: " + ", ".join(groups["skip_ids"][:8]))
+    log = failure.get("log")
+    if isinstance(log, Mapping) and log.get("available") is True:
+        path = log.get("path")
+        digest = log.get("sha256")
+        size = log.get("bytes")
+        truncated = log.get("truncated")
+        if (
+            isinstance(path, str)
+            and len(path) <= 512
+            and path.startswith(".kit/")
+            and ".." not in Path(path).parts
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+            and isinstance(size, int)
+            and not isinstance(size, bool)
+            and 0 <= size <= 256 * 1024
+            and isinstance(truncated, bool)
+        ):
+            parts.append(f"private log: {path} ({digest[:12]})")
+    return "Installed kit self-test failed: " + "; ".join(parts) + "."
 
 
 def _current_document(installation: managed_launcher.Installation) -> dict[str, Any]:
@@ -444,6 +738,29 @@ def _reviewed_current_mode(session: Mapping[str, Any]) -> str:
     return str(current.get("mode") or "") if isinstance(current, Mapping) else ""
 
 
+def _reviewed_changed_paths(session: Mapping[str, Any]) -> set[str]:
+    preview = session.get("preview")
+    raw = preview.get("raw") if isinstance(preview, Mapping) else None
+    material = raw.get("material") if isinstance(raw, Mapping) else None
+    changes = material.get("changes") if isinstance(material, Mapping) else None
+    if not isinstance(changes, list) or len(changes) > 4096:
+        raise KitChangeCheckError("approved change list is missing or malformed")
+    paths: set[str] = set()
+    for item in changes:
+        if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+            raise KitChangeCheckError("approved change list is malformed")
+        try:
+            relative = kit_change._safe_relative(item["path"])  # noqa: SLF001
+        except kit_change.KitChangeError as exc:
+            raise KitChangeCheckError(
+                f"approved change path is unsafe: {exc.detail}"
+            ) from exc
+        if relative in paths:
+            raise KitChangeCheckError("approved change list contains a duplicate path")
+        paths.add(relative)
+    return paths
+
+
 def _first_baseline(
     target: Path,
     issues: list[dict[str, object]],
@@ -508,6 +825,18 @@ def _baseline_plan(
     current_issues: list[dict[str, object]],
     current_binding: Mapping[str, str],
 ) -> tuple[dict[str, object], list[dict[str, object]], int]:
+    changed_paths = _reviewed_changed_paths(session)
+    changed_issues = [
+        str(issue.get("path") or "")
+        for issue in current_issues
+        if str(issue.get("path") or "") in changed_paths
+    ]
+    if changed_issues:
+        visible = ", ".join(sorted(set(changed_issues))[:8])
+        raise KitChangeCheckError(
+            "post-Apply verification reported a problem in a file changed by the kit: "
+            + visible
+        )
     request = session.get("request")
     mode = str(request.get("mode") or "") if isinstance(request, Mapping) else ""
     if mode == "install":
@@ -665,8 +994,13 @@ def run(
                 runner=runner,
             )
         self_test_receipt = _receipt(self_test, "self-test")
+        _validate_self_test_receipt(
+            self_test_receipt,
+            installation,
+            int(getattr(self_test, "returncode", -1)),
+        )
         if getattr(self_test, "returncode", None) != 0 or not self_test_receipt["ok"]:
-            return _failure("Installed kit self-test failed.")
+            return _failure(_self_test_failure_detail(self_test_receipt))
 
         scan_path = _scan_path(context, str(session.get("session_id") or ""))
         scan = _run_process(
@@ -729,6 +1063,12 @@ def run(
         static_ok = getattr(static, "returncode", None) == 0 and bool(
             static_receipt["ok"]
         )
+        if static_ok:
+            _validate_static_success(
+                static_receipt,
+                installation,
+                int(getattr(static, "returncode", -1)),
+            )
         if not static_ok:
             failed = _failure(
                 "Installed static verification failed after applying the exact baseline.",
@@ -737,7 +1077,8 @@ def run(
             failed["existing_issues"] = scan_issues
             return failed
         issues = scan_issues
-        project_ok = not issues
+        skips = _verification_skips(static_receipt)
+        project_ok = not issues and not skips
         if project_ok:
             detail = (
                 f"Offline kit and project checks passed; {resolved_count} old gap(s) resolved."
@@ -751,6 +1092,16 @@ def run(
             )
         elif issues:
             detail = f"Kit works; {len(issues)} unchanged existing project gap(s) remain."
+            if skips:
+                detail = (
+                    detail[:-1]
+                    + f"; these project checks are not ready: {_skip_detail(skips)}."
+                )
+        elif skips:
+            detail = (
+                "Kit works; these project checks are not ready: "
+                f"{_skip_detail(skips)}."
+            )
         else:
             detail = "Kit works; project checks failed and need adoption work."
         result: dict[str, object] = {

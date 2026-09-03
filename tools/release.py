@@ -40,6 +40,9 @@ FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MAX_MEMBERS = 512
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
+GIT_METADATA_TIMEOUT_SECONDS = 20
+GIT_METADATA_OUTPUT_CAP_BYTES = 1024 * 1024
+SUPERVISED_TRUNCATION_PREFIX = "[supervised output truncated:"
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 
 # ``ARCHITECTURE.md`` in a working project is generated from that game's code.
@@ -49,9 +52,9 @@ MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 # trusting a manifest to authorize arbitrary project-generated graph content.
 CANONICAL_ARCHITECTURE = b"""# Architecture
 
-This distributable starts with no game modules or dependency edges. The file is
-regenerated from the target project's code; it is not a snapshot of the project
-that built the kit.
+The graph below is generated from the project that owns this document. The
+distributable carries an empty version of this template, so it never contains
+module names or dependency edges from the project that built the kit.
 
 Regenerate it after adding game code:
 
@@ -286,11 +289,13 @@ VALIDATION_FILES = frozenset({
     "tools/tests/test_strict_verify.py",
 })
 
-# These tests depend on source-repository history and remain covered by source
-# self-test/CI discovery.  They cannot ship in a managed release, whose core is
-# an authenticated archive without a source .git directory.
+# These tests and CI proofs depend on source-repository history and remain
+# covered by source self-test/CI. They cannot ship in a managed release, whose
+# core is an authenticated archive without a source .git directory.
 SOURCE_ONLY_VALIDATION_FILES = frozenset({
     "tools/tests/test_lifecycle_e2e.py",
+    "tools/tests/test_managed_consumer_strict_ci.py",
+    "tools/tests/test_public_lifecycle_e2e.py",
 })
 
 FIXED_FILES = ROOT_FILES | DOC_FILES | TOOL_FILES | VALIDATION_FILES
@@ -1395,22 +1400,43 @@ def _git_state(root: Path) -> tuple[dict, str]:
             }
         )
         try:
-            completed = subprocess.run(
+            completed = process_supervisor.run_supervised(
                 command,
+                cwd=root,
+                timeout=GIT_METADATA_TIMEOUT_SECONDS,
+                environment=environment,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
-                env=environment,
+                output_cap_bytes=GIT_METADATA_OUTPUT_CAP_BYTES,
+                allow_child_breakaway=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, ValueError) as exc:
             raise ReleaseError(f"cannot read source Git metadata: {exc}") from exc
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if completed.launch_error:
+            raise ReleaseError(
+                f"cannot read source Git metadata: {completed.launch_error}"
+            )
+        if completed.timed_out:
+            raise ReleaseError("cannot read source Git metadata: command timed out")
+        if completed.cancelled:
+            raise ReleaseError("cannot read source Git metadata: command was cancelled")
+        if not completed.termination_verified:
+            raise ReleaseError(
+                "cannot read source Git metadata: process termination was not verified"
+            )
+        if stdout.startswith(SUPERVISED_TRUNCATION_PREFIX) or stderr.startswith(
+            SUPERVISED_TRUNCATION_PREFIX
+        ):
+            raise ReleaseError(
+                "cannot read source Git metadata: output exceeded the safe limit"
+            )
+        if completed.returncode is None:
+            raise ReleaseError("cannot read source Git metadata: no exit code")
         if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip()
+            detail = stderr.strip() or stdout.strip()
             raise ReleaseError(f"cannot read source Git metadata: {detail}")
-        return completed.stdout
+        return stdout
 
     commit = run("rev-parse", "--verify", "HEAD").strip().lower()
     if not COMMIT_RE.fullmatch(commit):
@@ -2670,6 +2696,11 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_parser = subparsers.add_parser("build", help="build and verify a release archive")
     build_parser.add_argument("archive", type=Path)
+    materialize_parser = subparsers.add_parser(
+        "materialize",
+        help="materialize an exact verified release directory as a canonical ZIP",
+    )
+    materialize_parser.add_argument("archive", type=Path)
     inspect_parser = subparsers.add_parser("inspect", help="safely inspect an archive")
     inspect_parser.add_argument("archive", type=Path)
     verify_parser = subparsers.add_parser("verify", help="fully verify an archive")
@@ -2684,6 +2715,10 @@ def main() -> int:
     try:
         if arguments.command == "build":
             result = build_release(arguments.root, arguments.archive)
+        elif arguments.command == "materialize":
+            result = materialize_verified_directory_zip(
+                arguments.root, arguments.archive
+            )
         elif arguments.command == "inspect":
             result = inspect_archive(arguments.archive)
         elif arguments.command == "smoke":

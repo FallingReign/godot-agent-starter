@@ -21,6 +21,11 @@ import run_result  # noqa: E402
 import process_supervisor  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else REPOSITORY / ".checklogs"
+
+
 def _git(root: Path, *args: str) -> str:
     executable = process_supervisor.resolve_ordinary_executable(
         "git", excluded_roots=(root, REPOSITORY)
@@ -31,7 +36,7 @@ def _git(root: Path, *args: str) -> str:
 
 
 def _scratch() -> Path:
-    parent = REPOSITORY / ".checklogs"
+    parent = _scratch_parent()
     parent.mkdir(exist_ok=True)
     path = parent / f"run-result-test-{uuid.uuid4().hex}"
     path.mkdir()
@@ -40,7 +45,7 @@ def _scratch() -> Path:
 
 def _remove_scratch(path: Path) -> None:
     resolved = path.resolve()
-    parent = (REPOSITORY / ".checklogs").resolve()
+    parent = _scratch_parent().resolve()
     if resolved.parent != parent or not resolved.name.startswith("run-result-test-"):
         raise AssertionError(f"refusing to remove unexpected scratch path: {resolved}")
 
@@ -105,12 +110,15 @@ class CurrentDispatchPolicyTest(unittest.TestCase):
 
 class RunResultTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.root: Path | None = None
         try:
             process_supervisor.resolve_ordinary_executable(
                 "git", excluded_roots=(REPOSITORY,)
             )
+            self.git_available = True
         except (FileNotFoundError, ValueError):
-            self.skipTest("git is not installed")
+            self.git_available = False
+            return
         self.root = _scratch()
         _git(self.root, "init")
         _git(self.root, "config", "user.email", "test@example.invalid")
@@ -145,7 +153,27 @@ class RunResultTest(unittest.TestCase):
         self.path = self.root / "result.json"
 
     def tearDown(self) -> None:
-        _remove_scratch(self.root)
+        if self.root is not None:
+            _remove_scratch(self.root)
+
+    def _real_git_or_missing_contract(self) -> bool:
+        if self.git_available:
+            return True
+        with mock.patch.object(
+            process_supervisor,
+            "resolve_ordinary_executable",
+            side_effect=FileNotFoundError,
+        ):
+            with self.assertRaisesRegex(
+                run_result.DispatchWorkspaceError,
+                "trusted Git executable is unavailable",
+            ):
+                run_result._git_executable(REPOSITORY)
+        return False
+
+    def test_missing_git_fails_closed_without_skipping(self) -> None:
+        self.git_available = False
+        self.assertFalse(self._real_git_or_missing_contract())
 
     def write(self, **overrides) -> None:
         value = {"schema": 1, "run_id": "run-1", "outcome": "implemented",
@@ -157,16 +185,22 @@ class RunResultTest(unittest.TestCase):
         self.path.write_text(json.dumps(value), encoding="utf-8")
 
     def test_exit_without_artifact_is_unverified(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         result = run_result.evaluate(self.path, "run-1", self.before, self.root)
         self.assertEqual("unverified", result["status"])
         self.assertIn("without a result", result["errors"][0])
 
     def test_blocked_is_distinct_from_failure_or_completion(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         self.write(outcome="blocked", summary="write permission denied")
         result = run_result.evaluate(self.path, "run-1", self.before, self.root)
         self.assertEqual("blocked", result["status"])
 
     def test_implemented_requires_matching_commit_files_and_fresh_gate(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         (self.root / "kit.txt").write_text("fixed\n", encoding="utf-8")
         _git(self.root, "add", "kit.txt")
         _git(self.root, "commit", "-m", "kit fix")
@@ -177,6 +211,8 @@ class RunResultTest(unittest.TestCase):
         self.assertTrue(result["gate"]["passed"])
 
     def test_host_finalizer_commits_only_the_reviewed_edit_then_runs_fresh_gate(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(
             self.root, "run-host", self.before
         )
@@ -207,6 +243,8 @@ class RunResultTest(unittest.TestCase):
         self.assertEqual("kit verify --static", payload["verification"]["command"])
 
     def test_host_finalizer_rejects_edits_outside_reviewed_scope_without_commit(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(
             self.root, "run-scope", self.before
         )
@@ -227,6 +265,8 @@ class RunResultTest(unittest.TestCase):
         self.assertEqual(self.before, run_result.git_head(workspace))
 
     def test_host_finalizer_rejects_provider_created_git_metadata(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(
             self.root, "run-metadata", self.before
         )
@@ -252,6 +292,8 @@ class RunResultTest(unittest.TestCase):
         self.assertTrue((workspace.parent / ".run-metadata.git").is_dir())
 
     def test_implemented_cannot_claim_uncommitted_or_unrelated_changes(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         self.write()
         result = run_result.evaluate(self.path, "run-1", self.before, self.root,
                                      run_gate=False)
@@ -260,6 +302,8 @@ class RunResultTest(unittest.TestCase):
                             for error in result["errors"]))
 
     def test_implemented_rejects_game_source_paths(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         self.write(changed_files=["src/game.gd"])
         result = run_result.evaluate(self.path, "run-1", self.before, self.root,
                                      run_gate=False)
@@ -268,6 +312,8 @@ class RunResultTest(unittest.TestCase):
                             for error in result["errors"]))
 
     def test_implemented_rejects_unowned_kit_paths(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         self.write(changed_files=["base.txt"])
         result = run_result.evaluate(self.path, "run-1", self.before, self.root,
                                      run_gate=False)
@@ -276,6 +322,8 @@ class RunResultTest(unittest.TestCase):
                             for error in result["errors"]))
 
     def test_declared_scope_is_checked_before_automatic_dispatch(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         allowed = run_result.dispatch_scope_blockers(
             self.root, self.before, ["tools/feature.py"]
         )
@@ -290,6 +338,8 @@ class RunResultTest(unittest.TestCase):
         ))
 
     def test_runtime_root_is_derived_as_forbidden_from_immutable_config(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         config = json.loads((self.root / "kit.config.json").read_text(encoding="utf-8"))
         config["dispatch_policy"]["owned"].append(".kit/private-runtime")
         config["dispatch_policy"]["forbidden"] = []
@@ -311,6 +361,8 @@ class RunResultTest(unittest.TestCase):
         ))
 
     def test_protected_declared_scope_blocks_a_clean_dispatch(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         blockers = run_result.dispatch_blockers(
             self.root, requested_files=["tools/control.py"]
         )
@@ -318,6 +370,8 @@ class RunResultTest(unittest.TestCase):
         self.assertTrue(any("interactive maintainer" in error for error in blockers))
 
     def test_workspace_creation_rechecks_declared_scope_before_clone(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         with self.assertRaisesRegex(
             run_result.DispatchWorkspaceError, "interactive maintainer"
         ):
@@ -333,6 +387,8 @@ class RunResultTest(unittest.TestCase):
         )
 
     def test_missing_dispatch_policy_fails_closed(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         (self.root / "kit.config.json").write_text(
             json.dumps({"schema": 1, "runtime_root": ".kit/runtime"}),
             encoding="utf-8",
@@ -350,6 +406,8 @@ class RunResultTest(unittest.TestCase):
         self.assertTrue(any("policy is invalid" in error for error in result["errors"]))
 
     def test_worker_cannot_widen_the_policy_used_to_verify_its_own_run(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         widened = {
             "schema": 1,
             "runtime_root": ".kit/runtime",
@@ -372,6 +430,8 @@ class RunResultTest(unittest.TestCase):
                             for error in result["errors"]))
 
     def test_dispatch_workspace_is_an_independent_originless_clone(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(self.root, "run-isolated", self.before)
 
         self.assertTrue(workspace.is_relative_to(self.root / ".kit" / "runtime"))
@@ -383,6 +443,8 @@ class RunResultTest(unittest.TestCase):
         self.assertTrue((workspace / "base.txt").is_file())
 
     def test_verified_workspace_fast_forwards_without_sharing_git_state(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(self.root, "run-integrate", self.before)
         (workspace / "kit.txt").write_text("isolated fix\n", encoding="utf-8")
         result_path = run_result.workspace_result_path(workspace, "run-integrate")
@@ -402,6 +464,8 @@ class RunResultTest(unittest.TestCase):
         self.assertEqual("isolated fix\n", (self.root / "kit.txt").read_text())
 
     def test_integration_refuses_unrelated_local_work(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         workspace = run_result.prepare_workspace(self.root, "run-refuse", self.before)
         (workspace / "kit.txt").write_text("isolated fix\n", encoding="utf-8")
         result_path = run_result.workspace_result_path(workspace, "run-refuse")

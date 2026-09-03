@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ sys.path.insert(0, str(TOOLS))
 
 import project_context  # noqa: E402
 import managed_launcher  # noqa: E402
+import release as release_contract  # noqa: E402
 import runtime_paths  # noqa: E402
 import proposal_authority  # noqa: E402
 import process_supervisor  # noqa: E402
@@ -54,7 +56,9 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 GATE_SKIP = re.compile(r"^\s*SKIP(?:\s+|$)")
 UNITTEST_RAN = re.compile(r"(?m)^Ran\s+(\d+)\s+tests?\s+in\s+")
 UNITTEST_SKIP = re.compile(
-    r"(?im)(?:\bskipped\s*=\s*[1-9]\d*|\.\.\.\s+skipped\s+['\"]|^skipped\s+)"
+    r"(?im)(?:\bskipped\s*=\s*[1-9]\d*|\bexpected failures\s*=\s*[1-9]\d*"
+    r"|\.\.\.\s+(?:skipped\s+['\"]|expected failure\b|unexpected success\b)"
+    r"|^skipped\s+)"
 )
 BROWSER_SUMMARY = re.compile(r"(?m)^\s*(\d+)/(\d+) browser checks passed\s*$")
 BROWSER_SKIP = re.compile(r"(?im)^.*browser (?:check )?skipped.*$")
@@ -63,6 +67,9 @@ LEGAL_FILES = (
 )
 MAINTAINER_FIXTURE_PATH = Path("src/.kit-maintainer-fixture")
 MAINTAINER_FIXTURE_CONTENT = "portable-agent-kit-maintainer-fixture-v1\n"
+STRICT_WORKSPACE_PREFIX = "gak-v-"
+MAX_WINDOWS_STRICT_WORKSPACE_CHARS = 96
+STRICT_CLEANUP_RETRY_DELAYS = (0.05, 0.1, 0.2)
 MAINTAINER_GATE_SKIPS = frozenset(
     {
         "SKIP shape (absent)",
@@ -186,18 +193,10 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _release_workspace(run_directory: Path) -> Iterator[Path]:
-    """Create bounded release scratch inside the private verification run."""
-    workspace = run_directory / "release-workspace"
+def _release_workspace(workspace: Path) -> Iterator[Path]:
+    """Create release scratch owned by the outer disposable workspace."""
     workspace.mkdir(parents=False, exist_ok=False)
-    try:
-        yield workspace
-    finally:
-        if workspace.parent == run_directory and workspace.name == "release-workspace":
-            if workspace.is_symlink():
-                workspace.unlink(missing_ok=True)
-            else:
-                shutil.rmtree(workspace, ignore_errors=True)
+    yield workspace
 
 
 def _relative(path: Path, root: Path) -> str:
@@ -516,6 +515,278 @@ def _overall_status(stages: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
     return "failed", EXIT_FAILED
 
 
+def _directory_identity(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    reparse_marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or bool(int(getattr(info, "st_file_attributes", 0)) & reparse_marker)
+        or path.resolve(strict=True) != path
+    ):
+        raise StrictVerifyError("strict workspace is redirected")
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _retryable_cleanup_error(exc: BaseException) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {
+        5,
+        32,
+    }
+
+
+def _remove_empty_strict_workspace(
+    workspace: Path,
+    temporary_root: Path,
+    identity: tuple[int, int] | None,
+) -> None:
+    """Remove only the still-empty root when creation validation fails."""
+    expected_identity = identity
+
+    def authenticate() -> None:
+        nonlocal expected_identity
+        if (
+            workspace.parent != temporary_root
+            or not workspace.name.startswith(STRICT_WORKSPACE_PREFIX)
+        ):
+            raise OSError("strict workspace escaped its exact parent")
+        info = workspace.lstat()
+        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or int(getattr(info, "st_file_attributes", 0)) & marker
+        ):
+            raise OSError("strict workspace is redirected")
+        current_identity = int(info.st_dev), int(info.st_ino)
+        if expected_identity is None:
+            expected_identity = current_identity
+        elif current_identity != expected_identity:
+            raise OSError("strict workspace identity changed")
+
+    try:
+        for attempt in range(len(STRICT_CLEANUP_RETRY_DELAYS) + 1):
+            if not os.path.lexists(workspace):
+                return
+            authenticate()
+            try:
+                os.rmdir(workspace)
+            except OSError as exc:
+                if not os.path.lexists(workspace):
+                    return
+                if (
+                    not _retryable_cleanup_error(exc)
+                    or attempt == len(STRICT_CLEANUP_RETRY_DELAYS)
+                ):
+                    raise
+                time.sleep(STRICT_CLEANUP_RETRY_DELAYS[attempt])
+                continue
+            if os.path.lexists(workspace):
+                raise OSError("empty strict workspace cleanup was incomplete")
+            return
+    except (OSError, RuntimeError) as exc:
+        raise StrictVerifyError(f"strict workspace cleanup failed: {exc}") from exc
+
+
+def _remove_exact_strict_workspace(
+    workspace: Path,
+    temporary_root: Path,
+    identity: tuple[int, int],
+) -> None:
+    def authenticate() -> None:
+        try:
+            current_identity = _directory_identity(workspace)
+        except (OSError, RuntimeError, StrictVerifyError) as exc:
+            raise OSError(f"strict workspace is unavailable: {exc}") from exc
+        if (
+            workspace.parent != temporary_root
+            or not workspace.name.startswith(STRICT_WORKSPACE_PREFIX)
+            or current_identity != identity
+        ):
+            raise OSError("refusing to remove a changed strict workspace")
+
+    def remove_readonly(
+        function: Callable[[str], object],
+        raw_path: str,
+        error: tuple[type[BaseException], BaseException, object],
+    ) -> None:
+        failure = error[1]
+        if not _retryable_cleanup_error(failure):
+            raise failure
+        authenticate()
+        candidate = Path(os.path.abspath(raw_path))
+        if candidate != workspace and not candidate.is_relative_to(workspace):
+            raise OSError("strict cleanup path escaped its exact root")
+        try:
+            before = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise OSError("strict cleanup path is unavailable") from exc
+        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        if (
+            resolved != candidate
+            or stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_file_attributes", 0)) & marker
+            or int(getattr(before, "st_nlink", 1)) != 1
+        ):
+            raise OSError("strict cleanup path is redirected or shared")
+        chmod_mode = stat.S_IMODE(before.st_mode) | stat.S_IWRITE
+        if os.chmod in os.supports_follow_symlinks:
+            os.chmod(candidate, chmod_mode, follow_symlinks=False)
+        else:
+            os.chmod(candidate, chmod_mode)
+        after = candidate.lstat()
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink")
+        if (
+            tuple(getattr(before, field, None) for field in stable_fields)
+            != tuple(getattr(after, field, None) for field in stable_fields)
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or int(getattr(after, "st_file_attributes", 0)) & marker
+        ):
+            raise OSError("strict cleanup path changed while enabling removal")
+        authenticate()
+        function(str(candidate))
+
+    try:
+        for attempt in range(len(STRICT_CLEANUP_RETRY_DELAYS) + 1):
+            if not os.path.lexists(workspace):
+                return
+            authenticate()
+            try:
+                shutil.rmtree(workspace, onerror=remove_readonly)
+            except OSError as exc:
+                if (
+                    not _retryable_cleanup_error(exc)
+                    or attempt == len(STRICT_CLEANUP_RETRY_DELAYS)
+                ):
+                    raise
+                time.sleep(STRICT_CLEANUP_RETRY_DELAYS[attempt])
+                continue
+            if os.path.lexists(workspace):
+                raise OSError("strict workspace cleanup was incomplete")
+            return
+    except (OSError, RuntimeError) as exc:
+        raise StrictVerifyError(f"strict workspace cleanup failed: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _short_strict_workspace(
+    project_root: Path,
+    core_root: Path,
+) -> Iterator[Path]:
+    """Create one short, private workspace outside project and active core."""
+    workspace: Path | None = None
+    identity: tuple[int, int] | None = None
+    try:
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        project = project_root.resolve(strict=True)
+        core = core_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError, StrictVerifyError) as exc:
+        raise StrictVerifyError(
+            f"short strict workspace is unavailable: {exc}"
+        ) from exc
+    try:
+        created = Path(
+            tempfile.mkdtemp(prefix=STRICT_WORKSPACE_PREFIX, dir=temporary_root)
+        ).absolute()
+        workspace = created
+        if (
+            workspace.parent != temporary_root
+            or not workspace.name.startswith(STRICT_WORKSPACE_PREFIX)
+        ):
+            raise StrictVerifyError(
+                "strict workspace escaped the system temporary root"
+            )
+        identity = _directory_identity(workspace)
+        if _paths_overlap(workspace, project) or _paths_overlap(workspace, core):
+            raise StrictVerifyError(
+                "strict workspace overlaps the project or active core"
+            )
+        if (
+            os.name == "nt"
+            and len(str(workspace)) > MAX_WINDOWS_STRICT_WORKSPACE_CHARS
+        ):
+            raise StrictVerifyError(
+                "system temporary path is too long for safe Windows regression tests"
+            )
+    except (OSError, RuntimeError, ValueError, StrictVerifyError) as exc:
+        if workspace is not None:
+            try:
+                _remove_empty_strict_workspace(
+                    workspace, temporary_root, identity
+                )
+            except StrictVerifyError as cleanup_exc:
+                raise cleanup_exc from exc
+        raise StrictVerifyError(
+            f"short strict workspace is unavailable: {exc}"
+        ) from exc
+    try:
+        yield workspace
+    finally:
+        _remove_exact_strict_workspace(workspace, temporary_root, identity)
+
+
+@contextlib.contextmanager
+def _isolated_strict_workspace(
+    core_root: Path,
+    project_root: Path,
+) -> Iterator[tuple[Path, Path, Path]]:
+    """Create all disposable strict state outside the project and active core."""
+    with _short_strict_workspace(project_root, core_root) as workspace:
+        test_scratch = workspace / "t"
+        release_scratch = workspace / "r"
+        test_scratch.mkdir()
+        if core_root == project_root:
+            yield core_root, test_scratch, release_scratch
+            return
+
+        destination = workspace / "c"
+        try:
+            source_report, _source_members = release_contract.read_verified_directory(
+                core_root
+            )
+            shutil.copytree(core_root, destination)
+            copied_report, _copied_members = release_contract.read_verified_directory(
+                destination
+            )
+            if copied_report.get("archive_sha256") != source_report.get(
+                "archive_sha256"
+            ):
+                raise StrictVerifyError(
+                    "managed test copy does not match the authenticated active release"
+                )
+            source_fixture = destination / "src"
+            source_fixture.mkdir()
+            (source_fixture / "project.godot").write_bytes(b"[application]\n")
+        except (OSError, release_contract.ReleaseError) as exc:
+            raise StrictVerifyError(
+                f"managed test copy is unavailable: {exc}"
+            ) from exc
+        try:
+            yield destination, test_scratch, release_scratch
+        finally:
+            try:
+                current_report, _current_members = (
+                    release_contract.read_verified_directory(core_root)
+                )
+            except (OSError, release_contract.ReleaseError) as exc:
+                raise StrictVerifyError(
+                    f"active managed core could not be revalidated: {exc}"
+                ) from exc
+            if current_report.get("archive_sha256") != source_report.get(
+                "archive_sha256"
+            ):
+                raise StrictVerifyError(
+                    "active managed core changed during strict verification"
+                )
+
+
 def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict[str, Any], int]:
     """Run every strict proof and atomically retain a machine-readable report."""
     root = root.resolve(strict=True)
@@ -528,8 +799,6 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
     )
     run_directory = verification / "runs" / run_id
     run_directory.mkdir(parents=True, exist_ok=False)
-    test_scratch = run_directory / "test-scratch"
-    test_scratch.mkdir()
     selected_runner = runner or _default_runner
     environment = process_supervisor.isolated_python_environment(
         CHILD_ENVIRONMENT if root == ROOT else {}
@@ -538,7 +807,6 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
         {
             "CI": environment.get("CI", "1"),
             "KIT_STRICT_VERIFY": "1",
-            "KIT_TEST_TMPDIR": str(test_scratch),
             "NO_COLOR": "1",
         }
     )
@@ -573,7 +841,11 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             ),
         ]
 
-    with _exclusive_run(verification / "strict.lock"):
+    with _exclusive_run(verification / "strict.lock"), _isolated_strict_workspace(
+        core_root,
+        root,
+    ) as (test_core, test_scratch, release_workspace):
+        environment["KIT_TEST_TMPDIR"] = str(test_scratch)
         commands = (
             (
                 "source-state",
@@ -596,10 +868,10 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             (
                 "unit-tests",
                 _isolated_unittest(
-                    core_root,
+                    test_core,
                     "discover",
                     "-s",
-                    str(core_root / "tools" / "tests"),
+                    str(test_core / "tools" / "tests"),
                     "-v",
                 ),
                 1200,
@@ -608,7 +880,8 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
             (
                 "browser-check",
                 _isolated_script(
-                    core_root, core_root / "tools" / "tests" / "browser_check.py"
+                    test_core,
+                    test_core / "tools" / "tests" / "browser_check.py",
                 ),
                 900,
                 _classify_browser,
@@ -631,6 +904,13 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 # authoritative gate receipt. Doctor and the regression suite
                 # may invoke nested checks; they must not overwrite it.
                 stage_environment = _without_gate_receipt(stage_environment)
+            if name in {"unit-tests", "browser-check"} and test_core != core_root:
+                # These stages execute from the disposable source-shaped copy.
+                # Retaining the managed installation binding would make its
+                # launcher reject that authenticated copy as the wrong core.
+                stage_environment.pop(managed_launcher.PROJECT_ROOT_ENV, None)
+                stage_environment.pop(managed_launcher.CORE_ROOT_ENV, None)
+                stage_environment.pop("KIT_LIFECYCLE_CHECK", None)
             stage, outcome = _run_stage(
                 name=name,
                 command=command,
@@ -683,26 +963,31 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 }
             )
         else:
-            with _release_workspace(run_directory) as release_workspace:
+            with _release_workspace(release_workspace):
                 release_one = release_workspace / "kit-one.zip"
                 release_two = release_workspace / "kit-two.zip"
                 release_tool = core_root / "tools" / "release.py"
+                release_create = "materialize" if core_root != root else "build"
+                release_create_stage = (
+                    "release-materialize" if release_create == "materialize"
+                    else "release-build"
+                )
                 release_commands = (
                     (
-                        "release-build-1",
+                        f"{release_create_stage}-1",
                         _isolated_script(
                             core_root,
                             release_tool,
-                            "build",
+                            release_create,
                             str(release_one),
                         ),
                     ),
                     (
-                        "release-build-2",
+                        f"{release_create_stage}-2",
                         _isolated_script(
                             core_root,
                             release_tool,
-                            "build",
+                            release_create,
                             str(release_two),
                         ),
                     ),
@@ -776,6 +1061,11 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                     first_hash = hashlib.sha256(first).hexdigest()
                     second_hash = hashlib.sha256(second).hexdigest()
                     identical = first == second
+                    release_noun = (
+                        "materializations"
+                        if release_create == "materialize"
+                        else "builds"
+                    )
                     detail = json.dumps(
                         {
                             "first_bytes": len(first),
@@ -795,9 +1085,12 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                             "name": "release-reproducibility",
                             "status": "passed" if identical else "failed",
                             "reason": (
-                                "two independent release builds are byte-identical"
-                                if identical
-                                else "two independent release builds differ byte-for-byte"
+                                f"two independent release {release_noun} "
+                                + (
+                                    "are byte-identical"
+                                    if identical
+                                    else "differ byte-for-byte"
+                                )
                             ),
                             "command": [],
                             "archive_sha256": first_hash if identical else None,
@@ -805,7 +1098,6 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                             "stderr_log": stderr_log,
                         }
                     )
-
         status, exit_code = _overall_status(stages)
         report: dict[str, Any] = {
             "schema": SCHEMA,

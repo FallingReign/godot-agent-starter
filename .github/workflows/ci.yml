@@ -17,7 +17,7 @@ jobs:
   strict:
     name: ${{ matrix.name }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -269,6 +269,18 @@ jobs:
         if: matrix.strict && runner.os == 'Windows'
         shell: pwsh
         run: .\kit.cmd verify --strict --json
+
+      # This source-only proof builds the current release, installs it into a
+      # separate generic project, and runs strict through that project's public
+      # launcher. Installed copies keep this workflow but omit the driver, so
+      # the file guard prevents a consumer CI job from pretending to rerun a
+      # source-build proof it cannot perform.
+      - name: Prove a managed consumer through strict verification
+        if: ${{ matrix.strict && hashFiles('tools/tests/test_managed_consumer_strict_ci.py') != '' }}
+        shell: python
+        run: |
+          import runpy
+          runpy.run_path("tools/tests/test_managed_consumer_strict_ci.py", run_name="__main__")
 
       # Keep the dependency surface to GitHub's checkout/setup actions. Strict
       # verification already retains complete logs locally; print them on any

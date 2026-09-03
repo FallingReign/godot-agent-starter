@@ -48,7 +48,7 @@ def _issue(
 class _Scratch:
     def __enter__(self) -> Path:
         configured = os.environ.get("KIT_TEST_TMPDIR")
-        candidates = ([Path(configured)] if configured else []) + [
+        candidates = [Path(configured)] if configured else [
             TOOLS.parent / ".checklogs" / "tests",
             Path(tempfile.gettempdir()),
             Path("/tmp"),

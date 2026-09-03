@@ -18,7 +18,7 @@ from tools import runtime_paths
 def _scratch() -> Iterator[Path]:
     repo = Path(__file__).resolve().parents[2]
     configured = os.environ.get("KIT_TEST_TMPDIR")
-    candidates = ([Path(configured)] if configured else []) + [
+    candidates = [Path(configured)] if configured else [
         repo / ".checklogs" / "tests", Path(tempfile.gettempdir()), Path("/tmp")
     ]
     parent = None
@@ -223,6 +223,43 @@ class RuntimePathsTests(unittest.TestCase):
                 ):
                     runtime_paths.resolve(root)
 
+    def test_private_child_rejects_an_existing_redirect(self) -> None:
+        with _scratch() as root:
+            _configure(root)
+            paths = runtime_paths.resolve(root, create=True)
+            outside = root / "outside"
+            outside.mkdir()
+            redirected = paths.runtime / "self-test"
+            redirected.mkdir()
+            redirected_info = redirected.lstat()
+
+            def is_redirect(info: object) -> bool:
+                return (
+                    getattr(info, "st_dev", None) == redirected_info.st_dev
+                    and getattr(info, "st_ino", None) == redirected_info.st_ino
+                )
+
+            with mock.patch.object(runtime_paths, "_is_reparse", side_effect=is_redirect):
+                with self.assertRaisesRegex(
+                    runtime_paths.RuntimeConfigError, "unredirected"
+                ):
+                    runtime_paths.ensure_private_directory(paths, "self-test/failures")
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_private_child_rejects_traversal_and_files(self) -> None:
+        with _scratch() as root:
+            _configure(root)
+            paths = runtime_paths.resolve(root, create=True)
+            for relative in ("", ".", "../outside", "self-test/../outside"):
+                with self.subTest(relative=relative), self.assertRaises(
+                    runtime_paths.RuntimeConfigError
+                ):
+                    runtime_paths.ensure_private_directory(paths, relative)
+            (paths.runtime / "self-test").write_text("file", encoding="utf-8")
+            with self.assertRaisesRegex(
+                runtime_paths.RuntimeConfigError, "must be unredirected"
+            ):
+                runtime_paths.ensure_private_directory(paths, "self-test/failures")
 
 if __name__ == "__main__":
     unittest.main()

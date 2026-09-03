@@ -16,9 +16,99 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import check as gate  # noqa: E402
+from tools import process_supervisor  # noqa: E402
 
 
 class GateChildIsolationTests(unittest.TestCase):
+    def test_lifecycle_conformance_does_not_refresh_the_project_plan(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gate-plan-lifecycle-") as raw:
+            project = Path(raw).resolve()
+            plan = project / "plan.html"
+            plan.write_bytes(b"existing reviewed plan\n")
+
+            def refresh_plan(
+                _script: Path,
+                _arguments: tuple[str, ...],
+                _timeout: int,
+                _log: Path,
+            ) -> tuple[int, str]:
+                plan.write_bytes(b"new projection\n")
+                return 0, ""
+
+            with mock.patch.object(
+                gate, "PROJECT_ROOT", project
+            ), mock.patch.object(
+                gate, "_run_internal_python", side_effect=refresh_plan
+            ) as run, mock.patch.dict(
+                os.environ, {"KIT_LIFECYCLE_CHECK": "1"}
+            ):
+                gate.write_plan()
+
+            run.assert_not_called()
+            self.assertEqual(b"existing reviewed plan\n", plan.read_bytes())
+
+            with mock.patch.object(
+                gate, "PROJECT_ROOT", project
+            ), mock.patch.object(
+                gate, "_run_internal_python", side_effect=refresh_plan
+            ) as run, mock.patch.dict(
+                os.environ, {"KIT_LIFECYCLE_CHECK": ""}
+            ):
+                gate.write_plan()
+
+            run.assert_called_once()
+            self.assertEqual(b"new projection\n", plan.read_bytes())
+
+    def test_lifecycle_design_check_does_not_write_project_projections(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gate-design-lifecycle-") as raw:
+            project = Path(raw).resolve()
+            design = project / "docs" / "design"
+            design.mkdir(parents=True)
+            section = design / "experience.md"
+            section.write_bytes(b"# Existing player design\n")
+            results = gate.Results()
+            analysis = json.dumps(
+                {
+                    "sections": [{"declared_tunables": []}],
+                    "bound": {},
+                    "unbound": [],
+                    "undeclared": [],
+                    "const_bound": [],
+                    "unstated_resolution": [],
+                    "metadata_warnings": [],
+                    "ready": [],
+                }
+            )
+
+            def run_design(
+                _tool: Path,
+                arguments: tuple[str, ...],
+                _timeout: int,
+                _log: Path,
+            ) -> tuple[int, str]:
+                if "--check" in arguments:
+                    return 0, analysis
+                (design / "INDEX.md").write_bytes(b"generated\n")
+                section.write_bytes(b"changed\n")
+                return 0, ""
+
+            with mock.patch.object(
+                gate, "PROJECT_ROOT", project
+            ), mock.patch.object(
+                gate, "RESULTS", results
+            ), mock.patch.object(
+                gate, "_run_internal_python", side_effect=run_design
+            ) as run, mock.patch.dict(
+                os.environ, {"KIT_LIFECYCLE_CHECK": "1"}
+            ):
+                gate.stage_design()
+
+            self.assertEqual(1, run.call_count)
+            self.assertEqual(("--json", "--check"), run.call_args.args[1])
+            self.assertEqual(b"# Existing player design\n", section.read_bytes())
+            self.assertFalse((design / "INDEX.md").exists())
+            self.assertIn("PASS  design", results.lines)
+
     def test_external_tool_environment_drops_project_python_controls(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -42,7 +132,7 @@ class GateChildIsolationTests(unittest.TestCase):
         runner = mock.Mock(return_value=(0, ""))
         with tempfile.TemporaryDirectory(prefix="gate-git-environment-") as raw, mock.patch.object(
             gate, "run", runner
-        ), mock.patch.object(gate, "_DEFAULT_RUNNER", runner), mock.patch.dict(
+        ), mock.patch.dict(
             os.environ,
             {
                 "GIT_EXTERNAL_DIFF": "project-tool",
@@ -70,7 +160,16 @@ class GateChildIsolationTests(unittest.TestCase):
     def test_gate_git_child_disables_repository_fsmonitor_process(self) -> None:
         git = shutil.which("git")
         if not git:
-            self.skipTest("Git is unavailable")
+            runner = mock.Mock(return_value=(0, ""))
+            with tempfile.TemporaryDirectory(prefix="gate-git-fallback-") as raw, \
+                    mock.patch.object(gate, "run", runner):
+                gate._run_git(
+                    ["trusted-git", "status"],
+                    30,
+                    Path(raw) / "git.log",
+                )
+            self.assertIn("core.fsmonitor=false", runner.call_args.args[0])
+            return
         with tempfile.TemporaryDirectory(prefix="gate-git-fsmonitor-") as raw:
             repository = Path(raw).resolve()
             sentinel = repository / "fsmonitor-ran.txt"
@@ -145,6 +244,27 @@ class GateChildIsolationTests(unittest.TestCase):
             )
             self.assertEqual(0, code, output)
             self.assertFalse(sentinel.exists())
+
+    def test_gate_git_child_uses_bounded_process_supervision(self) -> None:
+        supervised = process_supervisor.SupervisedResult(
+            0,
+            "bounded git output\n",
+            "",
+            0.01,
+        )
+        with tempfile.TemporaryDirectory(prefix="gate-git-bounded-") as raw, mock.patch.object(
+            process_supervisor,
+            "run_supervised",
+            return_value=supervised,
+        ) as runner:
+            log = Path(raw) / "git.log"
+            code, output = gate._run_git(["trusted-git", "status"], 30, log)
+
+        self.assertEqual(0, code)
+        self.assertEqual("bounded git output\n", output)
+        self.assertEqual(gate.LOG_CAP_BYTES, runner.call_args.kwargs["output_cap_bytes"])
+        self.assertEqual(gate.PROJECT_DIR, runner.call_args.kwargs["cwd"])
+        self.assertIn("--no-pager", runner.call_args.args[0])
 
     def test_gate_tool_resolution_never_selects_the_project(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gate-tool-boundary-") as raw:
@@ -234,7 +354,9 @@ class GateChildIsolationTests(unittest.TestCase):
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("PYTHONHOME", environment)
 
-    def test_lifecycle_scan_marks_unavailable_style_tools_incomplete(self) -> None:
+    def test_lifecycle_scan_reports_unavailable_style_tools_without_a_baseline_issue(
+        self,
+    ) -> None:
         results = gate.Results()
         gate.BROWNFIELD_CAPTURE_ERRORS.clear()
         with mock.patch.object(gate, "RESULTS", results), mock.patch.object(
@@ -246,13 +368,8 @@ class GateChildIsolationTests(unittest.TestCase):
             gate.stage_format()
             gate.stage_lint()
 
-        self.assertEqual(
-            [
-                "format: no trusted external gdformat is available",
-                "lint: no trusted external gdlint is available",
-            ],
-            gate.BROWNFIELD_CAPTURE_ERRORS,
-        )
+        self.assertEqual([], gate.BROWNFIELD_CAPTURE_ERRORS)
+        self.assertEqual([], gate.BROWNFIELD_CAPTURE_ISSUES)
         self.assertIn("SKIP  format", results.lines)
         self.assertIn("SKIP  lint", results.lines)
 

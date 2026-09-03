@@ -24,17 +24,22 @@ import os
 import re
 import runpy
 import secrets
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 CORE_ROOT = Path(__file__).resolve().parent
 TOOLS = CORE_ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import project_context  # noqa: E402
+import managed_launcher  # noqa: E402
 import engine_discovery  # noqa: E402
 import providers  # noqa: E402
 import cockpit  # noqa: E402
@@ -57,6 +62,52 @@ _ENGINE_STAGES = {"import", "typecheck", "resources", "gut", "smoke"}
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _VERIFY_NONCE = re.compile(r"^[0-9a-f]{32}$")
 _VERIFY_SECRET = re.compile(r"^[0-9a-f]{64}$")
+_SELF_TEST_CASE = re.compile(
+    r"(?m)^(FAIL|ERROR):\s+([A-Za-z0-9_.:-]{1,160})"
+    r"(?:\s+\(([A-Za-z0-9_.:-]{1,160})\))?"
+)
+_SELF_TEST_RAN = re.compile(r"(?m)^Ran\s+(\d+)\s+tests?\b")
+_SELF_TEST_FAILED = re.compile(r"(?m)^FAILED(?:\s+\(([^)]*)\))?\s*$")
+_SELF_TEST_OK = re.compile(r"(?m)^OK(?:\s+\(([^)]*)\))?\s*$")
+_SELF_TEST_SKIP = re.compile(
+    r"(?m)^[A-Za-z0-9_.:-]+\s+\(([A-Za-z0-9_.:-]{1,160})\)"
+    r"\s+\.\.\.\s+skipped\b"
+)
+_SELF_TEST_EXPECTED_FAILURE = re.compile(
+    r"(?m)^[A-Za-z0-9_.:-]+\s+\(([A-Za-z0-9_.:-]{1,160})\)"
+    r"\s+\.\.\.\s+expected failure\b"
+)
+_SELF_TEST_UNEXPECTED_SUCCESS = re.compile(
+    r"(?m)^[A-Za-z0-9_.:-]+\s+\(([A-Za-z0-9_.:-]{1,160})\)"
+    r"\s+\.\.\.\s+unexpected success\b"
+)
+_SELF_TEST_LOG_BYTES = 256 * 1024
+_SELF_TEST_FAILURE_LOG_LIMIT = 8
+_SELF_TEST_FAILURE_LOG_SCAN_LIMIT = 1024
+_SELF_TEST_FAILURE_LOG_NAME = re.compile(r"^failure-[0-9a-f]{32}\.log$")
+_WINDOWS_SELF_TEST_SCRATCH_CHARS = 96
+_SELF_TEST_CLEANUP_RETRY_DELAYS = (0.05, 0.1, 0.2)
+_STRICT_COMMON_STAGES = (
+    "source-state",
+    "doctor",
+    "gate",
+    "unit-tests",
+    "browser-check",
+)
+_STRICT_RELEASE_TAIL = (
+    "release-verify-1",
+    "release-verify-2",
+    "release-smoke",
+    "release-reproducibility",
+)
+_STRICT_COMPLETE_STAGE_SETS = (
+    _STRICT_COMMON_STAGES
+    + ("release-build-1", "release-build-2")
+    + _STRICT_RELEASE_TAIL,
+    _STRICT_COMMON_STAGES
+    + ("release-materialize-1", "release-materialize-2")
+    + _STRICT_RELEASE_TAIL,
+)
 
 
 class CliError(RuntimeError):
@@ -69,14 +120,17 @@ class CliError(RuntimeError):
         self.status = status
 
 
-def _add_common_options(parser: argparse.ArgumentParser) -> None:
+def _add_common_options(
+    parser: argparse.ArgumentParser, *, include_project: bool = True
+) -> None:
     # SUPPRESS lets the same options work before or after a subcommand without
     # a child parser's unused default overwriting the value parsed by its parent.
-    parser.add_argument(
-        "--project",
-        default=argparse.SUPPRESS,
-        help="target project directory (default: current directory)",
-    )
+    if include_project:
+        parser.add_argument(
+            "--project",
+            default=argparse.SUPPRESS,
+            help="target project directory (default: current directory)",
+        )
     parser.add_argument(
         "--json",
         dest="json_output",
@@ -357,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("upgrade", "review upgrading a project that already uses this kit"),
     ):
         lifecycle = commands.add_parser(name, help=help_text)
-        _add_common_options(lifecycle)
+        _add_common_options(lifecycle, include_project=False)
         lifecycle.add_argument("target", help="project directory to install or upgrade")
         lifecycle.add_argument(
             "--release",
@@ -373,9 +427,52 @@ def build_parser() -> argparse.ArgumentParser:
     recover = commands.add_parser(
         "recover", help="continue or restore one interrupted kit change"
     )
-    _add_common_options(recover)
+    _add_common_options(recover, include_project=False)
     recover.add_argument("session_id", help="full kit change session identity")
     recover.set_defaults(action="kit_change_recover")
+
+    change = commands.add_parser(
+        "change", help="inspect or finish an exact install or upgrade review"
+    )
+    _add_common_options(change, include_project=False)
+    change_commands = change.add_subparsers(dest="change_command", required=True)
+
+    change_list = change_commands.add_parser(
+        "list", help="list retained kit change sessions"
+    )
+    _add_common_options(change_list, include_project=False)
+    change_list.set_defaults(action="kit_change_command")
+
+    change_status = change_commands.add_parser(
+        "status", help="show one exact kit change session"
+    )
+    _add_common_options(change_status, include_project=False)
+    change_status.add_argument("session_id", help="full kit change session identity")
+    change_status.set_defaults(action="kit_change_command")
+
+    change_apply = change_commands.add_parser(
+        "apply", help="apply one exact reviewed kit change"
+    )
+    _add_common_options(change_apply, include_project=False)
+    change_apply.add_argument("session_id", help="full kit change session identity")
+    change_apply.add_argument(
+        "--plan-sha256",
+        required=True,
+        help="full review fingerprint printed by the exact session",
+    )
+    change_apply.set_defaults(action="kit_change_command")
+
+    change_restore = change_commands.add_parser(
+        "restore", help="restore one exact applied kit change"
+    )
+    _add_common_options(change_restore, include_project=False)
+    change_restore.add_argument("session_id", help="full kit change session identity")
+    change_restore.add_argument(
+        "--result-sha256",
+        required=True,
+        help="full result fingerprint printed after Apply",
+    )
+    change_restore.set_defaults(action="kit_change_command")
     return parser
 
 
@@ -554,13 +651,17 @@ def _isolated_python_command(script: Path, *arguments: object) -> list[str]:
         ) from exc
 
 
-def _isolated_unittest_command(*arguments: object) -> list[str]:
+def _isolated_unittest_command(
+    *arguments: object,
+    core_root: Path | None = None,
+) -> list[str]:
+    selected_core = CORE_ROOT if core_root is None else core_root
     try:
         return process_supervisor.isolated_python_module_command(
             sys.executable,
             "unittest",
-            CORE_ROOT / "kit.py",
-            CORE_ROOT,
+            selected_core / "kit.py",
+            selected_core,
             *arguments,
         )
     except (OSError, ValueError) as exc:
@@ -716,6 +817,358 @@ def _process_summary(result: subprocess.CompletedProcess[str]) -> dict[str, Any]
 def _output_tail(text: str, limit: int = 12) -> list[str]:
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return lines[-limit:]
+
+
+def _directory_identity(path: Path) -> tuple[object, ...]:
+    info = path.lstat()
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    if not stat.S_ISDIR(info.st_mode) or (
+        int(getattr(info, "st_file_attributes", 0)) & marker
+    ):
+        raise OSError(f"directory is redirected: {path}")
+    return tuple(
+        getattr(info, field, None)
+        for field in ("st_dev", "st_ino", "st_mode", "st_file_attributes")
+    )
+
+
+def _retryable_cleanup_error(exc: BaseException) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {
+        5,
+        32,
+    }
+
+
+def _remove_empty_self_test_scratch(
+    scratch: Path,
+    parent: Path,
+    identity: tuple[object, ...] | None,
+) -> None:
+    """Remove only the still-empty root when creation validation fails."""
+    expected_identity = identity
+
+    def authenticate() -> None:
+        nonlocal expected_identity
+        if scratch.parent != parent or not scratch.name.startswith("ak-"):
+            raise OSError("temporary directory escaped its exact parent")
+        current_identity = _directory_identity(scratch)
+        if expected_identity is None:
+            expected_identity = current_identity
+        elif current_identity != expected_identity:
+            raise OSError("temporary directory identity changed")
+
+    try:
+        for attempt in range(len(_SELF_TEST_CLEANUP_RETRY_DELAYS) + 1):
+            if not os.path.lexists(scratch):
+                return
+            authenticate()
+            try:
+                os.rmdir(scratch)
+            except OSError as exc:
+                if not os.path.lexists(scratch):
+                    return
+                if (
+                    not _retryable_cleanup_error(exc)
+                    or attempt == len(_SELF_TEST_CLEANUP_RETRY_DELAYS)
+                ):
+                    raise
+                time.sleep(_SELF_TEST_CLEANUP_RETRY_DELAYS[attempt])
+                continue
+            if os.path.lexists(scratch):
+                raise OSError("empty temporary directory cleanup was incomplete")
+            return
+    except (OSError, RuntimeError) as exc:
+        raise CliError(
+            f"self-test temporary storage could not be removed safely: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_cleanup_failed",
+        ) from exc
+
+
+def _create_self_test_scratch(project: Path, core: Path) -> tuple[Path, Path, tuple[object, ...]]:
+    """Create a short, fresh test root outside the project and active core."""
+    scratch: Path | None = None
+    parent: Path | None = None
+    identity: tuple[object, ...] | None = None
+    try:
+        parent = Path(tempfile.gettempdir()).resolve(strict=True)
+        scratch = Path(tempfile.mkdtemp(prefix="ak-", dir=parent)).absolute()
+        if scratch.parent != parent or not scratch.name.startswith("ak-"):
+            raise OSError("temporary directory escaped its exact parent")
+        identity = _directory_identity(scratch)
+        if scratch.resolve(strict=True) != scratch:
+            raise OSError("temporary directory is redirected")
+        project_root = project.resolve(strict=True)
+        core_root = core.resolve(strict=True)
+        overlaps = any(
+            scratch == root
+            or scratch.is_relative_to(root)
+            or root.is_relative_to(scratch)
+            for root in (project_root, core_root)
+        )
+        if overlaps:
+            raise OSError("temporary directory overlaps the project or active core")
+        if os.name == "nt" and len(str(scratch)) > _WINDOWS_SELF_TEST_SCRATCH_CHARS:
+            raise OSError("temporary directory path is too long for nested Windows tests")
+        return scratch, parent, identity
+    except (OSError, RuntimeError, ValueError) as exc:
+        if scratch is not None and parent is not None:
+            try:
+                _remove_empty_self_test_scratch(scratch, parent, identity)
+            except CliError as cleanup_exc:
+                raise cleanup_exc from exc
+        raise CliError(
+            f"self-test temporary storage is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_unavailable",
+        ) from exc
+
+
+def _remove_self_test_scratch(
+    scratch: Path, parent: Path, identity: tuple[object, ...]
+) -> None:
+    def authenticate() -> None:
+        try:
+            resolved = scratch.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise OSError("temporary directory is unavailable") from exc
+        if (
+            scratch.parent != parent
+            or not scratch.name.startswith("ak-")
+            or resolved != scratch
+            or _directory_identity(scratch) != identity
+        ):
+            raise OSError("temporary directory identity changed")
+
+    def remove_readonly(
+        function: Callable[[str], object],
+        raw_path: str,
+        error: tuple[type[BaseException], BaseException, object],
+    ) -> None:
+        failure = error[1]
+        if not _retryable_cleanup_error(failure):
+            raise failure
+        authenticate()
+        candidate = Path(os.path.abspath(raw_path))
+        if candidate != scratch and not candidate.is_relative_to(scratch):
+            raise OSError("temporary cleanup path escaped its exact root")
+        try:
+            before = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise OSError("temporary cleanup path is unavailable") from exc
+        marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+        if (
+            resolved != candidate
+            or stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_file_attributes", 0)) & marker
+            or int(getattr(before, "st_nlink", 1)) != 1
+        ):
+            raise OSError("temporary cleanup path is redirected or shared")
+        chmod_mode = stat.S_IMODE(before.st_mode) | stat.S_IWRITE
+        if os.chmod in os.supports_follow_symlinks:
+            os.chmod(candidate, chmod_mode, follow_symlinks=False)
+        else:
+            os.chmod(candidate, chmod_mode)
+        after = candidate.lstat()
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink")
+        if (
+            tuple(getattr(before, field, None) for field in stable_fields)
+            != tuple(getattr(after, field, None) for field in stable_fields)
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or int(getattr(after, "st_file_attributes", 0)) & marker
+        ):
+            raise OSError("temporary cleanup path changed while enabling removal")
+        authenticate()
+        function(str(candidate))
+
+    try:
+        for attempt in range(len(_SELF_TEST_CLEANUP_RETRY_DELAYS) + 1):
+            if not os.path.lexists(scratch):
+                return
+            authenticate()
+            try:
+                shutil.rmtree(scratch, onerror=remove_readonly)
+            except OSError as exc:
+                if (
+                    not _retryable_cleanup_error(exc)
+                    or attempt == len(_SELF_TEST_CLEANUP_RETRY_DELAYS)
+                ):
+                    raise
+                time.sleep(_SELF_TEST_CLEANUP_RETRY_DELAYS[attempt])
+                continue
+            if os.path.lexists(scratch):
+                raise OSError("temporary directory cleanup was incomplete")
+            return
+    except (OSError, RuntimeError) as exc:
+        raise CliError(
+            f"self-test temporary storage could not be removed safely: {exc}",
+            code=EXIT_REFUSED,
+            status="runtime_cleanup_failed",
+        ) from exc
+
+
+def _self_test_counts(
+    output: str,
+) -> tuple[int, int, int, int, list[str], list[str]]:
+    plain = _ANSI_ESCAPE.sub("", output)
+    cases = list(_SELF_TEST_CASE.finditer(plain))
+    test_ids: list[str] = []
+    seen: set[str] = set()
+    for match in cases:
+        identifier = match.group(3) or match.group(2)
+        if identifier not in seen and len(test_ids) < 20:
+            seen.add(identifier)
+            test_ids.append(identifier)
+    ran_matches = _SELF_TEST_RAN.findall(plain)
+    ran = int(ran_matches[-1]) if ran_matches else 0
+    counts: dict[str, int] = {}
+    summary_matches = _SELF_TEST_FAILED.findall(plain)
+    if not summary_matches:
+        summary_matches = _SELF_TEST_OK.findall(plain)
+    if summary_matches:
+        for key, value in re.findall(r"([a-z_ ]+)\s*=\s*(\d+)", summary_matches[-1]):
+            counts["_".join(key.split())] = int(value)
+    unexpected_success_ids = _SELF_TEST_UNEXPECTED_SUCCESS.findall(plain)
+    failures = counts.get(
+        "failures", sum(1 for match in cases if match.group(1) == "FAIL")
+    ) + counts.get("unexpected_successes", len(unexpected_success_ids))
+    errors = counts.get(
+        "errors", sum(1 for match in cases if match.group(1) == "ERROR")
+    )
+    all_skip_ids = [
+        *_SELF_TEST_SKIP.findall(plain),
+        *_SELF_TEST_EXPECTED_FAILURE.findall(plain),
+    ]
+    summary_skips = counts.get("skipped", 0) + counts.get("expected_failures", 0)
+    skipped = max(summary_skips, len(all_skip_ids))
+    for identifier in unexpected_success_ids:
+        if identifier not in seen and len(test_ids) < 20:
+            seen.add(identifier)
+            test_ids.append(identifier)
+    skip_ids = list(dict.fromkeys(all_skip_ids))[:20]
+    return ran, failures, errors, skipped, test_ids, skip_ids
+
+
+def _store_self_test_failure_log(project: Path, output: str) -> dict[str, Any]:
+    paths = runtime_paths.resolve(project, create=False)
+    directory = runtime_paths.ensure_private_directory(paths, "self-test/failures")
+    directory_identity = _directory_identity(directory)
+    _prune_self_test_failure_logs(
+        directory,
+        directory_identity,
+        keep=_SELF_TEST_FAILURE_LOG_LIMIT - 1,
+    )
+    encoded = output.encode("utf-8", errors="replace")
+    truncated = len(encoded) > _SELF_TEST_LOG_BYTES or encoded.startswith(
+        b"[supervised output truncated:"
+    )
+    stored = encoded[-_SELF_TEST_LOG_BYTES:]
+    if len(encoded) > _SELF_TEST_LOG_BYTES:
+        stored = stored.decode("utf-8", errors="ignore").encode("utf-8")
+    path = directory / f"failure-{uuid.uuid4().hex}.log"
+    with path.open("xb") as handle:
+        handle.write(stored)
+        handle.flush()
+        os.fsync(handle.fileno())
+    info = path.lstat()
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    if (
+        _directory_identity(directory) != directory_identity
+        or not stat.S_ISREG(info.st_mode)
+        or int(getattr(info, "st_nlink", 1)) != 1
+        or (int(getattr(info, "st_file_attributes", 0)) & marker)
+        or path.resolve(strict=True).parent != directory.resolve(strict=True)
+    ):
+        path.unlink(missing_ok=True)
+        raise OSError("failure log path changed while it was written")
+    return {
+        "available": True,
+        "path": path.relative_to(project.resolve(strict=True)).as_posix(),
+        "bytes": len(stored),
+        "sha256": hashlib.sha256(stored).hexdigest(),
+        "truncated": truncated,
+    }
+
+
+def _prune_self_test_failure_logs(
+    directory: Path,
+    expected_directory_identity: tuple[object, ...],
+    *,
+    keep: int,
+) -> None:
+    """Retain only the newest bounded set of regular kit-owned failure logs."""
+    if not 0 <= keep <= _SELF_TEST_FAILURE_LOG_LIMIT:
+        raise ValueError("failure log retention is invalid")
+    if _directory_identity(directory) != expected_directory_identity:
+        raise OSError("failure log directory changed before retention")
+    candidates: list[tuple[int, str, Path, tuple[object, ...]]] = []
+    with os.scandir(directory) as entries:
+        for index, entry in enumerate(entries, start=1):
+            if index > _SELF_TEST_FAILURE_LOG_SCAN_LIMIT:
+                raise OSError("failure log directory contains too many entries")
+            if _SELF_TEST_FAILURE_LOG_NAME.fullmatch(entry.name) is None:
+                continue
+            path = directory / entry.name
+            info = path.lstat()
+            marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or int(getattr(info, "st_nlink", 1)) != 1
+                or (int(getattr(info, "st_file_attributes", 0)) & marker)
+            ):
+                raise OSError("failure log directory contains an unsafe retained log")
+            identity = tuple(
+                getattr(info, field, None)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_nlink",
+                )
+            )
+            candidates.append((int(info.st_mtime_ns), entry.name, path, identity))
+    candidates.sort(reverse=True)
+    for _modified, _name, path, expected_identity in candidates[keep:]:
+        current = path.lstat()
+        current_identity = tuple(
+            getattr(current, field, None)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_size",
+                "st_mtime_ns",
+                "st_nlink",
+            )
+        )
+        if current_identity != expected_identity:
+            raise OSError("failure log changed during retention")
+        path.unlink()
+    if _directory_identity(directory) != expected_directory_identity:
+        raise OSError("failure log directory changed during retention")
+
+
+def _self_test_failure(project: Path, output: str) -> dict[str, Any]:
+    ran, failures, errors, skipped, test_ids, skip_ids = _self_test_counts(output)
+    try:
+        log = _store_self_test_failure_log(project, output)
+    except (OSError, ValueError, runtime_paths.RuntimeConfigError):
+        log = {"available": False}
+    return {
+        "ran": ran,
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+        "test_ids": test_ids,
+        "skip_ids": skip_ids,
+        "log": log,
+    }
 
 
 def _final_json_object(text: str) -> dict[str, Any] | None:
@@ -1163,6 +1616,10 @@ def _strict_report_is_valid(
         or report.get("exit_code") != expected_exit
     ):
         return False
+    if expected_status == "passed" and tuple(
+        str(stage.get("name")) for stage in stages
+    ) not in _STRICT_COMPLETE_STAGE_SETS:
+        return False
     if expected_status == "passed" and authority_receipt.get("receipt_trust") == "invalid":
         return False
     if gate_status in ("passed", "failed"):
@@ -1455,55 +1912,169 @@ def _verify_once(
     return code, payload, human
 
 
+def _copy_verified_self_test_core(
+    source: Path,
+    destination: Path,
+    expected_release_sha256: str,
+) -> None:
+    """Materialize one authenticated release as a disposable flat test core."""
+    try:
+        source_report, members = release_tool.read_verified_directory(source)
+        if source_report.get("archive_sha256") != expected_release_sha256:
+            raise ValueError("active release identity does not match its verified files")
+        destination.mkdir()
+        for relative, member in sorted(members.items()):
+            target = destination.joinpath(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                output.write(member.content)
+            if member.mode is not None:
+                target.chmod(member.mode)
+        copied_report, _copied_members = release_tool.read_verified_directory(
+            destination
+        )
+        if copied_report.get("archive_sha256") != expected_release_sha256:
+            raise ValueError("disposable test core identity does not match the release")
+        source_fixture = destination / "src"
+        source_fixture.mkdir()
+        (source_fixture / "project.godot").write_bytes(b"[application]\n")
+    except (OSError, ValueError, release_tool.ReleaseError) as exc:
+        raise CliError(
+            f"managed self-test copy is unavailable: {exc}",
+            code=EXIT_REFUSED,
+            status="self_test_copy_failed",
+        ) from exc
+
+
 def _self_test(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Run kit-owned regression tests behind an enforced no-engine boundary."""
-    command = _isolated_unittest_command(
-        "discover",
-        "-s",
-        str(CORE_ROOT / "tools" / "tests"),
+    try:
+        installation = project_context.resolve_active_installation(CORE_ROOT)
+        if installation.core_root != CORE_ROOT.resolve(strict=True):
+            raise project_context.ProjectContextError(
+                "the running core does not match the active installation"
+            )
+    except (OSError, ValueError, project_context.ProjectContextError) as exc:
+        raise CliError(
+            f"self-test cannot authenticate the running kit: {exc}",
+            code=EXIT_REFUSED,
+            status="managed_core_untrusted",
+        ) from exc
+    managed = installation.mode == "managed"
+    test_core = CORE_ROOT
+    scratch, scratch_parent, scratch_identity = _create_self_test_scratch(
+        project, CORE_ROOT
     )
-    environment = {
-        "KIT_ENGINE_DISABLED": "1",
-        "KIT_SELF_TEST": "1",
-        # A strict verifier may itself carry a public gate nonce.  The
-        # self-test's mocked/nested checks must never write that outer run's
-        # evidence receipt.
-        "KIT_VERIFY_NONCE": "",
-        "KIT_VERIFY_AUTH_KEY": "",
-        "KIT_VERIFY_REPOSITORY_SHA256": "",
-        "KIT_NATIVE_RETRY_TOKEN": "",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    streamed = not bool(getattr(args, "json_output", False))
-    result = (
-        _run_process_inherited(
+    failure: dict[str, Any] | None = None
+    try:
+        if managed:
+            release_sha256 = str(installation.release_sha256 or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", release_sha256):
+                raise CliError(
+                    "managed self-test release identity is unavailable",
+                    code=EXIT_REFUSED,
+                    status="managed_core_untrusted",
+                )
+            test_core = scratch / "core"
+            _copy_verified_self_test_core(
+                CORE_ROOT, test_core, release_sha256
+            )
+        command = _isolated_unittest_command(
+            "discover",
+            "-s",
+            str(test_core / "tools" / "tests"),
+            "-v",
+            core_root=test_core,
+        )
+        environment = {
+            "KIT_ENGINE_DISABLED": "1",
+            "KIT_SELF_TEST": "1",
+            "KIT_TEST_TMPDIR": str(scratch),
+            # The disposable managed copy behaves as a flat kit fixture.  It
+            # must never inherit bindings that identify the active core.
+            managed_launcher.PROJECT_ROOT_ENV: "" if managed else os.environ.get(
+                managed_launcher.PROJECT_ROOT_ENV, ""
+            ),
+            managed_launcher.CORE_ROOT_ENV: "" if managed else os.environ.get(
+                managed_launcher.CORE_ROOT_ENV, ""
+            ),
+            # A strict verifier may itself carry a public gate nonce.  The
+            # self-test's mocked/nested checks must never write that outer run's
+            # evidence receipt.
+            "KIT_VERIFY_NONCE": "",
+            "KIT_VERIFY_AUTH_KEY": "",
+            "KIT_VERIFY_REPOSITORY_SHA256": "",
+            "KIT_NATIVE_RETRY_TOKEN": "",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        streamed = False
+        result = _run_process(
             command,
-            cwd=CORE_ROOT,
+            cwd=test_core,
             timeout=1800,
             environment=_isolated_python_environment(environment),
             inherit_environment=False,
         )
-        if streamed
-        else _run_process(
-            command,
-            cwd=CORE_ROOT,
-            timeout=1800,
-            environment=_isolated_python_environment(environment),
-            inherit_environment=False,
+        output = (result.stdout or "") + (result.stderr or "")
+        ran, failures, errors, skipped, _test_ids, _skip_ids = _self_test_counts(
+            output
         )
-    )
-    ok = result.returncode == 0
-    output = (result.stdout or "") + (result.stderr or "")
+        ok = bool(
+            result.returncode == 0
+            and ran > 0
+            and failures == 0
+            and errors == 0
+            and skipped == 0
+            and _SELF_TEST_OK.search(_ANSI_ESCAPE.sub("", output))
+        )
+        if not ok:
+            failure = _self_test_failure(project, output)
+    finally:
+        core_problem: CliError | None = None
+        if managed:
+            try:
+                current = project_context.resolve_active_installation(CORE_ROOT)
+                if (
+                    current.mode != "managed"
+                    or current.core_root != installation.core_root
+                    or current.release_sha256 != installation.release_sha256
+                ):
+                    raise project_context.ProjectContextError(
+                        "the active release changed during self-test"
+                    )
+            except (OSError, ValueError, project_context.ProjectContextError) as exc:
+                core_problem = CliError(
+                    f"the installed kit changed during self-test: {exc}",
+                    code=EXIT_REFUSED,
+                    status="managed_core_changed",
+                )
+        cleanup_problem: CliError | None = None
+        try:
+            _remove_self_test_scratch(scratch, scratch_parent, scratch_identity)
+        except CliError as exc:
+            cleanup_problem = exc
+        if core_problem is not None:
+            raise core_problem
+        if cleanup_problem is not None:
+            raise cleanup_problem
     payload = {
         "ok": ok,
         "command": "self-test",
         "status": "passed" if ok else "failed",
         "project": str(project),
         "engine": "disabled",
-        "process": _process_payload(result),
+        "process": {"exit_code": result.returncode},
+        "tests": {
+            "ran": ran,
+            "failures": failures,
+            "errors": errors,
+            "skipped": skipped,
+        },
     }
+    if failure is not None:
+        payload["failure"] = failure
     human = [
         f"self-test: {'passed' if ok else 'failed'}",
         "  native engine: disabled",
@@ -2303,6 +2874,66 @@ def _register_kit_change_board(
     return review_url, board, result
 
 
+def _kit_change_error(exc: kit_change_controller.KitChangeControllerError) -> CliError:
+    return CliError(
+        exc.detail,
+        code=EXIT_REFUSED,
+        status=exc.code.replace("-", "_"),
+    )
+
+
+def _only_game_root_decision(state: Mapping[str, Any]) -> bool:
+    decisions = state.get("decisions")
+    blockers = state.get("blockers")
+    return (
+        state.get("status") == "blocked"
+        and isinstance(decisions, list)
+        and len(decisions) == 1
+        and isinstance(decisions[0], Mapping)
+        and decisions[0].get("id") == "D1"
+        and isinstance(decisions[0].get("choices"), list)
+        and len(decisions[0]["choices"]) >= 2
+        and all(
+            isinstance(choice, Mapping) and bool(choice.get("value"))
+            for choice in decisions[0]["choices"]
+        )
+        and isinstance(blockers, list)
+        and len(blockers) == 1
+        and isinstance(blockers[0], str)
+        and blockers[0].startswith("[game-root-ambiguous]")
+    )
+
+
+def _kit_change_outcome(
+    result: Mapping[str, Any], *, allow_game_root_decision: bool
+) -> tuple[int, bool, str]:
+    state = result.get("kit_change")
+    if not isinstance(state, Mapping):
+        return EXIT_FAILED, False, "failed"
+    status = str(state.get("status") or "failed")
+    if status == "blocked":
+        if allow_game_root_decision and _only_game_root_decision(state):
+            return EXIT_OK, True, "needs_decision"
+        return EXIT_REFUSED, False, "blocked"
+    if status in {"ready", "complete", "adoption_required", "restored"} and bool(
+        result.get("ok")
+    ):
+        return EXIT_OK, True, status
+    return EXIT_FAILED, False, status
+
+
+def _review_server_payload() -> dict[str, str]:
+    return {"status": "running", "stop_command": "kit serve stop"}
+
+
+def _review_server_human(review_url: str) -> list[str]:
+    return [
+        f"  Review: {review_url}",
+        "  Local review server: running",
+        "  Stop it: kit serve stop",
+    ]
+
+
 def _kit_change_prepare(
     project: Path, args: argparse.Namespace
 ) -> tuple[int, dict[str, Any], list[str]]:
@@ -2326,14 +2957,10 @@ def _kit_change_prepare(
             runtime, session_id, plan_url=review_url
         )
     except kit_change_controller.KitChangeControllerError as exc:
-        raise CliError(
-            exc.detail,
-            code=EXIT_REFUSED,
-            status=exc.code.replace("-", "_"),
-        ) from exc
+        raise _kit_change_error(exc) from exc
     state = prepared["kit_change"]
-    status = (
-        "needs_decision" if state["status"] == "blocked" else str(state["status"])
+    code, ok, status = _kit_change_outcome(
+        prepared, allow_game_root_decision=True
     )
     try:
         runtime.relative_to(target)
@@ -2341,7 +2968,7 @@ def _kit_change_prepare(
     except ValueError:
         review_storage = "initiating_kit_private_runtime"
     payload = {
-        "ok": True,
+        "ok": ok,
         "command": mode,
         "status": status,
         "target": str(target),
@@ -2352,13 +2979,102 @@ def _kit_change_prepare(
         "kit_change": state,
         "board": board,
         "process": _process_summary(process),
+        "review_server": _review_server_payload(),
     }
     human = [
         f"{mode}: {status.replace('_', ' ')}",
         f"  Session ID: {session_id}",
-        f"  Review: {review_url}",
     ]
-    return EXIT_OK, payload, human
+    if not ok and state.get("detail"):
+        human.append(f"  Problem: {state['detail']}")
+    human.extend(_review_server_human(review_url))
+    return code, payload, human
+
+
+def _kit_change_command(
+    project: Path, args: argparse.Namespace
+) -> tuple[int, dict[str, Any], list[str]]:
+    operation = str(args.change_command)
+    runtime = _source_controller_runtime(project)
+    if operation == "list":
+        try:
+            sessions = kit_change_controller.list_sessions(runtime)
+        except kit_change_controller.KitChangeControllerError as exc:
+            raise _kit_change_error(exc) from exc
+        payload = {
+            "ok": True,
+            "command": "change list",
+            "status": "listed" if sessions else "none",
+            "sessions": sessions,
+        }
+        human = [f"kit changes: {len(sessions)}"]
+        for session in sessions:
+            session_id = str(session.get("session_id") or "")
+            status = str(session.get("status") or "unavailable").replace("_", " ")
+            mode = str(session.get("mode") or "kit change")
+            target = session.get("project")
+            target_path = (
+                str(target.get("path") or "")
+                if isinstance(target, Mapping)
+                else ""
+            )
+            summary = f"  {session_id} — {mode}, {status}"
+            if target_path:
+                summary += f", {target_path}"
+            human.append(summary)
+        return EXIT_OK, payload, human
+
+    session_id = str(args.session_id)
+    try:
+        current = kit_change_controller.status(runtime, session_id)
+        current_state = current["kit_change"]
+        target = _explicit_path(
+            str(current_state["project"]["path"]), "target project"
+        )
+        review_url, board, process = _register_kit_change_board(
+            project, target, runtime, session_id
+        )
+        if operation == "apply":
+            changed = kit_change_controller.apply(
+                runtime, session_id, str(args.plan_sha256)
+            )
+        elif operation == "restore":
+            changed = kit_change_controller.restore(
+                runtime, session_id, str(args.result_sha256)
+            )
+        else:
+            changed = current
+        result = kit_change_controller.status(
+            runtime, changed["session_id"], plan_url=review_url
+        )
+    except kit_change_controller.KitChangeControllerError as exc:
+        raise _kit_change_error(exc) from exc
+
+    state = result["kit_change"]
+    code, ok, status = _kit_change_outcome(
+        result, allow_game_root_decision=(operation == "status")
+    )
+    payload = {
+        "ok": ok,
+        "command": f"change {operation}",
+        "status": status,
+        "target": str(target),
+        "session_id": result["session_id"],
+        "review_url": review_url,
+        "kit_change": state,
+        "board": board,
+        "process": _process_summary(process),
+        "review_server": _review_server_payload(),
+    }
+    human = [
+        f"change {operation}: {status.replace('_', ' ')}",
+        f"  Project: {target}",
+        f"  Session ID: {result['session_id']}",
+    ]
+    if not ok and state.get("detail"):
+        human.append(f"  Problem: {state['detail']}")
+    human.extend(_review_server_human(review_url))
+    return code, payload, human
 
 
 def _kit_change_recover(
@@ -2368,17 +3084,15 @@ def _kit_change_recover(
     try:
         recovered = kit_change_controller.recover(runtime, str(args.session_id))
     except kit_change_controller.KitChangeControllerError as exc:
-        raise CliError(
-            exc.detail,
-            code=EXIT_REFUSED,
-            status=exc.code.replace("-", "_"),
-        ) from exc
+        raise _kit_change_error(exc) from exc
     state = recovered["kit_change"]
     review_url = ""
     board: dict[str, Any] | None = None
     process: subprocess.CompletedProcess[str] | None = None
     reviewable_states = (
-        kit_change_controller.FINAL_STATES | kit_change_controller.RECOVERY_STATES
+        kit_change_controller.FINAL_STATES
+        | kit_change_controller.RECOVERY_STATES
+        | kit_change_controller.OPEN_STATES
     )
     if state["status"] in reviewable_states:
         # Controller status re-authenticates stored terminal/recovery state. It
@@ -2396,28 +3110,29 @@ def _kit_change_recover(
             plan_url=review_url,
         )
         state = recovered["kit_change"]
-    ok = state["status"] in {
-        "ready", "blocked", "complete", "adoption_required", "restored"
-    }
+    code, ok, status = _kit_change_outcome(
+        recovered, allow_game_root_decision=True
+    )
     payload = {
         "ok": ok,
         "command": "recover",
-        "status": state["status"],
+        "status": status,
         "session_id": recovered["session_id"],
         "review_url": review_url,
         "kit_change": state,
         "board": board,
         "process": _process_summary(process) if process is not None else None,
+        "review_server": _review_server_payload() if review_url else None,
     }
     human = [
-        f"recover: {state['status'].replace('_', ' ')}",
+        f"recover: {status.replace('_', ' ')}",
         f"  Session ID: {recovered['session_id']}",
     ]
     if not ok and state.get("detail"):
         human.append(f"  Problem: {state['detail']}")
     if review_url:
-        human.append(f"  Review: {review_url}")
-    return (EXIT_OK if ok else EXIT_FAILED), payload, human
+        human.extend(_review_server_human(review_url))
+    return code, payload, human
 
 
 _HANDLERS = {
@@ -2440,6 +3155,7 @@ _HANDLERS = {
     "release": _release,
     "brownfield_scan": _brownfield_scan,
     "kit_change_prepare": _kit_change_prepare,
+    "kit_change_command": _kit_change_command,
     "kit_change_recover": _kit_change_recover,
 }
 _COMMAND_LABELS = {
@@ -2461,6 +3177,7 @@ _COMMAND_LABELS = {
     "release": "release",
     "brownfield_scan": "brownfield scan",
     "kit_change_prepare": "kit change",
+    "kit_change_command": "change",
     "kit_change_recover": "recover",
 }
 
@@ -2513,6 +3230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": exc.status,
             "error": str(exc),
         }
+        if project is not None:
+            payload["project"] = str(project)
         human = [f"kit: {exc}"]
     payload["exit_code"] = code
     _emit(payload, human, json_output=json_output)

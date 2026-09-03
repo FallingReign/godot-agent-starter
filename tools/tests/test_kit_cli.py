@@ -17,6 +17,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,11 +36,21 @@ import kit  # noqa: E402
 import tools.tests.test_release as release_test_support  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(root).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in sorted(root.rglob("*"))
+    }
+
+
 class KitCliTest(unittest.TestCase):
     def setUp(self) -> None:
-        lock_root = (
-            ROOT / ".checklogs" / "tests" / f"kit-cli-lock-{uuid.uuid4().hex}"
-        )
+        lock_root = _scratch_parent() / f"kit-cli-lock-{uuid.uuid4().hex}"
         lock_root.mkdir(parents=True)
         shutil.copyfile(ROOT / ".agent-kit.json", lock_root / ".agent-kit.json")
         shutil.copyfile(ROOT / "kit.config.json", lock_root / "kit.config.json")
@@ -866,7 +877,12 @@ class KitCliTest(unittest.TestCase):
         inherited.assert_not_called()
 
     def test_self_test_uses_the_public_launcher_and_enforces_no_engine(self) -> None:
-        suite = self.completed(stdout="all kit tests passed\n")
+        suite = self.completed(
+            stderr=(
+                "test_probe (tests.Probe.test_probe) ... ok\n\n"
+                "Ran 1 test in 0.001s\n\nOK\n"
+            )
+        )
         with mock.patch.object(kit, "_run_process", return_value=suite) as run, \
                 mock.patch.object(kit, "_run_process_inherited") as inherited:
             code, output = self.invoke(
@@ -885,16 +901,343 @@ class KitCliTest(unittest.TestCase):
         self.assertRegex(command[8], r"^[0-9a-f]{64}$")
         self.assertEqual("unittest", command[11])
         self.assertEqual(
-            ["discover", "-s", str(kit.CORE_ROOT / "tools" / "tests")],
+            ["discover", "-s", str(kit.CORE_ROOT / "tools" / "tests"), "-v"],
             command[12:],
         )
         environment = run.call_args.kwargs["environment"]
         self.assertEqual(kit.CORE_ROOT, run.call_args.kwargs["cwd"])
         self.assertEqual("1", environment["KIT_ENGINE_DISABLED"])
         self.assertEqual("1", environment["KIT_SELF_TEST"])
+        self.assertTrue(Path(environment["KIT_TEST_TMPDIR"]).name.startswith("ak-"))
+        self.assertFalse(
+            Path(environment["KIT_TEST_TMPDIR"]).is_relative_to(kit.CORE_ROOT)
+        )
         self.assert_isolated_environment(environment)
         self.assertFalse(run.call_args.kwargs["inherit_environment"])
         inherited.assert_not_called()
+
+    def test_self_test_error_receipt_keeps_the_resolved_project(self) -> None:
+        with mock.patch.object(
+            kit.project_context,
+            "resolve_active_installation",
+            side_effect=kit.project_context.ProjectContextError("synthetic failure"),
+        ):
+            code, output = self.invoke(
+                "self-test", "--project", str(ROOT), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_REFUSED, code)
+        self.assertEqual("managed_core_untrusted", payload["status"])
+        self.assertEqual(str(ROOT.resolve()), payload["project"])
+        self.assertIn("synthetic failure", payload["error"])
+
+    def test_human_self_test_uses_the_captured_summary(self) -> None:
+        suite = self.completed(
+            stderr=(
+                "test_probe (tests.Probe.test_probe) ... ok\n\n"
+                "Ran 1 test in 0.001s\n\nOK\n"
+            )
+        )
+        with mock.patch.object(kit, "_run_process", return_value=suite), mock.patch.object(
+            kit, "_run_process_inherited"
+        ) as inherited:
+            code, output = self.invoke("self-test", "--project", str(ROOT))
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertIn("self-test: passed", output)
+        inherited.assert_not_called()
+
+    def test_failed_self_test_receipt_keeps_a_bounded_failure_report(self) -> None:
+        long_line = "x" * 800
+        suite = self.completed(
+            returncode=1,
+            stderr=(
+                "FAIL: test_packaged_contract\n"
+                + long_line
+                + "\nRan 1 test in 0.001s\nFAILED (failures=1)\n"
+            ),
+        )
+        log = {
+            "available": True,
+            "path": ".kit/runtime/self-test/failures/failure-a.log",
+            "bytes": 100,
+            "sha256": "a" * 64,
+            "truncated": False,
+        }
+        with mock.patch.object(kit, "_run_process", return_value=suite), mock.patch.object(
+            kit, "_store_self_test_failure_log", return_value=log
+        ):
+            code, output = self.invoke(
+                "self-test", "--project", str(ROOT), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_FAILED, code)
+        self.assertEqual(1, payload["failure"]["ran"])
+        self.assertEqual(1, payload["failure"]["failures"])
+        self.assertEqual(["test_packaged_contract"], payload["failure"]["test_ids"])
+        self.assertEqual(log, payload["failure"]["log"])
+        self.assertNotIn(long_line, output)
+
+    def test_repeated_self_test_failures_keep_bounded_private_logs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-failure-log-retention-") as raw:
+            project = Path(raw).resolve()
+            (project / "kit.config.json").write_text(
+                '{"schema":1,"runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+
+            for index in range(kit._SELF_TEST_FAILURE_LOG_LIMIT + 5):  # noqa: SLF001
+                kit._store_self_test_failure_log(  # noqa: SLF001
+                    project,
+                    f"failure {index}\n",
+                )
+
+            directory = project / ".kit" / "runtime" / "self-test" / "failures"
+            logs = list(directory.glob("failure-*.log"))
+            self.assertEqual(kit._SELF_TEST_FAILURE_LOG_LIMIT, len(logs))  # noqa: SLF001
+            self.assertLessEqual(
+                sum(path.stat().st_size for path in logs),
+                kit._SELF_TEST_FAILURE_LOG_LIMIT * kit._SELF_TEST_LOG_BYTES,  # noqa: SLF001
+            )
+
+    def test_self_test_refuses_a_skipped_test(self) -> None:
+        suite = self.completed(
+            stderr=(
+                "test_optional (tests.Probe.test_optional) ... skipped 'missing'\n\n"
+                "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"
+            )
+        )
+        with mock.patch.object(kit, "_run_process", return_value=suite), mock.patch.object(
+            kit,
+            "_store_self_test_failure_log",
+            return_value={"available": False},
+        ):
+            code, output = self.invoke(
+                "self-test", "--project", str(ROOT), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_FAILED, code)
+        self.assertEqual(1, payload["failure"]["skipped"])
+        self.assertEqual(
+            ["tests.Probe.test_optional"], payload["failure"]["skip_ids"]
+        )
+
+    def test_self_test_scratch_overlap_is_refused_and_cleaned_exactly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-overlap-") as temporary:
+            project = Path(temporary).resolve()
+            scratch = project / "ak-overlap"
+
+            def create(*, prefix: str, dir: Path) -> str:
+                self.assertEqual("ak-", prefix)
+                self.assertEqual(project, Path(dir))
+                scratch.mkdir()
+                return str(scratch)
+
+            with mock.patch.object(
+                kit.tempfile, "gettempdir", return_value=str(project)
+            ), mock.patch.object(
+                kit.tempfile, "mkdtemp", side_effect=create
+            ), self.assertRaisesRegex(
+                kit.CliError, "overlaps the project or active core"
+            ):
+                kit._create_self_test_scratch(project, kit.CORE_ROOT)  # noqa: SLF001
+
+            self.assertFalse(scratch.exists())
+
+    def test_self_test_scratch_cleans_an_empty_root_when_resolve_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-resolve-") as temporary:
+            parent = Path(temporary).resolve()
+            scratch = parent / "ak-resolve"
+            real_resolve = Path.resolve
+
+            def create(*, prefix: str, dir: Path) -> str:
+                self.assertEqual("ak-", prefix)
+                self.assertEqual(parent, Path(dir))
+                scratch.mkdir()
+                return str(scratch)
+
+            def resolve(selected: Path, strict: bool = False) -> Path:
+                if selected == scratch:
+                    raise OSError("synthetic canonicalization failure")
+                return real_resolve(selected, strict=strict)
+
+            with mock.patch.object(
+                kit.tempfile, "gettempdir", return_value=str(parent)
+            ), mock.patch.object(
+                kit.tempfile, "mkdtemp", side_effect=create
+            ), mock.patch.object(
+                Path, "resolve", autospec=True, side_effect=resolve
+            ), self.assertRaisesRegex(
+                kit.CliError, "temporary storage is unavailable"
+            ):
+                kit._create_self_test_scratch(parent, kit.CORE_ROOT)  # noqa: SLF001
+
+            self.assertFalse(os.path.lexists(scratch))
+
+    def test_self_test_scratch_removes_a_readonly_git_object(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-readonly-") as temporary:
+            parent = Path(temporary).resolve()
+            scratch = parent / "ak-readonly"
+            git_object = scratch / "nested" / ".git" / "objects" / "aa" / "object"
+            git_object.parent.mkdir(parents=True)
+            git_object.write_bytes(b"git object")
+            git_object.chmod(stat.S_IREAD)
+            identity = kit._directory_identity(scratch)  # noqa: SLF001
+
+            kit._remove_self_test_scratch(scratch, parent, identity)  # noqa: SLF001
+
+            self.assertFalse(os.path.lexists(scratch))
+
+    def test_self_test_scratch_retries_transient_permission_failures(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-retry-") as temporary:
+            parent = Path(temporary).resolve()
+            scratch = parent / "ak-retry"
+            scratch.mkdir()
+            (scratch / "object").write_bytes(b"git object")
+            identity = kit._directory_identity(scratch)  # noqa: SLF001
+            real_rmtree = shutil.rmtree
+            attempts = 0
+
+            def transient(path: Path, *, onerror: object) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError(13, "transient handle", str(path))
+                real_rmtree(path, onerror=onerror)
+
+            with mock.patch.object(
+                kit.shutil, "rmtree", side_effect=transient
+            ), mock.patch.object(kit.time, "sleep") as sleep:
+                kit._remove_self_test_scratch(  # noqa: SLF001
+                    scratch, parent, identity
+                )
+
+            self.assertEqual(3, attempts)
+            self.assertEqual(
+                [mock.call(0.05), mock.call(0.1)], sleep.call_args_list
+            )
+            self.assertFalse(os.path.lexists(scratch))
+
+    def test_self_test_scratch_refuses_unsafe_readonly_targets(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-unsafe-") as temporary:
+            parent = Path(temporary).resolve()
+            scratch = parent / "ak-unsafe"
+            scratch.mkdir()
+            child = scratch / "object"
+            child.write_bytes(b"git object")
+            outside = parent / "outside"
+            outside.write_bytes(b"human data")
+            identity = kit._directory_identity(scratch)  # noqa: SLF001
+            permission = PermissionError(13, "read only")
+
+            captured: dict[str, object] = {}
+
+            def expose_handler(path: Path, *, onerror: object) -> None:
+                del path
+                captured["handler"] = onerror
+                raise OSError("stop after capture")
+
+            with mock.patch.object(
+                kit.shutil, "rmtree", side_effect=expose_handler
+            ), self.assertRaises(kit.CliError):
+                kit._remove_self_test_scratch(  # noqa: SLF001
+                    scratch, parent, identity
+                )
+            handler = captured["handler"]
+            self.assertTrue(callable(handler))
+
+            with mock.patch.object(kit.os, "chmod") as chmod, self.assertRaisesRegex(
+                OSError, "escaped its exact root"
+            ):
+                handler(  # type: ignore[operator]
+                    os.unlink,
+                    str(outside),
+                    (PermissionError, permission, None),
+                )
+            chmod.assert_not_called()
+
+            linked = mock.Mock(
+                st_mode=stat.S_IFREG | stat.S_IREAD,
+                st_dev=1,
+                st_ino=2,
+                st_size=10,
+                st_mtime_ns=3,
+                st_nlink=2,
+                st_file_attributes=0,
+            )
+            real_lstat = Path.lstat
+
+            def lstat(selected: Path) -> object:
+                return linked if selected == child else real_lstat(selected)
+
+            with mock.patch.object(
+                Path, "lstat", autospec=True, side_effect=lstat
+            ), mock.patch.object(
+                kit.os, "chmod"
+            ) as chmod, self.assertRaisesRegex(OSError, "redirected or shared"):
+                handler(  # type: ignore[operator]
+                    os.unlink,
+                    str(child),
+                    (PermissionError, permission, None),
+                )
+            chmod.assert_not_called()
+
+    def test_self_test_scratch_refuses_exhausted_cleanup_retries(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-exhausted-") as temporary:
+            parent = Path(temporary).resolve()
+            scratch = parent / "ak-exhausted"
+            scratch.mkdir()
+            identity = kit._directory_identity(scratch)  # noqa: SLF001
+            failure = PermissionError(13, "persistent handle", str(scratch))
+
+            with mock.patch.object(
+                kit.shutil, "rmtree", side_effect=failure
+            ) as remove, mock.patch.object(kit.time, "sleep") as sleep, \
+                    self.assertRaisesRegex(
+                        kit.CliError, "could not be removed safely"
+                    ) as raised:
+                kit._remove_self_test_scratch(  # noqa: SLF001
+                    scratch, parent, identity
+                )
+
+            self.assertEqual("runtime_cleanup_failed", raised.exception.status)
+            self.assertEqual(
+                len(kit._SELF_TEST_CLEANUP_RETRY_DELAYS) + 1,  # noqa: SLF001
+                remove.call_count,
+            )
+            self.assertEqual(
+                [
+                    mock.call(delay)
+                    for delay in kit._SELF_TEST_CLEANUP_RETRY_DELAYS  # noqa: SLF001
+                ],
+                sleep.call_args_list,
+            )
+
+    def test_self_test_refuses_an_expected_failure(self) -> None:
+        suite = self.completed(
+            stderr=(
+                "test_known_gap (tests.Probe.test_known_gap) ... expected failure\n\n"
+                "Ran 1 test in 0.001s\n\nOK (expected failures=1)\n"
+            )
+        )
+        with mock.patch.object(kit, "_run_process", return_value=suite), mock.patch.object(
+            kit,
+            "_store_self_test_failure_log",
+            return_value={"available": False},
+        ):
+            code, output = self.invoke(
+                "self-test", "--project", str(ROOT), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_FAILED, code)
+        self.assertEqual(1, payload["failure"]["skipped"])
+        self.assertEqual(
+            ["tests.Probe.test_known_gap"], payload["failure"]["skip_ids"]
+        )
 
     def test_nested_self_test_and_static_children_ignore_python_startup_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kit-child-isolation-") as temporary:
@@ -904,8 +1247,22 @@ class KitCliTest(unittest.TestCase):
             tests.mkdir(parents=True)
             target = base / "target"
             target.mkdir()
+            (target / "kit.config.json").write_text(
+                '{"schema":1,"game_root":"src","runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            (target / "src").mkdir()
             poison = base / "pythonpath"
             poison.mkdir()
+            (core / ".agent-kit.json").write_text(
+                '{"kind":"portable-agent-kit-root","schema":1}\n',
+                encoding="utf-8",
+            )
+            (core / "kit.config.json").write_text(
+                '{"schema":1,"game_root":"src","runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            (core / "src").mkdir()
             (core / "kit.py").write_text("# authenticated anchor\n", encoding="utf-8")
             (core / "check.py").write_text(
                 "import base64\n"
@@ -917,12 +1274,18 @@ class KitCliTest(unittest.TestCase):
             )
             (tests / "test_probe.py").write_text(
                 "import base64\n"
+                "import os\n"
                 "import sys\n"
                 "import unittest\n\n"
+                "from pathlib import Path\n\n"
                 "class Probe(unittest.TestCase):\n"
                 "    def test_isolated(self):\n"
                 f"        self.assertNotIn({str(target)!r}, sys.path)\n"
-                "        self.assertTrue(base64.b64encode(b'proof'))\n",
+                "        self.assertTrue(base64.b64encode(b'proof'))\n"
+                "        scratch = Path(os.environ['KIT_TEST_TMPDIR']).resolve()\n"
+                "        core = Path(__file__).resolve().parents[2]\n"
+                "        self.assertFalse(scratch == core or scratch.is_relative_to(core))\n"
+                "        (scratch / 'probe.txt').write_text('private', encoding='utf-8')\n",
                 encoding="utf-8",
             )
             sentinels: list[Path] = []
@@ -941,7 +1304,10 @@ class KitCliTest(unittest.TestCase):
                 "PYTHONPATH": f"{target}{os.pathsep}{poison}",
                 "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
                 "PYTHONUSERBASE": str(poison),
+                kit.managed_launcher.PROJECT_ROOT_ENV: "",
+                kit.managed_launcher.CORE_ROOT_ENV: "",
             }
+            core_before = _tree_snapshot(core)
             with mock.patch.object(kit, "CORE_ROOT", core), mock.patch.object(
                 kit, "TOOLS", core / "tools"
             ), mock.patch.dict(os.environ, hostile, clear=False):
@@ -974,6 +1340,146 @@ class KitCliTest(unittest.TestCase):
             self.assertEqual(kit.EXIT_OK, verify_code)
             self.assertTrue(verify_payload["ok"])
             self.assertTrue(all(not sentinel.exists() for sentinel in sentinels))
+            self.assertEqual(core_before, _tree_snapshot(core))
+            self.assertEqual(
+                [], list((target / ".kit" / "runtime" / "self-test").glob("run-*"))
+            )
+
+    def test_managed_self_test_uses_a_verified_copy_and_preserves_active_core(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-managed-self-test-") as temporary:
+            base = Path(temporary).resolve()
+            core = base / "active-core"
+            (core / "tools" / "tests").mkdir(parents=True)
+            (core / "kit.py").write_text("# active entry point\n", encoding="utf-8")
+            (core / "tools" / "tests" / "test_probe.py").write_text(
+                "# copied test\n", encoding="utf-8"
+            )
+            (core / ".agent-kit.json").write_text(
+                '{"kind":"portable-agent-kit-root","schema":1}\n',
+                encoding="utf-8",
+            )
+            (core / "kit.config.json").write_text(
+                '{"schema":1,"game_root":"src","runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            project = base / "project"
+            (project / "src").mkdir(parents=True)
+            (project / "kit.config.json").write_text(
+                '{"schema":1,"game_root":"src","runtime_root":".kit/runtime"}\n',
+                encoding="utf-8",
+            )
+            release_sha256 = "a" * 64
+            installation = mock.Mock(
+                mode="managed",
+                core_root=core,
+                release_sha256=release_sha256,
+            )
+            members = {
+                path.relative_to(core).as_posix(): kit.release_tool.ArchiveMember(
+                    path.relative_to(core).as_posix(),
+                    path.read_bytes(),
+                    0o755 if path.suffix == ".py" else 0o644,
+                )
+                for path in core.rglob("*")
+                if path.is_file()
+            }
+            core_before = _tree_snapshot(core)
+
+            def verified_directory(path: Path):
+                if path == core:
+                    self.assertEqual(core_before, _tree_snapshot(core))
+                else:
+                    copied = {
+                        item.relative_to(path).as_posix(): item.read_bytes()
+                        for item in path.rglob("*")
+                        if item.is_file()
+                    }
+                    self.assertEqual(
+                        {name: member.content for name, member in members.items()},
+                        copied,
+                    )
+                return {"archive_sha256": release_sha256}, members
+
+            copied_core: Path | None = None
+
+            def run_from_copy(_command, *, cwd: Path, environment: dict, **_kwargs):
+                nonlocal copied_core
+                copied_core = cwd
+                self.assertNotEqual(core, cwd)
+                self.assertEqual(
+                    "", environment[kit.managed_launcher.PROJECT_ROOT_ENV]
+                )
+                self.assertEqual("", environment[kit.managed_launcher.CORE_ROOT_ENV])
+                (cwd / "future-test-mistake.txt").write_text(
+                    "disposable\n", encoding="utf-8"
+                )
+                return self.completed(
+                    stderr=(
+                        "test_probe (tests.Probe.test_probe) ... ok\n\n"
+                        "Ran 1 test in 0.001s\n\nOK\n"
+                    )
+                )
+
+            with mock.patch.object(kit, "CORE_ROOT", core), mock.patch.object(
+                kit.project_context,
+                "resolve_active_installation",
+                return_value=installation,
+            ) as resolve, mock.patch.object(
+                kit.release_tool,
+                "read_verified_directory",
+                side_effect=verified_directory,
+            ) as verify, mock.patch.object(
+                kit, "_run_process", side_effect=run_from_copy
+            ):
+                code, payload, _human = kit._self_test(
+                    project, argparse.Namespace(json_output=True)
+                )
+
+            self.assertEqual(kit.EXIT_OK, code)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(core_before, _tree_snapshot(core))
+            self.assertEqual(2, resolve.call_count)
+            self.assertEqual(2, verify.call_count)
+            self.assertIsNotNone(copied_core)
+            self.assertFalse(copied_core.exists())
+            self.assertEqual(
+                [], list((project / ".kit" / "runtime" / "self-test").glob("run-*"))
+            )
+
+    def test_managed_self_test_copy_is_verified_before_it_becomes_a_fixture(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="kit-self-test-copy-") as temporary:
+            base = Path(temporary).resolve()
+            archive = release_test_support._synthetic_smoke_archive(base)
+            source = base / "verified-core"
+            release_test_support._extract_exact(archive, source)
+            report = kit.release_tool.verify_archive(archive)
+            source_before = _tree_snapshot(source)
+            copied = base / "copied-core"
+
+            kit._copy_verified_self_test_core(
+                source, copied, str(report["archive_sha256"])
+            )
+
+            self.assertEqual(source_before, _tree_snapshot(source))
+            self.assertEqual(
+                b"[application]\n",
+                (copied / "src" / "project.godot").read_bytes(),
+            )
+            copied_files = {
+                path.relative_to(copied).as_posix(): path.read_bytes()
+                for path in copied.rglob("*")
+                if path.is_file() and "src" not in path.relative_to(copied).parts
+            }
+            source_files = {
+                path.relative_to(source).as_posix(): path.read_bytes()
+                for path in source.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(source_files, copied_files)
 
     def test_core_commands_are_resolved_from_the_selected_core(self) -> None:
         project = ROOT / "not-the-core"
@@ -1127,8 +1633,8 @@ class KitCliTest(unittest.TestCase):
                 "receipt_reasons": ["fixture"],
             },
             "stages": [
-                {"name": "source-state", "status": "passed"},
-                {"name": "gate", "status": "passed"},
+                {"name": name, "status": "passed"}
+                for name in kit._STRICT_COMPLETE_STAGE_SETS[0]
             ],
         }
         receipt = {"schema": 2}
@@ -1137,6 +1643,24 @@ class KitCliTest(unittest.TestCase):
         contradictory = {**base, "status": "blocked", "exit_code": 3, "ok": False}
         self.assertFalse(
             kit._strict_report_is_valid(ROOT, contradictory, 3, receipt)
+        )
+        missing_tests = {
+            **base,
+            "stages": [
+                stage for stage in base["stages"] if stage["name"] != "unit-tests"
+            ],
+        }
+        self.assertFalse(
+            kit._strict_report_is_valid(ROOT, missing_tests, 0, receipt)
+        )
+        missing_smoke = {
+            **base,
+            "stages": [
+                stage for stage in base["stages"] if stage["name"] != "release-smoke"
+            ],
+        }
+        self.assertFalse(
+            kit._strict_report_is_valid(ROOT, missing_smoke, 0, receipt)
         )
 
     def test_strict_report_can_block_before_gate_without_a_receipt(self) -> None:
@@ -1516,9 +2040,194 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual(
             "install: ready\n"
             f"  Session ID: {session_id}\n"
-            f"  Review: {review_url}\n",
+            f"  Review: {review_url}\n"
+            "  Local review server: running\n"
+            "  Stop it: kit serve stop\n",
             output,
         )
+
+    def test_install_keeps_non_decision_blocker_reviewable_but_returns_refused(self) -> None:
+        session_id = "4" * 64
+        blocked = self._kit_change_result(session_id, status="blocked")
+        blocked["ok"] = False
+        blocked["kit_change"].update({
+            "blockers": ["[game-project-missing] project.godot is missing"],
+            "detail": "Create the Godot project first.",
+        })
+        review_url = "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        process = self.completed()
+        with mock.patch.object(
+            kit.kit_change_controller, "prepare", return_value=blocked
+        ), mock.patch.object(
+            kit, "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, process),
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", return_value=blocked
+        ):
+            code, output = self.invoke(
+                "install", str(ROOT), "--release", str(ROOT / "release.zip"), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_REFUSED, code)
+        self.assertFalse(payload["ok"])
+        self.assertEqual("blocked", payload["status"])
+        self.assertEqual(review_url, payload["review_url"])
+        self.assertEqual("running", payload["review_server"]["status"])
+
+    def test_install_only_maps_the_single_game_folder_choice_to_needs_decision(self) -> None:
+        session_id = "5" * 64
+        blocked = self._kit_change_result(session_id, status="blocked")
+        blocked["ok"] = False
+        blocked["kit_change"].update({
+            "decisions": [{
+                "id": "D1",
+                "choices": [{"value": "first"}, {"value": "second"}],
+            }],
+            "blockers": ["[game-root-ambiguous] Choose the game folder."],
+        })
+        review_url = "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        with mock.patch.object(
+            kit.kit_change_controller, "prepare", return_value=blocked
+        ), mock.patch.object(
+            kit, "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, self.completed()),
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", return_value=blocked
+        ):
+            code, output = self.invoke(
+                "install", str(ROOT), "--release", str(ROOT / "release.zip"), "--json"
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("needs_decision", payload["status"])
+
+    def test_lifecycle_target_is_not_a_second_project_option(self) -> None:
+        parser = kit.build_parser()
+        parsed = parser.parse_args([
+            "--project", str(ROOT), "install", str(ROOT), "--json"
+        ])
+        self.assertEqual(str(ROOT), parsed.project)
+        self.assertEqual(str(ROOT), parsed.target)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+            SystemExit
+        ) as stopped:
+            parser.parse_args([
+                "install", str(ROOT), "--project", str(ROOT), "--json"
+            ])
+        self.assertEqual(2, stopped.exception.code)
+
+    def test_change_list_uses_the_current_incoming_kit_runtime(self) -> None:
+        runtime = ROOT / ".kit" / "runtime"
+        session_id = "6" * 64
+        sessions = [{
+            "session_id": session_id,
+            "mode": "install",
+            "status": "ready",
+            "project": {"name": ROOT.name, "path": str(ROOT)},
+            "incoming_version": "0.3.0",
+            "plan_sha256": "a" * 64,
+            "result_sha256": "",
+        }]
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "list_sessions", return_value=sessions
+        ) as listed:
+            code, output = self.invoke("change", "list", "--json")
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("change list", payload["command"])
+        self.assertEqual(sessions, payload["sessions"])
+        listed.assert_called_once_with(runtime)
+
+    def test_change_status_reopens_the_exact_review(self) -> None:
+        runtime = ROOT / ".kit" / "runtime"
+        session_id = "7" * 64
+        current = self._kit_change_result(session_id)
+        current["kit_change"]["project"]["path"] = str(ROOT)
+        refreshed = self._kit_change_result(session_id)
+        refreshed["kit_change"]["project"]["path"] = str(ROOT)
+        review_url = "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", side_effect=[current, refreshed]
+        ) as status, mock.patch.object(
+            kit, "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, self.completed()),
+        ):
+            code, output = self.invoke("change", "status", session_id, "--json")
+
+        payload = json.loads(output)
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("change status", payload["command"])
+        self.assertEqual(review_url, payload["review_url"])
+        self.assertEqual("kit serve stop", payload["review_server"]["stop_command"])
+        self.assertEqual([
+            mock.call(runtime, session_id),
+            mock.call(runtime, session_id, plan_url=review_url),
+        ], status.call_args_list)
+
+    def test_change_apply_uses_the_full_review_fingerprint(self) -> None:
+        runtime = ROOT / ".kit" / "runtime"
+        session_id = "8" * 64
+        digest = "a" * 64
+        current = self._kit_change_result(session_id)
+        current["kit_change"]["project"]["path"] = str(ROOT)
+        changed = self._kit_change_result(session_id, status="complete")
+        changed["kit_change"]["project"]["path"] = str(ROOT)
+        review_url = "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", side_effect=[current, changed]
+        ), mock.patch.object(
+            kit.kit_change_controller, "apply", return_value=changed
+        ) as apply, mock.patch.object(
+            kit, "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, self.completed()),
+        ):
+            code, output = self.invoke(
+                "change", "apply", session_id, "--plan-sha256", digest, "--json"
+            )
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("complete", json.loads(output)["status"])
+        apply.assert_called_once_with(runtime, session_id, digest)
+
+    def test_change_restore_uses_the_full_result_fingerprint(self) -> None:
+        runtime = ROOT / ".kit" / "runtime"
+        session_id = "9" * 64
+        digest = "b" * 64
+        current = self._kit_change_result(session_id, status="complete")
+        current["kit_change"]["project"]["path"] = str(ROOT)
+        current["kit_change"]["result_sha256"] = digest
+        restored = self._kit_change_result(session_id, status="restored")
+        restored["kit_change"]["project"]["path"] = str(ROOT)
+        restored["kit_change"]["result_sha256"] = digest
+        review_url = "http://127.0.0.1:43123/kit-change.html?session=" + session_id
+        with mock.patch.object(
+            kit, "_source_controller_runtime", return_value=runtime
+        ), mock.patch.object(
+            kit.kit_change_controller, "status", side_effect=[current, restored]
+        ), mock.patch.object(
+            kit.kit_change_controller, "restore", return_value=restored
+        ) as restore, mock.patch.object(
+            kit, "_register_kit_change_board",
+            return_value=(review_url, {"ok": True}, self.completed()),
+        ):
+            code, output = self.invoke(
+                "change", "restore", session_id,
+                "--result-sha256", digest, "--json"
+            )
+
+        self.assertEqual(kit.EXIT_OK, code)
+        self.assertEqual("restored", json.loads(output)["status"])
+        restore.assert_called_once_with(runtime, session_id, digest)
 
     def test_install_reports_controller_release_mismatch_before_board_start(
         self,
@@ -1684,10 +2393,10 @@ class KitCliTest(unittest.TestCase):
             ), mock.patch.dict(os.environ, hostile, clear=False):
                 try:
                     code, output = self.invoke(
-                        "install",
-                        str(target),
                         "--project",
                         str(extracted),
+                        "install",
+                        str(target),
                         "--json",
                     )
                     payload = json.loads(output)
@@ -1933,7 +2642,9 @@ class KitCliTest(unittest.TestCase):
             "recover: recovery required\n"
             f"  Session ID: {session_id}\n"
             f"  Problem: {detail}\n"
-            f"  Review: {review_url}\n",
+            f"  Review: {review_url}\n"
+            "  Local review server: running\n"
+            "  Stop it: kit serve stop\n",
             output,
         )
 

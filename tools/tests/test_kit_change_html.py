@@ -83,9 +83,14 @@ class ReviewRenderer(unittest.TestCase):
         )
 
     def test_install_is_the_only_first_use_term(self) -> None:
-        page = self.render()
+        page = self.render(status="ready", decisions=[])
         self.assertIn("Not installed → 0.3.0", page)
         self.assertIn(">Add kit</button>", page)
+
+    def test_game_folder_choice_only_creates_a_new_review(self) -> None:
+        page = self.render()
+        self.assertIn(">Review this folder</button>", page)
+        self.assertNotIn(">Add kit</button>", page)
 
     def test_upgrade_has_the_matching_title_and_action(self) -> None:
         page = self.render(
@@ -262,6 +267,37 @@ class ReviewRenderer(unittest.TestCase):
         self.assertNotIn("architecture-map", page)
         self.assertNotIn("<svg", page)
 
+    def test_adoption_problems_are_exact_and_collapsed(self) -> None:
+        issues = [{
+            "stage": "lint",
+            "code": "legacy-warning",
+            "path": "src/old.gd",
+            "line": 4,
+            "message_sha256": "d" * 64,
+        }, {
+            "stage": "format",
+            "code": "needs-formatting",
+            "path": "src/<unsafe>.gd",
+            "line": 0,
+            "message_sha256": "e" * 64,
+        }]
+        page = self.render(
+            status="adoption_required",
+            decisions=[],
+            result_sha256=RESULT_DIGEST,
+            check_evidence={"state": "apply_time", "checked_at": "2026-09-03T01:02:03Z"},
+            existing_gaps={"count": 2, "status": "checked", "issues": issues},
+        )
+        tag = re.search(r'<details class="problem-details"[^>]*>', page)
+        self.assertIsNotNone(tag)
+        self.assertNotIn(" open", tag.group(0))
+        self.assertNotIn(" hidden", tag.group(0))
+        self.assertIn("Show problems to address (2)", page)
+        self.assertIn("src/old.gd:4", page)
+        self.assertIn("lint — legacy-warning", page)
+        self.assertIn("src/&lt;unsafe&gt;.gd", page)
+        self.assertIn("renderProblems(gaps,checkedGaps)", page)
+
     def test_exact_digest_is_visible_and_bound_to_apply(self) -> None:
         page = self.render()
         self.assertGreaterEqual(page.count(DIGEST), 2)
@@ -292,6 +328,8 @@ class ReviewRenderer(unittest.TestCase):
         self.assertIn("A decision is still needed. Tell your agent your choice first.", page)
         self.assertIn("ask your agent to reopen this kit review", page)
         self.assertIn("Retry now", page)
+        self.assertIn("This review server runs only on this computer.", page)
+        self.assertIn("kit serve stop", page)
 
     def test_no_javascript_ready_review_routes_approval_to_the_agent(self) -> None:
         page = self.render(status="ready", decisions=[])
@@ -316,6 +354,18 @@ class ReviewRenderer(unittest.TestCase):
         self.assertIn("session_id:sessionId", page)
         self.assertIn('String(next.session_id || "") === sessionId', page)
         self.assertIn("gapCount.textContent", page)
+
+    def test_post_apply_requires_a_fresh_agent_instruction_check(self) -> None:
+        ready = self.render(status="ready", decisions=[])
+        complete = self.render(status="complete", decisions=[])
+        self.assertRegex(
+            ready,
+            r'id="kit-change-provider-handoff" hidden',
+        )
+        self.assertIn('id="kit-change-provider-handoff">', complete)
+        self.assertIn("Start a fresh Codex or Copilot chat", complete)
+        self.assertIn("Codex: check the active instruction sources.", complete)
+        self.assertIn("Copilot: run <code>/instructions</code> and check References.", complete)
 
     def test_all_statuses_have_one_current_step_and_plain_label(self) -> None:
         fixtures = {

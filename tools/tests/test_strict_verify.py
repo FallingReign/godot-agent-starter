@@ -15,14 +15,43 @@ import json
 import os
 import re
 import shutil
+import stat
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
 
-from tools import strict_verify
+from tools import release, strict_verify
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+
+def _unittest_skip_lines(tree: ast.AST) -> list[int]:
+    """Return every runtime or decorated unittest skip call in one test AST."""
+    skip_names = {"skip", "skipIf", "skipUnless", "skipTest", "SkipTest"}
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Name) and function.id in skip_names:
+            lines.add(node.lineno)
+        elif isinstance(function, ast.Attribute) and (
+            function.attr == "skipTest"
+            or (
+                isinstance(function.value, ast.Name)
+                and function.value.id == "unittest"
+                and function.attr in skip_names
+            )
+        ):
+            lines.add(node.lineno)
+    return sorted(lines)
+
+
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else REPOSITORY / ".checklogs"
 
 
 def _doctor(*, complete: bool = True) -> str:
@@ -85,6 +114,7 @@ class FakeRunner:
         self.commands: list[list[str]] = []
         self.environments: list[dict[str, str]] = []
         self.release_builds = 0
+        self.release_operations: list[str] = []
 
     def __call__(
         self,
@@ -114,8 +144,9 @@ class FakeRunner:
             return self.browser
         if script_name == "release.py":
             operation = child_arguments[0]
+            self.release_operations.append(operation)
             archive = Path(child_arguments[1])
-            if operation == "build":
+            if operation in ("build", "materialize"):
                 content = self.archive_one if self.release_builds == 0 else self.archive_two
                 self.release_builds += 1
                 archive.write_bytes(content)
@@ -137,15 +168,19 @@ class FakeRunner:
 
 class StrictFixture(unittest.TestCase):
     def setUp(self) -> None:
-        scratch = REPOSITORY / ".checklogs"
+        scratch = _scratch_parent()
         scratch.mkdir(exist_ok=True)
         self.root = scratch / f"strict-verify-test-{uuid.uuid4().hex}"
-        self.root.mkdir()
-        (self.root / "tools" / "tests").mkdir(parents=True)
-        (self.root / ".agent-kit.json").write_text(
+        self.create_project(self.root)
+
+    @staticmethod
+    def create_project(root: Path) -> None:
+        root.mkdir(parents=True)
+        (root / "tools" / "tests").mkdir(parents=True)
+        (root / ".agent-kit.json").write_text(
             '{"kind":"portable-agent-kit-root","schema":1}\n', encoding="utf-8"
         )
-        (self.root / "kit.config.json").write_text(
+        (root / "kit.config.json").write_text(
             '{"schema":1,"game_root":"src","runtime_root":".kit/runtime"}\n',
             encoding="utf-8",
         )
@@ -155,17 +190,17 @@ class StrictFixture(unittest.TestCase):
             "tools/tests/browser_check.py",
             "tools/release.py",
         ):
-            path = self.root / relative
+            path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# synthetic fixture\n", encoding="utf-8")
-        (self.root / "VERSION").write_text("1.0.0\n", encoding="utf-8")
-        (self.root / "LICENSE").write_text(
+        (root / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+        (root / "LICENSE").write_text(
             "Approved synthetic license.\n", encoding="utf-8"
         )
 
     def tearDown(self) -> None:
         resolved = self.root.resolve()
-        scratch = (REPOSITORY / ".checklogs").resolve()
+        scratch = _scratch_parent().resolve()
         if (resolved.parent != scratch
                 or not resolved.name.startswith("strict-verify-test-")):
             raise AssertionError(f"refusing to remove unexpected scratch path: {resolved}")
@@ -181,6 +216,46 @@ class StrictFixture(unittest.TestCase):
             strict_verify.MAINTAINER_FIXTURE_CONTENT if content is None else content,
             encoding="utf-8",
         )
+
+    def managed_core(self) -> Path:
+        core = self.root / "managed-core"
+        (core / "tools" / "tests").mkdir(parents=True)
+        for relative in (
+            "kit.py",
+            "check.py",
+            "tools/tests/browser_check.py",
+            "tools/release.py",
+        ):
+            path = core / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# synthetic managed core\n", encoding="utf-8")
+        (core / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+        (core / "LICENSE").write_text(
+            "Approved synthetic license.\n", encoding="utf-8"
+        )
+        return core
+
+    def external_test_workspace(self) -> tuple[Path, mock.Mock]:
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        workspace = temporary_root / (
+            strict_verify.STRICT_WORKSPACE_PREFIX + uuid.uuid4().hex[:8]
+        )
+        self.addCleanup(shutil.rmtree, workspace, True)
+
+        def create(*, prefix: str, dir: Path) -> str:
+            self.assertEqual(strict_verify.STRICT_WORKSPACE_PREFIX, prefix)
+            self.assertEqual(temporary_root, Path(dir))
+            workspace.mkdir()
+            return str(workspace)
+
+        return workspace, mock.Mock(side_effect=create)
+
+    def deep_source_project(self) -> Path:
+        prefix = "windows-long-source-"
+        padding = max(16, 150 - len(str(self.root)) - len(prefix) - 1)
+        project = self.root / (prefix + ("x" * padding))
+        self.create_project(project)
+        return project
 
 
 class StrictSuccessTests(StrictFixture):
@@ -223,6 +298,10 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(runner.commands[2][7], str(self.root / "check.py"))
         self.assertIn("unittest", runner.commands[3])
         self.assertTrue(runner.commands[4][7].endswith("browser_check.py"))
+        self.assertEqual(
+            ["build", "build", "verify", "verify", "smoke"],
+            runner.release_operations,
+        )
 
         report_path = self.root / report["report_path"]
         retained = json.loads(report_path.read_text(encoding="utf-8"))
@@ -232,6 +311,394 @@ class StrictSuccessTests(StrictFixture):
                 self.assertTrue((self.root / stage["stdout_log"]).is_file())
                 self.assertTrue((self.root / stage["stderr_log"]).is_file())
         self.assertFalse(list(report_path.parent.glob(".*.tmp")))
+
+    def test_managed_core_selects_materialization_without_source_git(
+        self,
+    ) -> None:
+        core = self.managed_core()
+        runner = FakeRunner()
+        workspace, create_workspace = self.external_test_workspace()
+
+        with mock.patch.object(strict_verify, "ROOT", self.root), mock.patch.object(
+            strict_verify, "CORE_ROOT", core
+        ), mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", create_workspace
+        ), mock.patch.object(
+            strict_verify.release_contract,
+            "read_verified_directory",
+            side_effect=[
+                ({"archive_sha256": "a" * 64}, {}),
+                ({"archive_sha256": "a" * 64}, {}),
+                ({"archive_sha256": "a" * 64}, {}),
+            ],
+        ) as verify_directory:
+            report, code = strict_verify.run_strict(self.root, runner=runner)
+
+        self.assertEqual(strict_verify.EXIT_OK, code)
+        self.assertEqual(
+            ["materialize", "materialize", "verify", "verify", "smoke"],
+            runner.release_operations,
+        )
+        self.assertEqual(
+            [
+                "release-materialize-1",
+                "release-materialize-2",
+            ],
+            [
+                stage["name"]
+                for stage in report["stages"]
+                if stage["name"].startswith("release-materialize")
+            ],
+        )
+        self.assertNotIn(
+            "release-build-1", [stage["name"] for stage in report["stages"]]
+        )
+        unit_command = runner.commands[3]
+        browser_command = runner.commands[4]
+        self.assertTrue(
+            any(str(workspace / "c") in argument for argument in unit_command)
+        )
+        self.assertTrue(
+            any(str(workspace / "c") in argument for argument in browser_command)
+        )
+        for environment in runner.environments[3:5]:
+            self.assertEqual(str(workspace / "t"), environment["KIT_TEST_TMPDIR"])
+            self.assertNotIn(
+                strict_verify.managed_launcher.PROJECT_ROOT_ENV,
+                environment,
+            )
+            self.assertNotIn(
+                strict_verify.managed_launcher.CORE_ROOT_ENV,
+                environment,
+            )
+            self.assertNotIn("KIT_LIFECYCLE_CHECK", environment)
+        self.assertEqual(
+            [mock.call(core), mock.call(workspace / "c"), mock.call(core)],
+            verify_directory.call_args_list,
+        )
+        copied_path = verify_directory.call_args_list[1].args[0]
+        self.assertEqual("c", copied_path.name)
+        self.assertEqual(workspace, copied_path.parent)
+        self.assertFalse((core / "src").exists())
+        self.assertFalse(workspace.exists())
+        for command in runner.commands[5:10]:
+            self.assertTrue(
+                any(str(workspace / "r") in argument for argument in command)
+            )
+        logs = self.root / report["logs_directory"]
+        self.assertTrue((logs / "unit-tests.stdout.log").is_file())
+        self.assertTrue((logs / "report.json").is_file())
+
+    def test_source_scratch_avoids_windows_long_nested_test_paths(self) -> None:
+        project = self.deep_source_project()
+        runner = FakeRunner()
+        workspace, create_workspace = self.external_test_workspace()
+
+        with mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", create_workspace
+        ):
+            report, code = strict_verify.run_strict(project, runner=runner)
+
+        self.assertEqual(strict_verify.EXIT_OK, code)
+        test_scratch = Path(runner.environments[3]["KIT_TEST_TMPDIR"])
+        self.assertEqual(workspace / "t", test_scratch)
+        self.assertIn(str(project / "tools" / "tests"), runner.commands[3])
+        self.assertFalse(test_scratch.is_relative_to(project))
+        legacy_scratch = (
+            project
+            / ".kit"
+            / "runtime"
+            / "verification"
+            / "runs"
+            / report["run_id"]
+            / "test-scratch"
+        )
+        nested_suffix = (
+            Path("board-api-test-" + ("a" * 32))
+            / ".kit"
+            / "runtime"
+            / "dispatch"
+            / "workspaces"
+            / ("run-" + ("b" * 32))
+        )
+        self.assertGreaterEqual(len(str(legacy_scratch / nested_suffix)), 260)
+        self.assertLess(len(str(test_scratch / nested_suffix)), 260)
+        self.assertFalse(workspace.exists())
+        self.assertTrue((project / report["logs_directory"] / "report.json").is_file())
+
+    def test_release_scratch_avoids_windows_long_smoke_paths(self) -> None:
+        project = self.deep_source_project()
+        runner = FakeRunner()
+        workspace, create_workspace = self.external_test_workspace()
+
+        with mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", create_workspace
+        ):
+            report, code = strict_verify.run_strict(project, runner=runner)
+
+        self.assertEqual(strict_verify.EXIT_OK, code)
+        smoke_command = next(
+            command
+            for command in runner.commands
+            if len(command) > 13
+            and Path(command[7]).name == "release.py"
+            and command[11] == "smoke"
+        )
+        smoke_workspace = Path(smoke_command[13])
+        self.assertEqual(workspace / "r" / "smoke", smoke_workspace)
+        self.assertFalse(smoke_workspace.is_relative_to(project))
+        legacy_smoke = (
+            project
+            / ".kit"
+            / "runtime"
+            / "verification"
+            / "runs"
+            / report["run_id"]
+            / "release-workspace"
+            / "smoke"
+        )
+        release_member = Path(
+            ".agents/skills/godot-headless-verification/SKILL.md"
+        )
+        self.assertGreaterEqual(len(str(legacy_smoke / release_member)), 260)
+        self.assertLess(len(str(smoke_workspace / release_member)), 260)
+        self.assertFalse(workspace.exists())
+
+    def test_managed_test_copy_mismatch_is_refused_and_removed(self) -> None:
+        core = self.managed_core()
+        workspace, create_workspace = self.external_test_workspace()
+
+        with mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", create_workspace
+        ), mock.patch.object(
+            strict_verify.release_contract,
+            "read_verified_directory",
+            side_effect=[
+                ({"archive_sha256": "a" * 64}, {}),
+                ({"archive_sha256": "b" * 64}, {}),
+            ],
+        ), self.assertRaisesRegex(
+            strict_verify.StrictVerifyError,
+            "does not match the authenticated active release",
+        ):
+            with strict_verify._isolated_strict_workspace(  # noqa: SLF001
+                core,
+                self.root,
+            ):
+                self.fail("mismatched managed test copy was executed")
+
+        self.assertFalse(workspace.exists())
+
+    def test_short_workspace_refuses_project_overlap_and_removes_exact_empty_root(
+        self,
+    ) -> None:
+        core = self.managed_core()
+        workspace = self.root / (strict_verify.STRICT_WORKSPACE_PREFIX + "overlap")
+
+        def create(*, prefix: str, dir: Path) -> str:
+            self.assertEqual(strict_verify.STRICT_WORKSPACE_PREFIX, prefix)
+            self.assertEqual(self.root, Path(dir))
+            workspace.mkdir()
+            return str(workspace)
+
+        with mock.patch.object(
+            strict_verify.tempfile, "gettempdir", return_value=str(self.root)
+        ), mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", side_effect=create
+        ), self.assertRaisesRegex(
+            strict_verify.StrictVerifyError,
+            "overlaps the project or active core",
+        ):
+            with strict_verify._short_strict_workspace(  # noqa: SLF001
+                self.root, core
+            ):
+                self.fail("overlapping strict workspace was used")
+
+        self.assertFalse(workspace.exists())
+
+    def test_short_workspace_refuses_cleanup_after_root_identity_changes(
+        self,
+    ) -> None:
+        core = self.managed_core()
+        workspace, create_workspace = self.external_test_workspace()
+
+        try:
+            with mock.patch.object(
+                strict_verify.tempfile, "mkdtemp", create_workspace
+            ), mock.patch.object(
+                strict_verify,
+                "_directory_identity",
+                side_effect=[(1, 1), (2, 2)],
+            ), self.assertRaisesRegex(
+                strict_verify.StrictVerifyError,
+                "changed strict workspace",
+            ):
+                with strict_verify._short_strict_workspace(  # noqa: SLF001
+                    self.root, core
+                ) as selected:
+                    self.assertEqual(workspace, selected)
+
+            self.assertTrue(workspace.is_dir())
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_short_workspace_cleans_an_empty_root_when_resolve_fails(self) -> None:
+        core = self.managed_core()
+        workspace, create_workspace = self.external_test_workspace()
+        real_resolve = Path.resolve
+
+        def resolve(selected: Path, strict: bool = False) -> Path:
+            if selected == workspace:
+                raise OSError("synthetic canonicalization failure")
+            return real_resolve(selected, strict=strict)
+
+        with mock.patch.object(
+            strict_verify.tempfile, "mkdtemp", create_workspace
+        ), mock.patch.object(
+            Path, "resolve", autospec=True, side_effect=resolve
+        ), self.assertRaisesRegex(
+            strict_verify.StrictVerifyError,
+            "short strict workspace is unavailable",
+        ):
+            with strict_verify._short_strict_workspace(  # noqa: SLF001
+                self.root, core
+            ):
+                self.fail("unresolved strict workspace was used")
+
+        self.assertFalse(os.path.lexists(workspace))
+
+    def test_strict_workspace_cleanup_removes_a_readonly_git_object(self) -> None:
+        workspace, _create_workspace = self.external_test_workspace()
+        git_object = workspace / ".git" / "objects" / "aa" / "object"
+        git_object.parent.mkdir(parents=True)
+        git_object.write_bytes(b"git object")
+        git_object.chmod(stat.S_IREAD)
+        identity = strict_verify._directory_identity(workspace)  # noqa: SLF001
+
+        strict_verify._remove_exact_strict_workspace(  # noqa: SLF001
+            workspace, workspace.parent, identity
+        )
+
+        self.assertFalse(os.path.lexists(workspace))
+
+    def test_strict_workspace_cleanup_retries_transient_permission_failures(
+        self,
+    ) -> None:
+        workspace, _create_workspace = self.external_test_workspace()
+        workspace.mkdir()
+        (workspace / "object").write_bytes(b"git object")
+        identity = strict_verify._directory_identity(workspace)  # noqa: SLF001
+        real_rmtree = shutil.rmtree
+        attempts = 0
+
+        def transient(path: Path, *, onerror: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError(13, "transient handle", str(path))
+            real_rmtree(path, onerror=onerror)
+
+        with mock.patch.object(
+            strict_verify.shutil, "rmtree", side_effect=transient
+        ), mock.patch.object(strict_verify.time, "sleep") as sleep:
+            strict_verify._remove_exact_strict_workspace(  # noqa: SLF001
+                workspace, workspace.parent, identity
+            )
+
+        self.assertEqual(3, attempts)
+        self.assertEqual([mock.call(0.05), mock.call(0.1)], sleep.call_args_list)
+        self.assertFalse(os.path.lexists(workspace))
+
+    def test_strict_workspace_cleanup_refuses_redirected_paths(self) -> None:
+        workspace, _create_workspace = self.external_test_workspace()
+        workspace.mkdir()
+        child = workspace / "object"
+        child.write_bytes(b"git object")
+        outside = workspace.parent / f"outside-{uuid.uuid4().hex}"
+        outside.write_bytes(b"human data")
+        self.addCleanup(outside.unlink, missing_ok=True)
+        identity = strict_verify._directory_identity(workspace)  # noqa: SLF001
+        permission = PermissionError(13, "read only")
+        captured: dict[str, object] = {}
+
+        def expose_handler(path: Path, *, onerror: object) -> None:
+            del path
+            captured["handler"] = onerror
+            raise OSError("stop after capture")
+
+        with mock.patch.object(
+            strict_verify.shutil, "rmtree", side_effect=expose_handler
+        ), self.assertRaises(strict_verify.StrictVerifyError):
+            strict_verify._remove_exact_strict_workspace(  # noqa: SLF001
+                workspace, workspace.parent, identity
+            )
+        handler = captured["handler"]
+        self.assertTrue(callable(handler))
+
+        with mock.patch.object(
+            strict_verify.os, "chmod"
+        ) as chmod, self.assertRaisesRegex(OSError, "escaped its exact root"):
+            handler(  # type: ignore[operator]
+                os.unlink,
+                str(outside),
+                (PermissionError, permission, None),
+            )
+        chmod.assert_not_called()
+
+        redirected = mock.Mock(
+            st_mode=stat.S_IFLNK | stat.S_IREAD,
+            st_dev=1,
+            st_ino=2,
+            st_size=10,
+            st_mtime_ns=3,
+            st_nlink=1,
+            st_file_attributes=0,
+        )
+        real_lstat = Path.lstat
+
+        def lstat(selected: Path) -> object:
+            return redirected if selected == child else real_lstat(selected)
+
+        with mock.patch.object(
+            Path, "lstat", autospec=True, side_effect=lstat
+        ), mock.patch.object(
+            strict_verify.os, "chmod"
+        ) as chmod, self.assertRaisesRegex(OSError, "redirected or shared"):
+            handler(  # type: ignore[operator]
+                os.unlink,
+                str(child),
+                (PermissionError, permission, None),
+            )
+        chmod.assert_not_called()
+
+    def test_strict_workspace_cleanup_refuses_exhausted_retries(self) -> None:
+        workspace, _create_workspace = self.external_test_workspace()
+        workspace.mkdir()
+        identity = strict_verify._directory_identity(workspace)  # noqa: SLF001
+        failure = PermissionError(13, "persistent handle", str(workspace))
+
+        with mock.patch.object(
+            strict_verify.shutil, "rmtree", side_effect=failure
+        ) as remove, mock.patch.object(
+            strict_verify.time, "sleep"
+        ) as sleep, self.assertRaisesRegex(
+            strict_verify.StrictVerifyError, "strict workspace cleanup failed"
+        ):
+            strict_verify._remove_exact_strict_workspace(  # noqa: SLF001
+                workspace, workspace.parent, identity
+            )
+
+        self.assertEqual(
+            len(strict_verify.STRICT_CLEANUP_RETRY_DELAYS) + 1,
+            remove.call_count,
+        )
+        self.assertEqual(
+            [
+                mock.call(delay)
+                for delay in strict_verify.STRICT_CLEANUP_RETRY_DELAYS
+            ],
+            sleep.call_args_list,
+        )
 
     def test_exact_maintainer_fixture_allows_only_project_state_skips(self) -> None:
         self.enable_maintainer_fixture()
@@ -370,6 +837,22 @@ class StrictFailureTests(StrictFixture):
                 "",
                 "test_optional ... skipped 'missing tool'\n\n"
                 "Ran 1 test in 0.001s\n\nOK (skipped=1)\n",
+            )
+        )
+        report, code = self.run_with(runner)
+
+        self.assertEqual(code, strict_verify.EXIT_FAILED)
+        stage = next(item for item in report["stages"] if item["name"] == "unit-tests")
+        self.assertEqual(stage["status"], "failed")
+        self.assertIn("skipped", stage["reason"])
+
+    def test_expected_unit_test_failure_is_a_failure(self) -> None:
+        runner = FakeRunner(
+            unit=strict_verify.ProcessOutcome(
+                0,
+                "",
+                "test_known_gap ... expected failure\n\n"
+                "Ran 1 test in 0.001s\n\nOK (expected failures=1)\n",
             )
         )
         report, code = self.run_with(runner)
@@ -567,28 +1050,32 @@ class StrictCliTests(unittest.TestCase):
 
 
 class StrictCiContractTests(unittest.TestCase):
-    def test_ci_suite_has_no_decorated_skips_hidden_by_the_local_platform(self) -> None:
+    def test_skip_contract_detects_a_runtime_skip_call(self) -> None:
+        tree = ast.parse(
+            "class Case:\n"
+            "    def test_runtime(self):\n"
+            "        self.skipTest('missing tool')\n"
+        )
+        self.assertEqual([3], _unittest_skip_lines(tree))
+
+    def test_shipped_suite_has_no_skips_hidden_by_the_local_platform(self) -> None:
         root = Path(__file__).resolve().parents[2]
         offenders: list[str] = []
-        for path in sorted((root / "tools" / "tests").glob("test_*.py")):
+        validation_tests = sorted(
+            relative
+            for relative in release.VALIDATION_FILES
+            if relative.startswith("tools/tests/test_") and relative.endswith(".py")
+        )
+        for relative in validation_tests:
+            path = root / relative
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            for node in ast.walk(tree):
-                decorators = getattr(node, "decorator_list", [])
-                for decorator in decorators:
-                    function = decorator.func if isinstance(decorator, ast.Call) else decorator
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "unittest"
-                        and function.attr in ("skip", "skipIf", "skipUnless")
-                    ):
-                        offenders.append(
-                            f"{path.relative_to(root).as_posix()}:{node.lineno}"
-                        )
+            offenders.extend(
+                f"{relative}:{line}" for line in _unittest_skip_lines(tree)
+            )
         self.assertEqual(
             [], offenders,
-            "strict rejects every unittest skip; platform-decorated tests would make "
-            "another CI leg fail even when the local leg passes",
+            "strict rejects every unittest skip; shipped tests must assert a safe "
+            "fallback when an optional host capability is absent",
         )
 
     def test_ci_uses_only_pinned_official_actions_and_authenticated_builds(self) -> None:

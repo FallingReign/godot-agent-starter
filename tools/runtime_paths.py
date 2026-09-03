@@ -107,6 +107,67 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return _inside(first, second) or _inside(second, first)
 
 
+def ensure_private_directory(paths: "RuntimePaths", relative: str) -> Path:
+    """Create one runtime child without following an existing redirect.
+
+    ``Path.mkdir(parents=True)`` follows a symlink or junction already present
+    below the runtime root.  Callers which create executable scratch space must
+    instead validate every existing component as it is traversed.
+    """
+    raw = str(relative).strip().replace("\\", "/")
+    candidate = Path(raw)
+    if (
+        not raw
+        or candidate.is_absolute()
+        or candidate == Path(".")
+        or any(part in ("", ".", "..") for part in candidate.parts)
+    ):
+        raise RuntimeConfigError(
+            "private runtime directory must be a non-empty relative path without '..'"
+        )
+    try:
+        runtime_relative = paths.runtime.relative_to(paths.root)
+    except ValueError as exc:
+        raise RuntimeConfigError("runtime root is outside the project") from exc
+    _require_unredirected_directories(paths.root, runtime_relative)
+    paths.runtime.mkdir(parents=True, exist_ok=True)
+    _require_unredirected_directories(paths.root, runtime_relative)
+
+    cursor = paths.runtime
+    for component in candidate.parts:
+        child = cursor / component
+        try:
+            info = child.lstat()
+        except FileNotFoundError:
+            try:
+                child.mkdir()
+                info = child.lstat()
+            except OSError as exc:
+                raise RuntimeConfigError(
+                    f"private runtime directory is unavailable: {child}: {exc}"
+                ) from exc
+        except OSError as exc:
+            raise RuntimeConfigError(
+                f"private runtime directory is unreadable: {child}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(info.st_mode) or _is_reparse(info):
+            raise RuntimeConfigError(
+                f"private runtime directory must be unredirected: {child}"
+            )
+        cursor = child
+
+    try:
+        resolved_runtime = paths.runtime.resolve(strict=True)
+        resolved = cursor.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeConfigError(
+            f"private runtime directory is unavailable: {cursor}: {exc}"
+        ) from exc
+    if not _inside(resolved, resolved_runtime):
+        raise RuntimeConfigError("private runtime directory escaped the runtime root")
+    return cursor
+
+
 def _absolute_private_root(root: Path, configured: object) -> Path:
     if not isinstance(configured, str) or not configured.strip():
         raise RuntimeConfigError(

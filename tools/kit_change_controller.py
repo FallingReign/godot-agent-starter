@@ -38,6 +38,7 @@ MAX_SESSION_BYTES = 16 * 1024 * 1024
 MAX_DETAIL_CHARS = 2048
 MAX_ISSUES = 4096
 MAX_ATTEMPTS = 1024
+MAX_LISTED_SESSIONS = 4096
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CHECKED_AT_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
@@ -88,6 +89,18 @@ class ControllerResult(TypedDict):
     session_id: str
     session_sha256: str
     kit_change: KitChangeView
+
+
+class KitChangeSummary(TypedDict, total=False):
+    session_id: str
+    session_sha256: str
+    mode: str
+    status: str
+    project: dict[str, str]
+    incoming_version: str
+    plan_sha256: str
+    result_sha256: str
+    problem: str
 
 
 PostApplyCheck = Callable[[Path, Mapping[str, Any]], Mapping[str, Any]]
@@ -798,6 +811,70 @@ def _public(session: Mapping[str, Any], plan_url: str = "") -> ControllerResult:
 def status(runtime_root: Path, session_id: str, *, plan_url: str = "") -> ControllerResult:
     """Return the exact state consumed by ``kit_change_html.render``."""
     return _public(load(runtime_root, session_id), plan_url)
+
+
+def list_sessions(runtime_root: Path) -> list[KitChangeSummary]:
+    """List bounded session identities without trusting partial identifiers."""
+    candidate = runtime_root.absolute()
+    if not candidate.exists():
+        return []
+    runtime = _root(candidate, "controller runtime")
+    try:
+        directory = kit_change._target(  # noqa: SLF001 - shared safety primitive
+            runtime, SESSIONS_ROOT, leaf="directory"
+        )
+    except kit_change.KitChangeError as exc:
+        raise KitChangeControllerError(exc.code, exc.detail) from exc
+    if not directory.exists():
+        return []
+
+    session_ids: list[str] = []
+    scanned = 0
+    try:
+        for entry in directory.iterdir():
+            scanned += 1
+            if scanned > MAX_LISTED_SESSIONS:
+                raise KitChangeControllerError(
+                    "session-limit",
+                    "too many retained kit change session files to list safely",
+                )
+            name = entry.name
+            if (
+                len(name) == 69
+                and name.endswith(".json")
+                and SHA256_RE.fullmatch(name[:-5])
+            ):
+                session_ids.append(name[:-5])
+    except KitChangeControllerError:
+        raise
+    except OSError as exc:
+        raise KitChangeControllerError(
+            "session-unavailable", f"cannot list controller sessions: {exc}"
+        ) from exc
+
+    summaries: list[KitChangeSummary] = []
+    for session_id in sorted(session_ids):
+        try:
+            session = load(runtime, session_id)
+        except KitChangeControllerError as exc:
+            summaries.append({
+                "session_id": session_id,
+                "status": "unavailable",
+                "problem": exc.code,
+            })
+            continue
+        view = _simple_state(session)
+        summaries.append({
+            "session_id": session_id,
+            "session_sha256": str(session["session_sha256"]),
+            "mode": view["mode"],
+            "status": view["status"],
+            "project": dict(view["project"]),
+            "incoming_version": view["incoming_version"],
+            "plan_sha256": view["plan_sha256"],
+            "result_sha256": view["result_sha256"],
+        })
+    return summaries
 
 
 def prepare(

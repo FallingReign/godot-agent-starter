@@ -21,15 +21,20 @@ import session_evidence  # noqa: E402
 import process_supervisor  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else TOOLS.parent
+
+
 def _scratch() -> Path:
-    path = TOOLS.parent / f".session-evidence-test-{uuid.uuid4().hex}"
-    path.mkdir()
+    path = _scratch_parent() / f".session-evidence-test-{uuid.uuid4().hex}"
+    path.mkdir(parents=True)
     return path
 
 
 def _remove_scratch(path: Path) -> None:
     resolved = path.resolve()
-    if resolved.parent != TOOLS.parent.resolve():
+    if resolved.parent != _scratch_parent().resolve():
         raise AssertionError(f"refusing to remove scratch outside repository: {resolved}")
     if not resolved.name.startswith(".session-evidence-test-"):
         raise AssertionError(f"refusing to remove unexpected scratch path: {resolved}")

@@ -91,6 +91,11 @@ SLUG_B = "a-second-differently-named-problem"
 FAKE_SESSIONS = [{"log": Path("nonexistent-1.jsonl"), "id": "s1"}]
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else TOOLS.parent / ".checklogs"
+
+
 def _remove_readonly(function, path: str, _error) -> None:
     """Allow Windows to remove read-only Git object files in scratch repos."""
     os.chmod(path, stat.S_IWRITE)
@@ -198,8 +203,7 @@ class FakeRunManager:
 
 class BoardTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.dir = (TOOLS.parent / ".checklogs"
-                    / f"board-api-test-{uuid.uuid4().hex}")
+        self.dir = _scratch_parent() / f"board-api-test-{uuid.uuid4().hex}"
         self.dir.mkdir(parents=True)
         self.retro = self.dir / "docs" / "retro"
         self.retro.mkdir(parents=True)

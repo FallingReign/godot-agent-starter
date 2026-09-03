@@ -29,10 +29,8 @@ from tools import process_supervisor  # noqa: E402
 @contextlib.contextmanager
 def _temporary_directory() -> Iterator[str]:
     configured = os.environ.get("KIT_TEST_TMPDIR")
-    candidates = ([Path(configured)] if configured else []) + [
-        Path(tempfile.gettempdir()),
-        Path("/tmp"),
-        ROOT / ".checklogs" / "tests",
+    candidates = [Path(configured)] if configured else [
+        Path(tempfile.gettempdir()), Path("/tmp"), ROOT / ".checklogs" / "tests"
     ]
     root = None
     for candidate in candidates:
@@ -81,8 +79,26 @@ class BootstrapGitSafety(unittest.TestCase):
             process_supervisor.resolve_ordinary_executable(
                 "git", excluded_roots=(ROOT,)
             )
+            self.git_available = True
         except (FileNotFoundError, ValueError):
-            self.skipTest("git is not installed")
+            self.git_available = False
+
+    def _real_git_or_missing_contract(self) -> bool:
+        if self.git_available:
+            return True
+        bootstrap.results.clear()
+        with mock.patch.object(
+            bootstrap, "_ordinary_tool", side_effect=FileNotFoundError
+        ):
+            self.assertFalse(bootstrap.check_git(initialise=False))
+        self.assertEqual("git", bootstrap.results[-1]["name"])
+        self.assertEqual(bootstrap.MANUAL, bootstrap.results[-1]["state"])
+        self.assertEqual("not on PATH", bootstrap.results[-1]["detail"])
+        return False
+
+    def test_missing_git_is_actionable_without_skipping(self) -> None:
+        self.git_available = False
+        self.assertFalse(self._real_git_or_missing_contract())
 
     def _run_with_unrelated_checks_stubbed(self, repo: Path, *arguments: str) -> int:
         stubbed = (
@@ -125,6 +141,8 @@ class BootstrapGitSafety(unittest.TestCase):
             return bootstrap.main()
 
     def test_target_local_git_command_is_never_started(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         if os.name != "nt":
             return
         with _temporary_directory() as temp:
@@ -147,6 +165,8 @@ class BootstrapGitSafety(unittest.TestCase):
             self.assertEqual(bootstrap.OK, bootstrap.results[-1]["state"])
 
     def test_fix_never_stages_or_commits_an_existing_repository(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         with _temporary_directory() as temp:
             repo = Path(temp)
             _git(repo, "init")
@@ -184,6 +204,8 @@ class BootstrapGitSafety(unittest.TestCase):
             self.assertEqual("developer work\n", (repo / "untracked.txt").read_text(encoding="utf-8"))
 
     def test_fix_does_not_initialise_or_commit_a_repository(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         with _temporary_directory() as temp:
             repo = Path(temp)
             (repo / "starter.txt").write_text("kit\n", encoding="utf-8")
@@ -194,6 +216,8 @@ class BootstrapGitSafety(unittest.TestCase):
             self.assertFalse((repo / "setup-generated.txt").exists())
 
     def test_init_git_never_stages_or_commits(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         with _temporary_directory() as temp:
             repo = Path(temp)
             (repo / "starter.txt").write_text("kit\n", encoding="utf-8")
@@ -225,6 +249,8 @@ class BootstrapGitSafety(unittest.TestCase):
             self.assertEqual(["?? starter.txt"], _git(repo, "status", "--porcelain=v1").splitlines())
 
     def test_fix_treats_a_linked_worktree_as_existing(self) -> None:
+        if not self._real_git_or_missing_contract():
+            return
         with _temporary_directory() as temp:
             base = Path(temp)
             primary = base / "primary"

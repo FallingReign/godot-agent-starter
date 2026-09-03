@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest import mock
 
@@ -254,6 +254,18 @@ class KitChangeTest(unittest.TestCase):
             self.root, self.archive, str(decision["approval"]["sha256"])
         )
 
+    def _transaction_paths(self, result: dict[str, object]) -> tuple[Path, Path]:
+        transaction = str(result["transaction_id"])
+        directory = (
+            self.root
+            / ".kit"
+            / "runtime"
+            / "upgrade"
+            / "transactions"
+            / transaction
+        )
+        return directory / "journal.json", directory / "backup.json"
+
     def _materialize_core(
         self,
         fixture: tuple[dict[str, object], dict[str, SimpleNamespace]],
@@ -289,6 +301,102 @@ class KitChangeTest(unittest.TestCase):
         self.assertFalse((self.root / ".agent-kit").exists())
         self.assertFalse((self.root / ".kit").exists())
         self.assertEqual((self.root / "AGENTS.md").read_bytes(), original)
+
+    def test_new_architecture_document_uses_the_target_project_graph(self) -> None:
+        _write(
+            self.root,
+            "src/custom/avatar.gd",
+            b"extends RefCounted\nclass_name Avatar\n",
+        )
+
+        plan = kit_change._build_plan(self.root, self.archive)
+
+        rendered = plan.replacements["ARCHITECTURE.md"]
+        self.assertIsInstance(rendered, bytes)
+        assert isinstance(rendered, bytes)
+        self.assertIn(b'm0["custom"]', rendered)
+        self.assertNotEqual(
+            self.fixture[1]["install/ARCHITECTURE.md"].content,
+            rendered,
+        )
+        change = next(
+            item
+            for item in plan.preview["material"]["changes"]
+            if item["path"] == "ARCHITECTURE.md"
+        )
+        self.assertEqual(_sha256(rendered), change["after"]["sha256"])
+
+        self._preview_and_apply()
+
+        self.assertEqual(rendered, (self.root / "ARCHITECTURE.md").read_bytes())
+
+    def test_target_graph_change_after_preview_invalidates_approval(self) -> None:
+        decision = kit_change.preview(self.root, self.archive)
+        _write(
+            self.root,
+            "src/custom/avatar.gd",
+            b"extends RefCounted\nclass_name Avatar\n",
+        )
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.apply(
+                self.root,
+                self.archive,
+                str(decision["approval"]["sha256"]),
+            )
+
+        self.assertEqual("approval-mismatch", raised.exception.code)
+        self.assertFalse((self.root / "ARCHITECTURE.md").exists())
+        self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+
+    def test_generated_architecture_over_the_file_limit_blocks_preview(self) -> None:
+        oversized = b"x" * (kit_change.MAX_MANAGED_FILE_BYTES + 1)
+
+        with mock.patch.object(
+            kit_change,
+            "_architecture_document_bytes",
+            return_value=oversized,
+        ):
+            decision = kit_change.preview(self.root, self.archive)
+
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertIn(
+            ("managed-file-too-large", "ARCHITECTURE.md"),
+            [
+                (item["code"], item["path"])
+                for item in decision["material"]["blockers"]
+            ],
+        )
+
+    def test_linked_architecture_source_is_a_clear_lifecycle_blocker(self) -> None:
+        source = _write(
+            self.root,
+            "src/custom/shared-source.gd",
+            b"extends RefCounted\n",
+        )
+        source_path = os.path.normcase(os.path.abspath(source))
+        real_lstat = Path.lstat
+
+        def simulated_hardlink(path: Path) -> os.stat_result:
+            info = real_lstat(path)
+            if os.path.normcase(os.path.abspath(path)) != source_path:
+                return info
+            values = list(info)
+            values[stat.ST_NLINK] = 2
+            return os.stat_result(values)
+
+        with mock.patch.object(Path, "lstat", simulated_hardlink):
+            decision = kit_change.preview(self.root, self.archive)
+
+        blocker = next(
+            item
+            for item in decision["material"]["blockers"]
+            if item["code"] == "architecture-generation-failed"
+        )
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual("ARCHITECTURE.md", blocker["path"])
+        self.assertIn("architecture scan blocked", blocker["detail"])
+        self.assertIn("hard-linked file is not allowed", blocker["detail"])
 
     def test_apply_rechecks_the_full_preview_digest(self) -> None:
         original = b"# Human project rules\n"
@@ -582,6 +690,94 @@ class KitChangeTest(unittest.TestCase):
         )
         self.assertEqual((self.root / "kit.config.json").read_bytes(), existing)
 
+    def test_root_codex_override_blocks_install_without_editing(self) -> None:
+        override = _write(
+            self.root,
+            "AGENTS.override.md",
+            b"# Human override\n",
+        )
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        blocker = next(
+            item
+            for item in decision["material"]["blockers"]
+            if item["code"] == "instruction-override-conflict"
+        )
+        self.assertEqual("AGENTS.override.md", blocker["path"])
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(b"# Human override\n", override.read_bytes())
+        self.assertFalse((self.root / "kit.cmd").exists())
+
+    def test_unsafe_codex_override_casing_or_redirect_blocks_install(self) -> None:
+        wrong_case = _write(
+            self.root,
+            "AGENTS.OVERRIDE.md",
+            b"# Human override\n",
+        )
+        decision = kit_change.preview(self.root, self.archive)
+        self.assertIn(
+            "instruction-override-conflict",
+            {item["code"] for item in decision["material"]["blockers"]},
+        )
+        wrong_case.unlink()
+
+        redirected = self.root / "AGENTS.override.md"
+        redirected.write_bytes(b"# Redirected override\n")
+        original = kit_change._is_reparse
+
+        def report_redirect(path: Path) -> bool:
+            return path == redirected or original(path)
+
+        with mock.patch.object(
+            kit_change,
+            "_is_reparse",
+            side_effect=report_redirect,
+        ):
+            decision = kit_change.preview(self.root, self.archive)
+        self.assertIn(
+            "instruction-override-conflict",
+            {item["code"] for item in decision["material"]["blockers"]},
+        )
+
+    def test_resulting_codex_instructions_over_32_kib_block_install(self) -> None:
+        original = b"x" * kit_change.MAX_CODEX_INSTRUCTIONS_BYTES
+        agents = _write(self.root, "AGENTS.md", original)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        blocker = next(
+            item
+            for item in decision["material"]["blockers"]
+            if item["code"] == "instruction-file-too-large"
+        )
+        self.assertEqual("AGENTS.md", blocker["path"])
+        self.assertIn("32768", blocker["detail"])
+        self.assertFalse(decision["approval"]["approvable"])
+        self.assertEqual(original, agents.read_bytes())
+
+    def test_csharp_marker_in_project_or_selected_game_root_blocks_install(self) -> None:
+        root_marker = _write(self.root, "Fixture.csproj", b"<Project />\n")
+        root_decision = kit_change.preview(self.root, self.archive)
+        root_blocker = next(
+            item
+            for item in root_decision["material"]["blockers"]
+            if item["code"] == "unsupported-csharp-project"
+        )
+        self.assertEqual("Fixture.csproj", root_blocker["path"])
+        root_marker.unlink()
+
+        (self.root / "src" / "Nested.CSPROJ").write_bytes(b"<Project />\n")
+        nested_decision = kit_change.preview(self.root, self.archive)
+        nested_blocker = next(
+            item
+            for item in nested_decision["material"]["blockers"]
+            if item["code"] == "unsupported-csharp-project"
+        )
+        self.assertEqual("src/Nested.CSPROJ", nested_blocker["path"])
+        self.assertFalse(nested_decision["approval"]["approvable"])
+        self.assertFalse((self.root / "kit.cmd").exists())
+
     def test_rollback_restores_exact_bytes_and_absence(self) -> None:
         original = b"# Human project rules\r\nKeep CRLF exactly.\r\n"
         _write(self.root, "AGENTS.md", original)
@@ -602,6 +798,184 @@ class KitChangeTest(unittest.TestCase):
             self.root, self.archive, str(next_preview["approval"]["sha256"])
         )
         self.assertEqual("applied", reapplied["status"])
+
+    def test_forged_transaction_core_path_cannot_delete_a_project_directory(self) -> None:
+        result = self._preview_and_apply()
+        protected = _write(self.root, "human-release/keep.txt", b"keep\n")
+        journal_path, _backup_path = self._transaction_paths(result)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["core"]["path"] = "human-release"
+        journal_path.write_bytes(_canonical(journal))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("journal-invalid", raised.exception.code)
+        self.assertEqual(b"keep\n", protected.read_bytes())
+
+    def test_forged_activation_phase_cannot_restore_project_files(self) -> None:
+        _write(self.root, "AGENTS.md", b"# Human policy\n")
+        result = self._preview_and_apply()
+        applied = (self.root / "AGENTS.md").read_bytes()
+        journal_path, _backup_path = self._transaction_paths(result)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        project_entry = next(
+            entry for entry in journal["entries"] if entry["path"] == "AGENTS.md"
+        )
+        project_entry["phase"] = "activation"
+        journal_path.write_bytes(_canonical(journal))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("journal-invalid", raised.exception.code)
+        self.assertEqual(applied, (self.root / "AGENTS.md").read_bytes())
+        self.assertTrue((self.root / ".agent-kit" / "current.json").is_file())
+
+    def test_forged_backup_blob_relationship_cannot_overwrite_a_project_file(self) -> None:
+        _write(self.root, "AGENTS.md", b"# Human policy\n")
+        result = self._preview_and_apply()
+        applied = (self.root / "AGENTS.md").read_bytes()
+        journal_path, _backup_path = self._transaction_paths(result)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        project_entry = next(
+            entry for entry in journal["entries"] if entry["path"] == "AGENTS.md"
+        )
+        project_entry["backup_blob"] = "blobs/" + "f" * 64
+        journal_path.write_bytes(_canonical(journal))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("journal-invalid", raised.exception.code)
+        self.assertEqual(applied, (self.root / "AGENTS.md").read_bytes())
+
+    def test_forged_created_directory_cannot_remove_a_human_directory(self) -> None:
+        result = self._preview_and_apply()
+        human_directory = self.root / "human-empty"
+        human_directory.mkdir()
+        applied = (self.root / "kit.cmd").read_bytes()
+        journal_path, backup_path = self._transaction_paths(result)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        backup = json.loads(backup_path.read_text(encoding="utf-8"))
+        backup["created_directories"].append("human-empty")
+        backup["created_directories"].sort(
+            key=lambda candidate: (len(PurePosixPath(candidate).parts), candidate)
+        )
+        backup_content = _canonical(backup)
+        backup_path.write_bytes(backup_content)
+        journal["backup_manifest_sha256"] = _sha256(backup_content)
+        journal_path.write_bytes(_canonical(journal))
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.rollback(self.root, str(result["transaction_id"]))
+
+        self.assertEqual("backup-invalid", raised.exception.code)
+        self.assertTrue(human_directory.is_dir())
+        self.assertEqual(applied, (self.root / "kit.cmd").read_bytes())
+
+    def test_backup_preflight_failure_creates_no_transaction_directory(self) -> None:
+        plan = kit_change._build_plan(self.root, self.archive)
+        _write(self.root, "AGENTS.md", b"changed after preview\n")
+        transactions = self.root.joinpath(
+            *kit_change.TRANSACTIONS_ROOT.split("/")
+        )
+
+        for transaction_id in ("1" * 32, "2" * 32):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change._prepare_backup(plan, transaction_id)
+            self.assertEqual("target-changed", raised.exception.code)
+
+        self.assertFalse(transactions.exists())
+
+    def test_failed_backup_writes_do_not_accumulate_transactions(self) -> None:
+        _write(self.root, "AGENTS.md", b"# Human policy\n")
+        plan = kit_change._build_plan(self.root, self.archive)
+        transactions = self.root.joinpath(
+            *kit_change.TRANSACTIONS_ROOT.split("/")
+        )
+
+        with mock.patch.object(
+            kit_change,
+            "_durable_json",
+            side_effect=OSError("simulated durable write failure"),
+        ):
+            for transaction_id in ("3" * 32, "4" * 32):
+                with self.assertRaises(OSError):
+                    kit_change._prepare_backup(plan, transaction_id)
+
+        self.assertTrue(transactions.is_dir())
+        self.assertEqual([], list(transactions.iterdir()))
+
+    def test_failed_journal_write_does_not_leave_a_journal_less_transaction(self) -> None:
+        _write(self.root, "AGENTS.md", b"# Human policy\n")
+        decision = kit_change.preview(self.root, self.archive)
+        transactions = self.root.joinpath(
+            *kit_change.TRANSACTIONS_ROOT.split("/")
+        )
+        durable_json = kit_change._durable_json
+
+        def fail_journal(path: Path, value: object) -> None:
+            if path.name == "journal.json":
+                raise OSError("simulated journal write failure")
+            durable_json(path, value)
+
+        with mock.patch.object(
+            kit_change,
+            "_durable_json",
+            side_effect=fail_journal,
+        ), self.assertRaises(OSError):
+            kit_change.apply(
+                self.root,
+                self.archive,
+                str(decision["approval"]["sha256"]),
+            )
+
+        self.assertTrue(transactions.is_dir())
+        self.assertEqual([], list(transactions.iterdir()))
+        self.assertFalse((self.root / "kit.cmd").exists())
+
+    def test_journal_less_private_backup_is_recovered_before_the_next_apply(self) -> None:
+        decision = kit_change.preview(self.root, self.archive)
+        transaction_id = "5" * 32
+        orphan = self.root.joinpath(
+            *kit_change.TRANSACTIONS_ROOT.split("/"), transaction_id
+        )
+        blobs = orphan / "blobs"
+        blobs.mkdir(parents=True)
+        content = b"interrupted private backup\n"
+        (blobs / _sha256(content)).write_bytes(content)
+        (orphan / "backup.json").write_bytes(b"{}\n")
+
+        result = kit_change.apply(
+            self.root,
+            self.archive,
+            str(decision["approval"]["sha256"]),
+        )
+
+        self.assertEqual("applied", result["status"])
+        self.assertFalse(orphan.exists())
+
+    def test_unsafe_journal_less_transaction_is_preserved_and_blocks_apply(self) -> None:
+        decision = kit_change.preview(self.root, self.archive)
+        transaction_id = "6" * 32
+        orphan = self.root.joinpath(
+            *kit_change.TRANSACTIONS_ROOT.split("/"), transaction_id
+        )
+        orphan.mkdir(parents=True)
+        unexpected = orphan / "unexpected.txt"
+        unexpected.write_bytes(b"do not delete\n")
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.apply(
+                self.root,
+                self.archive,
+                str(decision["approval"]["sha256"]),
+            )
+
+        self.assertEqual("transaction-incomplete", raised.exception.code)
+        self.assertEqual(b"do not delete\n", unexpected.read_bytes())
+        self.assertFalse((self.root / "kit.cmd").exists())
 
     def test_crash_during_project_writes_resumes_by_rolling_back(self) -> None:
         original = b"# Human project rules\n"
@@ -834,7 +1208,27 @@ class KitChangeTest(unittest.TestCase):
             check=False,
         )
         if completed.returncode != 0:
-            self.skipTest(completed.stderr or completed.stdout)
+            original = kit_change._is_reparse
+
+            def simulated_dangling_junction(path: Path) -> bool:
+                return path == junction or original(path)
+
+            with mock.patch.object(
+                kit_change,
+                "_is_reparse",
+                side_effect=simulated_dangling_junction,
+            ):
+                decision = kit_change.preview(self.root, self.archive)
+
+            self.assertFalse(decision["approval"]["approvable"])
+            self.assertIn(
+                "redirected-path",
+                {
+                    blocker["code"]
+                    for blocker in decision["material"]["blockers"]
+                },
+            )
+            return
         destination.rmdir()
         try:
             self.assertFalse(junction.exists())
@@ -856,13 +1250,23 @@ class KitChangeTest(unittest.TestCase):
 
     def test_hardlinked_managed_target_blocks_preview(self) -> None:
         agents = _write(self.root, "AGENTS.md", b"# Human project rules\n")
-        alias = self.root / "agents-hardlink-source.md"
-        try:
-            os.link(agents, alias)
-        except OSError as exc:
-            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+        path_type = type(agents)
+        original_lstat = path_type.lstat
 
-        decision = kit_change.preview(self.root, self.archive)
+        def report_hardlink(path: Path):
+            info = original_lstat(path)
+            if path == agents:
+                linked = mock.Mock(wraps=info)
+                linked.st_mode = info.st_mode
+                linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                linked.st_nlink = 2
+                return linked
+            return info
+
+        with mock.patch.object(
+            path_type, "lstat", autospec=True, side_effect=report_hardlink
+        ):
+            decision = kit_change.preview(self.root, self.archive)
 
         self.assertFalse(decision["approval"]["approvable"])
         self.assertIn(
@@ -880,16 +1284,24 @@ class KitChangeTest(unittest.TestCase):
             / str(self.fixture[0]["archive_sha256"])
         )
         member = core / "kit.py"
-        source = self.root / "core-hardlink-source.py"
-        source.write_bytes(member.read_bytes())
-        member.unlink()
-        try:
-            os.link(source, member)
-        except OSError as exc:
-            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+        path_type = type(member)
+        original_lstat = path_type.lstat
 
-        with self.assertRaises(kit_change.KitChangeError) as raised:
-            kit_change.preview(self.root, self.archive)
+        def report_hardlink(path: Path):
+            info = original_lstat(path)
+            if path == member:
+                linked = mock.Mock(wraps=info)
+                linked.st_mode = info.st_mode
+                linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                linked.st_nlink = 2
+                return linked
+            return info
+
+        with mock.patch.object(
+            path_type, "lstat", autospec=True, side_effect=report_hardlink
+        ):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change.preview(self.root, self.archive)
 
         self.assertEqual("installed-kit-untrusted", raised.exception.code)
 

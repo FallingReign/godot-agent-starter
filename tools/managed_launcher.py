@@ -28,6 +28,8 @@ CURRENT_NAME = "current.json"
 RELEASES_DIRECTORY = "releases"
 MANIFEST_NAME = "RELEASE-MANIFEST.json"
 INSTALL_MANIFEST_NAME = "INSTALL-MANIFEST.json"
+INSTALL_MANIFEST_SCHEMA = 1
+INSTALL_MANIFEST_KIND = "agent-kit-install-manifest"
 CURRENT_SCHEMA = 1
 CURRENT_KIND = "agent-kit-install-state"
 MANIFEST_SCHEMA = 2
@@ -39,6 +41,7 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_MEMBERS = 512
+MAX_SURFACES = 512
 
 ENTRYPOINT_BOOTSTRAP = (
     "import os,sys\n"
@@ -489,8 +492,8 @@ def _validate_release_state(value: object, label: str) -> dict:
     return value
 
 
-def _validate_managed_surfaces(value: object) -> None:
-    if not isinstance(value, list):
+def _validate_managed_surfaces(value: object) -> list[dict]:
+    if not isinstance(value, list) or len(value) > MAX_SURFACES:
         raise LauncherError("current.json managed_surfaces must be a list")
     identifiers: list[str] = []
     folded_paths: set[str] = set()
@@ -518,6 +521,212 @@ def _validate_managed_surfaces(value: object) -> None:
         identifiers.append(identifier)
     if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
         raise LauncherError("current.json managed surfaces must have sorted unique ids")
+    return value
+
+
+def _surface_file(project_root: Path, relative: str) -> bytes:
+    """Read one exact project surface without accepting casing or redirects."""
+    parts = _safe_member_parts(relative)
+    cursor = project_root
+    for component in parts[:-1]:
+        matches = _matching_names(cursor, component, f"managed surface {relative}")
+        if not matches:
+            raise LauncherError(f"managed surface is missing: {relative}")
+        cursor = cursor / component
+        _require_directory(cursor, f"managed surface parent {relative}")
+    matches = _matching_names(cursor, parts[-1], f"managed surface {relative}")
+    if not matches:
+        raise LauncherError(f"managed surface is missing: {relative}")
+    path = cursor / parts[-1]
+    return _require_regular_file(
+        path,
+        f"managed surface {relative}",
+        maximum=MAX_MEMBER_BYTES,
+    )
+
+
+def _managed_block_bytes(
+    content: bytes,
+    *,
+    begin: str,
+    end: str,
+    path: str,
+) -> bytes:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LauncherError(f"managed block file is not UTF-8: {path}") from exc
+    starts = [match.start() for match in re.finditer(re.escape(begin), text)]
+    ends = [match.start() for match in re.finditer(re.escape(end), text)]
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        raise LauncherError(f"managed block markers changed: {path}")
+    finish = ends[0] + len(end)
+    if text[finish:finish + 2] == "\r\n":
+        finish += 2
+    elif text[finish:finish + 1] == "\n":
+        finish += 1
+    return text[starts[0]:finish].encode("utf-8")
+
+
+def _validate_installed_surfaces(
+    project_root: Path,
+    core: Path,
+    current: dict,
+    install_manifest_content: bytes,
+) -> None:
+    """Bind current.json ownership to the active manifest and live project files."""
+    manifest = _json_object(install_manifest_content, "install manifest")
+    if install_manifest_content != _canonical_json(manifest):
+        raise LauncherError("install manifest is not canonically encoded")
+    expected_keys = {
+        "schema",
+        "kind",
+        "kit_version",
+        "install_schema",
+        "layout_schema",
+        "config_schema",
+        "supported_legacy_versions",
+        "supported_install_schemas",
+        "core_layout",
+        "owned_files",
+        "managed_blocks",
+        "legacy_retired_files",
+    }
+    if (
+        set(manifest) != expected_keys
+        or manifest.get("schema") != INSTALL_MANIFEST_SCHEMA
+        or manifest.get("kind") != INSTALL_MANIFEST_KIND
+        or manifest.get("kit_version") != current["active_release"]["kit_version"]
+        or manifest.get("install_schema") != current["install_schema"]
+        or manifest.get("layout_schema") != current["layout_schema"]
+        or manifest.get("config_schema") != current["config_schema"]
+        or manifest.get("core_layout") != "versioned-by-archive-sha256"
+    ):
+        raise LauncherError("install manifest fields do not match current.json")
+    owned = manifest.get("owned_files")
+    blocks = manifest.get("managed_blocks")
+    if (
+        not isinstance(owned, list)
+        or not isinstance(blocks, list)
+        or len(owned) + len(blocks) > MAX_SURFACES
+        or not isinstance(manifest.get("legacy_retired_files"), list)
+        or not isinstance(manifest.get("supported_legacy_versions"), list)
+        or not isinstance(manifest.get("supported_install_schemas"), list)
+    ):
+        raise LauncherError("install manifest surface lists are malformed")
+
+    declared: dict[str, dict[str, str]] = {}
+    folded_paths: set[str] = set()
+    for raw in owned:
+        if not isinstance(raw, dict):
+            raise LauncherError("install manifest contains a malformed owned surface")
+        strategy = raw.get("strategy")
+        required = {"id", "path", "source", "mode", "strategy", "legacy_sha256"}
+        if strategy == "schema-json":
+            required |= {
+                "schema_key",
+                "target_schema",
+                "supported_schemas",
+                "defaults",
+                "allowed_keys",
+            }
+        if set(raw) != required or strategy not in {
+            "replace", "create-only", "schema-json"
+        }:
+            raise LauncherError("install manifest contains a malformed owned surface")
+        identifier = raw.get("id")
+        if not isinstance(identifier, str) or SURFACE_ID_RE.fullmatch(identifier) is None:
+            raise LauncherError("install manifest contains an unsafe surface id")
+        path = "/".join(_safe_member_parts(raw.get("path")))
+        source = "/".join(_safe_member_parts(raw.get("source")))
+        if raw.get("mode") not in {"0644", "0755"}:
+            raise LauncherError(f"install surface mode is malformed: {path}")
+        if identifier in declared or path.casefold() in folded_paths:
+            raise LauncherError("install manifest surface identity is duplicated")
+        folded_paths.add(path.casefold())
+        declared[identifier] = {
+            "path": path,
+            "source": source,
+            "strategy": str(strategy),
+            "begin": "",
+            "end": "",
+        }
+    for raw in blocks:
+        if not isinstance(raw, dict) or set(raw) != {
+            "id", "path", "source", "mode", "legacy_file_sha256", "begin", "end"
+        }:
+            raise LauncherError("install manifest contains a malformed managed block")
+        identifier = raw.get("id")
+        begin = raw.get("begin")
+        end = raw.get("end")
+        if (
+            not isinstance(identifier, str)
+            or SURFACE_ID_RE.fullmatch(identifier) is None
+            or not isinstance(begin, str)
+            or not begin
+            or not isinstance(end, str)
+            or not end
+            or begin == end
+            or len(begin) > 512
+            or len(end) > 512
+            or raw.get("mode") not in {"0644", "0755"}
+        ):
+            raise LauncherError("install manifest contains a malformed managed block")
+        path = "/".join(_safe_member_parts(raw.get("path")))
+        source = "/".join(_safe_member_parts(raw.get("source")))
+        if identifier in declared or path.casefold() in folded_paths:
+            raise LauncherError("install manifest surface identity is duplicated")
+        folded_paths.add(path.casefold())
+        declared[identifier] = {
+            "path": path,
+            "source": source,
+            "strategy": "managed-block",
+            "begin": begin,
+            "end": end,
+        }
+
+    records = current["managed_surfaces"]
+    by_id = {str(item["id"]): item for item in records}
+    if sorted(by_id) != sorted(declared) or len(by_id) != len(records):
+        raise LauncherError("current.json does not name every active managed surface")
+    for identifier in sorted(declared):
+        surface = declared[identifier]
+        record = by_id[identifier]
+        if (
+            record["path"] != surface["path"]
+            or record["strategy"] != surface["strategy"]
+        ):
+            raise LauncherError(f"managed surface record differs: {surface['path']}")
+        source = _require_regular_file(
+            _member_file(core, _safe_member_parts(surface["source"])),
+            f"managed surface source {surface['source']}",
+            maximum=MAX_MEMBER_BYTES,
+        )
+        if surface["strategy"] == "managed-block" and not source.endswith(b"\n"):
+            source += b"\n"
+        source_sha = hashlib.sha256(source).hexdigest()
+        if record["base_sha256"] != source_sha:
+            raise LauncherError(f"managed surface source identity differs: {surface['path']}")
+        if surface["strategy"] in {"replace", "owned-file"}:
+            live = _surface_file(project_root, surface["path"])
+            if (
+                record["applied_sha256"] != source_sha
+                or hashlib.sha256(live).hexdigest() != source_sha
+            ):
+                raise LauncherError(f"managed kit file changed: {surface['path']}")
+        elif surface["strategy"] == "managed-block":
+            live = _surface_file(project_root, surface["path"])
+            block = _managed_block_bytes(
+                live,
+                begin=surface["begin"],
+                end=surface["end"],
+                path=surface["path"],
+            )
+            if (
+                record["applied_sha256"] != source_sha
+                or hashlib.sha256(block).hexdigest() != source_sha
+            ):
+                raise LauncherError(f"managed block changed: {surface['path']}")
 
 
 def _validate_applied_migrations(value: object) -> None:
@@ -576,7 +785,9 @@ def _validate_current(project_root: Path, managed_root: Path) -> Installation:
     previous = current.get("previous_release")
     if previous is not None:
         _validate_release_state(previous, "previous release")
-    _validate_managed_surfaces(current.get("managed_surfaces"))
+    current["managed_surfaces"] = _validate_managed_surfaces(
+        current.get("managed_surfaces")
+    )
     _validate_applied_migrations(current.get("applied_migrations"))
     release_sha = active["archive_sha256"]
 
@@ -594,6 +805,12 @@ def _validate_current(project_root: Path, managed_root: Path) -> Installation:
     )
     if hashlib.sha256(install_manifest_content).hexdigest() != active["install_manifest_sha256"]:
         raise LauncherError("install manifest SHA-256 does not match current.json")
+    _validate_installed_surfaces(
+        project_root,
+        core,
+        current,
+        install_manifest_content,
+    )
     return Installation(
         project_root=project_root,
         core_root=core,

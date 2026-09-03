@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +31,11 @@ import managed_launcher  # noqa: E402
 import process_supervisor  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
+
+
 def _canonical_json(value: dict) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
@@ -39,8 +46,22 @@ def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
     """Create one fully validated managed core from selected source files."""
     marker = {"kind": managed_launcher.MARKER_KIND, "schema": 1}
     (project / managed_launcher.MARKER_NAME).write_bytes(_canonical_json(marker))
+    install_manifest = {
+        "schema": managed_launcher.INSTALL_MANIFEST_SCHEMA,
+        "kind": managed_launcher.INSTALL_MANIFEST_KIND,
+        "kit_version": "0.3.0",
+        "install_schema": 1,
+        "layout_schema": 1,
+        "config_schema": 1,
+        "supported_legacy_versions": ["0.2.0"],
+        "supported_install_schemas": [1],
+        "core_layout": "versioned-by-archive-sha256",
+        "owned_files": [],
+        "managed_blocks": [],
+        "legacy_retired_files": [],
+    }
     contents: dict[str, bytes] = {
-        "INSTALL-MANIFEST.json": b'{"schema":1}\n',
+        managed_launcher.INSTALL_MANIFEST_NAME: _canonical_json(install_manifest),
         "LICENSE": b"MIT\n",
         "kit.py": b"#!/usr/bin/env python3\n",
     }
@@ -91,7 +112,7 @@ def _managed_core(project: Path, relative_files: tuple[str, ...]) -> Path:
         target.write_bytes(content)
         target.chmod(0o755 if relative.endswith(".py") else 0o644)
     (core / managed_launcher.MANIFEST_NAME).write_bytes(manifest_content)
-    install_content = contents["INSTALL-MANIFEST.json"]
+    install_content = contents[managed_launcher.INSTALL_MANIFEST_NAME]
     active_release = {
         "kit_version": "0.3.0",
         "archive_sha256": release_sha,
@@ -127,17 +148,25 @@ def _managed_environment(project: Path, core: Path) -> dict[str, str]:
 
 class ConfiguredGameRootConsumers(unittest.TestCase):
     def setUp(self) -> None:
-        parent = ROOT / ".checklogs" / "tests"
+        parent = _scratch_parent()
         parent.mkdir(parents=True, exist_ok=True)
         self.scratch = parent / f"layout-consumers-{uuid.uuid4().hex}"
         self.scratch.mkdir()
 
     def tearDown(self) -> None:
         resolved = self.scratch.resolve()
-        expected = (ROOT / ".checklogs" / "tests").resolve()
+        expected = _scratch_parent().resolve()
         if resolved.parent != expected or not resolved.name.startswith("layout-consumers-"):
             raise AssertionError(f"refusing to remove unexpected scratch: {resolved}")
         shutil.rmtree(resolved)
+
+    @staticmethod
+    def _sanitise_stat(info: os.stat_result, **changes: object) -> SimpleNamespace:
+        fields = set(sanitise._PATH_IDENTITY_FIELDS)
+        fields.add("st_file_attributes")
+        values = {field: getattr(info, field, None) for field in fields}
+        values.update(changes)
+        return SimpleNamespace(**values)
 
     def test_architecture_reads_a_root_layout_in_res_space(self) -> None:
         script = self.scratch / "scripts" / "logic" / "root_logic.gd"
@@ -175,6 +204,95 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
         self.assertNotIn("load_steps", cleaned)
         self.assertTrue(any("removed load_steps" in note for note in notes))
 
+    def test_sanitiser_rejects_a_hardlinked_resource_before_reading(self) -> None:
+        scene = self.scratch / "external.tscn"
+        scene.write_text("[gd_scene format=3]\n", encoding="utf-8")
+        scene_key = os.path.normcase(os.path.abspath(scene))
+        real_lstat = Path.lstat
+
+        def simulated_hardlink(path: Path) -> object:
+            info = real_lstat(path)
+            if os.path.normcase(os.path.abspath(path)) == scene_key:
+                return self._sanitise_stat(info, st_nlink=2)
+            return info
+
+        with mock.patch.object(
+            Path, "lstat", simulated_hardlink
+        ), mock.patch.object(
+            sanitise.os,
+            "open",
+            side_effect=AssertionError("linked resource was read"),
+        ):
+            with self.assertRaisesRegex(
+                sanitise.SanitiseScanError,
+                r"hard-linked file is not allowed: external\.tscn",
+            ):
+                sanitise.scan_project(self.scratch)
+
+    def test_sanitiser_rejects_res_path_traversal_without_reading_outside(self) -> None:
+        scene = self.scratch / "main.tscn"
+        text = (
+            '[gd_scene format=3]\n'
+            '[ext_resource type="Script" path="res://../outside.gd" '
+            'uid="uid://claimed" id="1"]\n'
+            '[node name="Root" type="Node"]\n'
+        )
+        scene.write_text(text, encoding="utf-8")
+        inventory = sanitise.scan_project(self.scratch)
+
+        with mock.patch.object(
+            Path, "read_text", side_effect=AssertionError("outside path was read")
+        ):
+            cleaned, _notes = sanitise.sanitise_text(
+                text, "main.tscn", scan=inventory
+            )
+            errors = sanitise.structural_errors(
+                cleaned, "main.tscn", scan=inventory
+            )
+
+        self.assertIn('uid="uid://claimed"', cleaned)
+        self.assertIn("not a canonical project path", errors[0])
+
+    def test_sanitiser_write_refuses_a_path_changed_to_a_link(self) -> None:
+        scene = self.scratch / "main.tscn"
+        scene.write_text('[gd_scene load_steps=2 format=3]\n', encoding="utf-8")
+        inventory = sanitise.scan_project(self.scratch)
+        source = inventory.resources[0]
+        scene_key = os.path.normcase(os.path.abspath(scene))
+        real_lstat = Path.lstat
+
+        def simulated_symlink(path: Path) -> object:
+            info = real_lstat(path)
+            if os.path.normcase(os.path.abspath(path)) == scene_key:
+                return self._sanitise_stat(
+                    info,
+                    st_mode=stat.S_IFLNK | stat.S_IMODE(info.st_mode),
+                )
+            return info
+
+        with mock.patch.object(
+            Path, "lstat", simulated_symlink
+        ), mock.patch.object(
+            sanitise.os,
+            "open",
+            side_effect=AssertionError("changed path was opened"),
+        ):
+            with self.assertRaisesRegex(
+                sanitise.SanitiseScanError,
+                r"linked file is not allowed: main\.tscn",
+            ):
+                sanitise._write_scanned_file(source, "[gd_scene format=3]\n")
+
+    def test_sanitiser_file_limit_bounds_resource_reads(self) -> None:
+        scene = self.scratch / "large.tscn"
+        scene.write_text("123456789", encoding="utf-8")
+        with mock.patch.object(sanitise, "MAX_SANITISE_FILE_BYTES", 8):
+            with self.assertRaisesRegex(
+                sanitise.SanitiseScanError,
+                r"resource exceeds 8 bytes: large\.tscn",
+            ):
+                sanitise.scan_project(self.scratch)
+
     def test_design_tunables_scan_the_configured_root(self) -> None:
         script = self.scratch / "scripts" / "data" / "root_config.gd"
         script.parent.mkdir(parents=True)
@@ -184,7 +302,7 @@ class ConfiguredGameRootConsumers(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with mock.patch.object(
+        with mock.patch.object(design, "ROOT", self.scratch), mock.patch.object(
             design, "_configured_game_root", return_value=self.scratch
         ):
             found = design.scan_tunables()

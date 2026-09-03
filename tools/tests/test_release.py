@@ -25,8 +25,13 @@ import release  # noqa: E402
 import process_supervisor  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else REPOSITORY / ".checklogs"
+
+
 def _scratch() -> Path:
-    parent = REPOSITORY / ".checklogs"
+    parent = _scratch_parent()
     parent.mkdir(exist_ok=True)
     path = parent / f"release-test-{uuid.uuid4().hex}"
     path.mkdir()
@@ -35,7 +40,7 @@ def _scratch() -> Path:
 
 def _remove_scratch(path: Path) -> None:
     resolved = path.resolve()
-    parent = (REPOSITORY / ".checklogs").resolve()
+    parent = _scratch_parent().resolve()
     if resolved.parent != parent or not resolved.name.startswith("release-test-"):
         raise AssertionError(f"refusing to remove unexpected scratch path: {resolved}")
 
@@ -552,19 +557,29 @@ class TestDeterministicBuild(ReleaseTestCase):
     def test_git_metadata_child_ignores_inherited_process_controls(self) -> None:
         calls: list[tuple[list[str], dict[str, str]]] = []
 
-        def completed(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            environment = kwargs.get("env")
+        def completed(command: list[str], **kwargs: object) -> process_supervisor.SupervisedResult:
+            environment = kwargs.get("environment")
             self.assertIsInstance(environment, dict)
             calls.append((command, dict(environment)))
             stdout = "a" * 40 + "\n" if "rev-parse" in command else ""
-            return subprocess.CompletedProcess(command, 0, stdout, "")
+            self.assertEqual(self.scratch, kwargs.get("cwd"))
+            self.assertEqual(
+                release.GIT_METADATA_TIMEOUT_SECONDS, kwargs.get("timeout")
+            )
+            self.assertEqual(
+                release.GIT_METADATA_OUTPUT_CAP_BYTES,
+                kwargs.get("output_cap_bytes"),
+            )
+            self.assertIs(kwargs.get("capture_output"), True)
+            self.assertIs(kwargs.get("allow_child_breakaway"), False)
+            return process_supervisor.SupervisedResult(0, stdout, "", 0.01)
 
         with mock.patch.object(
             release.process_supervisor,
             "resolve_ordinary_executable",
             return_value="trusted-git",
         ), mock.patch.object(
-            release.subprocess, "run", side_effect=completed
+            release.process_supervisor, "run_supervised", side_effect=completed
         ), mock.patch.dict(
             os.environ,
             {
@@ -604,6 +619,76 @@ class TestDeterministicBuild(ReleaseTestCase):
             self.assertEqual("1", environment["GIT_CONFIG_NOSYSTEM"])
             self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
             self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+
+    def test_git_metadata_refuses_output_larger_than_the_supervisor_cap(self) -> None:
+        calls = 0
+
+        def completed(
+            command: list[str], **kwargs: object
+        ) -> process_supervisor.SupervisedResult:
+            nonlocal calls
+            calls += 1
+            self.assertEqual(
+                release.GIT_METADATA_OUTPUT_CAP_BYTES,
+                kwargs.get("output_cap_bytes"),
+            )
+            if "rev-parse" in command:
+                return process_supervisor.SupervisedResult(
+                    0, "a" * 40 + "\n", "", 0.01
+                )
+            return process_supervisor.SupervisedResult(
+                0,
+                "[supervised output truncated: 1048576 bytes omitted; "
+                "showing bounded tail]\n?? final-file\n",
+                "",
+                0.01,
+            )
+
+        with mock.patch.object(
+            release.process_supervisor,
+            "resolve_ordinary_executable",
+            return_value="trusted-git",
+        ), mock.patch.object(
+            release.process_supervisor, "run_supervised", side_effect=completed
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError, "output exceeded the safe limit"
+            ):
+                release._git_state(self.scratch)
+
+        self.assertEqual(2, calls)
+
+    def test_git_metadata_refuses_an_unverified_or_timed_out_child(self) -> None:
+        cases = (
+            (
+                process_supervisor.SupervisedResult(
+                    0, "a" * 40 + "\n", "", 20.0, timed_out=True
+                ),
+                "command timed out",
+            ),
+            (
+                process_supervisor.SupervisedResult(
+                    0,
+                    "a" * 40 + "\n",
+                    "",
+                    0.01,
+                    termination_verified=False,
+                ),
+                "termination was not verified",
+            ),
+        )
+        for outcome, detail in cases:
+            with self.subTest(detail=detail), mock.patch.object(
+                release.process_supervisor,
+                "resolve_ordinary_executable",
+                return_value="trusted-git",
+            ), mock.patch.object(
+                release.process_supervisor,
+                "run_supervised",
+                return_value=outcome,
+            ):
+                with self.assertRaisesRegex(release.ReleaseError, detail):
+                    release._git_state(self.scratch)
 
     def test_git_metadata_child_disables_repository_fsmonitor(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
@@ -1181,6 +1266,21 @@ class TestVerifiedDirectory(ReleaseTestCase):
         self.assertEqual(report["archive_sha256"],
                          release.verify_archive(archive)["archive_sha256"])
 
+    def test_materialize_cli_uses_an_exact_release_directory_without_git(self) -> None:
+        archive, directory = self._directory()
+        output = self.scratch / "materialized-cli.zip"
+        stdout = io.StringIO()
+
+        with mock.patch.object(release, "ROOT", directory), mock.patch.object(
+            sys, "argv", ["release.py", "materialize", str(output)]
+        ), mock.patch.object(sys, "stdout", stdout):
+            code = release.main()
+
+        self.assertEqual(0, code)
+        self.assertFalse((directory / ".git").exists())
+        self.assertEqual(archive.read_bytes(), output.read_bytes())
+        self.assertTrue(json.loads(stdout.getvalue())["ok"])
+
     def test_directory_materialization_refuses_a_dangling_output_redirect(self) -> None:
         _archive, directory = self._directory()
         target = self.scratch / "removed-output-target"
@@ -1371,14 +1471,24 @@ class TestSourcePathSafety(ReleaseTestCase):
     def test_allowlisted_source_hardlink_is_refused(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
         readme = root / "README.md"
-        alias = root / "README-hardlink.md"
-        try:
-            os.link(readme, alias)
-        except OSError as exc:
-            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+        path_type = type(readme)
+        original_lstat = path_type.lstat
 
-        with self.assertRaisesRegex(release.ReleaseError, "hard link"):
-            release.collect_files(root)
+        def report_hardlink(path: Path):
+            info = original_lstat(path)
+            if path == readme:
+                linked = mock.Mock(wraps=info)
+                linked.st_mode = info.st_mode
+                linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                linked.st_nlink = 2
+                return linked
+            return info
+
+        with mock.patch.object(
+            path_type, "lstat", autospec=True, side_effect=report_hardlink
+        ):
+            with self.assertRaisesRegex(release.ReleaseError, "hard link"):
+                release.collect_files(root)
 
     def test_missing_reviewed_surface_refuses_incomplete_release(self) -> None:
         root, _commit = _fixture_repository(self.scratch)
@@ -1439,14 +1549,24 @@ class TestArchivePathSafety(ReleaseTestCase):
 
     def test_hardlinked_archive_is_refused(self) -> None:
         archive = self._zip_with("README.md")
-        alias = self.scratch / "archive-hardlink.zip"
-        try:
-            os.link(archive, alias)
-        except OSError as exc:
-            self.skipTest(f"hardlinks unavailable on this host: {exc}")
+        path_type = type(archive)
+        original_lstat = path_type.lstat
 
-        with self.assertRaisesRegex(release.ReleaseError, "hard link"):
-            release.inspect_archive(alias)
+        def report_hardlink(path: Path):
+            info = original_lstat(path)
+            if path == archive:
+                linked = mock.Mock(wraps=info)
+                linked.st_mode = info.st_mode
+                linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                linked.st_nlink = 2
+                return linked
+            return info
+
+        with mock.patch.object(
+            path_type, "lstat", autospec=True, side_effect=report_hardlink
+        ):
+            with self.assertRaisesRegex(release.ReleaseError, "hard link"):
+                release.inspect_archive(archive)
 
     def test_archive_growth_during_read_is_refused(self) -> None:
         archive = self._zip_with("README.md")

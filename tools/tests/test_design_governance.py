@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import unittest
@@ -20,9 +21,14 @@ import proposal_authority  # noqa: E402
 import schema  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
+
+
 class ProposalAuthoritySchemaTest(unittest.TestCase):
     def setUp(self) -> None:
-        parent = ROOT / ".checklogs" / "tests"
+        parent = _scratch_parent()
         parent.mkdir(parents=True, exist_ok=True)
         self.scratch = parent / f"design-governance-schema-{uuid.uuid4().hex}"
         self.scratch.mkdir()
@@ -38,7 +44,7 @@ class ProposalAuthoritySchemaTest(unittest.TestCase):
         design_path.write_text("# Confirming an action\n", encoding="utf-8")
 
     def tearDown(self) -> None:
-        expected = (ROOT / ".checklogs" / "tests").resolve()
+        expected = _scratch_parent().resolve()
         resolved = self.scratch.resolve()
         if resolved.parent != expected or not resolved.name.startswith(
             "design-governance-schema-"
@@ -208,7 +214,7 @@ class QuestionRelationSchemaTest(unittest.TestCase):
 
 class DesignMetadataTest(unittest.TestCase):
     def setUp(self) -> None:
-        parent = ROOT / ".checklogs" / "tests"
+        parent = _scratch_parent()
         parent.mkdir(parents=True, exist_ok=True)
         self.scratch = parent / f"design-governance-parser-{uuid.uuid4().hex}"
         self.scratch.mkdir()
@@ -216,7 +222,7 @@ class DesignMetadataTest(unittest.TestCase):
         self.design_root.mkdir()
 
     def tearDown(self) -> None:
-        expected = (ROOT / ".checklogs" / "tests").resolve()
+        expected = _scratch_parent().resolve()
         resolved = self.scratch.resolve()
         if resolved.parent != expected or not resolved.name.startswith(
             "design-governance-parser-"
@@ -380,7 +386,7 @@ The established interface design requires immediate acknowledgement and retained
 
 class DesignDecisionDigestMigrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        parent = ROOT / ".checklogs" / "tests"
+        parent = _scratch_parent()
         parent.mkdir(parents=True, exist_ok=True)
         self.scratch = parent / f"design-governance-shape-{uuid.uuid4().hex}"
         self.scratch.mkdir()
@@ -388,7 +394,7 @@ class DesignDecisionDigestMigrationTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         resolved = self.scratch.resolve()
-        expected = (ROOT / ".checklogs" / "tests").resolve()
+        expected = _scratch_parent().resolve()
         if resolved.parent != expected or not resolved.name.startswith(
             "design-governance-shape-"
         ):

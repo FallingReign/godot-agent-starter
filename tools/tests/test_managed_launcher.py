@@ -26,7 +26,7 @@ import managed_launcher as launcher  # noqa: E402
 @contextlib.contextmanager
 def _scratch() -> Iterator[Path]:
     configured = os.environ.get("KIT_TEST_TMPDIR")
-    candidates = ([Path(configured)] if configured else []) + [
+    candidates = [Path(configured)] if configured else [
         TOOLS.parent / ".checklogs" / "tests",
         Path(tempfile.gettempdir()),
         Path("/tmp"),
@@ -73,11 +73,30 @@ def _flat(root: Path) -> None:
 
 
 def _managed(
-    root: Path, *, extra_files: dict[str, bytes] | None = None
+    root: Path,
+    *,
+    extra_files: dict[str, bytes] | None = None,
+    owned_files: list[dict] | None = None,
+    managed_blocks: list[dict] | None = None,
+    managed_surfaces: list[dict] | None = None,
 ) -> tuple[Path, Path, dict]:
     _marker(root)
     source_commit = "b" * 40
-    install_manifest_content = b'{"schema":1}\n'
+    install_manifest = {
+        "schema": 1,
+        "kind": "agent-kit-install-manifest",
+        "kit_version": "0.3.0",
+        "install_schema": 1,
+        "layout_schema": 1,
+        "config_schema": 1,
+        "supported_legacy_versions": ["0.2.0"],
+        "supported_install_schemas": [1],
+        "core_layout": "versioned-by-archive-sha256",
+        "owned_files": list(owned_files or []),
+        "managed_blocks": list(managed_blocks or []),
+        "legacy_retired_files": [],
+    }
+    install_manifest_content = _canonical(install_manifest)
     contents = {
         launcher.INSTALL_MANIFEST_NAME: install_manifest_content,
         "LICENSE": b"MIT\n",
@@ -147,7 +166,7 @@ def _managed(
             ),
         },
         "previous_release": None,
-        "managed_surfaces": [],
+        "managed_surfaces": list(managed_surfaces or []),
         "applied_migrations": [],
     }
     current_path = root / launcher.MANAGED_DIRECTORY / launcher.CURRENT_NAME
@@ -164,6 +183,103 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 
 
 class InstallationSelection(unittest.TestCase):
+    def _managed_surface_fixture(self, root: Path) -> tuple[Path, Path, dict, bytes]:
+        begin = "<!-- BEGIN GODOT AGENT KIT -->"
+        end = "<!-- END GODOT AGENT KIT -->"
+        block = f"{begin}\nUse the managed policy.\n{end}\n".encode("utf-8")
+        replace = b"@echo off\necho managed\n"
+        create = b"# Shipped default\n"
+        schema = b'{"schema":1}\n'
+        owned = [
+            {
+                "id": "create-surface",
+                "path": "ARCHITECTURE.md",
+                "source": "install/ARCHITECTURE.md",
+                "mode": "0644",
+                "strategy": "create-only",
+                "legacy_sha256": None,
+            },
+            {
+                "id": "replace-surface",
+                "path": "kit.cmd",
+                "source": "install/kit.cmd",
+                "mode": "0644",
+                "strategy": "replace",
+                "legacy_sha256": None,
+            },
+            {
+                "id": "schema-surface",
+                "path": "kit.config.json",
+                "source": "install/kit.config.default.json",
+                "mode": "0644",
+                "strategy": "schema-json",
+                "legacy_sha256": None,
+                "schema_key": "schema",
+                "target_schema": 1,
+                "supported_schemas": [1],
+                "defaults": {"schema": 1},
+                "allowed_keys": ["schema"],
+            },
+        ]
+        blocks = [{
+            "id": "block-surface",
+            "path": "AGENTS.md",
+            "source": "install/agents.block.md",
+            "mode": "0644",
+            "legacy_file_sha256": None,
+            "begin": begin,
+            "end": end,
+        }]
+        project_create = b"# Human architecture\n"
+        project_schema = b'{"schema":1,"human":true}\n'
+        (root / "kit.cmd").write_bytes(replace)
+        (root / "AGENTS.md").write_bytes(b"# Human before\n" + block + b"# Human after\n")
+        (root / "ARCHITECTURE.md").write_bytes(project_create)
+        (root / "kit.config.json").write_bytes(project_schema)
+        surfaces = sorted([
+            {
+                "id": "block-surface",
+                "path": "AGENTS.md",
+                "strategy": "managed-block",
+                "base_sha256": hashlib.sha256(block).hexdigest(),
+                "applied_sha256": hashlib.sha256(block).hexdigest(),
+            },
+            {
+                "id": "create-surface",
+                "path": "ARCHITECTURE.md",
+                "strategy": "create-only",
+                "base_sha256": hashlib.sha256(create).hexdigest(),
+                "applied_sha256": hashlib.sha256(project_create).hexdigest(),
+            },
+            {
+                "id": "replace-surface",
+                "path": "kit.cmd",
+                "strategy": "replace",
+                "base_sha256": hashlib.sha256(replace).hexdigest(),
+                "applied_sha256": hashlib.sha256(replace).hexdigest(),
+            },
+            {
+                "id": "schema-surface",
+                "path": "kit.config.json",
+                "strategy": "schema-json",
+                "base_sha256": hashlib.sha256(schema).hexdigest(),
+                "applied_sha256": hashlib.sha256(project_schema).hexdigest(),
+            },
+        ], key=lambda item: item["id"])
+        core, current_path, current = _managed(
+            root,
+            extra_files={
+                "install/ARCHITECTURE.md": create,
+                "install/agents.block.md": block,
+                "install/kit.cmd": replace,
+                "install/kit.config.default.json": schema,
+            },
+            owned_files=owned,
+            managed_blocks=blocks,
+            managed_surfaces=surfaces,
+        )
+        return core, current_path, current, block
+
     def test_json_objects_reject_duplicate_keys(self) -> None:
         with self.assertRaisesRegex(launcher.LauncherError, "duplicate key 'schema'"):
             launcher._json_object(b'{"schema":1,"schema":2}\n', "fixture")
@@ -204,6 +320,50 @@ class InstallationSelection(unittest.TestCase):
                 current["active_release"]["source_commit"], selected.source_commit
             )
 
+    def test_managed_surface_drift_is_checked_by_ownership_strategy(self) -> None:
+        with _scratch() as root:
+            self._managed_surface_fixture(root)
+
+            launcher.resolve_installation(root)
+            (root / "AGENTS.md").write_bytes(
+                b"# Changed human text\n"
+                + (root / "AGENTS.md").read_bytes().split(b"\n", 1)[1]
+            )
+            launcher.resolve_installation(root)
+
+            (root / "kit.cmd").write_bytes(b"human replacement\n")
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                r"managed kit file changed: kit\.cmd",
+            ):
+                launcher.resolve_installation(root)
+
+    def test_managed_block_drift_is_detected_without_hashing_outside_text(self) -> None:
+        with _scratch() as root:
+            _core, _current_path, _current, block = self._managed_surface_fixture(root)
+            agents = root / "AGENTS.md"
+            agents.write_bytes(agents.read_bytes().replace(block, block.replace(
+                b"Use the managed policy.", b"Changed managed policy."
+            )))
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                "managed block changed: AGENTS.md",
+            ):
+                launcher.resolve_installation(root)
+
+    def test_current_state_must_name_every_manifest_surface(self) -> None:
+        with _scratch() as root:
+            _core, current_path, current, _block = self._managed_surface_fixture(root)
+            current["managed_surfaces"] = current["managed_surfaces"][:-1]
+            current_path.write_bytes(_canonical(current))
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                "does not name every active managed surface",
+            ):
+                launcher.resolve_installation(root)
+
     def test_managed_release_refuses_unlisted_core_content(self) -> None:
         with _scratch() as root:
             core, _current_path, _current = _managed(root)
@@ -242,16 +402,23 @@ class InstallationSelection(unittest.TestCase):
         with _scratch() as root:
             core, _current_path, _current = _managed(root)
             member = core / "kit.py"
-            source = root / "hardlink-source.py"
-            source.write_bytes(member.read_bytes())
-            member.unlink()
-            try:
-                os.link(source, member)
-            except OSError as exc:
-                self.skipTest(f"hardlinks unavailable on this host: {exc}")
+            original_lstat = launcher._lstat
 
-            with self.assertRaisesRegex(launcher.LauncherError, "hard link"):
-                launcher.resolve_installation(root)
+            def report_hardlink(path: Path, label: str):
+                info = original_lstat(path, label)
+                if path == member:
+                    linked = mock.Mock(wraps=info)
+                    linked.st_mode = info.st_mode
+                    linked.st_file_attributes = getattr(info, "st_file_attributes", 0)
+                    linked.st_nlink = 2
+                    return linked
+                return info
+
+            with mock.patch.object(
+                launcher, "_lstat", side_effect=report_hardlink
+            ):
+                with self.assertRaisesRegex(launcher.LauncherError, "hard link"):
+                    launcher.resolve_installation(root)
 
     def test_partial_managed_directory_never_falls_back_to_flat(self) -> None:
         with _scratch() as root:

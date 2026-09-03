@@ -434,11 +434,43 @@ def _run_git(root: Path, *arguments: str, timeout: int = 30) -> subprocess.Compl
         "git",
         excluded_roots=(root, CORE_ROOT),
     )
+    command = [
+        executable,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.trustExitCode=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-C",
+        str(root),
+        *arguments,
+    ]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     return subprocess.run(
-        [executable, "-C", str(root), *arguments],
+        command,
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=environment,
+        stdin=subprocess.DEVNULL,
     )
 
 

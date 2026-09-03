@@ -236,6 +236,31 @@ class KitChangeControllerTest(unittest.TestCase):
             controller.release.ROOT
         )
 
+    def test_list_sessions_returns_full_authenticated_session_details(self) -> None:
+        self.assertEqual([], controller.list_sessions(self.runtime))
+        self.assertFalse(self.runtime.exists())
+        prepared = self._prepare()
+
+        listed = controller.list_sessions(self.runtime)
+
+        self.assertEqual(1, len(listed))
+        self.assertEqual(prepared["session_id"], listed[0]["session_id"])
+        self.assertEqual("ready", listed[0]["status"])
+        self.assertEqual(str(self.target), listed[0]["project"]["path"])
+        self.assertEqual(prepared["kit_change"]["plan_sha256"], listed[0]["plan_sha256"])
+
+    def test_list_sessions_keeps_a_full_id_visible_when_its_preview_changed(self) -> None:
+        prepared = self._prepare()
+        self.preview_epoch += 1
+
+        listed = controller.list_sessions(self.runtime)
+
+        self.assertEqual([{
+            "session_id": prepared["session_id"],
+            "status": "unavailable",
+            "problem": "preview-changed",
+        }], listed)
+
     def test_mismatched_controller_is_refused_before_release_or_session_write(
         self,
     ) -> None:

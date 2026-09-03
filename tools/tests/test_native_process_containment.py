@@ -29,9 +29,14 @@ import process_supervisor  # noqa: E402
 import project_context  # noqa: E402
 
 
+def _scratch_parent() -> Path:
+    configured = os.environ.get("KIT_TEST_TMPDIR", "").strip()
+    return Path(configured) if configured else ROOT / ".checklogs" / "tests"
+
+
 @contextlib.contextmanager
 def _project() -> Iterator[Path]:
-    base = ROOT / ".checklogs" / "tests"
+    base = _scratch_parent()
     base.mkdir(parents=True, exist_ok=True)
     path = base / f"native-containment-{uuid.uuid4().hex}"
     path.mkdir()

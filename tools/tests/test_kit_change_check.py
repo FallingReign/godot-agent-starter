@@ -76,7 +76,24 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.game.write_text("extends Node\n", encoding="utf-8")
         self.issues: list[dict[str, object]] = []
         self.returncodes = {"self-test": 0, "scan": 0, "verify": 0}
+        self.self_test_failure: dict[str, object] = {
+            "ran": 1,
+            "failures": 1,
+            "errors": 0,
+            "skipped": 0,
+            "test_ids": ["tests.test_release.ReleaseTests.test_release_copy"],
+            "skip_ids": [],
+            "log": {
+                "available": True,
+                "path": ".kit/runtime/self-test/failures/failure-a.log",
+                "bytes": 120,
+                "sha256": "f" * 64,
+                "truncated": False,
+            },
+        }
+        self.self_test_cli_error: dict[str, object] | None = None
         self.malformed_verify = False
+        self.skips: list[str] = []
         self.commands: list[list[str]] = []
         self.environments: list[dict[str, str]] = []
         self.installation = SimpleNamespace(
@@ -96,6 +113,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
             "session_id": "b" * 64,
             "release": {"archive_sha256": "a" * 64},
             "request": {"mode": "install"},
+            "preview": {"raw": {"material": {"changes": []}}},
             "baseline": {
                 "prior": {"exists": False, "sha256": "", "content_base64": ""},
                 "generated": None,
@@ -156,9 +174,29 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
             )
             self.assertTrue((copied_kit.parent / "src").is_dir())
             code = self.returncodes["self-test"]
-            return self._process_outcome(code, json.dumps({
-                "command": "self-test", "ok": code == 0, "exit_code": code
-            }))
+            if self.self_test_cli_error is not None:
+                return self._process_outcome(
+                    code,
+                    json.dumps(self.self_test_cli_error),
+                )
+            receipt: dict[str, object] = {
+                "command": "self-test",
+                "ok": code == 0,
+                "exit_code": code,
+                "status": "passed" if code == 0 else "failed",
+                "project": str(self.target),
+                "engine": "disabled",
+                "process": {"exit_code": code},
+                "tests": {
+                    "ran": 1,
+                    "failures": 0 if code == 0 else 1,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+            }
+            if code != 0:
+                receipt["failure"] = self.self_test_failure
+            return self._process_outcome(code, json.dumps(receipt))
         if "__brownfield-scan" in command:
             code = self.returncodes["scan"]
             if code == 0:
@@ -171,8 +209,46 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
             code = self.returncodes["verify"]
             if self.malformed_verify:
                 return self._process_outcome(code, "{}")
+            nonce = "c" * 32
+            repository_sha = "d" * 64
+            skip_by_stage = {item.split(maxsplit=1)[0]: item for item in self.skips}
+            results = [
+                f"SKIP  {skip_by_stage[stage]}"
+                if stage in skip_by_stage
+                else f"PASS  {stage}"
+                for stage in check.STATIC_STAGES
+            ]
             return self._process_outcome(code, json.dumps({
-                "command": "verify", "ok": code == 0, "exit_code": code
+                "command": "verify",
+                "ok": code == 0,
+                "exit_code": code,
+                "status": "passed" if code == 0 else "failed",
+                "project": str(self.target),
+                "strict": False,
+                "static": True,
+                "stages": [],
+                "fast": False,
+                "engine": None,
+                "skips": self.skips,
+                "verification_nonce": nonce,
+                "process": {"exit_code": code},
+                "repository_start": {"available": True, "digest": repository_sha},
+                "repository_end": {"available": True, "digest": repository_sha},
+                "repository_stable": True,
+                "gate_summary": {
+                    "schema": 2,
+                    "run_id": nonce,
+                    "repository_sha256": repository_sha,
+                    "auth_sha256": "e" * 64,
+                    "failed": code != 0,
+                    "results": results,
+                    "diagnostics": {
+                        "native_crashes": [],
+                        "engine_refusals": [],
+                        "engine_start_failures": [],
+                        "timeouts": [],
+                    },
+                },
             }))
         raise AssertionError(f"unexpected command: {command}")
 
@@ -191,6 +267,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
             "raw": {
                 "material": {
                     "current": {"active_archive_sha256": previous_release},
+                    "changes": [],
                 },
             },
         }
@@ -274,6 +351,148 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertFalse(result["project_ok"])
         self.assertEqual(self.issues, result["existing_issues"])
 
+    def test_issue_in_a_kit_changed_file_is_never_baselined(self) -> None:
+        self.session["preview"]["raw"]["material"]["changes"] = [
+            {
+                "path": "ARCHITECTURE.md",
+                "before": {"kind": "absent"},
+                "after": {"kind": "file", "sha256": "a" * 64},
+            }
+        ]
+        self.issues = [
+            {
+                "stage": "arch",
+                "code": "stale-architecture-graph",
+                "path": "ARCHITECTURE.md",
+                "line": 0,
+                "message_sha256": "b" * 64,
+            }
+        ]
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertIsNone(brownfield.read_baseline_file(self.target))
+        self.assertIn("file changed by the kit", str(result["detail"]))
+
+    def test_skipped_project_checks_make_adoption_required_not_kit_failure(
+        self,
+    ) -> None:
+        self.skips = ["format", "lint", "tests (runner not configured)"]
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertTrue(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertEqual([], result["existing_issues"])
+        self.assertIn("these project checks are not ready", str(result["detail"]))
+        for skipped in self.skips:
+            self.assertIn(skipped, str(result["detail"]))
+
+    def test_malformed_skipped_checks_fail_the_installed_proof(self) -> None:
+        self.skips = ["format\nforged"]
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertIn("malformed skipped checks", str(result["detail"]))
+
+    def test_missing_skipped_check_list_fails_the_installed_proof(self) -> None:
+        original_runner = self._runner
+
+        def missing_skips(command: list[str], **kwargs: object) -> SimpleNamespace:
+            if "verify" in command:
+                outcome = original_runner(command, **kwargs)
+                receipt = json.loads(outcome.stdout)
+                receipt.pop("skips")
+                return self._process_outcome(0, json.dumps(receipt))
+            return original_runner(command, **kwargs)
+
+        result = check.run(self.target, self.session, runner=missing_skips)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertIn("no skipped-check list", str(result["detail"]))
+
+    def test_self_test_success_requires_the_exact_project_scope_and_counts(self) -> None:
+        variants = (
+            ("engine", lambda receipt: receipt.__setitem__("engine", "available")),
+            ("project", lambda receipt: receipt.__setitem__("project", str(self.target.parent))),
+            ("ran", lambda receipt: receipt["tests"].__setitem__("ran", 0)),
+            ("skipped", lambda receipt: receipt["tests"].__setitem__("skipped", 1)),
+            ("nested exit", lambda receipt: receipt["process"].__setitem__("exit_code", 1)),
+        )
+        original_runner = self._runner
+        for label, mutate in variants:
+            with self.subTest(label=label):
+                def forged(command: list[str], **kwargs: object) -> SimpleNamespace:
+                    outcome = original_runner(command, **kwargs)
+                    if "self-test" not in command:
+                        return outcome
+                    receipt = json.loads(outcome.stdout)
+                    mutate(receipt)
+                    return self._process_outcome(0, json.dumps(receipt))
+
+                result = check.run(self.target, self.session, runner=forged)
+                self.assertFalse(result["kit_ok"])
+                self.assertFalse(result["project_ok"])
+                self.assertIsNone(brownfield.read_baseline_file(self.target))
+
+    def test_static_success_requires_the_exact_scope_and_gate_evidence(self) -> None:
+        base = json.loads(self._runner(["verify"]).stdout)
+        variants = (
+            ("static", lambda receipt: receipt.__setitem__("static", False)),
+            ("strict", lambda receipt: receipt.__setitem__("strict", True)),
+            ("stages", lambda receipt: receipt.__setitem__("stages", ["lint"])),
+            ("fast", lambda receipt: receipt.__setitem__("fast", True)),
+            ("project", lambda receipt: receipt.__setitem__("project", str(self.target.parent))),
+            ("nested exit", lambda receipt: receipt["process"].__setitem__("exit_code", 1)),
+            ("gate failed", lambda receipt: receipt["gate_summary"].__setitem__("failed", True)),
+            (
+                "gate identity",
+                lambda receipt: receipt["gate_summary"].__setitem__("run_id", "f" * 32),
+            ),
+            ("empty stages", lambda receipt: receipt["gate_summary"].__setitem__("results", [])),
+            (
+                "duplicate stage",
+                lambda receipt: receipt["gate_summary"]["results"].__setitem__(
+                    1, "PASS  integrity"
+                ),
+            ),
+            (
+                "skip mismatch",
+                lambda receipt: receipt["gate_summary"]["results"].__setitem__(
+                    0, "SKIP  integrity"
+                ),
+            ),
+        )
+        for label, mutate in variants:
+            with self.subTest(label=label):
+                receipt = json.loads(json.dumps(base))
+                mutate(receipt)
+                with self.assertRaises(check.KitChangeCheckError):
+                    check._validate_static_success(receipt, self.installation, 0)
+
+    def test_wrong_static_scope_fails_with_the_written_baseline_identity(self) -> None:
+        original_runner = self._runner
+
+        def wrong_scope(command: list[str], **kwargs: object) -> SimpleNamespace:
+            outcome = original_runner(command, **kwargs)
+            if "verify" not in command:
+                return outcome
+            receipt = json.loads(outcome.stdout)
+            receipt["static"] = False
+            return self._process_outcome(0, json.dumps(receipt))
+
+        result = check.run(self.target, self.session, runner=wrong_scope)
+
+        self.assertFalse(result["kit_ok"])
+        baseline = brownfield.read_baseline_file(self.target)
+        self.assertIsNotNone(baseline)
+        self.assertEqual(_sha256(baseline or b""), result["baseline_sha256"])
+
     def test_upgrade_carries_only_an_unchanged_existing_gap(self) -> None:
         issue = {
             "stage": "lint",
@@ -336,7 +555,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
     def test_managed_upgrade_without_a_prior_baseline_stops(self) -> None:
         self.session["request"] = {"mode": "upgrade"}
         self.session["preview"] = {
-            "raw": {"material": {"current": {"mode": "managed"}}},
+            "raw": {"material": {"current": {"mode": "managed"}, "changes": []}},
         }
 
         result = check.run(self.target, self.session, runner=self._runner)
@@ -357,7 +576,7 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.issues = [issue]
         self.session["request"] = {"mode": "upgrade"}
         self.session["preview"] = {
-            "raw": {"material": {"current": {"mode": "legacy"}}},
+            "raw": {"material": {"current": {"mode": "legacy"}, "changes": []}},
         }
 
         result = check.run(self.target, self.session, runner=self._runner)
@@ -422,6 +641,50 @@ class OfflineKitChangeCheckTest(unittest.TestCase):
         self.assertFalse(result["kit_ok"])
         self.assertEqual(4, len(self.commands))
         self.assertIsNone(brownfield.read_baseline_file(self.target))
+        self.assertIn("test_release_copy", str(result["detail"]))
+        self.assertIn("1 failed", str(result["detail"]))
+        self.assertIn("private log", str(result["detail"]))
+
+    def test_self_test_cli_error_surfaces_the_bounded_original_problem(self) -> None:
+        self.returncodes["self-test"] = 3
+        self.self_test_cli_error = {
+            "ok": False,
+            "command": "self-test",
+            "status": "managed_core_untrusted",
+            "error": "self-test cannot authenticate the running kit",
+            "project": str(self.target),
+            "exit_code": 3,
+        }
+
+        result = check.run(self.target, self.session, runner=self._runner)
+
+        self.assertFalse(result["kit_ok"])
+        self.assertFalse(result["project_ok"])
+        self.assertIsNone(brownfield.read_baseline_file(self.target))
+        self.assertIn("managed core untrusted", str(result["detail"]))
+        self.assertIn("cannot authenticate the running kit", str(result["detail"]))
+
+    def test_self_test_cli_error_rejects_extra_or_unbounded_fields(self) -> None:
+        valid = {
+            "ok": False,
+            "command": "self-test",
+            "status": "managed_core_untrusted",
+            "error": "authentication failed",
+            "project": str(self.target),
+            "exit_code": 3,
+        }
+        for mutation in (
+            lambda receipt: receipt.__setitem__("process", {"exit_code": 3}),
+            lambda receipt: receipt.__setitem__("status", "Not Valid"),
+            lambda receipt: receipt.__setitem__("error", "x" * 2_001),
+            lambda receipt: receipt.__setitem__("error", "line one\nline two"),
+        ):
+            receipt = dict(valid)
+            mutation(receipt)
+            with self.subTest(receipt=receipt), self.assertRaises(
+                check.KitChangeCheckError
+            ):
+                check._validate_self_test_receipt(receipt, self.installation, 3)
 
     def test_scan_failure_stops_without_baseline(self) -> None:
         self.returncodes["scan"] = 2
@@ -489,7 +752,61 @@ if command == \"__brownfield-scan\":
     )
     raise SystemExit(0)
 if command in {\"self-test\", \"verify\"}:
-    print(json.dumps({\"command\": command, \"ok\": True, \"exit_code\": 0}))
+    project = str(Path(sys.argv[sys.argv.index(\"--project\") + 1]).resolve())
+    receipt = {
+        \"command\": command,
+        \"ok\": True,
+        \"exit_code\": 0,
+        \"status\": \"passed\",
+        \"project\": project,
+        \"process\": {\"exit_code\": 0},
+    }
+    if command == \"self-test\":
+        receipt[\"engine\"] = \"disabled\"
+        receipt[\"tests\"] = {
+            \"ran\": 1,
+            \"failures\": 0,
+            \"errors\": 0,
+            \"skipped\": 0,
+        }
+    else:
+        nonce = \"c\" * 32
+        repository_sha = \"d\" * 64
+        receipt.update({
+            \"strict\": False,
+            \"static\": True,
+            \"stages\": [],
+            \"fast\": False,
+            \"engine\": None,
+            \"skips\": [],
+            \"verification_nonce\": nonce,
+            \"repository_start\": {\"available\": True, \"digest\": repository_sha},
+            \"repository_end\": {\"available\": True, \"digest\": repository_sha},
+            \"repository_stable\": True,
+            \"gate_summary\": {
+                \"schema\": 2,
+                \"run_id\": nonce,
+                \"repository_sha256\": repository_sha,
+                \"auth_sha256\": \"e\" * 64,
+                \"failed\": False,
+                \"results\": [
+                    \"PASS  \" + stage
+                    for stage in (
+                        \"integrity\", \"skills\", \"schema\", \"shape\",
+                        \"design\", \"conformance\", \"format\", \"lint\",
+                        \"sanitise\", \"grep\", \"types\", \"arch\",
+                        \"tests\", \"assets\",
+                    )
+                ],
+                \"diagnostics\": {
+                    \"native_crashes\": [],
+                    \"engine_refusals\": [],
+                    \"engine_start_failures\": [],
+                    \"timeouts\": [],
+                },
+            },
+        })
+    print(json.dumps(receipt))
     raise SystemExit(0)
 raise SystemExit(4)
 """
