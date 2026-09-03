@@ -1982,10 +1982,8 @@ def _self_test(
                 CORE_ROOT, test_core, release_sha256
             )
         command = _isolated_unittest_command(
-            "discover",
-            "-s",
-            str(test_core / "tools" / "tests"),
             "-v",
+            *release_tool.SHIPPED_TEST_MODULES,
             core_root=test_core,
         )
         environment = {

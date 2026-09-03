@@ -290,13 +290,27 @@ VALIDATION_FILES = frozenset({
 })
 
 # These tests and CI proofs depend on source-repository history and remain
-# covered by source self-test/CI. They cannot ship in a managed release, whose
+# covered by explicit source CI. They cannot ship in a managed release, whose
 # core is an authenticated archive without a source .git directory.
 SOURCE_ONLY_VALIDATION_FILES = frozenset({
     "tools/tests/test_lifecycle_e2e.py",
     "tools/tests/test_managed_consumer_strict_ci.py",
     "tools/tests/test_public_lifecycle_e2e.py",
 })
+
+# Public self-test and strict verification run the same exact shipped suite in
+# both a source checkout and an installed kit. Source-only lifecycle proofs are
+# deliberately separate so they cannot recursively invoke the public suite.
+SHIPPED_TEST_MODULES = tuple(
+    relative[:-3].replace("/", ".")
+    for relative in sorted(VALIDATION_FILES)
+    if relative.startswith("tools/tests/test_") and relative.endswith(".py")
+)
+SOURCE_ONLY_TEST_MODULES = tuple(
+    relative[:-3].replace("/", ".")
+    for relative in sorted(SOURCE_ONLY_VALIDATION_FILES)
+    if relative.startswith("tools/tests/test_") and relative.endswith(".py")
+)
 
 FIXED_FILES = ROOT_FILES | DOC_FILES | TOOL_FILES | VALIDATION_FILES
 REQUIRED_AGENT_FILES = frozenset({

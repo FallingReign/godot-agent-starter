@@ -357,15 +357,15 @@ def _classify_gate(
 
 def _classify_unittest(outcome: ProcessOutcome) -> tuple[str, str]:
     if outcome.timed_out:
-        return "failed", "unit-test discovery timed out"
+        return "failed", "unit-test suite timed out"
     if outcome.launch_error:
-        return "blocked", f"unit-test discovery could not start: {outcome.launch_error}"
+        return "blocked", f"unit-test suite could not start: {outcome.launch_error}"
     output = ANSI_ESCAPE.sub("", outcome.stdout + "\n" + outcome.stderr)
     if UNITTEST_SKIP.search(output):
         return "failed", "strict verification rejects skipped unit tests"
     matches = UNITTEST_RAN.findall(output)
     if len(matches) != 1 or int(matches[0]) < 1:
-        return "failed", "unit-test output has no valid non-zero discovery summary"
+        return "failed", "unit-test output has no valid non-zero run summary"
     if outcome.returncode != 0 or re.search(r"(?m)^FAILED\s*\(", output):
         return "failed", f"unit tests exited {outcome.returncode}"
     if re.search(r"(?m)^OK(?:\s|$)", output) is None:
@@ -869,10 +869,8 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 "unit-tests",
                 _isolated_unittest(
                     test_core,
-                    "discover",
-                    "-s",
-                    str(test_core / "tools" / "tests"),
                     "-v",
+                    *release_contract.SHIPPED_TEST_MODULES,
                 ),
                 1200,
                 _classify_unittest,

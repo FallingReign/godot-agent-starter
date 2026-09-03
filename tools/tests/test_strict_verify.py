@@ -402,7 +402,13 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(strict_verify.EXIT_OK, code)
         test_scratch = Path(runner.environments[3]["KIT_TEST_TMPDIR"])
         self.assertEqual(workspace / "t", test_scratch)
-        self.assertIn(str(project / "tools" / "tests"), runner.commands[3])
+        self.assertEqual(
+            ["-v", *release.SHIPPED_TEST_MODULES],
+            runner.commands[3][12:],
+        )
+        self.assertNotIn("discover", runner.commands[3])
+        for module in release.SOURCE_ONLY_TEST_MODULES:
+            self.assertNotIn(module, runner.commands[3])
         self.assertFalse(test_scratch.is_relative_to(project))
         legacy_scratch = (
             project
@@ -1076,6 +1082,31 @@ class StrictCiContractTests(unittest.TestCase):
             [], offenders,
             "strict rejects every unittest skip; shipped tests must assert a safe "
             "fallback when an optional host capability is absent",
+        )
+
+    def test_ci_runs_source_only_lifecycle_proofs_outside_public_self_test(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        step = "Run source-only lifecycle proofs"
+
+        self.assertIn(step, workflow)
+        self.assertIn(
+            "matrix.strict && hashFiles('tools/tests/test_lifecycle_e2e.py', "
+            "'tools/tests/test_managed_consumer_strict_ci.py', "
+            "'tools/tests/test_public_lifecycle_e2e.py') != ''",
+            workflow,
+        )
+        self.assertIn("release.SOURCE_ONLY_TEST_MODULES", workflow)
+        self.assertIn("result.skipped", workflow)
+        self.assertGreater(
+            workflow.index(step),
+            workflow.index("Run kit control-plane tests through the Windows launcher"),
+        )
+        self.assertLess(
+            workflow.index(step),
+            workflow.index("Authenticate every canonical third-party lock source"),
         )
 
     def test_ci_uses_only_pinned_official_actions_and_authenticated_builds(self) -> None:

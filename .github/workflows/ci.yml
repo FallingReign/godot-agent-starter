@@ -103,6 +103,37 @@ jobs:
         shell: pwsh
         run: .\kit.cmd self-test
 
+      # These source-only proofs use repository history and nested installed
+      # kits. Keeping them separate makes public self-test bounded and identical
+      # in source and installed copies. Strict jobs cover Linux, Windows and macOS.
+      - name: Run source-only lifecycle proofs
+        if: ${{ matrix.strict && hashFiles('tools/tests/test_lifecycle_e2e.py', 'tools/tests/test_managed_consumer_strict_ci.py', 'tools/tests/test_public_lifecycle_e2e.py') != '' }}
+        shell: python
+        run: |
+          import pathlib
+          import sys
+          import unittest
+
+          sys.dont_write_bytecode = True
+          root = pathlib.Path(".").resolve()
+          sys.path.insert(0, str(root))
+          sys.path.insert(0, str(root / "tools"))
+          import release
+
+          suite = unittest.defaultTestLoader.loadTestsFromNames(
+              release.SOURCE_ONLY_TEST_MODULES
+          )
+          if suite.countTestCases() < 1:
+              raise SystemExit("source-only lifecycle suite is empty")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if (
+              not result.wasSuccessful()
+              or result.skipped
+              or result.expectedFailures
+              or result.unexpectedSuccesses
+          ):
+              raise SystemExit("source-only lifecycle suite did not pass without skips")
+
       - name: Authenticate every canonical third-party lock source
         if: matrix.strict && runner.os != 'Windows'
         shell: bash

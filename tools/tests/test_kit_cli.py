@@ -909,9 +909,12 @@ class KitCliTest(unittest.TestCase):
         self.assertRegex(command[8], r"^[0-9a-f]{64}$")
         self.assertEqual("unittest", command[11])
         self.assertEqual(
-            ["discover", "-s", str(kit.CORE_ROOT / "tools" / "tests"), "-v"],
+            ["-v", *kit.release_tool.SHIPPED_TEST_MODULES],
             command[12:],
         )
+        self.assertNotIn("discover", command)
+        for module in kit.release_tool.SOURCE_ONLY_TEST_MODULES:
+            self.assertNotIn(module, command)
         environment = run.call_args.kwargs["environment"]
         self.assertEqual(kit.CORE_ROOT, run.call_args.kwargs["cwd"])
         self.assertEqual("1", environment["KIT_ENGINE_DISABLED"])
@@ -1320,6 +1323,10 @@ class KitCliTest(unittest.TestCase):
             core_before = _tree_snapshot(core)
             with mock.patch.object(kit, "CORE_ROOT", core), mock.patch.object(
                 kit, "TOOLS", core / "tools"
+            ), mock.patch.object(
+                kit.release_tool,
+                "SHIPPED_TEST_MODULES",
+                ("tools.tests.test_probe",),
             ), mock.patch.dict(os.environ, hostile, clear=False):
                 self_code, self_payload, _human = kit._self_test(
                     target, argparse.Namespace(json_output=True)

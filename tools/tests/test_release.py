@@ -1412,10 +1412,24 @@ class TestSourcePathSafety(ReleaseTestCase):
             else set(release.SOURCE_ONLY_VALIDATION_FILES)
         )
         self.assertEqual(actual_tests, packaged_tests | present_source_only)
+        self.assertEqual(
+            tuple(
+                relative[:-3].replace("/", ".")
+                for relative in sorted(packaged_tests)
+            ),
+            release.SHIPPED_TEST_MODULES,
+        )
+        self.assertEqual(
+            tuple(
+                relative[:-3].replace("/", ".")
+                for relative in sorted(release.SOURCE_ONLY_VALIDATION_FILES)
+            ),
+            release.SOURCE_ONLY_TEST_MODULES,
+        )
         self.assertEqual(actual_skills, set(release.REQUIRED_SKILL_FILES))
         self.assertEqual(actual_agents, set(release.REQUIRED_AGENT_FILES))
 
-    def test_source_only_lifecycle_e2e_is_discoverable_but_not_released(self) -> None:
+    def test_source_only_lifecycle_e2e_is_explicit_but_not_released(self) -> None:
         relative = "tools/tests/test_lifecycle_e2e.py"
 
         self.assertIn(relative, release.SOURCE_ONLY_VALIDATION_FILES)
@@ -1426,7 +1440,7 @@ class TestSourcePathSafety(ReleaseTestCase):
         self.assertEqual(
             present,
             not self.packaged_layout,
-            "source checkout must discover the lifecycle E2E; installed release "
+            "source checkout must retain the explicit lifecycle E2E; installed release "
             "must exclude it",
         )
         self.assertNotIn(relative, release.VALIDATION_FILES)
