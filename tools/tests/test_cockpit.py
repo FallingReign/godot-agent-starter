@@ -199,6 +199,62 @@ class TestCockpitDecision(unittest.TestCase):
         design.DESIGN = self._saved_design_root
         shutil.rmtree(self.root, onerror=_remove_readonly)
 
+    def test_served_paths_are_bounded_and_reject_redirects_or_hardlinks(self) -> None:
+        plan_root = self.root / "plan"
+        plan_root.mkdir()
+        plan = plan_root / "review.html"
+        plan.write_text("<html></html>", encoding="utf-8")
+        self.assertEqual(
+            plan,
+            cockpit.safe_served_path(self.root, "/plan/review.html"),
+        )
+        self.assertEqual(
+            self.design_path,
+            cockpit.safe_served_path(self.root, "/docs/design/experience.md"),
+        )
+        self.assertIsNone(
+            cockpit.safe_served_path(self.root, "/plan/../outside.html")
+        )
+
+        linked = plan_root / "linked.html"
+        os.link(plan, linked)
+        self.assertIsNone(cockpit.safe_served_path(self.root, "/plan/linked.html"))
+        linked.unlink()
+        plan.unlink()
+        plan_root.rmdir()
+
+        outside = self.root.parent / f"cockpit-served-outside-{uuid.uuid4().hex}"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "review.html").write_text("outside", encoding="utf-8")
+        if os.name == "nt":
+            created = subprocess.run(
+                [
+                    cockpit.process_supervisor.windows_command_processor(),
+                    "/d",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(plan_root),
+                    str(outside),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr or created.stdout)
+        else:
+            plan_root.symlink_to(outside, target_is_directory=True)
+        try:
+            self.assertIsNone(
+                cockpit.safe_served_path(self.root, "/plan/review.html")
+            )
+        finally:
+            if os.name == "nt":
+                os.rmdir(plan_root)
+            else:
+                plan_root.unlink(missing_ok=True)
+
     def _proposal(self, refs: list[dict] | None = None) -> dict:
         digest = design.design_sha256(self.design_path.read_text(encoding="utf-8"))
         return {

@@ -3276,6 +3276,15 @@ def _serve_vendor(handler: http.server.BaseHTTPRequestHandler, path: str) -> Non
                  content_type="application/javascript; charset=utf-8")
 
 
+def _served_asset_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+    )
+
+
 def _serve_cockpit_asset(handler: http.server.BaseHTTPRequestHandler,
                          request_path: str) -> bool:
     if not (
@@ -3286,13 +3295,36 @@ def _serve_cockpit_asset(handler: http.server.BaseHTTPRequestHandler,
     path = cockpit.safe_served_path(ROOT, request_path)
     if path is None:
         return False
-    if path.suffix.lower() == ".html":
-        _serve_html(handler, path)
-        return True
+    descriptor = -1
     try:
-        body = path.read_bytes()
-    except OSError:
+        before = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            body = handle.read()
+        after_open = os.fstat(descriptor)
+        after = path.lstat()
+        checked = cockpit.safe_served_path(ROOT, request_path)
+    except (OSError, RuntimeError, ValueError):
         return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if checked != path or not (
+        _served_asset_identity(before)
+        == _served_asset_identity(opened)
+        == _served_asset_identity(after_open)
+        == _served_asset_identity(after)
+    ):
+        return False
+    if path.suffix.lower() == ".html":
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        _serve_html_text(handler, text)
+        return True
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     if content_type.startswith("text/") or path.suffix.lower() == ".svg":
         content_type += "; charset=utf-8"

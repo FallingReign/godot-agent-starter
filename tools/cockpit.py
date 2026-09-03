@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 import runtime_paths
@@ -2290,13 +2291,45 @@ def safe_served_path(root: Path, request_path: str) -> Path | None:
     pure = PurePosixPath(clean.lstrip("/"))
     if pure.is_absolute() or ".." in pure.parts:
         return None
-    if len(pure.parts) == 2 and pure.parts[0] == "plan" and pure.suffix.lower() == ".html":
-        base = (root / "plan").resolve(strict=False)
-    elif len(pure.parts) >= 3 and pure.parts[:2] == ("docs", "design") and pure.suffix.lower() in ASSET_SUFFIXES:
-        base = (root / "docs" / "design").resolve(strict=False)
-    else:
+    allowed_plan = (
+        len(pure.parts) == 2
+        and pure.parts[0] == "plan"
+        and pure.suffix.lower() == ".html"
+    )
+    allowed_design = (
+        len(pure.parts) >= 3
+        and pure.parts[:2] == ("docs", "design")
+        and pure.suffix.lower() in ASSET_SUFFIXES
+    )
+    if not (allowed_plan or allowed_design):
         return None
-    candidate = (root / Path(*pure.parts)).resolve(strict=False)
-    if candidate == base or not candidate.is_relative_to(base) or not candidate.is_file():
+    try:
+        canonical = root.resolve(strict=True)
+        root_info = canonical.lstat()
+    except (OSError, RuntimeError):
         return None
+    reparse = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or bool(int(getattr(root_info, "st_file_attributes", 0)) & reparse)
+    ):
+        return None
+    candidate = canonical
+    for index, component in enumerate(pure.parts):
+        candidate = candidate / component
+        try:
+            info = candidate.lstat()
+        except OSError:
+            return None
+        redirected = stat.S_ISLNK(info.st_mode) or bool(
+            int(getattr(info, "st_file_attributes", 0)) & reparse
+        )
+        final = index == len(pure.parts) - 1
+        if redirected:
+            return None
+        if final:
+            if not stat.S_ISREG(info.st_mode) or int(getattr(info, "st_nlink", 1)) != 1:
+                return None
+        elif not stat.S_ISDIR(info.st_mode):
+            return None
     return candidate
