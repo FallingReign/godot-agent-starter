@@ -278,6 +278,7 @@ real projects therefore continue to reject every skipped stage.
 | --- | --- |
 | Public launcher and JSON contract | CLI routing tests exercise every public command and refusal path |
 | Root and layout portability | Project-context fixtures cover root/src layouts, nested invocation and unsafe paths |
+| Lifecycle project format | Preview tests safely read and fingerprint the selected exact-case `project.godot`; accept an empty, comment-only or section-first header, or one single-line integer assignment `config_version=5`; and block older, newer, malformed, duplicate, ambiguous, redirected, unreadable or changing files |
 | Setup safety | Mutation-boundary fixtures preserve existing HEAD, staged, working and untracked state |
 | Engine selection and containment | Resolver and engine-boundary tests cover stale variables, exact-version console preference, no-launch diagnosis, owned timeouts and failure-cascade suppression |
 | Verification evidence | Cockpit tests cover immutable runs and unresolved-native recovery; CLI unit tests replace the writer so `kit self-test` cannot overwrite the project's real latest-verification pointer |
@@ -346,7 +347,7 @@ The kit is release-ready only when all answers are yes:
 - [ ] An exact verified 0.2.0 install migrates into the managed layout without treating modified legacy files as kit-owned.
 - [ ] Existing file-scoped project problems produce **Adoption required**; unchanged problems stay visible, while new problems and unresolved problems in changed files fail.
 - [ ] **Restore** recreates the exact prior bytes and restores prior file absence.
-- [ ] An empty folder or a selected folder without a regular exact-case `project.godot` is refused before project-facing writes.
+- [ ] An empty folder or a selected folder without a regular exact-case `project.godot` is refused before project-facing writes; its exact bytes and supported Godot 4 format declaration are bound into Preview without claiming full parsing or the exact engine patch.
 - [ ] A missing architecture document is generated from the destination graph and bound into the exact review; an existing document is preserved.
 - [ ] Missing test-runner or trusted style-tool checks are reported as adoption work, never invented or hidden, and strict verification rejects their skips.
 - [ ] A bounded full verification succeeds without repeated native launches.

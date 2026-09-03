@@ -97,6 +97,13 @@ The target must already be a real Godot 4.7.2 GDScript project with a regular
 folder is refused because the kit never invents or edits `project.godot`. For a
 new game, create and close a blank Godot project first, then install the kit.
 
+Preview safely reads that exact `project.godot` and binds its fingerprint into
+the review. An empty, comment-only or normal section-first header may omit
+`config_version`. When present, it must appear once as a one-line integer with
+value `5`, the current Godot 4 project format. Ambiguous multiline headers are
+refused. This guard checks the format declaration, not every project setting;
+full native verification parses the file and authenticates Godot 4.7.2.
+
 Preview also stops before writing when the project has a root
 `AGENTS.override.md`, when the resulting root `AGENTS.md` would exceed 32 KiB,
 or when a `.csproj` shows that the game uses C#. The override would hide the kit

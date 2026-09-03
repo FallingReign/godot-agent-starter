@@ -63,6 +63,7 @@ MAX_HISTORY = 32
 MAX_PROJECT_SCAN_ENTRIES = 20_000
 MAX_PROJECT_SCAN_DEPTH = 12
 MAX_CODEX_INSTRUCTIONS_BYTES = 32 * 1024
+SUPPORTED_GODOT_CONFIG_VERSION = 5
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -70,6 +71,7 @@ VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?\Z")
 SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\Z")
 MODE_RE = re.compile(r"0[0-7]{3}\Z")
 CONFIG_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}\Z")
+PROJECT_CONFIG_INTEGER_RE = re.compile(r"-?[0-9]+\Z")
 
 CREATE_ONLY_PATHS = frozenset({".gdlintrc", "ARCHITECTURE.md", "arch.rules.json"})
 CODEX_INSTRUCTIONS_PATH = "AGENTS.md"
@@ -336,6 +338,224 @@ def _game_project_blockers(
         "detail": (
             "the game root must contain a regular exact-case project.godot; "
             "create and close a blank Godot 4.7.2 GDScript project there, then retry"
+        ),
+    }]
+
+
+def _project_header_line(line: str) -> tuple[str, bool]:
+    """Remove one real comment and reject a string continued across lines."""
+    output: list[str] = []
+    quoted = False
+    escaped = False
+    for character in line:
+        if quoted:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == ";":
+            break
+        output.append(character)
+        if character == '"':
+            quoted = True
+    return "".join(output), not quoted and not escaped
+
+
+def _project_section_line(value: str) -> bool:
+    """Recognise only a complete one-line section boundary."""
+    if not value.startswith("["):
+        return False
+    escaped = False
+    closing = -1
+    for index, character in enumerate(value[1:], start=1):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "]":
+            closing = index
+            break
+    return (
+        closing > 1
+        and bool(value[1:closing].strip())
+        and not value[closing + 1:].strip()
+    )
+
+
+def _project_value_is_one_line(value: str) -> bool:
+    """Reject multiline header values without trying to clone Godot's parser."""
+    value = value.strip()
+    if not value:
+        return False
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = frozenset(pairs.values())
+    stack: list[str] = []
+    quoted = False
+    escaped = False
+    for character in value:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character in pairs:
+            stack.append(pairs[character])
+        elif character in closing:
+            if not stack or stack.pop() != character:
+                return False
+    return not quoted and not escaped and not stack
+
+
+def _game_project_format(
+    root: Path, game_root: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read and classify the selected Godot project without changing it."""
+    project_path = (
+        "project.godot" if game_root == "." else f"{game_root}/project.godot"
+    )
+    evidence: dict[str, Any] = {
+        "path": project_path,
+        "sha256": None,
+        "config_version": None,
+    }
+    try:
+        project = _target(root, project_path)
+    except KitChangeError as exc:
+        return evidence, [{
+            "code": exc.code,
+            "path": project_path,
+            "detail": exc.detail,
+        }]
+    if not project.exists():
+        return evidence, [{
+            "code": "game-project-missing",
+            "path": project_path,
+            "detail": (
+                "the game root must contain a regular exact-case project.godot; "
+                "create and close a blank Godot 4.7.2 GDScript project there, then retry"
+            ),
+        }]
+    try:
+        content = _stable_bytes(project)
+    except KitChangeError as exc:
+        code = {
+            "file-changed": "game-project-file-changed",
+            "file-unreadable": "game-project-file-unreadable",
+            "file-too-large": "game-project-file-too-large",
+        }.get(exc.code, "game-project-file-unsafe")
+        return evidence, [{
+            "code": code,
+            "path": project_path,
+            "detail": f"the selected project.godot could not be safely read ({exc.detail})",
+        }]
+
+    evidence["sha256"] = _sha256(content)
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return evidence, [{
+            "code": "game-project-config-version-malformed",
+            "path": project_path,
+            "detail": f"project.godot is not valid UTF-8 text: {exc}",
+        }]
+
+    declarations: list[tuple[int, str]] = []
+    ambiguous_line: int | None = None
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        content, balanced = _project_header_line(line)
+        stripped = content.strip()
+        if not balanced:
+            ambiguous_line = line_number
+            break
+        if not stripped:
+            continue
+        if stripped.startswith("["):
+            if _project_section_line(stripped):
+                break
+            ambiguous_line = line_number
+            break
+        if "=" not in content:
+            ambiguous_line = line_number
+            break
+        key, value = content.split("=", 1)
+        compact_key = "".join(character for character in key if ord(character) > 32)
+        if not compact_key or '"' in compact_key or not _project_value_is_one_line(value):
+            ambiguous_line = line_number
+            break
+        if compact_key == "config_version":
+            if key.strip() != "config_version":
+                ambiguous_line = line_number
+                break
+            declarations.append((line_number, value.strip()))
+
+    if ambiguous_line is not None:
+        return evidence, [{
+            "code": "game-project-config-version-ambiguous",
+            "path": project_path,
+            "detail": (
+                "the top-level project header is not in a safe one-line form "
+                f"(line {ambiguous_line}); save the project in Godot, then retry"
+            ),
+        }]
+
+    if not declarations:
+        return evidence, []
+    if len(declarations) != 1:
+        lines = ", ".join(str(line_number) for line_number, _line in declarations)
+        return evidence, [{
+            "code": "game-project-config-version-duplicate",
+            "path": project_path,
+            "detail": f"top-level config_version appears more than once (lines {lines})",
+        }]
+
+    line_number, raw_version = declarations[0]
+    if PROJECT_CONFIG_INTEGER_RE.fullmatch(raw_version) is None:
+        return evidence, [{
+            "code": "game-project-config-version-malformed",
+            "path": project_path,
+            "detail": (
+                "top-level config_version must be one integer "
+                f"(line {line_number})"
+            ),
+        }]
+    negative = raw_version.startswith("-")
+    digits = raw_version[1:] if negative else raw_version
+    normalized = digits.lstrip("0") or "0"
+    supported = str(SUPPORTED_GODOT_CONFIG_VERSION)
+    if not negative and normalized == supported:
+        evidence["config_version"] = SUPPORTED_GODOT_CONFIG_VERSION
+        return evidence, []
+    is_too_old = negative or (
+        len(normalized) < len(supported)
+        or (len(normalized) == len(supported) and normalized < supported)
+    )
+    display_version = raw_version if len(raw_version) <= 32 else (
+        raw_version[:29] + "..."
+    )
+    if is_too_old:
+        return evidence, [{
+            "code": "game-project-format-too-old",
+            "path": project_path,
+            "detail": (
+                f"project.godot uses format {display_version}; this kit supports "
+                f"Godot 4 project format {SUPPORTED_GODOT_CONFIG_VERSION}"
+            ),
+        }]
+    return evidence, [{
+        "code": "game-project-format-too-new",
+        "path": project_path,
+        "detail": (
+            f"project.godot uses format {display_version}; this kit supports "
+            f"Godot 4 project format {SUPPORTED_GODOT_CONFIG_VERSION}"
         ),
     }]
 
@@ -1729,7 +1949,17 @@ def _build_plan(
         *game_root_blockers,
         *_instruction_override_blockers(canonical_root),
     ]
+    godot_project: dict[str, Any] = {
+        "path": None,
+        "sha256": None,
+        "config_version": None,
+    }
     if game_root_selection["value"] is not None:
+        godot_project, project_format_blockers = _game_project_format(
+            canonical_root,
+            str(game_root_selection["value"]),
+        )
+        blockers.extend(project_format_blockers)
         blockers.extend(
             _csharp_project_blockers(
                 canonical_root,
@@ -2049,6 +2279,7 @@ def _build_plan(
             "active_archive_sha256": current["active_archive_sha256"],
         },
         "game_root": game_root_selection,
+        "godot_project": godot_project,
         "target_release": {
             "kit_version": identity["kit_version"],
             "archive_sha256": archive_sha256,
@@ -2099,6 +2330,33 @@ def preview(
 ) -> dict[str, Any]:
     """Return the stable read-only install or upgrade decision."""
     return _build_plan(root, archive, game_root=game_root).preview
+
+
+def _assert_godot_project_unchanged(plan: ChangePlan) -> None:
+    """Refuse mutation when the protected project file changed after planning."""
+    material = plan.preview.get("material")
+    expected = material.get("godot_project") if isinstance(material, Mapping) else None
+    path_value = expected.get("path") if isinstance(expected, Mapping) else None
+    sha_value = expected.get("sha256") if isinstance(expected, Mapping) else None
+    if (
+        not isinstance(path_value, str)
+        or not path_value
+        or not isinstance(sha_value, str)
+        or SHA256_RE.fullmatch(sha_value) is None
+    ):
+        raise KitChangeError(
+            "preview-invalid", "Preview does not bind a valid project.godot fingerprint"
+        )
+    try:
+        current = _stable_bytes(_target(plan.root, path_value))
+    except KitChangeError as exc:
+        raise KitChangeError(
+            "approval-mismatch", f"{path_value} changed after Preview ({exc.detail})"
+        ) from exc
+    if not hmac.compare_digest(_sha256(current), sha_value):
+        raise KitChangeError(
+            "approval-mismatch", f"{path_value} changed after Preview"
+        )
 
 
 def _ensure_directory(root: Path, relative: str, created: list[str]) -> Path:
@@ -3228,6 +3486,7 @@ def apply(
         blockers = plan.preview["material"]["blockers"]
         if blockers:
             raise KitChangeError("preview-blocked", blockers[0]["detail"])
+        _assert_godot_project_unchanged(plan)
         if plan.noop:
             return {
                 "ok": True,
@@ -3240,6 +3499,7 @@ def apply(
         backup, backup_sha, prepared = _prepare_backup(plan, transaction_id)
         del backup
         try:
+            _assert_godot_project_unchanged(plan)
             journal = _journal_for(plan, transaction_id, backup_sha)
             journal_path = _journal_path(canonical_root, transaction_id)
             _journal_write(journal_path, journal)
@@ -3269,16 +3529,20 @@ def apply(
             _journal_write(journal_path, journal)
             _failpoint("after-core-staged")
 
+            _assert_godot_project_unchanged(plan)
+
             _history(journal, "applying", "project-write-started")
             _journal_write(journal_path, journal)
             changes = {item["path"]: item for item in plan.preview["material"]["changes"]}
             for relative in plan.replacements:
+                _assert_godot_project_unchanged(plan)
                 _apply_entry(plan, relative, changes[relative])
                 _failpoint(f"after-entry:{relative}")
                 if relative == CURRENT_STATE:
                     _history(journal, "activated", "managed-core-activated")
                     _journal_write(journal_path, journal)
                     _failpoint("after-activated")
+            _assert_godot_project_unchanged(plan)
             _history(journal, "applied", "exact-change-applied")
             _journal_write(journal_path, journal)
             return {

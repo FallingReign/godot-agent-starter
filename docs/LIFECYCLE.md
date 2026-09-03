@@ -28,6 +28,14 @@ The target must already contain one regular `project.godot` at the project root,
 or one unique `project.godot` in a nested game folder. An empty folder is not a
 project and is refused. The kit never invents or edits `project.godot`.
 
+Preview safely reads the selected exact-case file and binds its fingerprint into
+the review. An empty, comment-only or normal section-first header may omit
+`config_version`; when present, Preview requires exactly one single-line integer
+assignment with value `5`. Older, newer, malformed, duplicate, ambiguous, redirected,
+unreadable or changing files block the review. This guard checks the format
+declaration, not every project setting. Bounded native verification parses the
+file and authenticates the exact Godot 4.7.2 engine.
+
 Preview also stops before writing when the project has a root
 `AGENTS.override.md`, when the resulting root `AGENTS.md` would exceed 32 KiB,
 or when a `.csproj` is present at the project root or selected game root. The

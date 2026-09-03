@@ -504,6 +504,224 @@ class KitChangeTest(unittest.TestCase):
         self.assertEqual(config["game_root"], ".")
         self.assertEqual((self.root / "project.godot").read_bytes(), b"[application]\n")
 
+    def test_empty_project_config_is_allowed_and_bound_into_the_preview(self) -> None:
+        project = _write(self.root, "src/project.godot", b"")
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertTrue(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["godot_project"],
+            {
+                "path": "src/project.godot",
+                "sha256": _sha256(b""),
+                "config_version": None,
+            },
+        )
+        self.assertEqual(project.read_bytes(), b"")
+
+    def test_current_project_config_version_is_allowed(self) -> None:
+        content = b"; Engine configuration file.\nconfig_version=5\n\n[application]\n"
+        _write(self.root, "src/project.godot", content)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertTrue(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["godot_project"],
+            {
+                "path": "src/project.godot",
+                "sha256": _sha256(content),
+                "config_version": 5,
+            },
+        )
+
+    def test_current_project_config_version_allows_leading_zeroes(self) -> None:
+        content = b"config_version=0005\n\n[application]\n"
+        _write(self.root, "src/project.godot", content)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertTrue(decision["approval"]["approvable"])
+        self.assertEqual(
+            decision["material"]["godot_project"]["config_version"],
+            5,
+        )
+
+    def test_only_top_level_project_config_version_controls_the_guard(self) -> None:
+        content = (
+            b"config_version/custom=4\n"
+            b'[application]\nconfig_version="game setting, not format"\n'
+        )
+        _write(self.root, "src/project.godot", content)
+
+        decision = kit_change.preview(self.root, self.archive)
+
+        self.assertTrue(decision["approval"]["approvable"])
+        self.assertIsNone(
+            decision["material"]["godot_project"]["config_version"]
+        )
+
+    def test_invalid_project_config_versions_have_specific_blockers(self) -> None:
+        cases = (
+            (b"config_version=4\n", "game-project-format-too-old"),
+            (b"config_version=6\n", "game-project-format-too-new"),
+            (b"config_version=99999999999\n", "game-project-format-too-new"),
+            (b'config_version="5"\n', "game-project-config-version-malformed"),
+            (
+                b"config_version=5\nconfig_version=5\n",
+                "game-project-config-version-duplicate",
+            ),
+            (b"\xffconfig_version=5\n", "game-project-config-version-malformed"),
+        )
+        for content, expected_code in cases:
+            with self.subTest(expected_code=expected_code, content=content):
+                _write(self.root, "src/project.godot", content)
+
+                decision = kit_change.preview(self.root, self.archive)
+
+                self.assertFalse(decision["approval"]["approvable"])
+                blocker = next(
+                    item
+                    for item in decision["material"]["blockers"]
+                    if item["code"] == expected_code
+                )
+                self.assertEqual(blocker["path"], "src/project.godot")
+
+    def test_ambiguous_project_headers_are_blocked(self) -> None:
+        cases = (
+            b"config_version\n=\n4\n",
+            b"config_ version=5\n",
+            b'"config_version"=4\n',
+            b"custom_setting=[\n1,\n2,\n]\n[application]\n",
+            b"config_version=5\nunterminated=\"value\n",
+        )
+        for content in cases:
+            with self.subTest(content=content):
+                _write(self.root, "src/project.godot", content)
+
+                decision = kit_change.preview(self.root, self.archive)
+
+                self.assertFalse(decision["approval"]["approvable"])
+                blocker = next(
+                    item
+                    for item in decision["material"]["blockers"]
+                    if item["code"] == "game-project-config-version-ambiguous"
+                )
+                self.assertEqual(blocker["path"], "src/project.godot")
+
+    def test_project_missing_at_format_read_is_still_blocked(self) -> None:
+        (self.root / "src" / "project.godot").unlink()
+
+        _evidence, blockers = kit_change._game_project_format(self.root, "src")
+
+        self.assertEqual([item["code"] for item in blockers], ["game-project-missing"])
+
+    def test_project_config_stable_read_failures_have_specific_blockers(self) -> None:
+        project = self.root / "src" / "project.godot"
+        stable_bytes = kit_change._stable_bytes
+        cases = (
+            ("unsafe-hardlink", "game-project-file-unsafe"),
+            ("file-unreadable", "game-project-file-unreadable"),
+            ("file-too-large", "game-project-file-too-large"),
+            ("file-changed", "game-project-file-changed"),
+        )
+        for source_code, expected_code in cases:
+            with self.subTest(source_code=source_code):
+
+                def guarded_read(
+                    path: Path,
+                    *,
+                    limit: int = kit_change.MAX_MANAGED_FILE_BYTES,
+                ) -> bytes:
+                    if path == project:
+                        raise kit_change.KitChangeError(source_code, "simulated refusal")
+                    return stable_bytes(path, limit=limit)
+
+                with mock.patch.object(
+                    kit_change,
+                    "_stable_bytes",
+                    side_effect=guarded_read,
+                ):
+                    decision = kit_change.preview(self.root, self.archive)
+
+                self.assertFalse(decision["approval"]["approvable"])
+                blocker = next(
+                    item
+                    for item in decision["material"]["blockers"]
+                    if item["code"] == expected_code
+                )
+                self.assertEqual(blocker["path"], "src/project.godot")
+
+    def test_project_config_change_after_preview_invalidates_approval(self) -> None:
+        project = _write(self.root, "src/project.godot", b"config_version=5\n")
+        decision = kit_change.preview(self.root, self.archive)
+        project.write_bytes(b"config_version=5\n; changed after Preview\n")
+
+        with self.assertRaises(kit_change.KitChangeError) as raised:
+            kit_change.apply(
+                self.root,
+                self.archive,
+                str(decision["approval"]["sha256"]),
+            )
+
+        self.assertEqual(raised.exception.code, "approval-mismatch")
+        self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+
+    def test_project_config_change_during_apply_rebuild_blocks_before_writes(self) -> None:
+        project = _write(self.root, "src/project.godot", b"config_version=5\n")
+        decision = kit_change.preview(self.root, self.archive)
+        original = kit_change._csharp_project_blockers
+
+        def mutate_after_format_read(root: Path, game_root: str) -> list[dict]:
+            blockers = original(root, game_root)
+            project.write_bytes(b"config_version=4\n")
+            return blockers
+
+        with mock.patch.object(
+            kit_change,
+            "_csharp_project_blockers",
+            side_effect=mutate_after_format_read,
+        ):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change.apply(
+                    self.root,
+                    self.archive,
+                    str(decision["approval"]["sha256"]),
+                )
+
+        self.assertEqual(raised.exception.code, "approval-mismatch")
+        self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+        self.assertFalse((self.root / ".agent-kit" / "transactions").exists())
+
+    def test_project_config_change_after_core_staging_rolls_back_kit_writes(self) -> None:
+        project = _write(self.root, "src/project.godot", b"config_version=5\n")
+        decision = kit_change.preview(self.root, self.archive)
+        original = kit_change._stage_core
+
+        def mutate_after_stage(plan: kit_change.ChangePlan, transaction_id: str) -> None:
+            original(plan, transaction_id)
+            project.write_bytes(b"config_version=4\n")
+
+        with mock.patch.object(
+            kit_change,
+            "_stage_core",
+            side_effect=mutate_after_stage,
+        ):
+            with self.assertRaises(kit_change.KitChangeError) as raised:
+                kit_change.apply(
+                    self.root,
+                    self.archive,
+                    str(decision["approval"]["sha256"]),
+                )
+
+        self.assertEqual(raised.exception.code, "approval-mismatch")
+        self.assertEqual(project.read_bytes(), b"config_version=4\n")
+        self.assertFalse((self.root / ".agent-kit" / "current.json").exists())
+        self.assertFalse((self.root / "kit.cmd").exists())
+        journals = list((self.root / ".agent-kit" / "transactions").glob("*.json"))
+        self.assertEqual(journals, [])
+
     def test_one_nested_godot_project_selects_its_parent(self) -> None:
         (self.root / "src" / "project.godot").unlink()
         _write(self.root, "game/project.godot", b"[application]\n")

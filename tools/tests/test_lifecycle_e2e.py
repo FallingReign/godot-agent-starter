@@ -412,7 +412,7 @@ def _write_game_fixture(destination: Path) -> None:
     _write(
         destination,
         "src/project.godot",
-        b'[application]\nconfig/name="Lifecycle fixture"\n',
+        b'config_version=5\n\n[application]\nconfig/name="Lifecycle fixture"\n',
     )
     _write(
         destination,

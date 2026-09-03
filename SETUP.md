@@ -24,6 +24,12 @@ The kit refuses an empty folder because it never invents or edits
 `project.godot`. For a new game, create and close a blank Godot project first,
 then install the kit.
 
+The lifecycle safely reads the selected `project.godot`. An empty, comment-only
+or normal section-first header may omit `config_version`; when present, it must
+be one single-line integer assignment with value `5`. Ambiguous multiline headers are
+refused. This checks the format declaration, not every setting. Full native
+verification parses the file and authenticates Godot 4.7.2.
+
 Run install, upgrade and recovery from the exact incoming extracted release, or
 from a clean source checkout that produces that exact release. A different or
 changed kit is refused before any project or review-session file is written.

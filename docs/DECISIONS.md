@@ -20,6 +20,7 @@ a maintainer would deliberately change it.
 | Both root-layout and `src/`-layout Godot projects are supported | Adoption must not require moving an existing game | Use `kit setup layout root` or `kit setup layout src`; add a layout only with cross-platform fixtures |
 | `src/`, game design, proposals, generated views and retrospective run state never ship | A reusable kit must not disclose or impose the source project's product state | Change the closed release policy and its leak-marker tests |
 | Godot 4.7.2 Standard and GDScript are the supported engine boundary | The gate, API lookup and strict-language guidance need one exact testable contract | Update `tools/engine_discovery.py`, `check.py`, `AGENTS.md`, dependency guidance and all authenticated CI archives together |
+| Lifecycle Preview allows an empty, comment-only or normal section-first header, or exactly one single-line integer assignment `config_version=5` | Godot permits an empty configuration; a conservative header guard prevents ambiguous declarations; format 5 identifies Godot 4 but cannot prove full parsing or the exact 4.7.2 engine patch | Change `tools/kit_change.py`, its exact-file lifecycle fixtures and the native version proof together |
 
 ## Public workflow and setup
 
