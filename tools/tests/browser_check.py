@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "tools"))
 import mock_board  # noqa: E402
 import page_parts  # noqa: E402
+import kit_change_html  # noqa: E402
 import plan_html  # noqa: E402
 import retro_html  # noqa: E402
 
@@ -81,6 +82,154 @@ class RunningBoard:
 
     def poll(self) -> int | None:
         return None if self.thread.is_alive() else 0
+
+
+KIT_CHANGE_SESSION = "a" * 64
+KIT_CHANGE_PLAN_SHA = "b" * 64
+KIT_CHANGE_RESULT_SHA = "c" * 64
+KIT_CHANGE_READY_SESSION = "d" * 64
+KIT_CHANGE_READY_PLAN_SHA = "e" * 64
+KIT_CHANGE_RECOVERY_SESSION = "f" * 64
+KIT_CHANGE_CHECKED_AT = "2026-09-03T12:34:56Z"
+
+
+def _kit_change_state(status: str, **changes) -> dict:
+    state = {
+        "session_id": KIT_CHANGE_SESSION,
+        "status": status,
+        "detail": f"Fixture state: {status}.",
+        "plan_sha256": KIT_CHANGE_PLAN_SHA,
+        "result_sha256": "",
+        "check_evidence": {"state": "not_run", "checked_at": ""},
+        "existing_gaps": {"status": "not_checked", "count": 0, "issues": []},
+    }
+    state.update(changes)
+    return state
+
+
+class KitChangeBrowserHandler(mock_board.Handler):
+    """A deterministic lifecycle API behind the real generated page."""
+
+    lifecycle_state: dict = {}
+    lifecycle_requests: list[tuple[str, dict]] = []
+
+    @classmethod
+    def reset(cls, state: dict) -> None:
+        cls.lifecycle_state = json.loads(json.dumps(state))
+        cls.lifecycle_requests = []
+
+    def _handle(self, method: str) -> None:
+        path, _, query = self.path.partition("?")
+        if method == "GET" and path == "/kit-change.html":
+            rejected = mock_board.board._validate_host(self)
+            if rejected is not None:
+                mock_board.board._json(self, rejected[0], rejected[1])
+                return
+            expected_query = f"session={KIT_CHANGE_READY_SESSION}"
+            if query != expected_query:
+                mock_board.board._json(
+                    self,
+                    404,
+                    {"ok": False, "code": "not_found", "error": "unknown fixture review"},
+                )
+                return
+            page = kit_change_html.render(_kit_change_ready_preview())
+            page = page.replace("</body>", KIT_CHANGE_READY_PROBE + "</body>", 1)
+            mock_board.board._serve_html_text(self, page)
+            return
+        super()._handle(method)
+
+    def _dispatch(self, method: str, path: str, body: dict):
+        cls = type(self)
+        if method == "GET" and path == "/api/state":
+            payload = mock_board.state_payload()
+            payload["kit_change"] = json.loads(json.dumps(cls.lifecycle_state))
+            return 200, payload
+        if method == "POST" and path.startswith("/api/kit-change/"):
+            cls.lifecycle_requests.append((path, json.loads(json.dumps(body))))
+            if path == "/api/kit-change/apply":
+                session_id = cls.lifecycle_state.get("session_id")
+                if session_id == KIT_CHANGE_SESSION:
+                    expected = {
+                        "session_id": KIT_CHANGE_SESSION,
+                        "plan_sha256": KIT_CHANGE_PLAN_SHA,
+                        "choices": {"D1": "game"},
+                    }
+                    if body != expected:
+                        return mock_board.board._error(
+                            409, "The browser did not submit the exact reviewed decision.",
+                            "fixture_request_mismatch",
+                        )
+                    cls.lifecycle_state = _kit_change_state(
+                        "ready",
+                        session_id=KIT_CHANGE_READY_SESSION,
+                        plan_sha256=KIT_CHANGE_READY_PLAN_SHA,
+                    )
+                    port = self.server.server_address[1]
+                    return 200, {
+                        "ok": True,
+                        "reprepared": True,
+                        "review_url": (
+                            f"http://127.0.0.1:{port}/kit-change.html"
+                            f"?session={KIT_CHANGE_READY_SESSION}"
+                        ),
+                        "kit_change": json.loads(json.dumps(cls.lifecycle_state)),
+                    }
+                expected = {
+                    "session_id": KIT_CHANGE_READY_SESSION,
+                    "plan_sha256": KIT_CHANGE_READY_PLAN_SHA,
+                    "choices": {},
+                }
+                if session_id != KIT_CHANGE_READY_SESSION or body != expected:
+                    return mock_board.board._error(
+                        409, "The browser did not submit the exact reviewed decision.",
+                        "fixture_request_mismatch",
+                    )
+                cls.lifecycle_state = _kit_change_state(
+                    "complete",
+                    session_id=KIT_CHANGE_READY_SESSION,
+                    plan_sha256=KIT_CHANGE_READY_PLAN_SHA,
+                    result_sha256=KIT_CHANGE_RESULT_SHA,
+                    check_evidence={
+                        "state": "apply_time",
+                        "checked_at": KIT_CHANGE_CHECKED_AT,
+                    },
+                    existing_gaps={"status": "checked", "count": 0, "issues": []},
+                )
+            elif path == "/api/kit-change/restore":
+                expected = {
+                    "session_id": KIT_CHANGE_READY_SESSION,
+                    "result_sha256": KIT_CHANGE_RESULT_SHA,
+                }
+                if body != expected:
+                    return mock_board.board._error(
+                        409, "The browser did not submit the exact applied result.",
+                        "fixture_request_mismatch",
+                    )
+                cls.lifecycle_state = _kit_change_state(
+                    "restored",
+                    session_id=KIT_CHANGE_READY_SESSION,
+                    plan_sha256=KIT_CHANGE_READY_PLAN_SHA,
+                )
+            elif path == "/api/kit-change/recover":
+                if body != {"session_id": KIT_CHANGE_RECOVERY_SESSION}:
+                    return mock_board.board._error(
+                        409, "The browser did not submit the exact recovery session.",
+                        "fixture_request_mismatch",
+                    )
+                cls.lifecycle_state = _kit_change_state(
+                    "restored",
+                    session_id=KIT_CHANGE_RECOVERY_SESSION,
+                )
+            else:
+                return mock_board.board._error(
+                    404, "Unknown fixture lifecycle action.", "not_found"
+                )
+            return 200, {
+                "ok": True,
+                "kit_change": json.loads(json.dumps(cls.lifecycle_state)),
+            }
+        return super()._dispatch(method, path, body)
 
 
 def check(scenario: str, name: str, cond: bool, extra: str = "") -> None:
@@ -471,7 +620,12 @@ def wait_for(
     return False
 
 
-def start_board(port: int, scenario: str, fixture_root: Path) -> RunningBoard:
+def start_board(
+    port: int,
+    scenario: str,
+    fixture_root: Path,
+    handler_cls: type[mock_board.Handler] = mock_board.Handler,
+) -> RunningBoard:
     fixture_items = json.loads(
         (fixture_root / "fixture-items.json").read_text(encoding="utf-8")
     )
@@ -487,7 +641,7 @@ def start_board(port: int, scenario: str, fixture_root: Path) -> RunningBoard:
         mock_board.FIXTURE_ITEMS = fixture_items
         mock_board.board.ROOT = fixture_root
         server = mock_board.board.BoardHTTPServer(
-            ("127.0.0.1", port), mock_board.Handler
+            ("127.0.0.1", port), handler_cls
         )
     except BaseException:
         mock_board.board.ROOT = previous_root
@@ -578,6 +732,201 @@ def _fixture_findings(items: list[dict]) -> str:
             "",
         ])
     return "\n".join(blocks)
+
+
+def _kit_change_fixture_preview() -> dict:
+    return {
+        "mode": "install",
+        "project": {"name": "Lifecycle fixture", "path": "C:/fixture/game"},
+        "current_version": "Not installed",
+        "incoming_version": "0.3.0",
+        "status": "needs_decision",
+        "session_id": KIT_CHANGE_SESSION,
+        "plan_sha256": KIT_CHANGE_PLAN_SHA,
+        "counts": {
+            "kit_files": 12,
+            "shared_files": 2,
+            "removed_files": 0,
+            "game_files": 0,
+        },
+        "decisions": [{
+            "id": "D1",
+            "question": "Which folder contains the game?",
+            "choices": [{
+                "value": "game",
+                "label": "game",
+                "description": "Use game as the game folder.",
+                "recommended": False,
+            }],
+        }],
+        "files": [{
+            "path": "kit.cmd",
+            "action": "Add",
+            "reason": "Expose the managed kit command.",
+        }],
+    }
+
+
+def _kit_change_ready_preview() -> dict:
+    preview = _kit_change_fixture_preview()
+    preview.update({
+        "status": "ready",
+        "session_id": KIT_CHANGE_READY_SESSION,
+        "plan_sha256": KIT_CHANGE_READY_PLAN_SHA,
+        "decisions": [],
+    })
+    return preview
+
+
+def _kit_change_recovery_preview() -> dict:
+    preview = _kit_change_fixture_preview()
+    preview.update({
+        "status": "recovery_required",
+        "session_id": KIT_CHANGE_RECOVERY_SESSION,
+        "decisions": [],
+    })
+    return preview
+
+
+KIT_CHANGE_DECISION_PROBE = r"""
+<script>
+(function(){
+  var body=document.body;
+  body.setAttribute("data-browser-probe-pending","true");
+  function finish(error){
+    if(error)body.setAttribute("data-kit-change-probe-error",String(error));
+    body.removeAttribute("data-browser-probe-pending");
+  }
+  function waitFor(label,test,next,attempt){
+    attempt=attempt||0;
+    try{
+      if(test()){next();return;}
+      if(attempt>=200){finish("Timed out waiting for "+label);return;}
+      setTimeout(function(){waitFor(label,test,next,attempt+1);},20);
+    }catch(error){finish(String(error));}
+  }
+  waitFor("the live review",function(){
+    return body.getAttribute("data-board-ready")==="true"
+      && window.Board && Board.mode()==="live";
+  },function(){
+    var apply=document.getElementById("kit-change-apply");
+    var choice=document.querySelector('[data-decision-id="D1"]');
+    sessionStorage.setItem("kit-change-initial-disabled",String(apply.disabled));
+    choice.click();
+    sessionStorage.setItem("kit-change-decision-enabled",String(!apply.disabled));
+    if(apply.disabled){finish("Apply stayed disabled after the decision");return;}
+    apply.click();
+  });
+})();
+</script>
+"""
+
+
+KIT_CHANGE_READY_PROBE = r"""
+<script>
+(function(){
+  var body=document.body;
+  body.setAttribute("data-browser-probe-pending","true");
+  function record(name,value){body.setAttribute(name,String(value));}
+  function finish(error){
+    if(error)record("data-kit-change-probe-error",error);
+    else record("data-kit-change-probe-ran","true");
+    body.removeAttribute("data-browser-probe-pending");
+  }
+  function waitFor(label,test,next,attempt){
+    attempt=attempt||0;
+    try{
+      if(test()){next();return;}
+      if(attempt>=200){finish("Timed out waiting for "+label);return;}
+      setTimeout(function(){waitFor(label,test,next,attempt+1);},20);
+    }catch(error){finish(String(error));}
+  }
+  waitFor("the second review",function(){
+    var apply=document.getElementById("kit-change-apply");
+    return body.getAttribute("data-board-ready")==="true"
+      && body.getAttribute("data-kit-change-status")==="ready"
+      && window.Board && Board.mode()==="live" && apply && !apply.disabled;
+  },function(){
+    record("data-kit-change-probe-initial-disabled",
+      sessionStorage.getItem("kit-change-initial-disabled")||"");
+    record("data-kit-change-probe-decision-enabled",
+      sessionStorage.getItem("kit-change-decision-enabled")||"");
+    record("data-kit-change-probe-second-review",
+      location.pathname+location.search);
+    document.getElementById("kit-change-apply").click();
+    waitFor("Apply completion",function(){
+      return body.getAttribute("data-kit-change-status")==="complete";
+    },function(){
+      var restore=document.getElementById("kit-change-restore");
+      record("data-kit-change-probe-apply-status",
+        body.getAttribute("data-kit-change-status")||"");
+      record("data-kit-change-probe-checked-at",
+        document.getElementById("kit-change-checked-at").textContent.trim());
+      record("data-kit-change-probe-restore-enabled",
+        !restore.hidden && !restore.disabled);
+      if(restore.hidden||restore.disabled){
+        finish("Restore was not enabled after Apply");return;
+      }
+      restore.click();
+      waitFor("Restore completion",function(){
+        return body.getAttribute("data-kit-change-status")==="restored";
+      },function(){
+        record("data-kit-change-probe-restore-status",
+          body.getAttribute("data-kit-change-status")||"");
+        record("data-kit-change-probe-review-enabled",
+          !document.getElementById("kit-change-review-again").disabled);
+        record("data-kit-change-probe-errors",
+          document.querySelectorAll(".board-error").length);
+        finish("");
+      });
+    });
+  });
+})();
+</script>
+"""
+
+
+KIT_CHANGE_RECOVERY_PROBE = r"""
+<script>
+(function(){
+  var body=document.body;
+  body.setAttribute("data-browser-probe-pending","true");
+  function record(name,value){body.setAttribute(name,String(value));}
+  function finish(error){
+    if(error)record("data-kit-change-recovery-error",error);
+    else record("data-kit-change-recovery-ran","true");
+    body.removeAttribute("data-browser-probe-pending");
+  }
+  function waitFor(label,test,next,attempt){
+    attempt=attempt||0;
+    try{
+      if(test()){next();return;}
+      if(attempt>=200){finish("Timed out waiting for "+label);return;}
+      setTimeout(function(){waitFor(label,test,next,attempt+1);},20);
+    }catch(error){finish(String(error));}
+  }
+  waitFor("the recovery action",function(){
+    var recover=document.getElementById("kit-change-recover");
+    return body.getAttribute("data-board-ready")==="true"
+      && body.getAttribute("data-kit-change-status")==="recovery_required"
+      && recover && !recover.hidden && !recover.disabled;
+  },function(){
+    document.getElementById("kit-change-recover").click();
+    waitFor("Recovery completion",function(){
+      return body.getAttribute("data-kit-change-status")==="restored";
+    },function(){
+      record("data-kit-change-recovery-status",
+        body.getAttribute("data-kit-change-status")||"");
+      record("data-kit-change-recovery-review-enabled",
+        !document.getElementById("kit-change-review-again").disabled);
+      record("data-kit-change-recovery-errors",
+        document.querySelectorAll(".board-error").length);
+      finish("");
+    });
+  });
+})();
+</script>
+"""
 
 
 @contextlib.contextmanager
@@ -1075,6 +1424,23 @@ def browser_fixture():
             1,
         ).replace("</body>", hidden_probe + "</body>", 1)
         (fixture_root / "plan-hidden.html").write_text(hidden_page, encoding="utf-8")
+
+        kit_change_page = kit_change_html.render(_kit_change_fixture_preview())
+        lifecycle_pages = fixture_root / "plan"
+        lifecycle_pages.mkdir()
+        (lifecycle_pages / "kit-change-browser.html").write_text(
+            kit_change_page.replace(
+                "</body>", KIT_CHANGE_DECISION_PROBE + "</body>", 1
+            ),
+            encoding="utf-8",
+        )
+        recovery_page = kit_change_html.render(_kit_change_recovery_preview())
+        (lifecycle_pages / "kit-change-recovery-browser.html").write_text(
+            recovery_page.replace(
+                "</body>", KIT_CHANGE_RECOVERY_PROBE + "</body>", 1
+            ),
+            encoding="utf-8",
+        )
         (fixture_root / "fixture-items.json").write_text(
             json.dumps(items, indent=2) + "\n", encoding="utf-8"
         )
@@ -1462,6 +1828,122 @@ def _run_browser_scenarios(browser: str, fixture_root: Path) -> int:
               and body_attribute(hidden_page, "data-hidden-fallback-hidden") == "true"
               and int(body_attribute(hidden_page, "data-hidden-nodes") or 0) > 0,
               body_class(hidden_page))
+    finally:
+        stop_board(proc)
+
+    # -------------------------- managed lifecycle page, real DOM and requests
+    KitChangeBrowserHandler.reset(_kit_change_state("needs_decision"))
+    proc = start_board(
+        port,
+        "healthy",
+        fixture_root,
+        handler_cls=KitChangeBrowserHandler,
+    )
+    try:
+        html = dump_dom(
+            browser,
+            f"http://127.0.0.1:{port}/plan/kit-change-browser.html",
+            profile,
+        )
+        s = "live/kit-change-decision-apply-restore"
+        check(s, "the two-review lifecycle proof ran to completion",
+              body_attribute(html, "data-kit-change-probe-ran") == "true"
+              and not body_attribute(html, "data-kit-change-probe-error"),
+              body_class(html))
+        check(s, "Apply starts disabled and the decision enables it",
+              body_attribute(
+                  html, "data-kit-change-probe-initial-disabled"
+              ) == "true"
+              and body_attribute(
+                  html, "data-kit-change-probe-decision-enabled"
+              ) == "true",
+              body_class(html))
+        check(s, "the decision opens the exact second review",
+              body_attribute(html, "data-kit-change-probe-second-review")
+              == (
+                  "/kit-change.html?session="
+                  + KIT_CHANGE_READY_SESSION
+              ),
+              body_class(html))
+        check(s, "Apply renders checked completion and enables Restore",
+              body_attribute(html, "data-kit-change-probe-apply-status") == "complete"
+              and body_attribute(
+                  html, "data-kit-change-probe-checked-at"
+              ) == KIT_CHANGE_CHECKED_AT
+              and body_attribute(
+                  html, "data-kit-change-probe-restore-enabled"
+              ) == "true",
+              body_class(html))
+        check(s, "Restore renders the restored decision state",
+              body_attribute(
+                  html, "data-kit-change-probe-restore-status"
+              ) == "restored"
+              and body_attribute(
+                  html, "data-kit-change-probe-review-enabled"
+              ) == "true"
+              and body_attribute(html, "data-kit-change-probe-errors") == "0",
+              body_class(html))
+        check(s, "the browser sent the exact Apply and Restore requests",
+              KitChangeBrowserHandler.lifecycle_requests == [
+                  (
+                      "/api/kit-change/apply",
+                      {
+                          "session_id": KIT_CHANGE_SESSION,
+                          "plan_sha256": KIT_CHANGE_PLAN_SHA,
+                          "choices": {"D1": "game"},
+                      },
+                  ),
+                  (
+                      "/api/kit-change/apply",
+                      {
+                          "session_id": KIT_CHANGE_READY_SESSION,
+                          "plan_sha256": KIT_CHANGE_READY_PLAN_SHA,
+                          "choices": {},
+                      },
+                  ),
+                  (
+                      "/api/kit-change/restore",
+                      {
+                          "session_id": KIT_CHANGE_READY_SESSION,
+                          "result_sha256": KIT_CHANGE_RESULT_SHA,
+                      },
+                  ),
+              ],
+              repr(KitChangeBrowserHandler.lifecycle_requests))
+
+        KitChangeBrowserHandler.reset(_kit_change_state(
+            "recovery_required",
+            session_id=KIT_CHANGE_RECOVERY_SESSION,
+        ))
+        recovery = dump_dom(
+            browser,
+            f"http://127.0.0.1:{port}/plan/kit-change-recovery-browser.html",
+            profile,
+        )
+        s = "live/kit-change-recovery"
+        check(s, "the recovery JavaScript proof ran to completion",
+              body_attribute(recovery, "data-kit-change-recovery-ran") == "true"
+              and not body_attribute(recovery, "data-kit-change-recovery-error"),
+              body_class(recovery))
+        check(s, "Recovery restores the previous state",
+              body_attribute(
+                  recovery, "data-kit-change-recovery-status"
+              ) == "restored"
+              and body_attribute(
+                  recovery, "data-kit-change-recovery-review-enabled"
+              ) == "true"
+              and body_attribute(
+                  recovery, "data-kit-change-recovery-errors"
+              ) == "0",
+              body_class(recovery))
+        check(s, "the browser sent only the exact Recovery request",
+              KitChangeBrowserHandler.lifecycle_requests == [
+                  (
+                      "/api/kit-change/recover",
+                      {"session_id": KIT_CHANGE_RECOVERY_SESSION},
+                  )
+              ],
+              repr(KitChangeBrowserHandler.lifecycle_requests))
     finally:
         stop_board(proc)
 

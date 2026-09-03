@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import page_parts  # noqa: E402
 import board_client  # noqa: E402
 import browser_check  # noqa: E402
+import kit_change_html  # noqa: E402
 import plan_html  # noqa: E402
 import process_supervisor  # noqa: E402
 import retro_html  # noqa: E402
@@ -2357,6 +2358,46 @@ class Harness(unittest.TestCase):
         target.write_text(html, encoding="utf-8")
         return target
 
+    @staticmethod
+    def _kit_change_fixture(*, ready: bool) -> Path:
+        """Render one real decision or post-decision lifecycle review."""
+        target = _scratch_parent() / (
+            "kit-change-ready-harness.html" if ready else "kit-change-decision-harness.html"
+        )
+        preview = {
+            "mode": "install",
+            "project": {"name": "Lifecycle fixture", "path": "C:/fixture/game"},
+            "current_version": "Not installed",
+            "incoming_version": "0.3.0",
+            "status": "ready" if ready else "needs_decision",
+            "session_id": ("d" if ready else "a") * 64,
+            "plan_sha256": ("e" if ready else "b") * 64,
+            "counts": {
+                "kit_files": 12,
+                "shared_files": 2,
+                "removed_files": 0,
+                "game_files": 0,
+            },
+            "decisions": [] if ready else [{
+                "id": "D1",
+                "question": "Which folder contains the game?",
+                "choices": [{
+                    "value": "game",
+                    "label": "game",
+                    "description": "Use game as the game folder.",
+                    "recommended": False,
+                }],
+            }],
+            "files": [{
+                "path": "kit.cmd",
+                "action": "Add",
+                "reason": "Expose the managed kit command.",
+            }],
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(kit_change_html.render(preview), encoding="utf-8")
+        return target
+
     def _run(self, page: str) -> dict | None:
         if page == "retro.html":
             target = self._retro_fixture()
@@ -2364,6 +2405,8 @@ class Harness(unittest.TestCase):
             target = self._recorded_plan_fixture()
         elif page == "plan-unchanged.html":
             target = self._unchanged_plan_fixture()
+        elif page in {"kit-change-decision.html", "kit-change-ready.html"}:
+            target = self._kit_change_fixture(ready=page == "kit-change-ready.html")
         else:
             target = self._plan_fixture()
         try:
@@ -2428,6 +2471,25 @@ class Harness(unittest.TestCase):
             return
         scenarios = {r["scenario"] for r in data["results"]}
         self.assertIn("recorded-plan-decision", scenarios)
+
+    def test_kit_change_page_executes_decision_apply_restore_and_recovery(self) -> None:
+        decision = self._run("kit-change-decision.html")
+        ready = self._run("kit-change-ready.html")
+        if decision is None or ready is None:
+            self.assertIn(
+                "'kit-change-decision'",
+                HARNESS.read_text(encoding="utf-8"),
+            )
+            self.assertIn("'kit-change-ready'", HARNESS.read_text(encoding="utf-8"))
+            return
+        self.assertEqual(
+            {"kit-change-decision"},
+            {result["scenario"] for result in decision["results"]},
+        )
+        self.assertEqual(
+            {"kit-change-ready"},
+            {result["scenario"] for result in ready["results"]},
+        )
 
     def test_static_dom_contract_runs_when_node_is_unavailable(self) -> None:
         with mock.patch.object(

@@ -42,6 +42,7 @@ class El {
     this.disabled = false;
     this.hidden = false;
     this.open = false;
+    this.checked = false;
     this.value = '';
     this.clientWidth = 800;
     this.clientHeight = 500;
@@ -166,6 +167,9 @@ function serialize(el) {
 }
 
 function matches(el, sel) {
+  const requiresChecked = sel.indexOf(':checked') >= 0;
+  if (requiresChecked && !el.checked) { return false; }
+  sel = sel.replace(/:checked/g, '');
   const re = /([.#]?[a-zA-Z][\w-]*)|(\[[^\]]+\])/g;
   let m;
   while ((m = re.exec(sel)) !== null) {
@@ -231,6 +235,9 @@ function parseInto(html, root) {
       el.attrs[am[1]] = decode(val);
     }
     if (Object.prototype.hasOwnProperty.call(el.attrs, 'hidden')) { el.hidden = true; }
+    if (Object.prototype.hasOwnProperty.call(el.attrs, 'disabled')) { el.disabled = true; }
+    if (Object.prototype.hasOwnProperty.call(el.attrs, 'checked')) { el.checked = true; }
+    if (Object.prototype.hasOwnProperty.call(el.attrs, 'value')) { el.value = el.attrs.value; }
     stack[stack.length - 1].appendChild(el);
     i = end + 1;
     if (VOID.has(tag) || selfClosing) { continue; }
@@ -658,8 +665,155 @@ async function main() {
   /* The retro page is identified by the element, not by the string: plan.html
      renders docs inline and can quite legitimately *mention* #list-toaction. */
   const isRetro = /<div id="list-toaction"/.test(html);
+  const isKitChange = /class="kit-change-page"/.test(html);
   const hasArchitecture = /id="architecture-map"/.test(html);
   const unchangedArchitecture = /Architecture unchanged fixture/.test(html);
+
+  /* ----------------------- managed lifecycle decision and recovery cockpit */
+  if (isKitChange) {
+    const decisionSession = 'a'.repeat(64);
+    const decisionPlanSha = 'b'.repeat(64);
+    const resultSha = 'c'.repeat(64);
+    const readySession = 'd'.repeat(64);
+    const readyPlanSha = 'e'.repeat(64);
+    const checkedAt = '2026-09-03T12:34:56Z';
+    const hasDecision = /data-decision="D1"/.test(html);
+    const lifecycleState = (status, sessionId, planSha, extra) => Object.assign({
+      session_id: sessionId,
+      status: status,
+      detail: 'Fixture state: ' + status + '.',
+      plan_sha256: planSha,
+      result_sha256: '',
+      check_evidence: {state: 'not_run', checked_at: ''},
+      existing_gaps: {status: 'not_checked', count: 0, issues: []}
+      }, extra || {});
+
+    let current = lifecycleState(
+      hasDecision ? 'needs_decision' : 'ready',
+      hasDecision ? decisionSession : readySession,
+      hasDecision ? decisionPlanSha : readyPlanSha
+    );
+    const routes = {
+      '/api/health': HEALTH_OK(),
+      '/api/state': () => Promise.resolve(response(
+        200, stateBody({kit_change: current})
+      )),
+      '/api/kit-change/apply': (_url, init) => {
+        if (hasDecision) {
+          current = lifecycleState('ready', readySession, readyPlanSha);
+          return Promise.resolve(response(200, JSON.stringify({
+            ok: true,
+            reprepared: true,
+            review_url: 'http://127.0.0.1:8899/kit-change.html?session=' + readySession,
+            kit_change: current
+          })));
+        }
+        current = lifecycleState('complete', readySession, readyPlanSha, {
+          result_sha256: resultSha,
+          check_evidence: {state: 'apply_time', checked_at: checkedAt},
+          existing_gaps: {status: 'checked', count: 0, issues: []}
+        });
+        return Promise.resolve(response(200, JSON.stringify({
+          ok: true, kit_change: current
+        })));
+      },
+      '/api/kit-change/restore': (_url, init) => {
+        current = lifecycleState('restored', readySession, readyPlanSha);
+        return Promise.resolve(response(200, JSON.stringify({
+          ok: true, kit_change: current
+        })));
+      },
+      '/api/kit-change/recover': (_url, init) => {
+        current = lifecycleState('restored', readySession, readyPlanSha);
+        return Promise.resolve(response(200, JSON.stringify({
+          ok: true, kit_change: current
+        })));
+      }
+    };
+
+    const env = await run(html, {routes: routes});
+    const S = hasDecision ? 'kit-change-decision' : 'kit-change-ready';
+    const apply = env.doc.getElementById('kit-change-apply');
+    if (hasDecision) {
+      const choice = env.doc.querySelector('[data-decision-id="D1"]');
+      check(S, 'a live undecided review keeps Apply disabled',
+            env.doc.body.classList.contains('board-live') && apply && apply.disabled);
+      if (choice) { choice.checked = true; choice.fire('change'); }
+      check(S, 'answering D1 enables the decision action',
+            choice && choice.value === 'game' && apply && !apply.disabled);
+      if (apply) { apply.fire('click'); }
+      await settle();
+      const mutation = env.log.find(item => item.url === '/api/kit-change/apply');
+      const body = mutation ? JSON.parse(mutation.body) : {};
+      check(S, 'D1 sends the exact first review and opens the second review',
+            mutation && mutation.method === 'POST'
+            && mutation.headers['X-Kit-Board-Token'] === 'dom-harness-capability'
+            && body.session_id === decisionSession
+            && body.plan_sha256 === decisionPlanSha
+            && body.choices && body.choices.D1 === 'game'
+            && env.ctx.location.href
+              === 'http://127.0.0.1:8899/kit-change.html?session=' + readySession,
+            JSON.stringify({body: body, href: env.ctx.location.href || ''}));
+    } else {
+      check(S, 'the second review enables Apply without another decision',
+            env.doc.body.classList.contains('board-live') && apply && !apply.disabled);
+      if (apply) { apply.fire('click'); }
+      await settle();
+      const applyMutation = env.log.find(item => item.url === '/api/kit-change/apply');
+      const applyBody = applyMutation ? JSON.parse(applyMutation.body) : {};
+      check(S, 'Apply sends the exact second review with no choices',
+            applyMutation && applyMutation.method === 'POST'
+            && applyMutation.headers['X-Kit-Board-Token'] === 'dom-harness-capability'
+            && applyBody.session_id === readySession
+            && applyBody.plan_sha256 === readyPlanSha
+            && Object.keys(applyBody.choices || {}).length === 0,
+            JSON.stringify(applyBody));
+      const restore = env.doc.getElementById('kit-change-restore');
+      check(S, 'a successful Apply renders checked state and enables Restore',
+            env.doc.body.getAttribute('data-kit-change-status') === 'complete'
+            && env.doc.getElementById('kit-change-checked-at').textContent === checkedAt
+            && env.doc.getElementById('kit-change-kit-files-check').textContent === 'Passed at Apply'
+            && restore && !restore.hidden && !restore.disabled);
+      if (restore) { restore.fire('click'); }
+      await settle();
+      const restoreMutation = env.log.find(item => item.url === '/api/kit-change/restore');
+      const restoreBody = restoreMutation ? JSON.parse(restoreMutation.body) : {};
+      check(S, 'Restore sends the exact applied result fingerprint',
+            restoreMutation && restoreMutation.method === 'POST'
+            && restoreBody.session_id === readySession
+            && restoreBody.result_sha256 === resultSha,
+            JSON.stringify(restoreBody));
+      check(S, 'a successful Restore renders the restored state',
+            env.doc.body.getAttribute('data-kit-change-status') === 'restored'
+            && env.doc.getElementById('kit-change-review-again').hidden === false);
+
+      current = lifecycleState('recovery_required', readySession, readyPlanSha);
+      const recoveryEnv = await run(html, {routes: routes});
+      const recover = recoveryEnv.doc.getElementById('kit-change-recover');
+      check(S, 'a recovery-required state enables the bounded recovery action',
+            recoveryEnv.doc.body.getAttribute('data-kit-change-status') === 'recovery_required'
+            && recover && !recover.hidden && !recover.disabled);
+      if (recover) { recover.fire('click'); }
+      await settle();
+      const recoveryMutation = recoveryEnv.log.find(
+        item => item.url === '/api/kit-change/recover'
+      );
+      const recoveryBody = recoveryMutation ? JSON.parse(recoveryMutation.body) : {};
+      check(S, 'Recovery sends only the exact session',
+            recoveryMutation && recoveryMutation.method === 'POST'
+            && Object.keys(recoveryBody).length === 1
+            && recoveryBody.session_id === readySession,
+            JSON.stringify(recoveryBody));
+      check(S, 'a successful recovery renders the restored state',
+            recoveryEnv.doc.body.getAttribute('data-kit-change-status') === 'restored'
+            && recoveryEnv.doc.getElementById('kit-change-review-again').hidden === false);
+    }
+
+    const failed = results.filter(r => !r.pass);
+    console.log(JSON.stringify({file: file, total: results.length,
+                                failed: failed.length, results: results}, null, 1));
+    process.exit(failed.length ? 1 : 0);
+  }
 
   /* ---------------------------------------------------- 1. healthy board */
   {
