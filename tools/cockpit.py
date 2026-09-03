@@ -755,15 +755,14 @@ def record_verification(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
             and re.fullmatch(r"[0-9a-f]{64}", end_warning_identity)
             else ""
         )
-        resolution_candidate = bool(
-            unresolved
-            and passed
-            and scope in ("full", "strict")
+        native_recovery_proved = bool(
+            scope in ("full", "strict")
             and current_failure is None
             and trusted_gate
             and warning_snapshot_stable
             and cas_identity
         )
+        resolution_candidate = bool(unresolved and native_recovery_proved)
         if not passed:
             evidence_status = "failed"
         elif (
@@ -880,7 +879,11 @@ def record_verification(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        pointer["status"] = "fresh"
+        # Native safety and the combined verification result are separate.
+        # A later non-native strict stage may fail after the trusted Godot gate
+        # proved recovery, so retain that failed result while clearing only the
+        # exact native warning.
+        pointer["status"] = "fresh" if passed else evidence_status
         pointer["failure_class"] = current_failure
         pointer.pop("unresolved_failure", None)
         pointer["resolved_failure"] = resolved_failure

@@ -1003,6 +1003,113 @@ class TestCockpitDecision(unittest.TestCase):
         finally:
             retro_due.ROOT = saved_root
 
+    def test_trusted_native_recovery_survives_a_later_strict_failure(self) -> None:
+        fingerprint = {
+            "available": True,
+            "digest": "f" * 64,
+            "head": "a" * 40,
+            "untracked": 0,
+        }
+        identity = "7" * 64
+        unresolved_snapshot = cockpit.native_engine.NativeWarningSnapshot(
+            "unresolved", identity
+        )
+        warning = {
+            "code": "engine-start-failed",
+            "recorded_at": "2026-09-02T00:00:00Z",
+            "operation": "verification",
+            "summary": "engine start failed",
+        }
+        payload = _passing_gate_payload(
+            ok=False,
+            status="failed",
+            exit_code=1,
+            strict=True,
+            native_warning_start={"state": "unresolved", "identity": identity},
+        )
+
+        with mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=fingerprint
+        ), mock.patch.object(
+            cockpit.native_engine,
+            "snapshot_native_warning",
+            return_value=unresolved_snapshot,
+        ), mock.patch.object(
+            cockpit, "persisted_native_warning", return_value=warning
+        ), mock.patch.object(
+            cockpit.native_engine, "resolve_native_warning", return_value=True
+        ) as resolve:
+            record = cockpit.record_verification(self.root, payload)
+
+        self.assertEqual("failed", record["status"])
+        self.assertFalse(record["passed"])
+        self.assertIsNone(record["failure_class"])
+        self.assertNotIn("unresolved_failure", record)
+        self.assertEqual(
+            "engine-start-failed", record["resolved_failure"]["failure_class"]
+        )
+        resolve.assert_called_once_with(
+            self.root,
+            verification_scope="strict",
+            expected_identity=identity,
+        )
+
+        with mock.patch.object(
+            cockpit, "persisted_native_warning", return_value=None
+        ), mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=fingerprint
+        ):
+            view = cockpit.verification_view(self.root)
+        self.assertEqual("failed", view["status"])
+        self.assertEqual("The latest verification failed.", view["summary"])
+        self.assertIsNone(view["unresolved_failure"])
+
+    def test_failed_native_gate_cannot_clear_an_existing_warning(self) -> None:
+        fingerprint = {
+            "available": True,
+            "digest": "f" * 64,
+            "head": "a" * 40,
+            "untracked": 0,
+        }
+        identity = "6" * 64
+        unresolved_snapshot = cockpit.native_engine.NativeWarningSnapshot(
+            "unresolved", identity
+        )
+        warning = {
+            "code": "engine-start-failed",
+            "recorded_at": "2026-09-02T00:00:00Z",
+            "operation": "verification",
+            "summary": "engine start failed",
+        }
+        payload = _passing_gate_payload(
+            ok=False,
+            status="failed",
+            exit_code=1,
+            strict=True,
+            native_warning_start={"state": "unresolved", "identity": identity},
+        )
+        payload["gate_summary"]["failed"] = True
+
+        with mock.patch.object(
+            cockpit, "repository_fingerprint", return_value=fingerprint
+        ), mock.patch.object(
+            cockpit.native_engine,
+            "snapshot_native_warning",
+            return_value=unresolved_snapshot,
+        ), mock.patch.object(
+            cockpit, "persisted_native_warning", return_value=warning
+        ), mock.patch.object(
+            cockpit.native_engine, "resolve_native_warning"
+        ) as resolve:
+            record = cockpit.record_verification(self.root, payload)
+
+        self.assertEqual("failed", record["status"])
+        self.assertEqual(
+            "engine-start-failed", record["unresolved_failure"]["failure_class"]
+        )
+        self.assertNotIn("resolved_failure", record)
+        resolve.assert_not_called()
+
     def test_unchanged_static_diagnostic_preserves_fresh_complete_pointer(self) -> None:
         fingerprint = {
             "available": True,

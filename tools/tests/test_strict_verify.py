@@ -261,7 +261,13 @@ class StrictFixture(unittest.TestCase):
 class StrictSuccessTests(StrictFixture):
     def test_runs_all_proofs_sequentially_and_retains_complete_logs(self) -> None:
         runner = FakeRunner()
-        report, code = self.run_with(runner)
+        outer_bindings = {
+            strict_verify.managed_launcher.PROJECT_ROOT_ENV: "hostile-project",
+            strict_verify.managed_launcher.CORE_ROOT_ENV: "hostile-core",
+            "KIT_LIFECYCLE_CHECK": "1",
+        }
+        with mock.patch.dict(strict_verify.os.environ, outer_bindings, clear=False):
+            report, code = self.run_with(runner)
 
         self.assertEqual(code, strict_verify.EXIT_OK)
         self.assertTrue(report["ok"])
@@ -298,6 +304,18 @@ class StrictSuccessTests(StrictFixture):
         self.assertEqual(runner.commands[2][7], str(self.root / "check.py"))
         self.assertIn("unittest", runner.commands[3])
         self.assertTrue(runner.commands[4][7].endswith("browser_check.py"))
+        for name, value in outer_bindings.items():
+            self.assertEqual(value, runner.environments[2][name])
+        for environment in runner.environments[3:5]:
+            self.assertNotIn(
+                strict_verify.managed_launcher.PROJECT_ROOT_ENV,
+                environment,
+            )
+            self.assertNotIn(
+                strict_verify.managed_launcher.CORE_ROOT_ENV,
+                environment,
+            )
+            self.assertNotIn("KIT_LIFECYCLE_CHECK", environment)
         self.assertEqual(
             ["build", "build", "verify", "verify", "smoke"],
             runner.release_operations,

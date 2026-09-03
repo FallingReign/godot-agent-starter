@@ -902,10 +902,11 @@ def run_strict(root: Path = ROOT, *, runner: Runner | None = None) -> tuple[dict
                 # authoritative gate receipt. Doctor and the regression suite
                 # may invoke nested checks; they must not overwrite it.
                 stage_environment = _without_gate_receipt(stage_environment)
-            if name in {"unit-tests", "browser-check"} and test_core != core_root:
-                # These stages execute from the disposable source-shaped copy.
-                # Retaining the managed installation binding would make its
-                # launcher reject that authenticated copy as the wrong core.
+            if name in {"unit-tests", "browser-check"}:
+                # Regression and browser checks create independent project
+                # fixtures. Never let the outer installation binding select
+                # the source project inside those fixtures. Managed checks also
+                # execute from a disposable source-shaped core copy.
                 stage_environment.pop(managed_launcher.PROJECT_ROOT_ENV, None)
                 stage_environment.pop(managed_launcher.CORE_ROOT_ENV, None)
                 stage_environment.pop("KIT_LIFECYCLE_CHECK", None)
