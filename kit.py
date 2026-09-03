@@ -1992,14 +1992,11 @@ def _self_test(
             "KIT_ENGINE_DISABLED": "1",
             "KIT_SELF_TEST": "1",
             "KIT_TEST_TMPDIR": str(scratch),
-            # The disposable managed copy behaves as a flat kit fixture.  It
-            # must never inherit bindings that identify the active core.
-            managed_launcher.PROJECT_ROOT_ENV: "" if managed else os.environ.get(
-                managed_launcher.PROJECT_ROOT_ENV, ""
-            ),
-            managed_launcher.CORE_ROOT_ENV: "" if managed else os.environ.get(
-                managed_launcher.CORE_ROOT_ENV, ""
-            ),
+            # Tests create independent project fixtures.  The test process must
+            # never inherit the launcher's binding to the kit being tested,
+            # whether this is a source checkout or a disposable managed copy.
+            managed_launcher.PROJECT_ROOT_ENV: "",
+            managed_launcher.CORE_ROOT_ENV: "",
             # A strict verifier may itself carry a public gate nonce.  The
             # self-test's mocked/nested checks must never write that outer run's
             # evidence receipt.

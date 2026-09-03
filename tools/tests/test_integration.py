@@ -170,18 +170,26 @@ def _git(directory: Path, *args: str) -> str:
 def _stub_worker(directory: Path) -> Path:
     """An executable that behaves like a worker and costs nothing.
 
-    It sleeps long enough for the board to observe a `working` item and a
-    second approval queued behind it, then exits 0. This is what keeps the
-    end-to-end test off a paid model while still exercising Popen, the
-    watcher thread, the queue and the state file.
+    Normal runs pause briefly. A held run waits for a test-owned release file,
+    so queue assertions do not depend on machine speed. This keeps the test
+    off a paid model while still exercising Popen, the watcher thread, the
+    queue and the state file.
     """
     seconds = 3
     worker = directory / "stub_worker.py"
     worker.write_text(
         "import os, sys, time\n"
         "from pathlib import Path\n"
-        f"time.sleep({seconds})\n"
         "mode = sys.argv[1]\n"
+        "if mode == 'held':\n"
+        "    release = Path(__file__).with_name('release-first')\n"
+        "    deadline = time.monotonic() + 30\n"
+        "    while not release.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.05)\n"
+        "    if not release.exists():\n"
+        "        raise SystemExit(9)\n"
+        "else:\n"
+        f"    time.sleep({seconds})\n"
         "if mode == 'missing':\n"
         "    raise SystemExit(0)\n"
         "run_id = os.environ['KIT_RUN_ID']\n"
@@ -204,7 +212,11 @@ def _stub_command(worker: Path, mode: str) -> list[str]:
     Windows where a ``.cmd`` wrapper can reinterpret a multiline prompt before
     the stub sees it.
     """
-    return [sys.executable, str(worker), mode]
+    return [
+        process_supervisor.isolated_python_executable(sys.executable),
+        str(worker),
+        mode,
+    ]
 
 
 class TestEndToEnd(BoardTestCase):
@@ -235,7 +247,9 @@ class TestEndToEnd(BoardTestCase):
         self.stub_dir = self.runtime / "test-stubs"
         self.stub_dir.mkdir(parents=True, exist_ok=True)
         self.stub = _stub_worker(self.stub_dir)
-        board.providers._copilot_launcher = lambda: [sys.executable]
+        board.providers._copilot_launcher = lambda: [
+            process_supervisor.isolated_python_executable(sys.executable)
+        ]
         board.providers.worker_command = (
             lambda _spec: _stub_command(self.stub, "implemented")
         )
@@ -319,6 +333,10 @@ class TestEndToEnd(BoardTestCase):
 
     def test_approve_dispatches_the_prompt_the_page_displayed(self) -> None:
         comment = "Do the smallest version, and keep the CLI."
+        release_first = self.stub.with_name("release-first")
+        board.providers.worker_command = (
+            lambda _spec: _stub_command(self.stub, "held")
+        )
 
         # what the page shows before approving
         _, detail = _fetch(self.port, f"/api/finding/{SLUG_A}")
@@ -358,6 +376,10 @@ class TestEndToEnd(BoardTestCase):
         self.assertEqual(self.state_of(SLUG_B)["state"], "queued",
                          "a second approval ran concurrently instead of queueing")
 
+        board.providers.worker_command = (
+            lambda _spec: _stub_command(self.stub, "implemented")
+        )
+        release_first.touch()
         done = self.wait_for(SLUG_A, ("done", "blocked", "unverified", "failed"))
         self.assertEqual(done["state"], "done", done["status_detail"])
         self.assertEqual(

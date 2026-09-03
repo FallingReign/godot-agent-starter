@@ -114,7 +114,8 @@ class KitCliTest(unittest.TestCase):
     def assert_isolated_script(
         self, command: list[str], script: Path, *arguments: str
     ) -> None:
-        self.assertEqual([sys.executable, "-B", "-I", "-S", "-c"], command[:5])
+        interpreter = kit.process_supervisor.isolated_python_executable(sys.executable)
+        self.assertEqual([interpreter, "-B", "-I", "-S", "-c"], command[:5])
         self.assertEqual("script", command[6])
         self.assertEqual(str(script.resolve()), command[7])
         self.assertRegex(command[8], r"^[0-9a-f]{64}$")
@@ -883,7 +884,13 @@ class KitCliTest(unittest.TestCase):
                 "Ran 1 test in 0.001s\n\nOK\n"
             )
         )
-        with mock.patch.object(kit, "_run_process", return_value=suite) as run, \
+        inherited_bindings = {
+            kit.managed_launcher.PROJECT_ROOT_ENV: str(ROOT),
+            kit.managed_launcher.CORE_ROOT_ENV: str(ROOT),
+        }
+        with mock.patch.dict(os.environ, inherited_bindings), mock.patch.object(
+                kit, "_run_process", return_value=suite
+        ) as run, \
                 mock.patch.object(kit, "_run_process_inherited") as inherited:
             code, output = self.invoke(
                 "self-test", "--project", str(ROOT), "--json"
@@ -895,7 +902,8 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual("disabled", payload["engine"])
         run.assert_called_once()
         command = run.call_args.args[0]
-        self.assertEqual([sys.executable, "-B", "-I", "-S", "-c"], command[:5])
+        interpreter = kit.process_supervisor.isolated_python_executable(sys.executable)
+        self.assertEqual([interpreter, "-B", "-I", "-S", "-c"], command[:5])
         self.assertEqual("module", command[6])
         self.assertEqual(str((kit.CORE_ROOT / "kit.py").resolve()), command[7])
         self.assertRegex(command[8], r"^[0-9a-f]{64}$")
@@ -908,6 +916,8 @@ class KitCliTest(unittest.TestCase):
         self.assertEqual(kit.CORE_ROOT, run.call_args.kwargs["cwd"])
         self.assertEqual("1", environment["KIT_ENGINE_DISABLED"])
         self.assertEqual("1", environment["KIT_SELF_TEST"])
+        self.assertEqual("", environment[kit.managed_launcher.PROJECT_ROOT_ENV])
+        self.assertEqual("", environment[kit.managed_launcher.CORE_ROOT_ENV])
         self.assertTrue(Path(environment["KIT_TEST_TMPDIR"]).name.startswith("ak-"))
         self.assertFalse(
             Path(environment["KIT_TEST_TMPDIR"]).is_relative_to(kit.CORE_ROOT)

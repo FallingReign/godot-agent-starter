@@ -2375,11 +2375,18 @@ def _verify_member_set(
     version_content = members["VERSION"].content.decode("utf-8").strip()
     if version_content != manifest["version"]:
         raise ReleaseError("VERSION content does not match release manifest")
-    if members["ARCHITECTURE.md"].content != CANONICAL_ARCHITECTURE:
+    exact_legacy_archive = container_sha256 == LEGACY_0_2_0_ARCHIVE_SHA256
+    if (
+        not exact_legacy_archive
+        and members["ARCHITECTURE.md"].content != CANONICAL_ARCHITECTURE
+    ):
         raise ReleaseError(
             "ARCHITECTURE.md is not the canonical empty release template"
         )
-    if members["arch.rules.json"].content != CANONICAL_ARCH_RULES:
+    if (
+        not exact_legacy_archive
+        and members["arch.rules.json"].content != CANONICAL_ARCH_RULES
+    ):
         raise ReleaseError(
             "arch.rules.json is not the canonical genre-neutral release template"
         )
@@ -2391,7 +2398,7 @@ def _verify_member_set(
     # 0.2.0 predates canonical cross-container identity. Keep the exact known
     # archive bound to its historical identity even if a future ZIP writer
     # changes its canonical representation.
-    if container_sha256 == LEGACY_0_2_0_ARCHIVE_SHA256:
+    if exact_legacy_archive:
         identity_sha256 = LEGACY_0_2_0_ARCHIVE_SHA256
     report = {
         "ok": True,

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Iterator
 
 
 TOOLS = Path(__file__).resolve().parent.parent
@@ -23,7 +23,6 @@ sys.path.insert(0, str(TOOLS))
 import brownfield  # noqa: E402
 import kit_change  # noqa: E402
 import kit_change_controller as controller  # noqa: E402
-import managed_launcher  # noqa: E402
 import process_supervisor  # noqa: E402
 import release  # noqa: E402
 
@@ -32,12 +31,16 @@ _CONTROLLER_RESULT_PREFIX = "__KIT_LIFECYCLE_CONTROLLER_RESULT__="
 _WINDOWS_E2E_SCRATCH_CHARS = 96
 _CONTROLLER_DRIVER = r"""
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 release_root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(release_root / "tools"))
 import kit_change_controller as controller
+import managed_launcher
+import process_supervisor
 
 request = json.loads(sys.argv[2])
 runtime = Path(request["runtime"])
@@ -58,11 +61,95 @@ elif action == "apply":
             "detail": "Injected lifecycle check passed without starting Godot.",
         }
 
+    def public_static(checked_target, _session):
+        if checked_target.resolve() != Path(request["target"]).resolve():
+            raise AssertionError("lifecycle check received a different target")
+        environment = process_supervisor.isolated_python_environment(
+            {
+                "KIT_ENGINE_DISABLED": "1",
+                "KIT_LIFECYCLE_CHECK": "1",
+                "KIT_NATIVE_RETRY_TOKEN": "",
+                "KIT_PYTHON": process_supervisor.isolated_python_executable(
+                    sys.executable
+                ),
+                "KIT_VERIFY_AUTH_KEY": "",
+                "KIT_VERIFY_NONCE": "",
+                "KIT_VERIFY_REPOSITORY_SHA256": "",
+            }
+        )
+        environment.pop(managed_launcher.PROJECT_ROOT_ENV, None)
+        environment.pop(managed_launcher.CORE_ROOT_ENV, None)
+        commands = (("doctor", "--json"), ("verify", "--static", "--json"))
+        for arguments in commands:
+            if os.name == "nt":
+                command = [
+                    process_supervisor.windows_command_processor(),
+                    "/d",
+                    "/c",
+                    str(checked_target / "kit.cmd"),
+                    *arguments,
+                ]
+            else:
+                command = [str(checked_target / "kit"), *arguments]
+            completed = subprocess.run(
+                command,
+                cwd=checked_target,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                check=False,
+            )
+            try:
+                payload = json.loads(completed.stdout.lstrip("\ufeff"))
+            except json.JSONDecodeError:
+                payload = None
+            valid = False
+            if isinstance(payload, dict) and payload.get("command") == arguments[0]:
+                if arguments[0] == "doctor":
+                    valid = (
+                        completed.returncode == 0
+                        and payload.get("ok") is True
+                        and payload.get("status") == "ready"
+                    ) or (
+                        completed.returncode == 3
+                        and payload.get("ok") is False
+                        and payload.get("status") == "needs_setup"
+                    )
+                else:
+                    valid = (
+                        completed.returncode == 0
+                        and payload.get("ok") is True
+                        and payload.get("status") == "passed"
+                    )
+            if not valid:
+                detail = " ".join(
+                    (completed.stderr or completed.stdout or "invalid response").split()
+                )[:500]
+                return {
+                    "kit_ok": False,
+                    "project_ok": False,
+                    "existing_issues": [],
+                    "detail": (
+                        f"Public {' '.join(arguments)} failed with "
+                        f"exit {completed.returncode}: {detail}"
+                    )[:1000],
+                }
+        return {
+            "kit_ok": True,
+            "project_ok": True,
+            "existing_issues": [],
+            "detail": "Public doctor response and static verification passed.",
+        }
+
+    hook = public_static if request.get("public_check") else passed
     result = controller.apply(
         runtime,
         request["session_id"],
         request["plan_sha256"],
-        post_apply_check=None if request.get("real_check") else passed,
+        post_apply_check=None if request.get("real_check") else hook,
     )
 elif action == "restore":
     result = controller.restore(
@@ -308,14 +395,17 @@ def _seed_empty_baseline(target: Path) -> bytes:
     return content
 
 
-def _extract_verified_release(archive: Path, destination: Path) -> None:
+def _extract_verified_release(
+    archive: Path, destination: Path, *, verify_directory: bool = True
+) -> None:
     _report, members = release.read_verified_archive(archive)
     destination.mkdir()
     for relative, member in sorted(members.items()):
         path = _write(destination, relative, member.content)
         if member.mode is not None:
             path.chmod(member.mode)
-    release.read_verified_directory(destination)
+    if verify_directory:
+        release.read_verified_directory(destination)
 
 
 def _write_game_fixture(destination: Path) -> None:
@@ -327,7 +417,7 @@ def _write_game_fixture(destination: Path) -> None:
     _write(
         destination,
         "src/custom/avatar.gd",
-        b"extends RefCounted\nclass_name LifecycleFixtureAvatar\n",
+        b"class_name LifecycleFixtureAvatar\nextends RefCounted\n",
     )
 
 
@@ -380,63 +470,6 @@ def _guarded_snapshot(root: Path) -> dict[str, dict[str, str]]:
         relative: _tree_snapshot(root / relative)
         for relative in ("src", "docs/design", ".git")
     }
-
-
-def _launcher_command(target: Path, *arguments: str) -> list[str]:
-    if os.name == "nt":
-        return [
-            process_supervisor.windows_command_processor(),
-            "/d",
-            "/c",
-            str(target / "kit.cmd"),
-            *arguments,
-        ]
-    return [str(target / "kit"), *arguments]
-
-
-def _run_launcher(target: Path, *arguments: str) -> dict[str, object]:
-    environment = dict(os.environ)
-    environment.pop(managed_launcher.PROJECT_ROOT_ENV, None)
-    environment.pop(managed_launcher.CORE_ROOT_ENV, None)
-    environment.update(
-        {
-            "KIT_ENGINE_DISABLED": "1",
-            "KIT_NATIVE_RETRY_TOKEN": "",
-            "KIT_PYTHON": str(Path(sys.executable).resolve()),
-            "KIT_VERIFY_AUTH_KEY": "",
-            "KIT_VERIFY_NONCE": "",
-            "KIT_VERIFY_REPOSITORY_SHA256": "",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-    )
-    completed = subprocess.run(
-        _launcher_command(target, *arguments),
-        cwd=target,
-        env=environment,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=300,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise AssertionError(
-            f"managed launcher {' '.join(arguments)} failed ({completed.returncode}): {detail}"
-        )
-    try:
-        payload = json.loads(completed.stdout.lstrip("\ufeff"))
-    except json.JSONDecodeError as exc:
-        raise AssertionError(
-            f"managed launcher {' '.join(arguments)} returned invalid JSON: "
-            f"{completed.stdout[:500]}"
-        ) from exc
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise AssertionError(
-            f"managed launcher {' '.join(arguments)} returned a failing receipt: {payload}"
-        )
-    return payload
 
 
 def _run_release_controller(
@@ -598,7 +631,7 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
             self.assertEqual("complete", applied_a["kit_change"]["status"])
             self.assertEqual(guarded, _guarded_snapshot(target))
             self.assertIn(
-                b'custom["custom"]',
+                b'm0["custom"]',
                 (target / "ARCHITECTURE.md").read_bytes(),
             )
 
@@ -610,13 +643,20 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 report_a["archive_sha256"],
                 current_a["active_release"]["archive_sha256"],
             )
-            provider_content_a: dict[str, bytes] = {}
+            bridge_content_a: dict[str, bytes] = {}
             for path, before in human_text.items():
                 content = target.joinpath(*path.split("/")).read_bytes()
                 self.assertTrue(content.startswith(before), path)
                 self.assertEqual(1, content.count(managed_blocks_a[path]), path)
                 if path in {"AGENTS.md", ".github/copilot-instructions.md"}:
-                    provider_content_a[path] = content
+                    bridge_content_a[path] = content
+            core_a = target.joinpath(
+                *current_a["active_release"]["core_path"].split("/")
+            )
+            provider_core_a = {
+                path: core_a.joinpath(*path.split("/")).read_bytes()
+                for path in bridge_content_a
+            }
             baseline_a_bytes = _seed_empty_baseline(target)
             public_a = _tree_snapshot(
                 target,
@@ -689,6 +729,9 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 report_a["archive_sha256"],
                 current_b["previous_release"]["archive_sha256"],
             )
+            core_b = target.joinpath(
+                *current_b["active_release"]["core_path"].split("/")
+            )
             self.assertEqual(guarded, _guarded_snapshot(target))
             baseline_b_bytes = target.joinpath(
                 *brownfield.BASELINE_RELATIVE.split("/")
@@ -707,12 +750,18 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 content = target.joinpath(*path.split("/")).read_bytes()
                 self.assertTrue(content.startswith(before), path)
                 self.assertEqual(1, content.count(managed_blocks_b[path]), path)
-                if path in provider_content_a:
-                    self.assertNotEqual(
+                if path in bridge_content_a:
+                    self.assertEqual(
                         managed_blocks_a[path], managed_blocks_b[path]
                     )
-                    self.assertNotEqual(provider_content_a[path], content, path)
-                    self.assertNotIn(managed_blocks_a[path], content, path)
+                    self.assertEqual(bridge_content_a[path], content, path)
+                    active_content = core_b.joinpath(*path.split("/")).read_bytes()
+                    self.assertNotEqual(provider_core_a[path], active_content, path)
+                    self.assertIn(
+                        b"Lifecycle release B provider contract.",
+                        active_content,
+                        path,
+                    )
 
             restored = _run_release_controller(
                 extracted_b,
@@ -766,11 +815,13 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                     )
                     archive_before = archive.read_bytes() if label == "archive" else None
 
-                    prepared = controller.prepare(
-                        runtime,
-                        target,
-                        release_source,
-                        "install",
+                    prepared = _run_release_controller(
+                        extracted,
+                        action="prepare",
+                        runtime=str(runtime),
+                        target=str(target),
+                        release=str(release_source),
+                        mode="install",
                     )
                     self.assertEqual("ready", prepared["kit_change"]["status"])
                     reviewed = controller.status(runtime, prepared["session_id"])
@@ -784,51 +835,27 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                     if archive_before is not None:
                         self.assertEqual(archive_before, archive.read_bytes())
 
-                    receipts: list[dict[str, object]] = []
-
-                    def check_applied(
-                        checked_target: Path, _session: Mapping[str, object]
-                    ) -> Mapping[str, object]:
-                        try:
-                            self.assertEqual(target, checked_target)
-                            receipts.append(_run_launcher(target, "doctor", "--json"))
-                            receipts.append(
-                                _run_launcher(target, "verify", "--static", "--json")
-                            )
-                        except (
-                            AssertionError,
-                            OSError,
-                            subprocess.SubprocessError,
-                        ) as exc:
-                            return {
-                                "kit_ok": False,
-                                "project_ok": False,
-                                "existing_issues": [],
-                                "detail": " ".join(str(exc).split())[:1000],
-                            }
-                        return {
-                            "kit_ok": True,
-                            "project_ok": True,
-                            "existing_issues": [],
-                            "detail": "Managed doctor and static verification passed.",
-                        }
-
-                    applied = controller.apply(
-                        runtime,
-                        prepared["session_id"],
-                        prepared["kit_change"]["plan_sha256"],
-                        post_apply_check=check_applied,
+                    applied = _run_release_controller(
+                        extracted,
+                        action="apply",
+                        runtime=str(runtime),
+                        target=str(target),
+                        session_id=prepared["session_id"],
+                        plan_sha256=prepared["kit_change"]["plan_sha256"],
+                        public_check=True,
                     )
                     self.assertEqual(
                         "complete", applied["kit_change"]["status"], applied
                     )
                     self.assertEqual(
-                        ["doctor", "verify"],
-                        [item["command"] for item in receipts],
+                        "Public doctor response and static verification passed.",
+                        controller.load(runtime, prepared["session_id"])["check"][
+                            "detail"
+                        ],
                     )
                     self.assertEqual(guarded, _guarded_snapshot(target))
                     self.assertIn(
-                        b'custom["custom"]',
+                        b'm0["custom"]',
                         (target / "ARCHITECTURE.md").read_bytes(),
                     )
                     for path, before in human_text.items():
@@ -836,10 +863,12 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                         self.assertTrue(content.startswith(before), path)
                         self.assertEqual(1, content.count(managed_blocks[path]), path)
 
-                    restored = controller.restore(
-                        runtime,
-                        prepared["session_id"],
-                        applied["kit_change"]["result_sha256"],
+                    restored = _run_release_controller(
+                        extracted,
+                        action="restore",
+                        runtime=str(runtime),
+                        session_id=prepared["session_id"],
+                        result_sha256=applied["kit_change"]["result_sha256"],
                     )
                     self.assertEqual(
                         "restored", restored["kit_change"]["status"], restored
@@ -867,6 +896,7 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
             historic_archive = scratch / "godot-agent-kit-0.2.0.zip"
             current_source = scratch / "current-source"
             current_archive = scratch / "godot-agent-kit-current.zip"
+            current_release = scratch / "current-release"
             target = scratch / "legacy-project"
             runtime = scratch / "controller"
             runtime.mkdir()
@@ -883,11 +913,16 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 historic_report["source"]["commit"],
             )
 
-            current_commit = _run_git(ROOT, "rev-parse", "HEAD")
-            _clone_exact_commit(current_source, current_commit)
+            _make_clean_release_source(current_source)
             release.build_release(current_source, current_archive)
+            _extract_verified_release(current_archive, current_release)
             managed_blocks = _managed_block_sources(current_archive)
-            _extract_verified_release(historic_archive, target)
+            # The exact 0.2.0 ZIP is pinned by its historic container digest.
+            # Once extracted, it is a legacy project input rather than a
+            # current release directory and must not claim current templates.
+            _extract_verified_release(
+                historic_archive, target, verify_directory=False
+            )
             _write_game_fixture(target)
             _run_git(target, "init", "--quiet")
             _run_git(target, "config", "user.name", "Kit lifecycle test")
@@ -917,11 +952,13 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
             original = _tree_snapshot(target, exclude_top=frozenset({".kit"}))
             guarded = _guarded_snapshot(target)
 
-            prepared = controller.prepare(
-                runtime,
-                target,
-                current_archive,
-                "upgrade",
+            prepared = _run_release_controller(
+                current_release,
+                action="prepare",
+                runtime=str(runtime),
+                target=str(target),
+                release=str(current_archive),
+                mode="upgrade",
             )
             self.assertEqual("ready", prepared["kit_change"]["status"], prepared)
             self.assertEqual(
@@ -929,10 +966,13 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 controller.load(runtime, prepared["session_id"])["preview"]["raw"]
                 ["material"]["current"]["mode"],
             )
-            applied = controller.apply(
-                runtime,
-                prepared["session_id"],
-                prepared["kit_change"]["plan_sha256"],
+            applied = _run_release_controller(
+                current_release,
+                action="apply",
+                runtime=str(runtime),
+                session_id=prepared["session_id"],
+                plan_sha256=prepared["kit_change"]["plan_sha256"],
+                real_check=True,
             )
 
             self.assertIn(
@@ -951,10 +991,12 @@ class ManagedLifecycleEndToEndTest(unittest.TestCase):
                 self.assertEqual(managed_blocks[path], content, path)
             self.assertEqual(guarded, _guarded_snapshot(target))
 
-            restored = controller.restore(
-                runtime,
-                prepared["session_id"],
-                applied["kit_change"]["result_sha256"],
+            restored = _run_release_controller(
+                current_release,
+                action="restore",
+                runtime=str(runtime),
+                session_id=prepared["session_id"],
+                result_sha256=applied["kit_change"]["result_sha256"],
             )
 
             self.assertEqual("restored", restored["kit_change"]["status"], restored)

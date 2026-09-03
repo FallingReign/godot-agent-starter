@@ -717,7 +717,11 @@ class ProcessBoundary(unittest.TestCase):
                     entrypoint.write_bytes(replacement)
                 return content
 
-            with mock.patch.object(
+            environment = {
+                key: value for key, value in os.environ.items()
+                if key not in (launcher.PROJECT_ROOT_ENV, launcher.CORE_ROOT_ENV)
+            }
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
                 launcher, "_require_regular_file", side_effect=capture_then_replace
             ):
                 self.assertEqual(
