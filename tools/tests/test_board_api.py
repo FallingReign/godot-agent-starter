@@ -1443,26 +1443,31 @@ class TestLiveness(BoardTestCase):
         process.poll.side_effect = [None, None, 0]
         process.wait.return_value = 0
         failed = subprocess.CompletedProcess(["taskkill"], 1)
-        with mock.patch.object(board.os, "name", "nt"), \
-                mock.patch.object(
-                    board.subprocess, "run", return_value=failed
-                ) as run:
+        windows_os = mock.Mock()
+        windows_os.name = "nt"
+        taskkill = r"C:\Windows\System32\taskkill.exe"
+        with mock.patch.object(board, "os", windows_os), mock.patch.object(
+            board.process_supervisor,
+            "windows_system_executable",
+            return_value=taskkill,
+        ) as resolve, mock.patch.object(
+            board.subprocess, "run", return_value=failed
+        ) as run:
             terminated = board._terminate_process_tree(process)
         self.assertTrue(terminated)
-        self.assertEqual(
-            board.process_supervisor.windows_system_executable("taskkill.exe"),
-            run.call_args.args[0][0],
-        )
+        resolve.assert_called_once_with("taskkill.exe")
+        self.assertEqual(taskkill, run.call_args.args[0][0])
         process.kill.assert_called_once_with()
 
     def test_posix_tree_kill_escalates_from_term_to_kill(self) -> None:
         process = mock.Mock(pid=12345)
         process.poll.side_effect = [None, -9]
         process.wait.side_effect = [subprocess.TimeoutExpired("provider", 5), -9]
-        with mock.patch.object(board.os, "name", "posix"), \
-                mock.patch.object(board.os, "killpg", create=True) as kill_group, \
-                mock.patch.object(board.signal, "SIGKILL", 9, create=True):
-            kill_group.side_effect = [None, None, None, ProcessLookupError()]
+        posix_os = mock.Mock()
+        posix_os.name = "posix"
+        posix_os.killpg.side_effect = [None, None, None, ProcessLookupError()]
+        with mock.patch.object(board, "os", posix_os), mock.patch.object(
+                board.signal, "SIGKILL", 9, create=True):
             terminated = board._terminate_process_tree(process)
         self.assertTrue(terminated)
         self.assertEqual(
@@ -1470,7 +1475,7 @@ class TestLiveness(BoardTestCase):
                 mock.call(12345, signal.SIGTERM), mock.call(12345, 0),
                 mock.call(12345, 9), mock.call(12345, 0),
             ],
-            kill_group.call_args_list,
+            posix_os.killpg.call_args_list,
         )
 
     def test_worker_environment_cannot_inherit_broad_or_parent_git_access(self) -> None:

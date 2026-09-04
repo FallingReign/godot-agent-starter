@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Iterator
 from unittest import mock
 
@@ -433,12 +433,18 @@ class ExecutableResolution(unittest.TestCase):
         )
 
     def test_current_app_exec_alias_uses_exact_base_prefix_interpreter(self) -> None:
-        alias = Path(r"C:\Users\person\AppData\Local\Microsoft\WindowsApps\python.exe")
-        ordinary = Path(r"C:\Program Files\WindowsApps\Python\python.exe")
+        alias = PureWindowsPath(
+            r"C:\Users\person\AppData\Local\Microsoft\WindowsApps\python.exe"
+        )
+        ordinary = PureWindowsPath(
+            r"C:\Program Files\WindowsApps\Python\python.exe"
+        )
         with mock.patch.object(
             process_supervisor.sys, "executable", str(alias)
         ), mock.patch.object(
             process_supervisor.sys, "base_prefix", str(ordinary.parent)
+        ), mock.patch.object(
+            process_supervisor, "Path", PureWindowsPath
         ), mock.patch.object(
             process_supervisor,
             "_windows_app_execution_alias",
@@ -553,7 +559,7 @@ class ExecutableResolution(unittest.TestCase):
                 process_supervisor.resolve_ordinary_executable(
                     "git",
                     environment={"PATH": temporary},
-                    excluded_roots=(ROOT,),
+                    excluded_roots=(root, ROOT),
                 )
 
     def test_windows_target_local_git_node_and_cmd_never_execute(self) -> None:

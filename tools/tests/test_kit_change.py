@@ -1995,12 +1995,15 @@ class KitChangeTest(unittest.TestCase):
     def test_windows_replace_retries_only_a_sharing_violation(self) -> None:
         sharing = PermissionError("file is in use")
         sharing.winerror = 32
-        with mock.patch.object(kit_change.os, "name", "nt"), mock.patch.object(
-            kit_change.os, "replace", side_effect=[sharing, None]
-        ) as replace, mock.patch.object(kit_change.time, "sleep") as sleep:
+        windows_os = mock.Mock()
+        windows_os.name = "nt"
+        windows_os.replace.side_effect = [sharing, None]
+        with mock.patch.object(kit_change, "os", windows_os), mock.patch.object(
+            kit_change.time, "sleep"
+        ) as sleep:
             kit_change._replace_file(Path("temporary"), Path("destination"))
 
-        self.assertEqual(replace.call_count, 2)
+        self.assertEqual(windows_os.replace.call_count, 2)
         sleep.assert_called_once_with(0.02)
 
 
