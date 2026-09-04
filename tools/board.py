@@ -670,7 +670,7 @@ def ensure_running() -> str | None:
                     Path(__file__).resolve(),
                     CORE_ROOT,
                     "--serve",
-                    "--port", str(port), "--instance-id", instance_id,
+                    "--port", str(port), f"--instance-id={instance_id}",
                     "--repository-scope-id", repository_scope_id,
                     "--controller-runtime-id", _controller_runtime_id(),
                     "--started", started,

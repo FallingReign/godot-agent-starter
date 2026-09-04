@@ -1407,6 +1407,28 @@ class TestLiveness(BoardTestCase):
             board._controller_runtime_id(), arguments[runtime_index + 1]
         )
 
+    def test_start_binds_a_leading_hyphen_instance_id_to_its_option(self) -> None:
+        process = mock.Mock(pid=54321)
+        process.poll.return_value = None
+        instance_id = "-valid-random-instance"
+        with mock.patch.object(board, "board_health", return_value={
+            "alive": False, "detail": "no board", "url": None,
+        }), mock.patch.object(board, "_free_port", return_value=48991), \
+                mock.patch.object(board, "_probe", return_value=False), \
+                mock.patch.object(board.time, "sleep", return_value=None), \
+                mock.patch.object(
+                    board.secrets, "token_urlsafe", return_value=instance_id
+                ), mock.patch.object(
+                    board.subprocess, "Popen", return_value=process
+                ) as spawn, mock.patch.object(
+                    board, "_terminate_process_tree", return_value=True
+                ):
+            board.ensure_running()
+
+        arguments = spawn.call_args.args[0]
+        self.assertIn(f"--instance-id={instance_id}", arguments)
+        self.assertNotIn("--instance-id", arguments)
+
     def test_failed_start_is_not_persisted_or_reported_as_live(self) -> None:
         process = mock.Mock(pid=54321)
         process.poll.return_value = None
