@@ -325,6 +325,8 @@ def _make_clean_release_source(destination: Path) -> None:
     _run_git(destination, "init", "--quiet")
     _run_git(destination, "config", "user.name", "Kit lifecycle test")
     _run_git(destination, "config", "user.email", "kit-lifecycle@example.invalid")
+    _run_git(destination, "config", "gc.auto", "0")
+    _run_git(destination, "config", "maintenance.auto", "false")
     _run_git(destination, "add", "--all")
     _run_git(
         destination,
@@ -434,6 +436,8 @@ def _copy_project_fixture(destination: Path) -> None:
     _run_git(destination, "init", "--quiet")
     _run_git(destination, "config", "user.name", "Kit lifecycle test")
     _run_git(destination, "config", "user.email", "kit-lifecycle@example.invalid")
+    _run_git(destination, "config", "gc.auto", "0")
+    _run_git(destination, "config", "maintenance.auto", "false")
     _run_git(destination, "add", "--all")
     _run_git(
         destination,
@@ -562,6 +566,18 @@ def _run_release_controller(
 
 
 class ManagedLifecycleEndToEndTest(unittest.TestCase):
+    def test_project_fixture_disables_background_git_maintenance(self) -> None:
+        with _short_scratch() as scratch:
+            target = scratch / "project"
+            target.mkdir()
+            _copy_project_fixture(target)
+
+            self.assertEqual("0", _run_git(target, "config", "--get", "gc.auto"))
+            self.assertEqual(
+                "false",
+                _run_git(target, "config", "--get", "maintenance.auto"),
+            )
+
     def test_short_scratch_is_bounded_and_removed(self) -> None:
         retained: Path | None = None
         with _short_scratch() as scratch:
