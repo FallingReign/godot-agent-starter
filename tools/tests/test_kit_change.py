@@ -1543,8 +1543,6 @@ class KitChangeTest(unittest.TestCase):
         )
 
     def test_incoming_core_with_case_colliding_directory_cannot_be_reused(self) -> None:
-        if os.path.normcase("install") == os.path.normcase("INSTALL"):
-            return
         self._preview_and_apply()
         incoming = _release_fixture(
             version="0.4.0",
@@ -1552,7 +1550,12 @@ class KitChangeTest(unittest.TestCase):
             launcher=b"@echo off\necho managed kit 0.4\n",
         )
         core = self._materialize_core(incoming)
-        (core / "INSTALL").mkdir()
+        collision = core / "INSTALL"
+        try:
+            collision.mkdir()
+        except FileExistsError:
+            self.assertTrue(collision.samefile(core / "install"))
+            return
         self._switch_release(incoming)
 
         decision = kit_change.preview(self.root, self.archive)
