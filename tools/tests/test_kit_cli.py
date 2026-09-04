@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Contract tests for the unified public kit CLI.
 
-The tests deliberately use the checked-out repository as their content fixture
-and replace every delegated process. Verification locks use a private test
-root, so this suite can run inside strict verification without contending with
-the parent verifier. Tests cannot accidentally run a provider, installer, gate,
-or server.
+The tests deliberately use the authenticated kit core as their content fixture
+and replace every delegated process. The core may be a source checkout or the
+verified copy made while testing an installed kit, so repository evidence is a
+stable synthetic fixture unless a test explicitly replaces it. Verification
+locks use a private test root, so this suite can run inside strict verification
+without contending with the parent verifier. Tests cannot accidentally run a
+provider, installer, gate, or server.
 """
 from __future__ import annotations
 
@@ -77,6 +79,18 @@ class KitCliTest(unittest.TestCase):
         )
         warning_patch.start()
         self.addCleanup(warning_patch.stop)
+        fingerprint_patch = mock.patch.object(
+            kit.cockpit,
+            "repository_fingerprint",
+            return_value={
+                "available": True,
+                "digest": "a" * 64,
+                "head": "test-fixture",
+                "untracked": 0,
+            },
+        )
+        fingerprint_patch.start()
+        self.addCleanup(fingerprint_patch.stop)
 
     @staticmethod
     def completed(

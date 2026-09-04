@@ -40,6 +40,8 @@ MAINTAINER_MARKER = "src/.kit-maintainer-fixture"
 COMPLETE_APPLY_STATUS = "complete"
 ADOPTION_APPLY_STATUS = "adoption_required"
 DESIGN_RELATIVE = "docs/design/experience/action-confirmation.md"
+FAILURE_LOG_TAIL_BYTES = 12_000
+FAILURE_EVIDENCE_CHARS = 24_000
 
 DESIGN_TEXT = """# Action confirmation
 
@@ -287,6 +289,91 @@ def _public_environment() -> dict[str, str]:
     return environment
 
 
+def _file_identity(info: os.stat_result) -> tuple[object, ...]:
+    return tuple(
+        getattr(info, field, None)
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_nlink",
+        )
+    )
+
+
+def _failure_log_tail(target: Path, relative: object) -> str:
+    if not isinstance(relative, str):
+        return ""
+    pure = PurePosixPath(relative)
+    expected_prefix = PurePosixPath(".kit/runtime/verification/runs")
+    if (
+        pure.is_absolute()
+        or ".." in pure.parts
+        or pure.as_posix() != relative
+        or not pure.is_relative_to(expected_prefix)
+        or pure.suffix != ".log"
+    ):
+        return ""
+    path = target.joinpath(*pure.parts)
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or _is_reparse(before)
+            or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_nlink", 1)) != 1
+        ):
+            return ""
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(before):
+                return ""
+            offset = max(0, int(opened.st_size) - FAILURE_LOG_TAIL_BYTES)
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            content = os.read(descriptor, FAILURE_LOG_TAIL_BYTES)
+            after_handle = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after = path.lstat()
+    except OSError:
+        return ""
+    if (
+        _file_identity(before) != _file_identity(after_handle)
+        or _file_identity(after_handle) != _file_identity(after)
+        or _is_reparse(after)
+    ):
+        return ""
+    return content.decode("utf-8", errors="replace")
+
+
+def _failed_stage_evidence(target: Path, payload: object) -> str:
+    report = payload.get("report") if isinstance(payload, dict) else None
+    stages = report.get("stages") if isinstance(report, dict) else None
+    if not isinstance(stages, list):
+        return ""
+    evidence: list[str] = []
+    for stage in stages:
+        if not isinstance(stage, dict) or stage.get("status") == "passed":
+            continue
+        evidence.append(
+            f"stage={stage.get('name')!r} status={stage.get('status')!r} "
+            f"reason={stage.get('reason')!r}"
+        )
+        for field in ("stdout_log", "stderr_log"):
+            tail = _failure_log_tail(target, stage.get(field))
+            if tail:
+                evidence.append(f"{field} tail:\n{tail}")
+    return "\n".join(evidence)[:FAILURE_EVIDENCE_CHARS]
+
+
 def _run_public(target: Path, *arguments: str, timeout: int = 900) -> dict[str, Any]:
     completed = subprocess.run(
         _launcher_command(target, *arguments),
@@ -311,9 +398,20 @@ def _run_public(target: Path, *arguments: str, timeout: int = 900) -> dict[str, 
         or not isinstance(payload, dict)
         or payload.get("ok") is not True
     ):
+        evidence = _failed_stage_evidence(target, payload)
+        summary = (
+            {
+                key: payload.get(key)
+                for key in ("ok", "status", "exit_code", "error", "detail")
+                if key in payload
+            }
+            if isinstance(payload, dict)
+            else {"payload_type": type(payload).__name__}
+        )
         raise AssertionError(
             f"public {' '.join(arguments)} failed ({completed.returncode}): "
-            f"{payload!r}; stderr={completed.stderr[-1000:]!r}"
+            f"summary={summary!r}; stderr={completed.stderr[-1000:]!r}"
+            + (f"; failing stage evidence:\n{evidence}" if evidence else "")
         )
     return payload
 
@@ -545,6 +643,39 @@ def run_managed_consumer_proof() -> dict[str, object]:
 
 
 class ManagedConsumerStrictCiContractTests(unittest.TestCase):
+    def test_failure_evidence_keeps_the_bounded_unit_test_tail(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="managed-consumer-evidence-") as raw:
+            target = Path(raw)
+            relative = (
+                ".kit/runtime/verification/runs/fixture/unit-tests.stderr.log"
+            )
+            log = target.joinpath(*PurePosixPath(relative).parts)
+            log.parent.mkdir(parents=True)
+            log.write_text(
+                "discarded-prefix\n" + ("x" * FAILURE_LOG_TAIL_BYTES) + "\nFAIL marker\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            payload = {
+                "report": {
+                    "stages": [
+                        {
+                            "name": "unit-tests",
+                            "status": "failed",
+                            "reason": "unit tests exited 1",
+                            "stderr_log": relative,
+                        }
+                    ]
+                }
+            }
+
+            evidence = _failed_stage_evidence(target, payload)
+
+        self.assertIn("stage='unit-tests' status='failed'", evidence)
+        self.assertIn("FAIL marker", evidence)
+        self.assertNotIn("discarded-prefix", evidence)
+        self.assertLessEqual(len(evidence), FAILURE_EVIDENCE_CHARS)
+
     def test_driver_is_source_only_and_runs_after_source_strict(self) -> None:
         self.assertIn(DRIVER_RELATIVE, release.SOURCE_ONLY_VALIDATION_FILES)
         self.assertNotIn(DRIVER_RELATIVE, release.VALIDATION_FILES)
