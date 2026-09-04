@@ -914,6 +914,41 @@ class TestManagedInstallContract(ReleaseTestCase):
             with self.subTest(platform="windows" if b"@echo off" in rendered else "unix"):
                 self.assertIn(b"-B -I -S -c", rendered)
 
+    def test_managed_windows_launcher_uses_canonical_lf_line_endings(self) -> None:
+        rendered = release._managed_windows_launcher(b"print('managed launcher')\n")
+
+        self.assertIn(b"\n", rendered)
+        self.assertNotIn(b"\r\n", rendered)
+
+    def test_managed_windows_launcher_can_be_staged_with_safecrlf(self) -> None:
+        project = self.scratch / "safecrlf-project"
+        project.mkdir()
+        attributes = (REPOSITORY / ".gitattributes").read_bytes()
+        launcher = release._managed_windows_launcher(b"print('managed launcher')\n")
+        _write(project, ".gitattributes", attributes)
+        _write(project, ".agent-kit/releases/example/.gitattributes", attributes)
+        _write(
+            project,
+            ".agent-kit/releases/example/install/kit.cmd",
+            launcher,
+        )
+        _write(project, "kit.cmd", launcher)
+        _git(project, "init", "--quiet")
+        _git(project, "config", "core.autocrlf", "false")
+        _git(project, "config", "core.safecrlf", "true")
+
+        self.assertEqual(
+            ".agent-kit/releases/example/install/kit.cmd: eol: lf",
+            _git(
+                project,
+                "check-attr",
+                "eol",
+                "--",
+                ".agent-kit/releases/example/install/kit.cmd",
+            ),
+        )
+        _git(project, "add", "--all")
+
     def test_generated_launcher_refuses_redirected_launcher_folder(self) -> None:
         source = (
             b"from pathlib import Path\n"
